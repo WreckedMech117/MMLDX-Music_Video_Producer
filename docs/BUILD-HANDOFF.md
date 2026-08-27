@@ -102,16 +102,27 @@ and then left in a commit subject is a number nobody will find.**
   geometry a fact about the whole project, and without the memo every preview on a twenty-shot
   project paid **538 ms** re-probing takes. This is the number that justifies the preview route
   taking no busy check — see AD-24.
-- **The band panel is 503.6px in a 626px rail, with 212px below the fold — and the spectrum strip
-  still has to fit in it.** Measured in a real browser 2026-08-27, with seven numeric inputs, the
-  drive control and the panel's own notes. It was **553px** before a four-line gate note was split
-  so its second clause is drawn only when a gated setting actually holds a tuned value; that saved
-  49px, and prose was **37% of the panel** before it. Two consequences for story 10.2, which adds a
-  canvas to this same box: the strip's height is a budget rather than a preference, and the first
-  build overflowed so far that Selenium reported `element not interactable` — a Director meets that
-  as a control they cannot reach, and it reads like a layout fault when it is a scroll distance.
-  `panelBelowFold` and `railScrollHeight` are recorded by `tests/e2e_band_panel.py` so the density
-  is a number to argue with rather than a screenshot to notice.
+- **The band panel is 516.6px in a 626px rail, with 225px below the fold — the spectrum strip is
+  36px of that, and it cost 13.** Measured in a real browser 2026-08-27, with seven numeric inputs,
+  the drive control, the canvas and the panel's own notes. It was **553px** before a four-line gate
+  note was split so its second clause is drawn only when a gated setting actually holds a tuned
+  value (−49px), and **503.6px** immediately before story 10.2. The strip's 36px canvas and its 7px
+  margin are 43 of those, and 30 came back because the sentence it replaced — which named *two*
+  missing canvases — became one naming the drive readout alone. **Prose was 37% of this panel
+  once**, which is the whole argument: a canvas that *replaces* an explanation is cheaper than one
+  that joins it. The bound panel, which draws no "what is still needed" block, is 454px with 46px
+  below the fold. The first build of the panel overflowed so far that Selenium reported `element
+  not interactable` — a Director meets that as a control they cannot reach, and it reads like a
+  layout fault when it is a scroll distance. `panelBelowFold` and `railScrollHeight` are recorded
+  by `tests/e2e_band_panel.py` so the density is a number to argue with rather than a screenshot to
+  notice.
+- **`band_width`'s minimum draws a region 3.2px wide, not 4.4.** The strip's canvas is **183px** on
+  this rail — not the ~220px story 10.2's spec estimated — so the minimum band is under four pixels
+  and has no interior at all. Both edge handles keep about 8.6px of grip there, because each is
+  capped inward at half the region and keeps its full reach outward (R-16), and the body drag owns
+  every pixel the handles do not, the ground outside the region included. At the minimum width
+  *and* zero softness the softness handle has three pixels left, which is below the floor, so it is
+  withdrawn and the panel names the box that still sets it.
 - **A bound Shot's preview cache hit is 20.5 ms, not 2.1 ms — and only a bound Shot pays it.**
   Measured 2026-08-27 on a 3-minute master (7.9 MB) with a 326 KB envelope sidecar: **2.08 ms
   unbound, 20.46 ms bound** on a cache hit, and 74 ms for a bound first render. The cost is the

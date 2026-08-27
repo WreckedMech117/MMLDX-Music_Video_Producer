@@ -1,4 +1,4 @@
-import { aiModPlan, alignLyricsKeptTranscription, api, applyRenderStatus, APPLY_DOCUMENTS_CONTROL, approvalControl, approvalNotice, assetNamePlan, assetsForTab, assetTab, assetTabEmpty, ASSET_NAME_HELP, ASSET_NAME_LABEL, ASSET_ROLE_LABELS, ASSET_TABS, assistantControl, assistantFillAllControl, assistantToast, ASSISTANT_EDIT_BLOCKED, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, batchReportToast, beatBandIdentity, beatMarkersControlPlan, characterSlotPlan, CITATION_MISSING_LABEL, clearDocumentConsent, clipEffectsChip, comfyOutputUrl, consistencyAnchorPlan, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, DOCUMENT_CONTROLS, effectBandChange, effectBandToggle, effectBindingsBody, effectBindingsSet, effectControlKey, effectControlTarget, effectCopyBody, effectCopyReport, effectDropTarget, effectMoveOffered, effectNudgeDirection, effectNudgeTarget, effectParameterDefinition, effectParameterReadout, effectParameterValue, effectSliderFill, effectsPanelModel, effectsRefusalNotice, effectStackAdd, effectStackChanged, effectStackMove, effectStackRemove, effectStackSetParameter, effectStackToggle, effectStackWrite, EFFECT_BAND_CLOSED, EFFECT_BAND_ID, EFFECT_PARAMETER_ID, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, expansionReport, generateAllPlan, hasActiveRenderJobs, INSTRUMENTAL_NOTE, jobTarget, markReadyControl, markReadyNotice, monitorPreviewView, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, PLACEHOLDER_PROMPT, prefillControl, PREVIEW_UNPLAYABLE, previewAdoption, randomSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, RENDER_POLL_INTERVAL_MS, resolveShotMode, shotBoundaries, shotCitations, shotEffectStack, shotExpansionToast, shotInspectorReadiness, shotLabel, shotModeOptionLabel, shotPreviewWanted, shotPromptCell, shotSpecificationProblems, shotTab, shotTabAfterKey, shotTabStrip, shotTakeUrl, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SHOT_TABS, SINGING_STATES, snapSeconds, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songOrderRanks, songRefusalMessage, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, tagLyricLine, threadHtml, unsavedWorkPending, unsavedWorkQuestion, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, vocalTaggingPlan, vocalTypeSpec, VOCAL_TYPES, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE } from "./api.js";
+import { aiModPlan, alignLyricsKeptTranscription, api, applyRenderStatus, APPLY_DOCUMENTS_CONTROL, approvalControl, approvalNotice, assetNamePlan, assetsForTab, assetTab, assetTabEmpty, ASSET_NAME_HELP, ASSET_NAME_LABEL, ASSET_ROLE_LABELS, ASSET_TABS, assistantControl, assistantFillAllControl, assistantToast, ASSISTANT_EDIT_BLOCKED, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, batchReportToast, beatBandIdentity, beatMarkersControlPlan, characterSlotPlan, CITATION_MISSING_LABEL, clearDocumentConsent, clipEffectsChip, comfyOutputUrl, consistencyAnchorPlan, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, DOCUMENT_CONTROLS, effectBandChange, effectBandEdit, effectBandStripDrag, effectBandStripHit, effectBandStripPlan, effectBandToggle, effectBindingsBody, effectBindingsSet, effectControlKey, effectControlTarget, effectCopyBody, effectCopyReport, effectDropTarget, effectMoveOffered, effectNudgeDirection, effectNudgeTarget, effectParameterDefinition, effectParameterReadout, effectParameterValue, effectSliderFill, effectsPanelModel, effectsRefusalNotice, effectStackAdd, effectStackChanged, effectStackMove, effectStackRemove, effectStackSetParameter, effectStackToggle, effectStackWrite, EFFECT_BAND_CLOSED, EFFECT_BAND_ID, EFFECT_PARAMETER_ID, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, expansionReport, generateAllPlan, hasActiveRenderJobs, INSTRUMENTAL_NOTE, jobTarget, markReadyControl, markReadyNotice, monitorPreviewView, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, PLACEHOLDER_PROMPT, prefillControl, PREVIEW_UNPLAYABLE, previewAdoption, randomSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, RENDER_POLL_INTERVAL_MS, resolveShotMode, shotBoundaries, shotCitations, shotEffectStack, shotExpansionToast, shotInspectorReadiness, shotLabel, shotModeOptionLabel, shotPreviewWanted, shotPromptCell, shotSpecificationProblems, shotTab, shotTabAfterKey, shotTabStrip, shotTakeUrl, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SHOT_TABS, SINGING_STATES, snapSeconds, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songOrderRanks, songRefusalMessage, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, tagLyricLine, threadHtml, unsavedWorkPending, unsavedWorkQuestion, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, vocalTaggingPlan, vocalTypeSpec, VOCAL_TYPES, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE } from "./api.js";
 import { ASSEMBLE_RUNNING, EXPORT_PRESETS, EXPORT_PRESET_DEFAULT, assemblyControl, assemblyProgress, effectiveOffset, latestAssemblyExport, monitorShowsTake, monitorState, newShotFromPlan, renderProgressByTarget, renderingFlag, shotRenderState, takeAnchorControl, takeAudioControl, takesStripRows, trimNudgeControl } from "./api.js";
 import { EXPAND_ALL_PROMPTS_CONFIRM, EXPAND_ALL_PROMPTS_RUNNING, EXPAND_ALL_PROMPTS_TIMELINE_CONTROL, EXPAND_ALL_PROMPTS_TIMELINE_LABEL, NOTICE_KINDS, expansionSweepLines } from "./api.js";
 // Generate All Empty: the cuts bar's second batch door, beside Expand All Prompts. Its whole
@@ -2565,6 +2565,22 @@ let effectCopy = { shotId: "", open: false, ids: [] };
 //: cleared once a write lands, so the panel then draws what the server stored.
 let effectBand = { ...EFFECT_BAND_CLOSED };
 
+// What the open band panel's spectrum strip is drawn from, and the gesture in flight over it.
+//
+// Two slots and not one, because they answer different questions. The **view** is what the last
+// render handed the canvas -- the measurement's own band average, the served bounds, and the band
+// values the panel model settled on -- so a repaint that is not a gesture (a tab switch, a
+// device-pixel-ratio change) has everything it needs without rebuilding the panel. The **drag**
+// exists only between `pointerdown` and release, and while it does it is the band's live value.
+//
+// Neither is a second owner of *where the band is*. At rest the value is the panel model's, which
+// is `effectBandValues`' answer over the stored binding and the draft; during a gesture it is the
+// drag's, and on release it goes back through `effectBandEdit` -- the same door the three numeric
+// boxes write through. The canvas and those boxes are one band, and this is where that is true or
+// not.
+let effectStripView = null;
+let effectStrip = null;
+
 //: The last copy's report, and the Shot it was about. Kept rather than left to a toast for
 //: `lastEffectsRefusal`'s reason: a toast is gone in four seconds and this one names the Shots
 //: that were left alone and how to unlock them.
@@ -2615,6 +2631,10 @@ function showShotTab(inspector, tabId) {
     const panel = $("#" + tab.panel, inspector);
     if (panel) panel.hidden = !active;
   });
+  // A canvas inside a hidden panel measures zero, so a strip drawn while `Shot Info` was in front
+  // has nothing in it. Repainted here rather than on a rebuild, because switching tabs does not
+  // rebuild the inspector and a Director who comes back to a blank strip has no way to fix it.
+  paintEffectBandStrip(inspector);
 }
 
 // Open or close the picker, and record which it is on the panel's dataset -- `showShotTab`'s
@@ -2710,11 +2730,10 @@ function effectRowHtml(card, row) {
 // The band panel (DESIGN 4.4), opened inline beneath its parameter row and bordered left in
 // `--blue` to mark it as reactive rather than static.
 //
-// **The spectrum strip is not here and the panel says so.** What ships is the Band as the three
-// labelled numeric inputs the accessibility floor already requires of the canvas — centre, width
-// and softness — plus the drive, the floor, the depth and the removal. The strip and the Drive
-// readout are the next two slices; a panel that read as finished would be claiming the canvas had
-// been decided against rather than deferred.
+// **The spectrum strip is the first thing in it**, and the three labelled numeric inputs beneath
+// are its equivalent rather than its substitute — the accessibility floor requires both, and a
+// canvas is not a control a Director without a mouse can operate. The Drive readout is the slice
+// after this one and the panel still says so.
 //
 // Every string, every bound, every `disabled` and the whole question of which of these parts is
 // drawn at all is `effectBandPanel`'s. An absence draws its sentence and no controls, because a
@@ -2731,6 +2750,21 @@ function effectBandHtml(key, band) {
   const analyze = band.analyze?.shown
     ? `<button type="button" class="quiet-button full effect-band-analyze" id="${id("analyze")}" title="${escapeHtml(band.analyze.title)}">${escapeHtml(band.analyze.label)}</button>`
     : "";
+  // The spectrum strip, and it is the panel's **first** control (EXPERIENCE, DESIGN 4.4): the
+  // Band is a thing you look at, and the three boxes beneath it are its equivalent rather than
+  // its substitute. `aria-hidden` because every fact it carries is in those boxes and a canvas
+  // announces nothing (UX-DR15) -- the tooltip is a hover convenience over the same numbers.
+  //
+  // Where the measurement carries no spectrum the canvas is **absent and a sentence takes its
+  // place**, which is `effectBandPanel`'s answer and not this template's. An empty box where an
+  // explanation belongs is the regression this panel refuses everywhere else.
+  const strip = band.strip?.shown
+    ? `<canvas class="effect-band-strip" id="${id("strip")}" aria-hidden="true"`
+      + `${band.strip.disabled ? ' data-locked="true"' : ""}></canvas>`
+      + `<p class="effect-band-crowded" id="${id("crowded")}"></p>`
+    : (band.strip?.note
+      ? `<p class="effect-band-undrawn" id="${id("undrawn")}">${escapeHtml(band.strip.note)}</p>`
+      : "");
   const drive = band.drive?.shown
     ? `<div class="effect-band-row"><span class="effect-band-label" id="${id("drive-label")}">${escapeHtml(band.drive.label)}</span><span class="effect-band-modes" role="group" aria-labelledby="${id("drive-label")}">${band.drive.options.map((option) =>
       `<button type="button" class="effect-band-mode${option.selected ? " chosen" : ""}" id="${id(`drive-${option.value}`)}" title="${escapeHtml(option.title)}" aria-pressed="${option.selected}" ${band.drive.disabled ? "disabled" : ""}>${escapeHtml(option.label)}</button>`).join("")}</span></div>`
@@ -2749,8 +2783,10 @@ function effectBandHtml(key, band) {
   const needs = (band.needs || []).length || band.unwritten
     ? `<div class="effect-band-needs" id="${id("needs")}">${(band.needs || []).map((line) => `<p>${escapeHtml(line)}</p>`).join("")}${band.unwritten ? `<p>${escapeHtml(band.unwritten)}</p>` : ""}</div>`
     : `<div class="effect-band-needs" id="${id("needs")}" hidden></div>`;
-  const strip = band.stripNote
-    ? `<p class="effect-band-strip" id="${id("strip")}">${escapeHtml(band.stripNote)}</p>` : "";
+  // What is still absent from this panel, and it is an exhaustive claim -- the strip above is why
+  // it now names one thing where it named two.
+  const pending = band.pending
+    ? `<p class="effect-band-pending" id="${id("pending")}">${escapeHtml(band.pending)}</p>` : "";
   const remove = band.remove?.shown
     ? `<button type="button" class="quiet-button full effect-band-remove" id="${id("remove")}" title="${escapeHtml(band.remove.title)}" ${band.remove.disabled ? "disabled" : ""}>${escapeHtml(band.remove.label)}</button>`
     : "";
@@ -2759,7 +2795,7 @@ function effectBandHtml(key, band) {
   // seventh accent, and one that is a refusal about a parameter the music can never reach takes
   // an inert edge. Browser QA on 2026-08-27 found the refusal wearing the reactive colour, which
   // is the one thing DESIGN 1 closed the palette to prevent.
-  return `<div class="effect-band" id="effect-band-panel-${key}" data-state="${escapeHtml(band.state)}" role="group" aria-label="${escapeHtml(band.legend || "")}">${note}${analyze}${drive}${controls}${gate}${needs}${strip}${remove}</div>`;
+  return `<div class="effect-band" id="effect-band-panel-${key}" data-state="${escapeHtml(band.state)}" role="group" aria-label="${escapeHtml(band.legend || "")}">${note}${analyze}${strip}${drive}${controls}${gate}${needs}${pending}${remove}</div>`;
 }
 
 // The card's grip (DESIGN 4.2), drawn **only where there is somewhere to go**. C2 left it out on
@@ -3192,6 +3228,10 @@ function paintEffectSlider(inspector, target, input) {
 // route refuses regardless, which is the half that is actually a guard.
 function bindEffectsPanel(inspector, shot, model) {
   const shotId = shot.id;
+  // Whatever the last render left the strip holding is gone: this render decides again whether
+  // there is a strip at all, and a view left over from another Shot's panel would repaint one
+  // Shot's band onto another's canvas the next time a tab switch asked for a repaint.
+  effectStripView = null;
   const stack = () => shotEffectStack(selectedShot() || shot);
   $("#effect-add", inspector)?.addEventListener("click", () => {
     showEffectPicker(inspector, inspector.dataset?.effectPicker !== "open");
@@ -3256,6 +3296,194 @@ function bindEffectsPanel(inspector, shot, model) {
   bindEffectCopy(inspector, shot, model);
 }
 
+
+// The three boxes the strip and the canvas share. Written out because they are the settings a
+// *drag* can move -- `floor`, `hold` and `sustain` are on the same panel and no gesture on the
+// strip touches them.
+const EFFECT_BAND_STRIP_INPUTS = ["band_centre", "band_width", "band_softness"];
+// The spectrum strip, painted from the plan `api.js` handed back.
+//
+// **Nothing here decides anything.** Where every bar goes, how tall it is, where the region's
+// edges fall, which pixels the falloff covers and which handles are offered at this width are all
+// `effectBandStripPlan`'s answers; this measures one box, hands over its width, and strokes what
+// comes back. The two tokens are read off the canvas's own computed style rather than written
+// out, so the palette stays where the palette is.
+//
+// The picture is three passes and the middle one is the point: the bars are drawn `--dim`, then
+// drawn again in `--blue` **clipped to the weight profile**, so the blue part of each bar is
+// exactly that band's weight times its level — the falloff is not illustrated, it is the clip.
+// A hard-edged rectangle over a soft band would be a picture that lies about what the export will
+// do, which is this epic's recurring failure.
+function drawEffectBandStrip(canvas, plan) {
+  const context = canvas?.getContext ? canvas.getContext("2d") : null;
+  if (!context || !plan?.shown) return;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.max(1, Math.round(plan.width * dpr));
+  canvas.height = Math.max(1, Math.round(plan.height * dpr));
+  context.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const style = window.getComputedStyle(canvas);
+  const token = (name) => String(style.getPropertyValue(name) || "").trim();
+  const dim = token("--dim") || "#5a6161";
+  const blue = token("--blue") || "#5b9bd5";
+  const bars = () => {
+    for (const bar of plan.bars) {
+      context.fillRect(bar.x, plan.height - bar.height, bar.width, bar.height);
+    }
+  };
+  const outline = () => {
+    context.beginPath();
+    context.moveTo(0, plan.height);
+    for (const point of plan.curve) context.lineTo(point.x, point.y);
+    context.lineTo(plan.width, plan.height);
+    context.closePath();
+  };
+  context.clearRect(0, 0, plan.width, plan.height);
+  context.fillStyle = dim;
+  bars();
+  context.save();
+  outline();
+  context.clip();
+  context.fillStyle = blue;
+  bars();
+  context.restore();
+  context.save();
+  context.globalAlpha = 0.22;
+  context.fillStyle = blue;
+  outline();
+  context.fill();
+  context.restore();
+  context.strokeStyle = blue;
+  context.lineWidth = 1;
+  context.beginPath();
+  plan.curve.forEach((point, index) => {
+    const y = Math.min(plan.height - 0.5, point.y + 0.5);
+    if (index === 0) context.moveTo(point.x, y);
+    else context.lineTo(point.x, y);
+  });
+  context.stroke();
+  // The handles, and only the ones the plan offers. A handle drawn where a press cannot land is
+  // the control that appears to do nothing, and the panel says which gesture is missing instead.
+  context.fillStyle = blue;
+  for (const handle of plan.handles) {
+    const x = Math.round(handle.x);
+    const top = Math.round(handle.top);
+    const bottom = Math.round(handle.bottom);
+    context.fillRect(x - 1, top, 2, bottom - top);
+    context.fillRect(x - 2, top, 4, 3);
+    context.fillRect(x - 2, bottom - 3, 4, 3);
+  }
+}
+
+// Repaint the open panel's strip from whatever the band is holding now, and hand back the plan so
+// a gesture can be resolved against the same geometry that was just drawn.
+//
+// The values are the drag's while one is in flight and the panel model's otherwise — one owner at
+// a time, and the numeric boxes are written from the same object in the same breath, so the
+// canvas and the three numbers cannot come to disagree mid-gesture.
+function paintEffectBandStrip(inspector = null) {
+  const view = effectStripView;
+  if (!view) return null;
+  const panel = inspector || $("#shot-inspector");
+  const canvas = $("#" + EFFECT_BAND_ID + view.key + "-strip", panel);
+  if (!canvas) return null;
+  const values = effectStrip ? effectStrip.values : view.values;
+  const rect = canvas.getBoundingClientRect?.() || { width: 0, height: 0 };
+  const plan = effectBandStripPlan({
+    bands: view.bands,
+    edges: view.edges,
+    settings: view.settings,
+    values,
+    width: rect.width,
+    height: rect.height,
+  });
+  // The sentence naming a gesture this width has no room for, and the frequencies this band
+  // covers. Both are the plan's, and both are blank where the measurement cannot answer them.
+  const crowded = $("#" + EFFECT_BAND_ID + view.key + "-crowded", panel);
+  if (crowded) crowded.textContent = plan.note || "";
+  if (plan.hz) canvas.setAttribute?.("title", plan.hz);
+  else canvas.removeAttribute?.("title");
+  for (const name of EFFECT_BAND_STRIP_INPUTS) {
+    const input = $("#" + EFFECT_BAND_ID + view.key + "-" + name, panel);
+    if (input && Object.prototype.hasOwnProperty.call(values || {}, name)) {
+      input.value = String(values[name]);
+    }
+  }
+  drawEffectBandStrip(canvas, plan);
+  return plan;
+}
+
+
+// Taking hold of the strip.
+//
+// **Pointer tracking on `window`**, the idiom every other drag in this file uses, and the
+// inspector rebuild is suppressed for the length of the gesture for `startEffectDrag`'s reason:
+// this panel is redrawn by the two-second reload and by every reply nobody awaited, and a rebuild
+// mid-drag replaces the canvas under the pointer.
+//
+// **One write, on release** (constraint 5). A drag that wrote per pixel would be a save per pixel
+// and a manifest rewritten sixty times a second; what moves during the gesture is the picture and
+// the three boxes beside it, and what lands at the end goes through `effectBandEdit` — the same
+// door a typed number goes through.
+function bindEffectBandStrip(inspector, canvas, band, land) {
+  canvas.addEventListener("pointerdown", (event) => {
+    if (event?.button) return;
+    const plan = paintEffectBandStrip(inspector);
+    if (!plan?.shown) return;
+    const settings = effectCatalogue?.binding_settings || [];
+    const at = (moved) => {
+      const box = canvas.getBoundingClientRect();
+      return Number(moved?.clientX ?? 0) - box.left;
+    };
+    // Which gesture this press is, and where inside it the Director took hold. Both are
+    // `effectBandStripHit`'s answers — this handler never asks which handle is nearest.
+    const hit = effectBandStripHit(plan, at(event));
+    if (!hit) return;
+    // The gesture's own geometry is frozen at the press: an edge drag holds the *opposite* edge
+    // still for the whole gesture, and re-planning under it every move would let a clamp at one
+    // end quietly move the anchor at the other.
+    event.preventDefault?.();
+    effectStrip = {
+      shotId: effectBand.shotId, plan, hit, settings, moved: false,
+      values: { ...(plan.values || {}) },
+    };
+    const apply = (moved) => {
+      if (!effectStrip) return;
+      const patch = effectBandStripDrag(effectStrip.plan, effectStrip.hit, at(moved), settings);
+      if (!patch) return;
+      effectStrip.values = { ...effectStrip.values, ...patch };
+      effectStrip.moved = true;
+      paintEffectBandStrip($("#shot-inspector"));
+    };
+    const move = (moved) => apply(moved);
+    const finish = (write) => {
+      window.removeEventListener?.("pointermove", move);
+      window.removeEventListener?.("pointerup", finished);
+      window.removeEventListener?.("keydown", cancel);
+      const drag = effectStrip;
+      effectStrip = null;
+      if (!drag) return;
+      // Abandoned, or a press that never moved anything: the panel is redrawn from what is
+      // stored, because the rebuild it was owed while the gesture was in flight never happened.
+      if (!write || !drag.moved) {
+        renderShotInspector();
+        return;
+      }
+      land(effectBandEdit(band, effectCatalogue, drag.values), "");
+    };
+    const finished = () => finish(true);
+    // Escape abandons the gesture and writes nothing — `startEffectDrag`'s bargain, and for its
+    // reason: a drag a Director changed their mind about must not be one they have to complete
+    // somewhere harmless.
+    const cancel = (pressed) => { if (pressed?.key === "Escape") finish(false); };
+    // Applied on the press itself, so a press on the strip's empty ground moves the band to where
+    // it was pressed rather than waiting for a movement the Director may not make.
+    apply(event);
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", finished);
+    window.addEventListener("keydown", cancel);
+  });
+}
+
 // The bind glyph and, where it is open, everything inside its band panel.
 //
 // **The glyph is bound on every row, in every state.** An undrivable parameter and an unmeasured
@@ -3298,8 +3526,7 @@ function bindEffectBand(inspector, shot, card, row) {
   // on the control that caused it -- `bindEffectCopy`'s Section button, and for its reason. A
   // `change` has already committed by the time it fires, so there is no caret mid-number to lose;
   // what would be lost by *not* rebuilding is the panel's own account of what is still needed.
-  const changed = (name, raw, control) => {
-    const plan = effectBandChange(band, effectCatalogue, name, raw);
+  const land = (plan, control) => {
     const stack = shotEffectStack(selectedShot() || shot);
     effectBand = { ...effectBand, values: plan.values };
     if (plan.binding) {
@@ -3308,8 +3535,27 @@ function bindEffectBand(inspector, shot, card, row) {
       return;
     }
     renderShotInspector();
-    $(control, $("#shot-inspector"))?.focus?.();
+    if (control) $(control, $("#shot-inspector"))?.focus?.();
   };
+  const changed = (name, raw, control) => land(
+    effectBandChange(band, effectCatalogue, name, raw), control);
+  // The strip, drawn from the same measurement the panel decided its absences off and operated
+  // through the same `land` a typed number goes through. A locked Shot draws it and does not bind
+  // it: the panel is readable, and every writing control on it is off (FX-7).
+  if (band.strip?.shown) {
+    effectStripView = {
+      key,
+      settings: effectCatalogue?.binding_settings || [],
+      bands: band.strip.bands,
+      edges: band.strip.edges,
+      values: band.values,
+    };
+    const canvas = $(id("strip"), inspector);
+    if (canvas) {
+      paintEffectBandStrip(inspector);
+      if (!band.strip.disabled) bindEffectBandStrip(inspector, canvas, band, land);
+    }
+  }
   for (const option of band.drive?.options || []) {
     const control = id(`drive-${option.value}`);
     $(control, inspector)?.addEventListener("click", () => {
@@ -3634,6 +3880,11 @@ export function renderShotInspector() {
   // suppression rather than a carry. Bounded by the gesture -- `pointerup` and `Escape` both clear
   // it on `window`, and the drop's own write rebuilds this panel a moment later.
   if (effectDrag && effectDrag.shotId === shot.id) return;
+  // And a drag on the spectrum strip owns it for the same reason and on the same terms: the
+  // canvas the Director has hold of would be replaced mid-gesture, and the band would jump back
+  // to the value the reply carried. Bounded by the gesture -- `pointerup` and `Escape` both clear
+  // it on `window`, and the release's own write rebuilds this panel a moment later.
+  if (effectStrip && effectStrip.shotId === shot.id) return;
   const place = captureInspectorEdit(inspector, shot.id);
   const assets = state.project.assets || [];
   // The refusal sends the Director here -- "Write a prompt in the shot inspector" -- so the panel

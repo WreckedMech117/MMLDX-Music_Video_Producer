@@ -19975,8 +19975,17 @@ EFFECTS_SONG = {
 #: The merged snap-targets read for a song that has been measured. `analysed` is the only evidence
 #: this browser has and `reason` is the server's own sentence beside it; both come off one read, so
 #: the band panel and the timeline's marks cannot describe different states.
+#: `band_average` and `band_edges` are here because the spectrum strip is drawn from them and
+#: from nothing else (AD-26). **Six bands and seven edges, not eight and nine**: the count is read
+#: off the data, and a fixture carrying the shipped count would let a literal 8 pass every test in
+#: this file. The levels are deliberately uneven so a bar drawn to the wrong height is visible as
+#: a number rather than as eight identical rectangles.
+EFFECTS_BAND_AVERAGE = [0.42, 0.31, 0.18, 0.24, 0.09, 0.05]
+EFFECTS_BAND_EDGES = [30.0, 96.0, 308.0, 985.0, 3150.0, 10080.0, 22050.0]
 EFFECTS_MEASURED = {"gaps": [], "beats": [1.0, 2.0], "measured": False, "analysed": True,
-                    "reason": "", "start": 0.0, "end": 8.0, "envelope": {"beats": [1.0, 2.0]}}
+                    "reason": "", "start": 0.0, "end": 8.0,
+                    "envelope": {"beats": [1.0, 2.0], "band_average": EFFECTS_BAND_AVERAGE,
+                                 "band_edges": EFFECTS_BAND_EDGES}}
 
 
 def effects_unmeasured(reason: str) -> dict:
@@ -23379,7 +23388,9 @@ def band_exports() -> dict:
     return run_module("""
       import { EFFECT_BAND_NEEDS_DRIVE, EFFECT_BAND_NEEDS_DEPTH, EFFECT_BAND_UNWRITTEN,
                EFFECT_BAND_UNCHANGED, EFFECT_BAND_UNDRIVABLE_NOTE, EFFECT_BAND_NEEDS_MEASUREMENT,
-               EFFECT_BAND_UNRESOLVABLE_NOTE, EFFECT_BAND_UNREAD_NOTE, EFFECT_BAND_STRIP_PENDING,
+               EFFECT_BAND_UNRESOLVABLE_NOTE, EFFECT_BAND_UNREAD_NOTE,
+               EFFECT_BAND_READOUT_PENDING, EFFECT_BAND_STRIP_UNDRAWN,
+               EFFECT_BAND_STRIP_CROWDED, EFFECT_STRIP_TARGETS,
                EFFECT_BAND_REMOVE_LABEL, EFFECT_BAND_DRIVE_ONLY_NOTE,
                EFFECT_BAND_DRIVE_ONLY_HELP, EFFECT_BAND_DRIVE_ONLY_KEPT,
                EFFECT_BIND_STATES, EFFECT_BIND_TITLES,
@@ -23391,7 +23402,9 @@ def band_exports() -> dict:
         unwritten: EFFECT_BAND_UNWRITTEN, unchanged: EFFECT_BAND_UNCHANGED,
         undrivable: EFFECT_BAND_UNDRIVABLE_NOTE, needsMeasurement: EFFECT_BAND_NEEDS_MEASUREMENT,
         unresolvable: EFFECT_BAND_UNRESOLVABLE_NOTE, unread: EFFECT_BAND_UNREAD_NOTE,
-        strip: EFFECT_BAND_STRIP_PENDING, remove: EFFECT_BAND_REMOVE_LABEL,
+        pending: EFFECT_BAND_READOUT_PENDING, undrawn: EFFECT_BAND_STRIP_UNDRAWN,
+        crowded: EFFECT_BAND_STRIP_CROWDED, targets: EFFECT_STRIP_TARGETS,
+        remove: EFFECT_BAND_REMOVE_LABEL,
         driveOnly: EFFECT_BAND_DRIVE_ONLY_NOTE, driveOnlyHelp: EFFECT_BAND_DRIVE_ONLY_HELP,
         driveOnlyKept: EFFECT_BAND_DRIVE_ONLY_KEPT,
         states: EFFECT_BIND_STATES, titles: EFFECT_BIND_TITLES, locked: EFFECTS_LOCKED_NOTE,
@@ -23590,7 +23603,7 @@ def test_the_band_panels_bounds_are_the_servers_and_never_this_files():
     # Exposure's amount runs -1..1, so a binding may move it by at most its own span either way.
     assert bounds(inputs["depth"]) == (-2.0, 2.0), inputs["depth"]
     # And the panel names exactly what it is still missing rather than reading as finished.
-    assert escape_for_markup(said["strip"]) in panel["effects"]
+    assert escape_for_markup(said["pending"]) in panel["effects"]
 
 
 def test_a_binding_survives_every_other_gesture_on_its_card():
@@ -24117,15 +24130,20 @@ def test_a_timing_the_punch_drive_ignores_is_still_carried_through_every_write()
 def test_the_panel_names_exactly_what_it_is_still_missing():
     """The sentence under the band inputs is an exhaustive claim, so it is checked as one.
 
-    With `hold` and `sustain` drawn, story 10.1 is met by this panel and the only parts of the band
-    surface that do not exist are 10.2's spectrum strip and 10.3's drive readout. The sentence says
-    *only two things*, and a slice that added a third absence without editing it would leave a
-    false statement on screen -- which is what the `STALE` label shipped as, one epic ago.
+    **Narrowed by story 10.2 rather than deleted, which is what an exhaustive claim is for.** It
+    named two absences while the Band was three numbers -- the spectrum strip and the drive
+    readout. The strip is now drawn above those numbers, so the sentence names the readout and
+    nothing else, and the claim is checked from both ends: it must say *only*, it must not still
+    be claiming a strip this panel has, and the canvas must actually be in the markup. A slice
+    that added a third absence without editing this would leave a false statement on screen, which
+    is what the `STALE` label shipped as one epic ago.
     """
     said = band_exports()
 
-    assert "only two things" in said["strip"], said["strip"]
-    assert "spectrum strip" in said["strip"] and "readout" in said["strip"], said["strip"]
+    assert "only thing" in said["pending"], said["pending"]
+    assert "readout" in said["pending"], said["pending"]
+    assert "spectrum strip" not in said["pending"], (
+        "the panel still says the strip is missing, and it is drawn above the sentence")
     # Every control story 10.1 names is reachable, which is what makes the claim true today.
     panel = drawn_effects_panel(
         band_shot(), song=EFFECTS_SONG, measurement=EFFECTS_MEASURED,
@@ -24138,6 +24156,561 @@ def test_the_panel_names_exactly_what_it_is_still_missing():
         assert f'id="effect-band-0-amount-{control}"' in panel, control
     for mode in EFFECT_CATALOGUE["drives"]:
         assert f'id="effect-band-0-amount-drive-{mode}"' in panel, mode
-    # And nothing canvas-shaped has quietly appeared, which would make the sentence false the
-    # other way round.
+    # And the strip is really there, which is the half of the claim that would otherwise be a
+    # sentence saying the canvas exists over a panel that has none.
+    assert '<canvas class="effect-band-strip" id="effect-band-0-amount-strip"' in panel, panel
+    assert 'aria-hidden="true"' in panel.split('class="effect-band-strip"', 1)[1][:120], panel
+
+
+# --------------------------------------------------------------------------------------
+# The spectrum strip (story 10.2). The canvas is a drawing and none of its decisions is: which
+# pixel is which band, where the region's edges fall, what a drag at x resolves to and which
+# handle a press is nearest are all `api.js`'s, and every one of them is executed below with no
+# DOM at all. The gesture itself is then driven through the real workspace, because "one write on
+# release" is a claim about a sequence of events and no pure function can hold it.
+# --------------------------------------------------------------------------------------
+
+#: The measured spectrum as a strip plan is handed one, and the strip's own box. 200px is close to
+#: what the 260px rail actually gives the canvas -- measured at 183px on 2026-08-27 -- and a round
+#: number keeps the arithmetic in these tests readable.
+STRIP_BOX = {"width": 200, "height": 36}
+
+
+def strip_plan(body: str) -> dict:
+    """Run `effectBandStripPlan`/`Hit`/`Drag` against the measured fixture and report the answers.
+
+    `plan(values)` is the six-band measurement drawn at `STRIP_BOX`; `SETTINGS` is the served
+    catalogue's own bounds, so nothing below states a bound of its own.
+    """
+    return run_module("""
+      import { effectBandStripPlan, effectBandStripHit, effectBandStripDrag }
+        from './src/music_video_producer/web/assets/api.js';
+      const SETTINGS = __SETTINGS__;
+      const BANDS = __BANDS__;
+      const EDGES = __EDGES__;
+      const BOX = __BOX__;
+      const plan = (values, over = {}) => effectBandStripPlan({
+        bands: BANDS, edges: EDGES, settings: SETTINGS, ...BOX, values, ...over,
+      });
+      __BODY__
+    """.replace("__SETTINGS__", json.dumps(EFFECT_CATALOGUE["binding_settings"]))
+       .replace("__BANDS__", json.dumps(EFFECTS_BAND_AVERAGE))
+       .replace("__EDGES__", json.dumps(EFFECTS_BAND_EDGES))
+       .replace("__BOX__", json.dumps(STRIP_BOX))
+       .replace("__BODY__", body))
+
+
+def band_gesture(shot: str, body: str, responses: dict | None = None,
+                 measurement: dict | None = None) -> dict:
+    """Draw one Shot's Effects tab and perform a gesture on the strip inside it.
+
+    Its own `console.log`, unlike `drawn_effects_panel`'s: a gesture is a *sequence*, and what has
+    to be read is what was true between the press and the release rather than what the panel
+    settled on afterwards.
+    """
+    return run_effects_workspace(f"""
+      state.project = {effects_project(shot, song=EFFECTS_SONG)};
+      state.songMeasurement = {json.dumps(measurement or EFFECTS_MEASURED)};
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      {body}
+    """, responses=responses)
+
+
+def test_the_strip_draws_the_falloff_the_compiler_computes():
+    """The picture's weight curve and the export's are one function, asked for the same numbers.
+
+    **This is the only place in this epic where a second implementation was accepted, so it is the
+    one place a cross-engine assertion is compulsory.** The strip has to answer *what does this
+    band hear* on every pointer move, before anything is written and with no compiled binding on
+    the server to ask -- R-27 bars a second renderer of a signal the compiler can serve, and this
+    is the case where it cannot serve one. What that leaves is drift, and drift is what this
+    closes: both constants are compared to `effects.py`'s own, and the curve is then evaluated in
+    both engines over a grid that sits inside the region, crosses its edge, and runs well out into
+    the skirt at both extremes of softness.
+
+    A test that compared the two *constants* only would pass just as happily for a port that had
+    squared the wrong term.
+    """
+    from music_video_producer.effects import (
+        DRIVE_SOFTNESS_FLOOR,
+        DRIVE_SOFTNESS_SPAN,
+        _band_weight,
+    )
+
+    cases = [
+        (position, centre, width, softness)
+        for position in (0.0, 0.1, 0.25, 0.4, 0.5, 0.75, 1.0)
+        for centre, width in ((0.25, 0.3), (0.5, 0.02), (0.0, 1.0))
+        for softness in (0.0, 0.35, 1.0)
+    ]
+    drawn = run_module("""
+      import { effectBandWeight, EFFECT_STRIP_SOFTNESS_FLOOR, EFFECT_STRIP_SOFTNESS_SPAN }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        floor: EFFECT_STRIP_SOFTNESS_FLOOR, span: EFFECT_STRIP_SOFTNESS_SPAN,
+        weights: __CASES__.map(([position, centre, width, softness]) =>
+          effectBandWeight(position, centre, width, softness)),
+      }));
+    """.replace("__CASES__", json.dumps(cases)))
+
+    assert drawn["floor"] == DRIVE_SOFTNESS_FLOOR
+    assert drawn["span"] == DRIVE_SOFTNESS_SPAN
+    for case, weight in zip(cases, drawn["weights"], strict=True):
+        assert weight == pytest.approx(_band_weight(*case), abs=1e-12), case
+    # And the grid is not one where the answer is 1 throughout: a curve returning 1 everywhere
+    # would satisfy every assertion above if the compiler agreed, and the compiler does not.
+    assert min(drawn["weights"]) < 0.01, drawn["weights"]
+
+
+def test_the_strip_reads_its_band_count_off_the_measurement_and_never_assumes_eight():
+    """Six bands draw six bars, three draw three, and none draws nothing at all.
+
+    `served_measurement` carries a short array **short**, on purpose, so a hand-edited sidecar
+    surfaces as a drawing that is short rather than as arrays of zeros that look measured. A strip
+    assuming the shipped eight would undo that deliberately, and R-30's delegated decision says
+    the count is read off `band_average`'s own length and written down nowhere.
+
+    The bars are also asserted to *land on their own bands*: `band_series` puts band `k` at
+    `k / (count - 1)`, so each bar's box centre has to be the pixel that position maps to. A strip
+    laid straight across the width instead would draw a region half a bar out of step with the one
+    the export hears -- the same class of error as a marker on the wrong second.
+    """
+    read = strip_plan("""
+      const values = { band_centre: 0.25, band_width: 0.3, band_softness: 0.35 };
+      const counts = (bands, edges) => {
+        const drawn = effectBandStripPlan({
+          bands, edges, settings: SETTINGS, values, ...BOX });
+        return { shown: drawn.shown, count: drawn.count, bars: drawn.bars.length, hz: drawn.hz };
+      };
+      const six = plan(values);
+      console.log(JSON.stringify({
+        six: {
+          count: six.count, bars: six.bars.length, hz: six.hz,
+          centres: six.bars.map((bar) => bar.x + bar.width / 2),
+          positions: six.bars.map((bar) => bar.position),
+          heights: six.bars.map((bar) => bar.height),
+        },
+        three: counts([0.5, 0.25, 0.125], [30, 300, 3000, 22050]),
+        one: counts([0.5], [30, 22050]),
+        none: counts([], []),
+        ragged: counts([0.4, 0.3, 0.2], [30, 300, 3000]),
+        unreadable: counts([0.4, "loud", 0.2], [30, 300, 3000, 22050]),
+        whole: plan({ band_centre: 0.5, band_width: 1.0, band_softness: 0.0 }).hz,
+        // The *axis*, asked through the region rather than through the bar boxes: a band centred
+        // on band `k` has to draw its region centred on band `k`'s own bar.
+        onEachBand: [0, 1, 2, 3, 4, 5].map((index) => plan({
+          band_centre: index / 5, band_width: 0.02, band_softness: 0,
+        }).band.centre),
+        quiet: (() => {
+          const drawn = effectBandStripPlan({
+            bands: [0.5, 0.0, 0.25], edges: [30, 300, 3000, 22050],
+            settings: SETTINGS, values, ...BOX });
+          return drawn.bars.map((bar) => bar.height);
+        })(),
+      }));
+    """)
+
+    assert read["six"]["count"] == 6 and read["six"]["bars"] == 6
+    assert read["three"]["count"] == 3 and read["three"]["bars"] == 3
+    assert read["one"]["count"] == 1 and read["one"]["bars"] == 1
+    # No spectrum is not a strip with nothing in it: the plan is not shown at all, so the panel
+    # draws its sentence instead of an empty box.
+    assert read["none"]["shown"] is False and read["none"]["bars"] == 0
+    # An array this cannot read whole is the same nothing. Two-thirds of a measurement drawn as a
+    # spectrum is exactly what `served_measurement` drops a non-number to prevent.
+    assert read["unreadable"]["shown"] is False, read["unreadable"]
+
+    # Each bar's centre is its own band's position, through the axis and nothing else.
+    inset = STRIP_BOX["width"] / 6 / 2
+    span = STRIP_BOX["width"] - STRIP_BOX["width"] / 6
+    for index, centre in enumerate(read["six"]["centres"]):
+        assert centre == pytest.approx(inset + (index / 5) * span, abs=0.001), index
+    assert read["six"]["positions"] == pytest.approx([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+    # **And the region uses that same axis**, which is the half a bar-box assertion cannot see:
+    # `band_series` weights band `k` at `k / (count - 1)`, so a band centred there has to draw
+    # over that bar and not half a bar off it. An axis laid straight across the strip instead
+    # leaves every bar box exactly where it was and moves only the region -- which is a picture
+    # that shows the Director a band the export does not hear.
+    assert read["onEachBand"] == pytest.approx(read["six"]["centres"]), (
+        read["onEachBand"], read["six"]["centres"])
+    # And the bars stand relative to the loudest band, so the picture answers *where is this
+    # song's energy* rather than drawing six stubs at the envelope's absolute levels. A pixel of
+    # headroom is kept at the top, because a bar and a plateau both landing on row zero drew a
+    # region open at the top -- caught by looking at the painted canvas, 2026-08-27.
+    roof = STRIP_BOX["height"] - 1
+    assert read["six"]["heights"][0] == roof
+    assert read["six"]["heights"][1] == pytest.approx(
+        roof * EFFECTS_BAND_AVERAGE[1] / EFFECTS_BAND_AVERAGE[0])
+    # And a band the analysis measured at nothing is **still a bar**. The weight curve draws a
+    # line along the foot of the strip where its weight is nothing, and a one-pixel bar
+    # disappeared under it -- a measured band drawing as nothing at all is the one thing this
+    # picture must not do, because "eight bands, one of them silent" and "seven bands" are
+    # different measurements. Asserted on a spectrum that actually holds a zero: the fixture above
+    # has no silent band, and a fixture that makes the defect impossible is why nine guards
+    # survived their first mutation across E1 to E3.
+    assert min(read["quiet"]) >= 2, read["quiet"]
+    assert read["quiet"][1] == 2, ("a silent band is not drawn at all", read["quiet"])
+
+    # `band_edges` is read only where it matches `band_average` -- one more edge than there are
+    # bands, and the frequencies printed are the analysis's own. A ragged pair prints nothing
+    # rather than an invented edge.
+    assert read["six"]["hz"] == "This band covers 96 Hz to 308 Hz.", read["six"]["hz"]
+    assert read["whole"] == "This band covers 30 Hz to 22 kHz.", read["whole"]
+    assert read["ragged"]["hz"] == "", read["ragged"]["hz"]
+    assert read["none"]["hz"] == ""
+
+
+def test_every_gesture_the_strip_offers_is_reachable_at_the_minimum_band_width():
+    """`band_width`'s minimum is 0.02, which on this strip is a region three pixels across holding
+    two edge handles and a softness handle with no interior left to drag.
+
+    **So no gesture depends on that interior.** The two edges keep their full grip outward and are
+    capped inward by half the region, so they meet at its own midpoint however narrow it becomes
+    and each has eight pixels apiece at the minimum -- more than a wide region gives them. The
+    body drag owns every pixel the handles do not, the ground *outside* the region included, so
+    moving the band is reachable at any width. And the softness handle, which takes what is left
+    beyond the edges, is **withdrawn and named** when there is nothing left: at the minimum width
+    *and* zero softness its ground is three pixels, and a three-pixel target is the flat-radius
+    failure R-16 exists about.
+
+    Asserted by sweeping every pixel of the strip rather than by asking the handles where they
+    are: a partition with a hole in it is a press that does nothing, and a press that does nothing
+    is invisible to a test that only reads handle positions.
+    """
+    said = band_exports()
+    swept = strip_plan("""
+      const sweep = (values) => {
+        const drawn = plan(values);
+        const hits = [];
+        for (let x = 0; x <= BOX.width; x += 1) hits.push(effectBandStripHit(drawn, x).target);
+        const ground = {};
+        for (const name of hits) ground[name] = (ground[name] || 0) + 1;
+        return {
+          ground, note: drawn.note, holes: hits.filter((name) => !name).length,
+          handles: drawn.handles.map((handle) => handle.name),
+          softness: drawn.handles.filter((handle) => handle.name === 'softness')
+            .map((handle) => handle.side),
+          region: drawn.band.right - drawn.band.left,
+        };
+      };
+      console.log(JSON.stringify({
+        tightest: sweep({ band_centre: 0.5, band_width: 0.02, band_softness: 0.0 }),
+        narrow: sweep({ band_centre: 0.5, band_width: 0.02, band_softness: 0.35 }),
+        wide: sweep({ band_centre: 0.5, band_width: 0.9, band_softness: 0.35 }),
+        atTheTop: sweep({ band_centre: 1.0, band_width: 0.3, band_softness: 0.6 }),
+      }));
+    """)
+
+    for state, read in swept.items():
+        # Every pixel belongs to a gesture. Nothing falls through to nothing.
+        assert read["holes"] == 0, state
+        # The body is reachable in every state, which is what makes the minimum width workable.
+        assert read["ground"]["centre"] > 50, (state, read["ground"])
+        # And nothing is offered that is not one of the gestures this strip has.
+        assert set(read["ground"]) <= set(said["targets"]), (state, read["ground"])
+
+    # The region really is three pixels wide there, which is what the rest of this is about.
+    assert swept["narrow"]["region"] < 4, swept["narrow"]["region"]
+    for state in ("tightest", "narrow", "wide"):
+        ground = swept[state]["ground"]
+        assert ground["low"] >= 8 and ground["high"] >= 8, (state, ground)
+    # At the minimum width the softness handle is still on the strip, because the falloff puts it
+    # well clear of both edges. This is the ordinary narrow band: every gesture is there.
+    assert swept["narrow"]["handles"] == ["low", "high", "softness"], swept["narrow"]
+    assert swept["narrow"]["note"] == ""
+    # Take the softness to zero as well and there is no ground left to stand on. Withdrawn, named,
+    # and the box that still sets it named with it.
+    assert swept["tightest"]["handles"] == ["low", "high"], swept["tightest"]
+    assert swept["tightest"]["note"] == said["crowded"], swept["tightest"]["note"]
+    assert "softness" not in swept["tightest"]["ground"], swept["tightest"]["ground"]
+    # A band pressed against the top of the spectrum overhangs it: its high edge is off the strip
+    # -- which `band_centre`'s own bound allows and which the low edge still sets the width from
+    # -- and the softness handle goes to the side that has room rather than off the end with it.
+    assert "high" not in swept["atTheTop"]["ground"], swept["atTheTop"]["ground"]
+    assert swept["atTheTop"]["ground"]["low"] >= 8, swept["atTheTop"]["ground"]
+    assert swept["atTheTop"]["softness"] == [-1], swept["atTheTop"]
+
+
+def test_a_drag_on_one_edge_holds_the_other_still_and_never_turns_the_region_inside_out():
+    """Dragging an edge sets the width against the edge that is not moving, which is what makes it
+    a width gesture rather than a move; dragging the body sets the centre and leaves the width
+    alone; dragging the softness handle sets softness and nothing else.
+
+    Each returns **only the settings it changes**, so a gesture on the strip cannot quietly
+    rewrite a number the Director typed into a box, and every value comes back on the same step
+    that box takes -- a drag produces numbers a Director could have typed.
+
+    Dragged past its partner the region collapses to the catalogue's own minimum against the
+    stationary edge. It never flips, and the minimum comes off the served bounds rather than out
+    of this file.
+    """
+    dragged = strip_plan("""
+      const drawn = plan({ band_centre: 0.5, band_width: 0.4, band_softness: 0.35 });
+      const grab = (x) => effectBandStripHit(drawn, x);
+      const from = (held, to) => effectBandStripDrag(drawn, grab(held), to, SETTINGS);
+      const soft = drawn.handles.find((handle) => handle.name === 'softness');
+      console.log(JSON.stringify({
+        targets: [grab(drawn.band.left).target, grab(drawn.band.right).target,
+                  grab(drawn.band.centre).target, grab(5).target, grab(soft.x).target],
+        low: from(drawn.band.left, drawn.band.left - 23),
+        high: from(drawn.band.right, drawn.band.right + 23),
+        body: from(drawn.band.centre, 179),
+        soft: from(soft.x, soft.x + 13),
+        flipped: from(drawn.band.left, drawn.band.right + 40),
+        held: drawn.values,
+      }));
+    """)
+
+    # Taking hold of an edge is a width gesture; taking hold of the middle of a wide region, or of
+    # the ground outside it, is a move.
+    assert dragged["targets"] == ["low", "high", "centre", "centre", "softness"]
+    assert dragged["held"] == {"band_centre": 0.5, "band_width": 0.4, "band_softness": 0.35}
+    # The low edge moved out and the high edge stayed where it was -- to within the half step the
+    # quantisation below is allowed to move it, and no further. The distances are deliberately not
+    # a whole number of steps, so a drag that skipped the quantisation would land somewhere the
+    # box could not have produced: a fixture whose arithmetic came out on the step by luck is what
+    # let this guard survive its first mutation.
+    half = 0.005
+    assert set(dragged["low"]) == {"band_width", "band_centre"}
+    assert dragged["low"]["band_centre"] + dragged["low"]["band_width"] / 2 == pytest.approx(
+        0.7, abs=half)
+    assert dragged["low"]["band_width"] > 0.4
+    # And the same the other way, against a stationary low edge.
+    assert dragged["high"]["band_centre"] - dragged["high"]["band_width"] / 2 == pytest.approx(
+        0.3, abs=half)
+    assert dragged["high"]["band_width"] > 0.4
+    # The body moves the centre and touches neither the width nor the softness.
+    assert set(dragged["body"]) == {"band_centre"}
+    assert dragged["body"]["band_centre"] > 0.5
+    # Softness moves softness and nothing else.
+    assert set(dragged["soft"]) == {"band_softness"}
+    assert dragged["soft"]["band_softness"] > 0.35
+    # Dragged through its partner the region collapses to the served minimum and does not flip.
+    minimum = next(item["minimum"] for item in EFFECT_CATALOGUE["binding_settings"]
+                   if item["name"] == "band_width")
+    assert dragged["flipped"]["band_width"] == minimum, dragged["flipped"]
+    assert dragged["flipped"]["band_centre"] == pytest.approx(0.7 - minimum / 2, abs=half)
+    # Every number is on the step its own box takes, so the canvas never shows a value the input
+    # could not have produced.
+    for gesture in ("low", "high", "body", "soft", "flipped"):
+        for name, value in dragged[gesture].items():
+            assert value * 100 == pytest.approx(round(value * 100)), (gesture, name, value)
+
+
+def test_a_drag_on_the_strip_writes_once_on_release_and_the_boxes_agree_all_the_way_through():
+    """The gesture, driven: press, move, release -- and the whole of it is one write.
+
+    **A drag that wrote per pixel would be a save per pixel** (constraint 5); this panel's other
+    controls already write on release and the route saves the manifest. So the requests are
+    counted at three moments and the two before the release must be none.
+
+    And the three numeric boxes are read *during* the drag rather than after it. The canvas and
+    those boxes are one band, which means one of them owns the value and the other reads it -- if
+    they only caught up on the rebuild after the release, the panel would spend the whole gesture
+    showing a band that is not the one on screen, and the two would be one band only at rest.
+    """
+    bound = {"parameter": "amount", "drive": "punch", "depth": 0.5}
+    shot = json.loads(band_shot(bindings=[bound]))
+    moved = json.loads(band_shot(bindings=[{**bound, "band_centre": 0.62}]))
+    read = band_gesture(
+        json.dumps(shot),
+        responses={BAND_ROUTE: {"body": band_reply(moved)}},
+        body="""
+          at('#effect-band-0-amount-strip').rect = { left: 0, top: 0, width: 200, height: 36 };
+          await fire('#effect-bind-0-amount:click', {});
+          await flush();
+          requests.length = 0;
+          const box = () => ['band_centre', 'band_width', 'band_softness']
+            .map((name) => at('#effect-band-0-amount-' + name).value);
+          fire('#effect-band-0-amount-strip:pointerdown',
+               { button: 0, clientX: 150, preventDefault() {} });
+          const pressed = { sent: requests.length, box: box() };
+          fire('window:pointermove', { clientX: 120 });
+          const during = { sent: requests.length, box: box() };
+          fire('window:pointerup', {});
+          await flush();
+          console.log(JSON.stringify({
+            pressed, during, after: box(),
+            requests: requests.map((item) => ({ path: item.path, method: item.method, body: item.body })),
+          }));
+        """,
+    )
+
+    # Nothing is written by the press, and nothing by the move.
+    assert read["pressed"]["sent"] == 0, read["pressed"]
+    assert read["during"]["sent"] == 0, read["during"]
+    # One write on release, at the bindings route, carrying the band the strip was left showing.
+    assert [(item["method"], item["path"]) for item in read["requests"]] == [
+        ("PUT", BAND_ROUTE)
+    ], read["requests"]
+    written = json.loads(read["requests"][0]["body"])["bindings"]
+    assert written == [{**bound, "band_centre": 0.62}], written
+    # The boxes tracked it the whole way. A press on the ground outside the region moves the band
+    # to where it was pressed, and the move takes it on from there.
+    assert read["pressed"]["box"][0] == "0.8", read["pressed"]
+    assert read["during"]["box"][0] == "0.62", read["during"]
+    # Width and softness were never touched by a centre drag, in the boxes or on the wire.
+    assert read["during"]["box"][1:] == ["0.3", "0.35"], read["during"]
+
+
+def test_two_effects_on_one_shot_listen_to_different_bands_through_the_real_gesture():
+    """Story 10.2's second criterion, driven rather than assumed.
+
+    A binding lives on its own `EffectSpec` keyed by parameter name (R-26), so two cards holding
+    the same effect carry two independent bands -- and the strip is addressed by its own card's
+    index, so a drag on the second card's panel writes to the second card's route and leaves the
+    first exactly as it was. The alternative that would satisfy a weaker test is a strip that drew
+    or wrote whichever binding it found first, which is the failure a positional key was rejected
+    for.
+    """
+    low = {"parameter": "amount", "drive": "punch", "depth": 0.5, "band_centre": 0.1}
+    high = {"parameter": "amount", "drive": "sustain", "depth": -0.4, "band_centre": 0.9}
+    shot = json.loads(band_shot(
+        bindings=[low],
+        extra=[{"effect": "exposure", "enabled": True, "parameters": {"amount": 0.4},
+                "bindings": [high]}],
+    ))
+    second = "/api/projects/p1/shots/shot_a/effects/1/bindings"
+    read = band_gesture(
+        json.dumps(shot),
+        responses={second: {"body": band_reply(shot)}},
+        body="""
+          at('#effect-band-1-amount-strip').rect = { left: 0, top: 0, width: 200, height: 36 };
+          await fire('#effect-bind-1-amount:click', {});
+          await flush();
+          const shown = at('#effect-band-1-amount-band_centre').value;
+          requests.length = 0;
+          fire('#effect-band-1-amount-strip:pointerdown',
+               { button: 0, clientX: 60, preventDefault() {} });
+          fire('window:pointerup', {});
+          await flush();
+          console.log(JSON.stringify({
+            shown, stored: state.project.shots[0].effects,
+            requests: requests.map((item) => ({ path: item.path, method: item.method, body: item.body })),
+          }));
+        """,
+    )
+
+    # The second card's panel opened on the second card's own band, not the first card's.
+    assert read["shown"] == "0.9", read["shown"]
+    assert [(item["method"], item["path"]) for item in read["requests"]] == [
+        ("PUT", second)
+    ], read["requests"]
+    body = json.loads(read["requests"][0]["body"])
+    assert body["effect"] == "exposure"
+    # Dragged onto a band of its own, keeping its own drive and its own depth.
+    written = body["bindings"][0]
+    assert written["drive"] == "sustain" and written["depth"] == -0.4
+    assert written["band_centre"] == pytest.approx(0.26, abs=0.011), written
+    # And the first card's binding was never in the request at all.
+    assert read["stored"][0]["bindings"] == [low], read["stored"][0]
+
+
+def test_a_locked_shots_strip_is_drawn_readable_and_cannot_be_dragged():
+    """FX-7: every writing control on a locked Shot is off, and the stack stays readable.
+
+    **A canvas has no `disabled` to inherit**, which is what makes this its own test rather than a
+    line in the one above. Every other control on this panel ships the attribute and a disabled
+    control dispatches nothing; a canvas ships nothing, so "the gesture is off" is a decision
+    somebody has to have made, and asserting the markup alone would pass for a strip that was
+    marked locked and bound anyway. So the press is *performed*: nothing may be listening, and
+    nothing may be written.
+    """
+    locked = band_gesture(
+        band_shot(bindings=[BOUND_AMOUNT], locked=True),
+        body="""
+          at('#effect-band-0-amount-strip').rect = { left: 0, top: 0, width: 200, height: 36 };
+          await fire('#effect-bind-0-amount:click', {});
+          await flush();
+          requests.length = 0;
+          let listening = true;
+          try {
+            fire('#effect-band-0-amount-strip:pointerdown',
+                 { button: 0, clientX: 150, preventDefault() {} });
+          } catch (error) { listening = false; }
+          if (listening) {
+            fire('window:pointermove', { clientX: 60 });
+            fire('window:pointerup', {});
+          }
+          await flush();
+          console.log(JSON.stringify({
+            listening,
+            drawn: at('#shot-inspector').innerHTML.includes('class="effect-band-strip"'),
+            marked: at('#shot-inspector').innerHTML.includes('data-locked="true"'),
+            centre: at('#effect-band-0-amount-band_centre').value,
+            requests: requests.map((item) => ({ path: item.path, method: item.method })),
+          }));
+        """,
+    )
+
+    # Drawn, and marked so -- the look is readable on a locked Shot, which is the point of drawing
+    # a stack that cannot be changed at all.
+    assert locked["drawn"] is True, locked
+    assert locked["marked"] is True, locked
+    # And nothing is listening on it, so nothing can be written from it.
+    assert locked["listening"] is False, "a locked Shot's strip took hold of a pointer"
+    assert locked["requests"] == [], locked["requests"]
+    assert locked["centre"] == str(BOUND_AMOUNT["band_centre"]), locked["centre"]
+
+
+def test_a_measured_song_carrying_no_spectrum_says_so_instead_of_drawing_an_empty_box():
+    """`served_measurement` lets a missing `band_average` through as **missing** rather than as an
+    array of zeros, so a hand-edited sidecar surfaces as a drawing that is absent rather than one
+    that looks measured. The panel's job at that point is to say which absence it is -- every
+    other absence here already does -- and a canvas painting an empty box where the sentence
+    belongs would be the regression.
+
+    The rest of the panel is untouched: the song *is* measured, so the band is still settable and
+    still writable through the three boxes.
+    """
+    spectrumless = {**EFFECTS_MEASURED, "envelope": {"beats": [1.0, 2.0]}}
+    opened = """
+          await fire('#effect-bind-0-amount:click', {});
+          await flush();
+        """
+    panel = drawn_effects_panel(
+        band_shot(), song=EFFECTS_SONG, measurement=spectrumless, extra=opened,
+    )["effects"]
+    said = band_exports()
+
     assert "<canvas" not in panel, panel
+    assert escape_for_markup(said["undrawn"]) in panel, panel
+    # And the panel is otherwise entirely itself: the three boxes, the drive, and what is missing.
+    for control in BAND_CONTROL_ORDER:
+        assert f'id="effect-band-0-amount-{control}"' in panel, control
+    assert escape_for_markup(said["pending"]) in panel
+
+    # The strip is absent in every absence the panel already handles, and so is that sentence -- a
+    # canvas under a refusal would offer a choice that cannot be written, and a sentence about a
+    # missing spectrum under "this song has no measurement" would answer a question nobody asked.
+    for measurement in (effects_unmeasured("Never analyzed."), None):
+        refused = drawn_effects_panel(
+            band_shot(), song=EFFECTS_SONG, measurement=measurement, extra=opened,
+        )["effects"]
+        assert "<canvas" not in refused, refused
+        assert escape_for_markup(said["undrawn"]) not in refused, refused
+
+    # **And an unresolvable binding is the case that catches this**, because it is the one absence
+    # that keeps every control on the panel and so reaches the strip's own branch. Its song has no
+    # measurement at all, which the note above already says at length with the action that fixes
+    # it; printing "this measurement carries no spectrum" underneath is a second sentence about
+    # one absence. The strip's first pass did exactly that, and it was caught by looking.
+    stale = drawn_effects_panel(
+        band_shot(bindings=[BOUND_AMOUNT]), song=EFFECTS_SONG,
+        measurement=effects_unmeasured("Never analyzed."), extra=opened,
+    )["effects"]
+    assert 'data-state="unresolvable"' in stale, stale
+    assert "<canvas" not in stale, stale
+    assert escape_for_markup(said["undrawn"]) not in stale, (
+        "one absence, said twice on one screen", stale)
+    assert escape_for_markup(said["unresolvable"]) in stale, stale
+
+    # A locked Shot draws the strip and never binds it: readable, and marked so, which is what
+    # FX-7 already does to every box and drive beside it. A canvas has no `disabled` to inherit.
+    locked = drawn_effects_panel(
+        band_shot(bindings=[BOUND_AMOUNT], locked=True), song=EFFECTS_SONG,
+        measurement=EFFECTS_MEASURED, extra=opened,
+    )["effects"]
+    assert '<canvas class="effect-band-strip"' in locked, locked
+    assert 'data-locked="true"' in locked, ("a locked strip is drawn as operable", locked)

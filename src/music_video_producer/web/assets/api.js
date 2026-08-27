@@ -6655,14 +6655,17 @@ export const EFFECT_BAND_LEGEND = "{label} · band";
 //: 10.2 and the accessibility floor requires both, so a panel that read as finished here would be
 //: claiming the canvas had been decided against.
 //:
-//: **Made exact 2026-08-27, once `hold` and `sustain` landed.** The first wording said the strip
-//: and the readout were "still to come", which was true and vague -- it could have been read as a
-//: panel with an open-ended list of missing parts. With the gate's own timings drawn, those two
-//: canvases are the whole of what is absent, and saying *only* is a claim
-//: `test_the_panel_names_exactly_what_it_is_still_missing` holds against the stories themselves.
-export const EFFECT_BAND_STRIP_PENDING =
-  "The band is three numbers here. The spectrum strip that would draw it over the song, and the "
-  + "readout of the drive it produces, are the only two things this panel is still missing.";
+//: **Made exact 2026-08-27, once `hold` and `sustain` landed**, and **narrowed the same day when
+//: the strip landed.** The sentence has always been an exhaustive claim -- it says *only* -- and
+//: `test_the_panel_names_exactly_what_it_is_still_missing` holds it against the stories
+//: themselves. It named two absences while the band was three numbers; the spectrum strip is now
+//: drawn above these boxes, so the drive readout (story 10.3) is the whole of what is left, and
+//: the constant is renamed with the claim rather than kept as a name that says *strip pending*
+//: over a panel that has one. A label outliving the state it describes is what the `STALE` chip
+//: shipped as, one epic ago.
+export const EFFECT_BAND_READOUT_PENDING =
+  "The drive this band produces has no readout yet, and that is the only thing this panel is "
+  + "still missing.";
 
 //: Every setting the panel draws, in the order it draws them.
 //:
@@ -6848,15 +6851,25 @@ export function effectBindingOf(spec, name) {
 // where there is audio to measure. A button on a song nobody has rendered is a press that cannot
 // help, and a button on a working measurement is a re-measurement nobody asked for.
 export function effectBandMeasurement(project = null, report = null) {
-  const absent = (reason) => ({ state: "absent", reason, offer: false });
-  if (!project) return { state: "unread", reason: "", offer: false };
+  // The two arrays the spectrum strip draws, off the **same one read** as `analysed` and its
+  // reason. `SERVED_ENVELOPE_KEYS` puts them on this body precisely so the band selector needs no
+  // second request -- and reading them here rather than inside the strip's own plan is what makes
+  // the panel's absences and its drawing describe one measurement instead of two.
+  const spectrum = {
+    bands: bandNumbers(report?.envelope?.band_average),
+    edges: bandNumbers(report?.envelope?.band_edges),
+  };
+  const absent = (reason) => ({ state: "absent", reason, offer: false, ...spectrum });
+  if (!project) return { state: "unread", reason: "", offer: false, ...spectrum };
   const song = project.song || null;
   if (!song) return absent(SNAP_TARGET_UNSONGED);
   if (!song.path) return absent(SNAP_TARGET_UNRENDERED);
   const analysed = report?.analysed;
-  if (analysed === undefined || analysed === null) return { state: "unread", reason: "", offer: false };
-  if (analysed) return { state: "ready", reason: "", offer: false };
-  return { state: "absent", reason: String(report?.reason || ""), offer: true };
+  if (analysed === undefined || analysed === null) {
+    return { state: "unread", reason: "", offer: false, ...spectrum };
+  }
+  if (analysed) return { state: "ready", reason: "", offer: false, ...spectrum };
+  return { state: "absent", reason: String(report?.reason || ""), offer: true, ...spectrum };
 }
 
 // Which of the six states this row's glyph is in. Decided here, in the order the states are
@@ -6918,6 +6931,379 @@ export function effectBandDepthBound(parameter) {
   if (!Number.isFinite(minimum) || !Number.isFinite(maximum)) return 0;
   const span = maximum - minimum;
   return span > 0 ? span : 0;
+}
+
+//: ------------------------------------------------------------------------------------------
+//: The spectrum strip (DESIGN 4.5, story 10.2): what the canvas is, where every pixel of it goes,
+//: and which gesture a press on it resolves to.
+//:
+//: **Everything below is a decision and none of it is a drawing.** `app.js` measures one box,
+//: hands the width over, and strokes the shapes this file hands back -- which pixel is which
+//: band, where the region's edges fall, what a drag at x resolves to and which handle a press is
+//: nearest are all pure, and all tested with no DOM at all. A canvas is the place that separation
+//: is most often lost, because drawing and deciding sit in one function unless they are pulled
+//: apart on purpose.
+//: ------------------------------------------------------------------------------------------
+
+//: The band edge's falloff at softness 0 and at softness 1, **ported from `effects.py`'s
+//: `DRIVE_SOFTNESS_FLOOR` and `DRIVE_SOFTNESS_SPAN`** and pinned to them by
+//: `test_the_strip_draws_the_falloff_the_compiler_computes`, which asks both engines for the same
+//: numbers rather than comparing two constants to each other.
+//:
+//: **Why a port at all, when a second implementation is what this repository refuses.** The
+//: picture has to answer *what does this band hear* on every pointer move while a Director drags,
+//: before anything is written and with nothing on the server to ask. R-27 bars a second renderer
+//: of a signal the compiler can serve; this is the case where it cannot serve one, because the
+//: question is asked of a band that does not exist yet. What that leaves is drift, so drift is
+//: what the test closes: change either constant, or the shape of the curve in `effects.py`, and
+//: the assertion fails on the numbers themselves rather than on a comment going stale.
+export const EFFECT_STRIP_SOFTNESS_FLOOR = 0.02;
+export const EFFECT_STRIP_SOFTNESS_SPAN = 0.25;
+
+//: How far a handle's grip reaches when nothing crowds it, and the narrowest strip of ground a
+//: handle may be offered on.
+//:
+//: **The reach is capped by local spacing and no target is exempt** (R-16). This project shipped a
+//: flat 8px snap radius once and it erased 100% of the dead zone between targets 6.5px apart; the
+//: rule that came out of it is that a target's pull is bounded by the distance to its own
+//: neighbours. Here the two edges meet at the region's own midpoint however narrow it gets, so
+//: each always owns the ground nearest to it -- at `band_width`'s minimum of 0.02 the region is
+//: about three pixels across and both edges are still eight pixels of grip. The softness handle
+//: takes the ground left beyond them, and below `EFFECT_STRIP_MIN_TARGET` there is none left to
+//: take: a gesture with no ground is **withdrawn and named**, never offered at two pixels.
+export const EFFECT_STRIP_HANDLE_REACH = 7;
+export const EFFECT_STRIP_MIN_TARGET = 5;
+
+//: The gap drawn between two bars, and it is dropped rather than swallowing a bar whole once the
+//: bars are narrower than it -- which is what a band count well past eight would do.
+export const EFFECT_STRIP_BAR_GAP = 2;
+
+//: What the panel says instead of a strip when the measurement carries no spectrum.
+//:
+//: `served_measurement` lets a missing `band_average` through as **missing** rather than as an
+//: array of zeros, on purpose, so a hand-edited sidecar surfaces as a drawing that is short or
+//: absent rather than one that looks measured. The panel says which it is; drawing an empty box
+//: where a sentence belongs is the regression this surface refuses everywhere else.
+export const EFFECT_BAND_STRIP_UNDRAWN =
+  "This song's measurement carries no spectrum to draw, so the band is these numbers.";
+
+//: And what it says when the softness handle has nowhere to sit: a band pushed against the end of
+//: the spectrum, or one whose edges are so hard that the falloff has no room outside them, leaves
+//: that handle no ground to be pressed on. The gesture is withdrawn and the box that still sets
+//: it is named, which is what makes the minimum-width state a state rather than an edge case
+//: somebody discovers with a mouse.
+export const EFFECT_BAND_STRIP_CROWDED =
+  "There is no room on the strip for the softness handle here. The Softness box still sets it.";
+
+//: The strip's own tooltip, where `band_edges` can answer it. The frequencies are the analysis's,
+//: never computed here.
+export const EFFECT_BAND_STRIP_HZ = "This band covers {low} to {high}.";
+
+//: Every gesture the strip offers, in the order a press is resolved against them. `centre` is
+//: last because it is the one that owns whatever the others do not.
+export const EFFECT_STRIP_TARGETS = ["low", "high", "softness", "centre"];
+
+// How much one band counts toward a binding's level: 1 inside the region, a Gaussian skirt
+// outside it. `effects._band_weight`, in the language the picture has to be drawn in.
+export function effectBandWeight(position, centre, width, softness) {
+  const half = Number(width) / 2;
+  const distance = Math.abs(Number(position) - Number(centre));
+  if (distance <= half) return 1;
+  const soft = EFFECT_STRIP_SOFTNESS_FLOOR + Number(softness) * EFFECT_STRIP_SOFTNESS_SPAN;
+  const reach = (distance - half) / soft;
+  return Math.exp(-reach * reach);
+}
+
+// Every number in a served array, or `[]` for one this cannot read whole.
+//
+// **All or nothing, which is `served_measurement`'s own rule said on this side of the wire.** A
+// band average with one string in it is not a spectrum seven-eighths drawn; it is a measurement
+// nobody can vouch for, and drawing the readable part would invent the rest.
+function bandNumbers(value) {
+  if (!Array.isArray(value)) return [];
+  const kept = value.filter((item) => typeof item === "number" && Number.isFinite(item));
+  return kept.length === value.length ? kept : [];
+}
+
+// One band setting's declared bounds, off the served catalogue and never restated here.
+function bandBounds(settings, name) {
+  const found = (settings || []).find((entry) => String(entry?.name ?? "") === String(name));
+  const minimum = Number(found?.minimum);
+  const maximum = Number(found?.maximum);
+  return {
+    minimum: Number.isFinite(minimum) ? minimum : 0,
+    maximum: Number.isFinite(maximum) ? maximum : 1,
+  };
+}
+
+function bandClamp(value, minimum, maximum) {
+  if (!Number.isFinite(value)) return minimum;
+  return Math.min(maximum, Math.max(minimum, value));
+}
+
+// One dragged value, on the same step its own numeric box takes.
+//
+// **A drag produces the numbers a Director could have typed**, which is what keeps the canvas and
+// the three boxes one band rather than two: an unquantised drag would write 0.3271 into a box
+// whose step is 0.01, so the panel would show a number the box could not have produced and the
+// next arrow key would jump. The step is `bandStep`'s -- the same function the input's own `step`
+// attribute is built from -- so there is no second opinion about how finely a band divides.
+function bandQuantised(value, bounds) {
+  const step = bandStep(bounds.minimum, bounds.maximum);
+  const snapped = step > 0 ? Math.round(Number(value) / step) * step : Number(value);
+  return Number(bandClamp(snapped, bounds.minimum, bounds.maximum).toFixed(6));
+}
+
+// Where band `k` sits, and how a pixel maps back to a position on the spectrum.
+//
+// **Band `k` is at `k / (count - 1)`, bass at 0 and treble at 1** -- `band_series`' own spacing,
+// which is what the compiler weights against. So the axis is inset by half a bar at each end: the
+// bar boxes then divide the strip into `count` equal columns *and* each column's centre lands
+// exactly on its own band's position, so the region drawn over the bars covers the bars it is
+// actually weighting. Laying the axis across the full width instead would draw a region half a
+// bar out of step with the one the export hears.
+//
+// A one-band envelope has no spacing at all and `band_series` sits it at 0. The axis spreads
+// across the whole strip there rather than collapsing to a point, so the gestures still work on a
+// measurement whose band selection cannot mean anything.
+function stripAxis(width, count) {
+  if (!(width > 0)) return null;
+  if (!(count > 1)) return { bar: width, inset: 0, span: width };
+  const bar = width / count;
+  return { bar, inset: bar / 2, span: width - bar };
+}
+
+function stripPixel(axis, position) {
+  return axis.inset + position * axis.span;
+}
+
+function stripPosition(axis, x) {
+  return axis.span > 0 ? (x - axis.inset) / axis.span : 0;
+}
+
+// How a frequency off `band_edges` is written. Round numbers, because these are the edges of a
+// log-spaced split and a fourth digit is precision the split does not carry.
+function bandHertz(value) {
+  const hz = Number(value);
+  if (!Number.isFinite(hz) || hz <= 0) return "";
+  if (hz < 1000) return `${Math.round(hz)} Hz`;
+  const k = hz / 1000;
+  return `${k < 10 ? Number(k.toFixed(1)) : Math.round(k)} kHz`;
+}
+
+// The frequencies this band covers, or `""` where the measurement cannot say.
+//
+// **`band_edges` is read only where it matches `band_average`.** `audio.py` writes one more edge
+// than there are bands; a sidecar whose two disagree is a file this cannot describe, and
+// inventing an edge for it would print a frequency nobody measured. The bands whose own positions
+// fall inside the region are the ones it covers; a region narrow enough to fall between two of
+// them takes the nearer one.
+function bandHertzSpan(bands, edges, centre, width) {
+  const count = bands.length;
+  if (!count || edges.length !== count + 1) return "";
+  const at = (index) => (count > 1 ? index / (count - 1) : 0);
+  const half = Number(width) / 2;
+  const inside = [];
+  for (let index = 0; index < count; index += 1) {
+    if (Math.abs(at(index) - Number(centre)) <= half) inside.push(index);
+  }
+  if (!inside.length) {
+    let nearest = 0;
+    for (let index = 0; index < count; index += 1) {
+      if (Math.abs(at(index) - Number(centre)) < Math.abs(at(nearest) - Number(centre))) {
+        nearest = index;
+      }
+    }
+    inside.push(nearest);
+  }
+  const low = bandHertz(edges[inside[0]]);
+  const high = bandHertz(edges[inside[inside.length - 1] + 1]);
+  if (!low || !high) return "";
+  return EFFECT_BAND_STRIP_HZ.replace("{low}", low).replace("{high}", high);
+}
+
+// Everything the strip draws and everything a press on it can land on, from one measurement, one
+// set of band values and one measured width.
+//
+// `bands` is the served `band_average` and **its length is the band count** -- there is no 8 in
+// this file and there must never be one (R-30's delegated decision). A plan that assumed eight
+// bars would undo `served_measurement`'s deliberate shortness, which exists so a hand-edited
+// sidecar draws short rather than as zeros that look measured.
+//
+// Bar heights are relative to the loudest band, because a spectrum strip answers *where is this
+// song's energy* rather than *how loud is it*: the envelope's absolute levels sit in the low
+// tenths on a real master, and drawn to an absolute scale they would be a row of stubs.
+export function effectBandStripPlan({
+  bands = [], edges = [], settings = [], values = null, width = 0, height = 0,
+  reach = EFFECT_STRIP_HANDLE_REACH, floor = EFFECT_STRIP_MIN_TARGET,
+} = {}) {
+  const level = bandNumbers(bands);
+  const frequencies = bandNumbers(edges);
+  const box = Number(width);
+  const tall = Number(height);
+  const axis = stripAxis(box, level.length);
+  const absent = {
+    shown: false, count: level.length, bars: [], curve: [], handles: [], targets: [],
+    note: "", hz: "",
+  };
+  if (!level.length || !axis || !(tall > 0)) return absent;
+  const bounds = {
+    centre: bandBounds(settings, "band_centre"),
+    width: bandBounds(settings, "band_width"),
+    softness: bandBounds(settings, "band_softness"),
+  };
+  const centre = bandClamp(Number(values?.band_centre), bounds.centre.minimum, bounds.centre.maximum);
+  const span = bandClamp(Number(values?.band_width), bounds.width.minimum, bounds.width.maximum);
+  const softness = bandClamp(
+    Number(values?.band_softness), bounds.softness.minimum, bounds.softness.maximum);
+  const peak = Math.max(...level);
+  const gap = axis.bar > EFFECT_STRIP_BAR_GAP + 1 ? EFFECT_STRIP_BAR_GAP : 0;
+  // **A pixel of headroom at the top, and a floor of two at the bottom**, both caught by looking
+  // at the painted canvas on 2026-08-27. Drawn to the full box, the loudest bar and the region's
+  // flat top both land on row zero and the stroke along the plateau is half outside the canvas,
+  // so a band at full weight reads as a box open at the top. And the weight curve's own baseline
+  // is a line across the foot of the strip, which swallowed a one-pixel bar whole -- a measured
+  // band drawing as nothing at all is the one thing this picture must not do.
+  const roof = Math.max(1, tall - 1);
+  const bars = level.map((value, index) => ({
+    index,
+    position: level.length > 1 ? index / (level.length - 1) : 0,
+    x: index * axis.bar + gap / 2,
+    width: axis.bar - gap,
+    height: peak > 0 ? Math.max(2, (value / peak) * roof) : 2,
+  }));
+  // The weight profile, one sample per pixel column: flat across the region and falling away in
+  // the compiler's own Gaussian outside it. **This is the falloff drawn as a falloff.** A
+  // hard-edged rectangle over a soft band is a picture that lies about what the export will do,
+  // which is this epic's recurring failure and the reason the preview fingerprint hashes the
+  // composed chain rather than the stack that composed it.
+  const curve = [];
+  for (let x = 0; x <= Math.round(box); x += 1) {
+    const weight = effectBandWeight(stripPosition(axis, x), centre, span, softness);
+    curve.push({ x, y: tall - weight * roof, weight });
+  }
+  const left = stripPixel(axis, centre - span / 2);
+  const right = stripPixel(axis, centre + span / 2);
+  // Which side the softness handle sits on: whichever end of the spectrum the region leaves more
+  // room at. **Decided from centre and width alone**, so it cannot change sides under the drag
+  // that is moving it -- a handle that jumps across the region mid-gesture is a control the
+  // Director has to chase.
+  const side = (1 - (centre + span / 2)) >= (centre - span / 2) ? 1 : -1;
+  const soft = EFFECT_STRIP_SOFTNESS_FLOOR + softness * EFFECT_STRIP_SOFTNESS_SPAN;
+  const skirt = side > 0 ? centre + span / 2 + soft : centre - span / 2 - soft;
+  const room = side > 0 ? 1 - (centre + span / 2) : centre - span / 2;
+  const skirtX = stripPixel(axis, skirt);
+  // The two edges first. **Each reaches its full grip outward and is capped by local spacing
+  // inward** -- half the region, so the two meet at its own midpoint however narrow it becomes
+  // and neither can be squeezed out by the other. At `band_width`'s minimum the region is about
+  // three pixels and each edge still has eight of grip; across a wide region the cap leaves the
+  // interior to the body drag, which is what makes taking hold of the middle of a band move it
+  // rather than resize it.
+  const inward = Math.min(reach, (right - left) / 2);
+  const targets = [
+    { name: "low", from: left - reach, to: left + inward, x: left },
+    { name: "high", from: right - inward, to: right + reach, x: right },
+  ];
+  const held = side > 0
+    ? { name: "softness", from: Math.max(targets[1].to, skirtX - reach), to: skirtX + reach, x: skirtX }
+    : { name: "softness", from: skirtX - reach, to: Math.min(targets[0].from, skirtX + reach), x: skirtX };
+  const offered = skirt >= 0 && skirt <= 1 && (held.to - held.from) >= floor;
+  if (offered) targets.push(held);
+  return {
+    shown: true,
+    count: level.length,
+    width: box,
+    height: tall,
+    bar: axis.bar,
+    bars,
+    curve,
+    band: { left, right, centre: stripPixel(axis, centre) },
+    // Drawn only where it can be taken hold of. A handle a press cannot land on is the control
+    // that appears to do nothing, and this surface has already refused one of those by name.
+    //
+    // **The two kinds are told apart by height, not by colour** -- the palette is closed and both
+    // are the band. An edge runs the full strip because it *is* the region's boundary. The
+    // softness handle rises from the foot to the falloff curve itself, which by construction
+    // passes through weight `1/e` at exactly that point (`DRIVE_SOFTNESS_SPAN`'s own docstring):
+    // so it reads as a grip on the shoulder it moves rather than as a third edge. Both readings
+    // of it were caught by looking at the painted canvas on 2026-08-27 -- full height, it was a
+    // third edge; hanging from the top, it floated over the shoulder unattached to anything.
+    handles: [
+      { name: "low", x: left, top: 0, bottom: tall },
+      { name: "high", x: right, top: 0, bottom: tall },
+      ...(offered
+        ? [{ name: "softness", x: skirtX, side, top: tall - Math.exp(-1) * roof, bottom: tall }]
+        : []),
+    ],
+    targets,
+    side,
+    room,
+    values: { band_centre: centre, band_width: span, band_softness: softness },
+    note: offered ? "" : EFFECT_BAND_STRIP_CROWDED,
+    hz: bandHertzSpan(level, frequencies, centre, span),
+  };
+}
+
+// Which gesture a press at `x` resolves to, and what it took hold of.
+//
+// **Nothing falls through to nothing.** Every pixel of the strip belongs to a gesture: the
+// handles own the ground nearest them and the region body -- the centre -- owns everything else,
+// the ground outside the region included. A press out there moves the band to where it was
+// pressed and tracks from there, which is what this application's own timeline playhead does and
+// what keeps every gesture reachable at the minimum width, where the region is three pixels
+// across and has no interior left to grab.
+export function effectBandStripHit(plan, x) {
+  if (!plan?.shown) return null;
+  const at = Number(x);
+  if (!Number.isFinite(at)) return null;
+  for (const target of plan.targets) {
+    if (at >= target.from && at <= target.to) return { target: target.name, offset: at - target.x };
+  }
+  const inside = at >= plan.band.left && at <= plan.band.right;
+  return { target: "centre", offset: inside ? at - plan.band.centre : 0 };
+}
+
+// What a drag to `x` resolves the band to -- the settings it changes and no others, each inside
+// its own served bound.
+//
+// **The opposite edge is what an edge drag holds still**, so dragging one edge changes the centre
+// and the width together rather than sliding the band along. Dragged past its partner the region
+// collapses to the catalogue's own minimum against the edge that was not moving, and never turns
+// inside out.
+export function effectBandStripDrag(plan, hit, x, settings = []) {
+  if (!plan?.shown || !hit) return null;
+  const axis = stripAxis(plan.width, plan.count);
+  if (!axis) return null;
+  const at = Number(x) - Number(hit.offset || 0);
+  if (!Number.isFinite(at)) return null;
+  const position = stripPosition(axis, at);
+  const centre = Number(plan.values?.band_centre) || 0;
+  const span = Number(plan.values?.band_width) || 0;
+  const bounds = {
+    centre: bandBounds(settings, "band_centre"),
+    width: bandBounds(settings, "band_width"),
+    softness: bandBounds(settings, "band_softness"),
+  };
+  if (hit.target === "centre") {
+    return { band_centre: bandQuantised(position, bounds.centre) };
+  }
+  if (hit.target === "low" || hit.target === "high") {
+    const fixed = hit.target === "low" ? centre + span / 2 : centre - span / 2;
+    const wanted = hit.target === "low" ? fixed - position : position - fixed;
+    const width = bandQuantised(wanted, bounds.width);
+    const moved = hit.target === "low" ? fixed - width / 2 : fixed + width / 2;
+    return { band_width: width, band_centre: bandQuantised(moved, bounds.centre) };
+  }
+  // Softness, and the clamp is geometry as well as bound: the handle sits `soft` outside the
+  // region's own edge, so a drag may not push it past the end of the spectrum it is drawn on. A
+  // Director can still type a softness the strip has no room to show -- and the strip then says
+  // so -- but the gesture can never put its own handle somewhere it cannot be picked up again.
+  const edge = plan.side > 0 ? centre + span / 2 : centre - span / 2;
+  const reached = plan.side > 0 ? position - edge : edge - position;
+  const wanted = (reached - EFFECT_STRIP_SOFTNESS_FLOOR) / EFFECT_STRIP_SOFTNESS_SPAN;
+  const roomy = (Math.max(0, Number(plan.room) || 0) - EFFECT_STRIP_SOFTNESS_FLOOR)
+    / EFFECT_STRIP_SOFTNESS_SPAN;
+  return { band_softness: bandQuantised(Math.min(wanted, roomy), bounds.softness) };
 }
 
 // The values the panel is holding: the stored binding where there is one, the catalogue's defaults
@@ -6999,13 +7385,27 @@ export function effectBindingWrite(name, values, settings) {
 // and an unreadable number clears the field rather than being coerced to zero, because a depth of
 // zero is a binding that does nothing and a Director who cleared a box did not ask for one.
 export function effectBandChange(panel, catalogue, name, raw) {
+  const patch = String(name) === "drive"
+    ? { drive: String(raw ?? "") }
+    : { [String(name)]: bandNumber(raw) };
+  return effectBandEdit(panel, catalogue, patch);
+}
+
+// The same decision for a gesture that moves more than one number at once.
+//
+// **The strip and the three numeric inputs go through this one function, which is what makes them
+// one band rather than two.** Dragging an edge changes the centre and the width together; typing
+// in a box changes one. Both arrive here as a patch over the panel's own values, both are
+// completed by `effectBandValues` and judged by `effectBandReady`, and both produce the same
+// sparse body from `effectBindingWrite`. A canvas that wrote its own binding would be the second
+// implementation of *where is the band* this repository has already paid for four times.
+export function effectBandEdit(panel, catalogue, patch) {
   const settings = catalogue?.binding_settings || [];
-  const wanted = { ...(panel?.values || {}) };
-  if (String(name) === "drive") {
-    wanted.drive = String(raw ?? "");
-  } else {
-    wanted[String(name)] = bandNumber(raw);
-  }
+  // Spread rather than assigned key by key, so a patch carrying an explicitly empty value still
+  // counts as *drafted* -- `effectBandValues` reads presence, not truthiness, and that is the
+  // difference between a panel reporting what the Director did and one quietly putting a number
+  // back.
+  const wanted = { ...(panel?.values || {}), ...(patch || {}) };
   const values = effectBandValues(settings, null, wanted);
   const verdict = effectBandReady(values);
   return {
@@ -7067,7 +7467,7 @@ export function effectBandPanel(parameter, spec, {
     ...shut, shown: true, legend: EFFECT_BAND_LEGEND.replace("{label}", label),
     parameter: name, label, note, analyze,
     drive: { shown: false, options: [] }, remove: { shown: false }, written: Boolean(binding),
-    stripNote: "",
+    pending: "", strip: { shown: false, note: "", bands: [], edges: [] },
   });
   const offer = measurement?.offer
     ? { ...silent, shown: true }
@@ -7155,7 +7555,36 @@ export function effectBandPanel(parameter, spec, {
       ? `${String(measurement?.reason || "")} ${EFFECT_BAND_UNRESOLVABLE_NOTE}`.trim()
       : "",
     analyze: state === "unresolvable" ? offer : silent,
-    stripNote: EFFECT_BAND_STRIP_PENDING,
+    pending: EFFECT_BAND_READOUT_PENDING,
+    // The strip is drawn from the **whole-song** per-band average and nothing else (AD-26): one
+    // array, computed once at analysis, identical in every Shot's panel -- which is what makes
+    // copying a stack carry its bindings meaningfully, because the band the Director chose
+    // against the reference is the same band on the target. Per-Shot spectra are not stored and
+    // are not drawable.
+    //
+    // **Absent rather than empty, and it says which.** A measured song whose envelope carries no
+    // band average is a real state -- `served_measurement` lets that key through *missing* rather
+    // than as zeros -- and a canvas drawing an empty box where the sentence belongs is the
+    // regression every other absence on this panel already refuses.
+    //
+    // **And the sentence is said only where it is the answer.** An `unresolvable` binding keeps
+    // every control on this panel, so it reaches here -- and its song has no measurement at all,
+    // which the note above already says at length with the action that fixes it. Adding "this
+    // measurement carries no spectrum" underneath is a second sentence about one absence, which
+    // is the thing this panel refuses everywhere else. Caught by looking, 2026-08-27: the strip's
+    // first pass printed both, one under the other, on the same screen.
+    strip: {
+      shown: (measurement?.bands || []).length > 0,
+      note: (measurement?.bands || []).length || state === "unresolvable"
+        ? ""
+        : EFFECT_BAND_STRIP_UNDRAWN,
+      bands: measurement?.bands || [],
+      edges: measurement?.edges || [],
+      // Drawn on a locked Shot and not operable on one -- the stack is readable and every writing
+      // control is off, which is FX-7 as this panel already applies it to its boxes and its
+      // drives. A canvas has no `disabled`, so the gesture is simply never bound.
+      disabled: Boolean(locked),
+    },
     controls: [...shared, depth, ...gated],
     // Said once under the pair rather than once per box, because it is one fact about both --
     // and drawn only while it is true, so a `sustain` binding sees its timings and no sentence

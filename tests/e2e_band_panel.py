@@ -1,4 +1,4 @@
-"""Browser QA for the band panel (Epic 10, slice E3).
+"""Browser QA for the band panel and its spectrum strip (Epic 10, slices E3 and E4).
 
 The offline harness executes every decision this surface makes -- which state a glyph is in, what
 the panel says in each absence, whether a binding is complete enough to write, what the request
@@ -39,6 +39,22 @@ What is driven, in order:
 8. **A locked Shot draws the panel readable with every writing control disabled.**
 9. **Remove binding takes it off and leaves the parameter's own number where it was.**
 
+And, added by slice E4 as steps 7b and 7c:
+
+7b. **The spectrum strip is drawn, and drawn in both tokens** -- the census below counts the
+   painted pixels of a real canvas and separates the `--dim` spectrum from the `--blue` band, so
+   "the strip is there" is a number rather than a screenshot somebody has to squint at. A drag on
+   its body then writes **once, on release**, and the three numeric boxes read the dragged band
+   the whole way through.
+7c. **At `band_width`'s minimum the region is under four pixels across**, and every gesture is
+   still reachable: both edge handles are painted and both still resize. Take the softness to
+   zero as well and its handle has no ground left -- it is withdrawn and the panel names the box
+   that still sets it.
+
+The panel's height and its distance below the rail's fold are recorded in both the unbound and
+the bound states, because the strip is 36px added to a panel that was already 503.6px in a 626px
+rail with 212px of it below the fold.
+
 Screenshots of every one of those states are written to `test-artifacts/`.
 
 Run from the repo root -- it starts and proves its own server, and takes no base URL::
@@ -74,6 +90,7 @@ from e2e_support import (
     visible_and_clickable,
 )
 from e2e_timeline_edit import manifest, post_multipart_project, select_project
+from selenium.webdriver import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
@@ -119,6 +136,22 @@ const box = (node) => {
   };
 };
 const panel = document.querySelector('.effect-band');
+const strip = panel ? panel.querySelector('.effect-band-strip') : null;
+const painted = (() => {
+  if (!strip || !strip.getContext || !strip.width) return null;
+  const data = strip.getContext('2d').getImageData(0, 0, strip.width, strip.height).data;
+  let lit = 0;
+  let blue = 0;
+  let dim = 0;
+  for (let index = 0; index < data.length; index += 4) {
+    const [r, g, b, a] = [data[index], data[index + 1], data[index + 2], data[index + 3]];
+    if (!a) continue;
+    lit += 1;
+    if (b - r > 30) blue += 1;
+    else if (Math.abs(r - g) < 12 && Math.abs(g - b) < 12) dim += 1;
+  }
+  return { width: strip.width, height: strip.height, lit, blue, dim };
+})();
 const glyphs = [...document.querySelectorAll('.effect-bind')].map((node) => ({
   id: node.id,
   state: node.dataset.state,
@@ -161,7 +194,18 @@ return {
   note: sentence('.effect-band-note'),
   gate: sentence('.effect-band-gate'),
   needs: sentence('.effect-band-needs'),
-  strip: sentence('.effect-band-strip'),
+  pending: sentence('.effect-band-pending'),
+  crowded: sentence('.effect-band-crowded'),
+  undrawn: sentence('.effect-band-undrawn'),
+  strip: box(strip),
+  stripTitle: strip ? strip.getAttribute('title') : null,
+  stripHidden: strip ? strip.getAttribute('aria-hidden') : null,
+  // **A census of the painted canvas**, which is the only way a drawing is verifiable at all: a
+  // canvas that threw halfway through, or one measured at zero width inside a hidden tab, is a
+  // correctly-sized empty box that every structural assertion in this file would pass. `dim`
+  // counts the spectrum's own bars and `blue` the band drawn over them, told apart by channel
+  // rather than by token string, because what is on screen is blended pixels and not a variable.
+  painted,
   analyze: box(panel ? panel.querySelector('.effect-band-analyze') : null),
   remove: box(panel ? panel.querySelector('.effect-band-remove') : null),
   panelState: panel ? panel.dataset.state : null,
@@ -299,8 +343,108 @@ def type_into(driver, control: str, text: str) -> None:
     element.send_keys(text)
 
 
+#: The strip's geometry, asked of **the same pure function the page asks** rather than worked out
+#: again here. `api.js` is a module this server already serves, so the browser imports it and
+#: answers where this canvas's handles are and which ground each of them owns -- at the width the
+#: canvas is really painted at. A harness that recomputed the axis for itself would be a second
+#: implementation of the thing under test, and would agree with a wrong one.
+STRIP_PLAN = """
+const [bands, edges, settings, values, done] = arguments;
+const node = document.querySelector('.effect-band-strip');
+if (!node) { done(null); }
+else {
+  const rect = node.getBoundingClientRect();
+  import('/assets/api.js').then((api) => {
+    const plan = api.effectBandStripPlan({
+      bands, edges, settings, values, width: rect.width, height: rect.height,
+    });
+    done({
+      width: rect.width, height: rect.height, left: rect.left, top: rect.top,
+      count: plan.count, band: plan.band, note: plan.note, hz: plan.hz,
+      handles: plan.handles, targets: plan.targets,
+    });
+  }).catch((error) => done({ error: String(error) }));
+}
+"""
+
+
+def strip_geometry(driver, envelope: dict, settings: list[dict], values: dict) -> dict:
+    """Where this canvas's handles are, and what ground each of them owns."""
+    plan = driver.execute_async_script(
+        STRIP_PLAN,
+        envelope.get("band_average") or [],
+        envelope.get("band_edges") or [],
+        settings,
+        values,
+    )
+    assert plan and not plan.get("error"), plan
+    return plan
+
+
+def band_values(state: dict) -> dict:
+    """The three band numbers as the panel is showing them, read off the boxes themselves.
+
+    From the inputs rather than from the manifest on purpose: the claim being checked is that the
+    canvas and the boxes are one band, and a value read back from storage would prove only that
+    storage agrees with itself.
+    """
+    values = {}
+    for item in state["inputs"]:
+        name = item["id"].replace("effect-band-0-amount-", "")
+        if name in ("band_centre", "band_width", "band_softness"):
+            values[name] = float(item["value"])
+    return values
+
+
+def free_ground(plan: dict) -> float:
+    """An x on the strip that belongs to the body drag and to no handle.
+
+    Swept rather than assumed: which ground is free depends on where the band is, and an x picked
+    by eye would silently become a handle press the first time a default moved.
+    """
+    for x in range(int(plan["width"]) - 2, 1, -1):
+        if not any(target["from"] <= x <= target["to"] for target in plan["targets"]):
+            return float(x)
+    raise AssertionError(("no pixel of the strip is free of a handle", plan["targets"]))
+
+
+class StripPointer:
+    """A pointer on the strip, holding its own position.
+
+    `move_by_offset` is relative, so a drag that has lost track of where it is releases on a band
+    nobody chose -- which would read as a defect in the gesture rather than in this script.
+    Offsets are given from the element's in-view centre, which is what Selenium 4 means by them.
+    """
+
+    def __init__(self, driver, canvas, plan: dict) -> None:
+        self.driver = driver
+        self.canvas = canvas
+        self.plan = plan
+        self.x = 0.0
+
+    def press(self, x: float) -> None:
+        self.x = float(x)
+        ActionChains(self.driver).move_to_element_with_offset(
+            self.canvas, round(x - self.plan["width"] / 2), 0
+        ).click_and_hold().perform()
+
+    def drag_to(self, x: float) -> None:
+        ActionChains(self.driver).move_by_offset(round(x - self.x), 0).perform()
+        self.x = float(x)
+
+    def release(self) -> None:
+        ActionChains(self.driver).release().perform()
+
+
 def shot(driver, state: str) -> None:
     driver.find_element(By.ID, "shot-inspector").screenshot(
+        str(artifact_dir() / f"{NAME}-{state}.png"))
+
+
+def strip_shot(driver, state: str) -> None:
+    """The canvas on its own, because 183x36 inside a 280px panel screenshot is not something a
+    person can judge a drawing from -- and this drawing is the whole slice."""
+    driver.find_element(By.CSS_SELECTOR, ".effect-band-strip").screenshot(
         str(artifact_dir() / f"{NAME}-{state}.png"))
 
 
@@ -420,15 +564,21 @@ def main() -> None:
                     driver, driver.find_element(By.ID, item["id"]), f"the {item['text']} drive")
             # The sentences are readable at this width rather than a column of single words.
             assert fresh["needs"]["width"] > 150, ("the needs block is a narrow column", fresh)
-            assert fresh["strip"]["text"], "the panel does not say the strip is still to come"
+            assert fresh["pending"]["text"], "the panel does not say what it is still missing"
+            # The strip is drawn on a fresh, unwritten binding too: the Band is a thing a Director
+            # looks at *while* deciding, not a picture that appears once it has been decided.
+            assert fresh["strip"] and fresh["painted"], (
+                "the strip is absent on a fresh panel", fresh["strip"], fresh["painted"])
             result["fresh_panel"] = {
                 "panel": fresh["panel"], "inputs": fresh["inputs"], "modes": fresh["modes"],
                 "needs": fresh["needs"], "gate": fresh["gate"],
+                "strip": fresh["strip"], "painted": fresh["painted"],
                 "railScroll": fresh["railScroll"], "panelBelowFold": fresh["panelBelowFold"],
                 "railScrollHeight": fresh["railScrollHeight"],
                 "railClientHeight": fresh["railClientHeight"],
             }
             shot(driver, "02-fresh-panel")
+            strip_shot(driver, "02-strip-canvas-fresh")
 
             # --- 4. The drive alone still writes nothing -------------------------------------
             punch = next(item for item in fresh["modes"] if item["text"] == "punch")
@@ -635,6 +785,166 @@ def main() -> None:
             ], revived
             result["after_re_analysis"] = {"bindings": revived, "state": glyph(live, BIND)["state"]}
             shot(driver, "07-live-again")
+
+            # --- 7b. The spectrum strip: drawn, drawn in both tokens, and dragged ------------
+            #
+            # The census is the point. A canvas that threw halfway through drawing, or one
+            # measured at zero width inside a panel that was hidden when it was painted, is a
+            # correctly-sized empty box -- and every structural assertion in this file would pass
+            # over it. So the pixels are counted and the two tokens are told apart.
+            catalogue = get_json(f"{server.base_url}/api/effects/catalogue")
+            settings = catalogue["binding_settings"]
+            envelope = targets(server, project_id)["envelope"]
+            assert envelope and envelope.get("band_average"), (
+                "the measured song serves no spectrum for the strip to draw", envelope)
+            reach(driver, "effect-band-0-amount-band_centre")
+            drawn = look(driver)
+            assert drawn["strip"], "the spectrum strip is not drawn on a measured song"
+            assert drawn["stripHidden"] == "true", (
+                "the canvas is in the accessibility tree, where it announces nothing (UX-DR15)",
+                drawn["stripHidden"])
+            assert drawn["strip"]["right"] <= drawn["panel"]["right"] + 1, drawn["strip"]
+            assert drawn["strip"]["width"] > 120, ("the strip is too narrow to pick a band on",
+                                                   drawn["strip"])
+            assert drawn["painted"], "nothing is painted on the strip"
+            # Both halves of the picture: the song's own spectrum in `--dim`, and the band over it
+            # in `--blue`. Either alone is a drawing that has lost the thing it exists to compare.
+            assert drawn["painted"]["dim"] > 100, drawn["painted"]
+            assert drawn["painted"]["blue"] > 100, drawn["painted"]
+            # And it is the panel's *first* control -- the Band is a thing you look at, and the
+            # three boxes under it are its equivalent rather than its substitute.
+            assert drawn["strip"]["top"] < min(item["top"] for item in drawn["modes"]), (
+                drawn["strip"], drawn["modes"])
+            assert drawn["strip"]["top"] < min(item["top"] for item in drawn["inputs"]), (
+                drawn["strip"], drawn["inputs"])
+            assert drawn["stripTitle"] and "Hz" in drawn["stripTitle"], drawn["stripTitle"]
+            # The sentence that used to stand where the canvas now is names one absence, not two.
+            assert "spectrum strip" not in drawn["pending"]["text"], drawn["pending"]
+            assert "readout" in drawn["pending"]["text"], drawn["pending"]
+            assert drawn["crowded"] is None or not drawn["crowded"]["text"], drawn["crowded"]
+            result["strip"] = {
+                "box": drawn["strip"], "painted": drawn["painted"], "title": drawn["stripTitle"],
+                "pending": drawn["pending"]["text"],
+                "panel": drawn["panel"], "panelBelowFold": drawn["panelBelowFold"],
+                "railScrollHeight": drawn["railScrollHeight"],
+                "railClientHeight": drawn["railClientHeight"], "railScroll": drawn["railScroll"],
+            }
+            shot(driver, "07b-strip-drawn")
+            strip_shot(driver, "07b-strip-canvas")
+
+            # **A canvas measured inside a hidden panel is zero pixels wide**, and switching tabs
+            # does not rebuild the inspector -- so a Director who looked at Shot Info while this
+            # panel was redrawn behind them, and came back, would find a correctly-sized empty box
+            # with no way to fix it. The rebuild is the load-bearing half and it is forced here
+            # rather than waited for: re-selecting the clip is what the two-second reload does to
+            # this panel, and it happens while the Effects tab is hidden.
+            driver.find_element(By.ID, "shot-tab-info").click()
+            settle(driver, "#shot-inspector", quiet_ms=350)
+            select_clip(driver, wait, SHOT)
+            settle(driver, "#shot-inspector", quiet_ms=350)
+            open_effects(driver)
+            reach(driver, "effect-band-0-amount-band_centre")
+            again = look(driver)
+            assert again["painted"], "the strip came back from a tab switch unpainted"
+            # Within a few pixels rather than exactly: the rail's own scroll position moves the
+            # canvas by a fraction of a pixel and the antialiasing follows it. What is being
+            # checked is that the picture came back at all, not that it came back bit for bit.
+            assert abs(again["painted"]["lit"] - drawn["painted"]["lit"]) < 40, (
+                "the strip came back from a tab switch different", again["painted"],
+                drawn["painted"])
+            assert again["painted"]["blue"] > 100 and again["painted"]["dim"] > 100, (
+                again["painted"])
+            result["strip"]["after_tab_switch"] = again["painted"]
+
+            # A drag on the strip's body: pressed, moved, and **nothing stored until release**.
+            plan = strip_geometry(driver, envelope, settings, band_values(drawn))
+            assert plan["count"] == len(envelope["band_average"]), (
+                "the strip drew a band count the measurement does not carry", plan)
+            held = stack(server.base_url, project_id)[0]["bindings"][0]
+            canvas = driver.find_element(By.CSS_SELECTOR, ".effect-band-strip")
+            body = free_ground(plan)
+            pointer = StripPointer(driver, canvas, plan)
+            pointer.press(body)
+            pointer.drag_to(max(2.0, body - 30))
+            mid = stack(server.base_url, project_id)[0]["bindings"][0]
+            assert mid == held, ("the drag wrote before it was released -- a save per pixel", mid)
+            # The boxes track the band while it is being dragged, because the canvas and the three
+            # numbers are one band rather than two: one owns the value and the other reads it.
+            moving = look(driver)
+            assert band_values(moving)["band_centre"] != band_values(drawn)["band_centre"], (
+                "the numeric boxes did not follow the drag", band_values(moving))
+            pointer.release()
+            dragged = wait_for_stack(
+                server.base_url, project_id,
+                lambda entries: entries[0]["bindings"][0] != held,
+                "releasing the drag wrote nothing",
+            )[0]["bindings"][0]
+            assert dragged["drive"] == held["drive"] and dragged["depth"] == held["depth"], (
+                "a band drag rewrote a decision it does not own", dragged)
+            settle(driver, "#shot-inspector", quiet_ms=350)
+            landed = look(driver)
+            assert band_values(landed)["band_centre"] == dragged.get("band_centre"), (
+                "the panel and the manifest disagree about where the band is",
+                band_values(landed), dragged)
+            result["dragged_band"] = {
+                "before": held, "after": dragged, "shown": band_values(landed),
+                "pressed_at": body, "released_at": max(2.0, body - 30),
+            }
+            shot(driver, "07b-strip-dragged")
+            strip_shot(driver, "07b-strip-canvas-dragged")
+
+            # --- 7c. The minimum band width, which is a state and not an edge case ------------
+            #
+            # `band_width`'s minimum is 0.02, which on this strip is a region under four pixels
+            # across holding two edge handles and a softness handle with no interior left to
+            # drag. Every gesture has to survive that, and the one that cannot is named.
+            for name, value in (("band_width", "0.02"), ("band_softness", "0")):
+                type_into(driver, f"effect-band-0-amount-{name}", value)
+                driver.find_element(By.ID, "shot-tab-effects").click()
+                settle(driver, "#shot-inspector", quiet_ms=500)
+                open_effects(driver)
+            wait_for_stack(
+                server.base_url, project_id,
+                lambda entries: entries[0]["bindings"][0].get("band_width") == 0.02,
+                "the minimum width did not reach the manifest",
+            )
+            reach(driver, "effect-band-0-amount-band_centre")
+            tightest = look(driver)
+            narrow = strip_geometry(driver, envelope, settings, band_values(tightest))
+            assert narrow["band"]["right"] - narrow["band"]["left"] < 4, (
+                "the minimum width is not the narrow case this step is about", narrow["band"])
+            # The softness handle has no ground left, so it is withdrawn -- and named, with the
+            # box that still sets it, rather than offered at two pixels (R-16).
+            assert [handle["name"] for handle in narrow["handles"]] == ["low", "high"], narrow
+            assert tightest["crowded"] and "Softness" in tightest["crowded"]["text"], (
+                tightest["crowded"])
+            assert tightest["crowded"]["colour"] == tightest["palette"]["muted"], (
+                "a geometry note took an accent", tightest["crowded"])
+            shot(driver, "07c-minimum-width")
+            strip_shot(driver, "07c-strip-canvas-minimum")
+            # And the two edges are still reachable: pressed on the low edge, the drag widens the
+            # band rather than moving it, at a width where the region itself is three pixels.
+            widened_from = stack(server.base_url, project_id)[0]["bindings"][0]
+            canvas = driver.find_element(By.CSS_SELECTOR, ".effect-band-strip")
+            low = next(handle["x"] for handle in narrow["handles"] if handle["name"] == "low")
+            pointer = StripPointer(driver, canvas, narrow)
+            pointer.press(low)
+            pointer.drag_to(max(2.0, low - 25))
+            pointer.release()
+            widened = wait_for_stack(
+                server.base_url, project_id,
+                lambda entries: entries[0]["bindings"][0].get("band_width", 0) > 0.02,
+                "the low edge is unreachable at the minimum width",
+            )[0]["bindings"][0]
+            assert widened["band_width"] > widened_from["band_width"], widened
+            result["minimum_width"] = {
+                "region_pixels": round(narrow["band"]["right"] - narrow["band"]["left"], 2),
+                "handles": [handle["name"] for handle in narrow["handles"]],
+                "withdrawn": tightest["crowded"]["text"],
+                "widened": {"from": widened_from, "to": widened},
+            }
+            shot(driver, "07c-widened-from-the-minimum")
+            strip_shot(driver, "07c-strip-canvas-widened")
 
             # --- 8. A locked Shot: readable, and every writing control disabled --------------
             #

@@ -956,8 +956,27 @@ dialog p { color: var(--muted); line-height: 1.5; }
    working rows above, so at a glance the pair read as live -- caught by looking, 2026-08-27.
    `.effect-card.effect-off` is the precedent: the unit that is inert is what recedes. */
 .effect-band-row.idle { opacity: .55; }
-/* The strip is the next slice and the panel says so, quietly, at --dim. */
-.effect-band-strip { margin: 6px 0; color: var(--dim); font-size: 10px; line-height: 1.45; }
+/* The spectrum strip (DESIGN 4.5), and the whole of its geometry is these three declarations:
+   this application's only data-driven chart, 36px of a 626px rail. The height is a budget rather
+   than a preference -- the panel it joins was already 503.6px with 212px of it below the fold,
+   and the sentence it replaced was five lines of prose saying the strip did not exist. Every
+   colour in it is painted from --dim and --blue by `drawEffectBandStrip`, read off this element's
+   own computed style, so the palette is not restated in JavaScript. */
+.effect-band-strip { display: block; width: 100%; height: 36px; margin: 0 0 7px; cursor: ew-resize; touch-action: none; }
+/* A locked Shot's strip is readable and not operable, which is what FX-7 already does to every
+   box and drive on this panel. A canvas has no `disabled` to inherit, so it takes the same
+   opacity and the same cursor by hand -- an `ew-resize` pointer over a band nothing can move is
+   the control that appears to do nothing, wearing a cursor. */
+.effect-band-strip[data-locked="true"] { opacity: .5; cursor: not-allowed; }
+/* Which gesture this width has no room for, said only while that is true. `:empty` keeps the
+   ordinary panel from paying a margin for a sentence it is not showing. */
+.effect-band-crowded { margin: -3px 0 7px; color: var(--muted); font-size: 10px; line-height: 1.45; }
+.effect-band-crowded:empty { display: none; }
+/* And what stands where the canvas would, on a measured song whose envelope carries no spectrum
+   to draw. A sentence, not an empty box. */
+.effect-band-undrawn { margin: 0 0 7px; color: var(--muted); font-size: 10px; line-height: 1.45; }
+/* What this panel is still missing -- the drive readout, and nothing else now. Quiet, at --dim. */
+.effect-band-pending { margin: 6px 0; color: var(--dim); font-size: 10px; line-height: 1.45; }
 .effect-band-analyze, .effect-band-remove { min-height: 26px; margin-top: 4px; font-size: 11px; font-weight: 400; }
 /* The picker: a grouped list under Consolas family headers, opened from `+ Effect`. No
    thumbnails -- an effect is a name and a set of bounds, and a picture of one would be a picture
