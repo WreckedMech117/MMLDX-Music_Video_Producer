@@ -596,6 +596,59 @@ causes — this one, and the `T` flag in R-29.
 
 ---
 
+## R-31 — The Trigger Floor is not a hairline on the Drive readout, because it is not on that axis
+
+Story 10.3's acceptance criterion, UX-DR7 and `DESIGN.md` §6 all say the same thing: the readout
+draws *"the Trigger Floor as a `--dim` hairline"* through the envelope. **It cannot, and this is a
+consequence of R-27 rather than a disagreement with it.**
+
+The floor is compared against the **band level** — `_punch_series` computes
+`0.0 if raw < floor else envelope`, and `_sustain_series` gates on `raw >= floor`, where `raw` is
+the measured band. R-27 makes the readout draw the **compiled parameter value**. Those are
+different units. A horizontal line at the floor's number, drawn on a value axis, names a value the
+floor has nothing to say about — a picture that reads as information and is not. The only drawing
+where the floor and the signal share an axis is one of the *band series*, and serving that is
+exactly what R-27 rejected, because it puts a second renderer between the picture and the export.
+
+**The ruling: the readout draws a `--dim` rest line — where the parameter sits when nothing fires
+— and expresses the floor as ground beneath the silenced runs.** That satisfies the clause of the
+same AC that carries the actual requirement, *"where the envelope falls below the floor it draws
+`--dim`, so a silenced passage looks silenced rather than merely low"*, and it is what the UX flow
+describes a Director doing: *raising the Floor until the quiet verse passage drops to `--dim`.*
+
+**And colour alone could not have carried it anyway, which is the measured half.** Below the floor
+a `punch` drive is exactly zero, so a silenced run's line lies *on* the rest line, in the same
+token — "the floor shut this" and "nothing is happening here" draw identically. The state needs
+width, not hue: a 4px ground bar under the silenced runs, which grows as the Floor rises. That is
+also the honest answer to why the epic could specify a hairline in good faith — on a band-level
+axis it would have worked.
+
+Two amendments follow and are made: the AC and UX-DR7 in `epics-effects.md`, and `DESIGN.md` §6 and
+`EXPERIENCE.md`'s readout section.
+
+---
+
+## R-32 — The readout's spoken equivalent lives under the readout, not in the band panel
+
+UX-DR7 says the Drive readout is `aria-hidden` and *"the facts it shows (peak time, whether the
+binding fires at all) are also stated in text on the band panel."*
+
+**The band panel is closed most of the time.** A screen reader meeting the canvas with no panel open
+gets nothing at all — which is the case the requirement exists to serve. Stating the equivalent in a
+different panel, for one parameter, that is usually not on screen, satisfies the sentence and not
+the rule.
+
+**The ruling: the facts are stated in a caption immediately beneath the canvas, inside the same
+`<figure>`** — which binding is drawn, where its drive peaks, and whether it fires at all. The band
+panel points at the readout without restating the numbers: repeating them is the doubled-sentence
+defect Story 10.2's browser QA found on the unresolvable panel, where one absence was explained
+twice on one screen.
+
+The standing rule is unchanged and is what this ruling serves: **every canvas in this application
+has a non-canvas equivalent**, and the equivalent has to be reachable wherever the canvas is.
+
+---
+
 ## Delegated decisions
 
 Not the Director's calls. Recorded here because they were made *for* the Director on 2026-08-27,

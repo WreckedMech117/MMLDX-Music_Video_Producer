@@ -368,6 +368,30 @@
               <p class="monitor-note" id="monitor-note"></p>
               <button id="monitor-fullscreen" class="monitor-fullscreen" title="Fullscreen the Monitor (Esc to leave)">⛶</button>
             </div>
+            <!-- The Drive readout (FX-22, UX-DR7): the envelope that is moving a bound parameter,
+                 drawn immediately beneath the Monitor and spanning the *selected* Shot's window,
+                 with the `--acid` playhead through it so the envelope and the picture read against
+                 one time axis.
+
+                 **It draws the compiled `sendcmd` values themselves** — the numbers the export
+                 hands ffmpeg, served by `GET .../shots/{id}/drive` off the same walk that writes
+                 the script's lines (R-27). Nothing in this application computes a drive in
+                 JavaScript; a second renderer would let the picture and the export disagree with
+                 every automated gate passing.
+
+                 **Absent, not empty**, and this element ships `hidden` for that reason: a Shot
+                 carrying no binding has no readout at all, rather than a flat line or an empty box
+                 in the space where one would be. `syncDriveReadout` is the only thing that
+                 unhides it, and only once there are compiled values in hand.
+
+                 A `figure`, because the caption is the canvas's equivalent rather than a note
+                 beside it: the canvas is `aria-hidden` and announces nothing, and every fact it
+                 draws — which binding, whether it fires, where it peaks — is in the `figcaption`
+                 immediately under it. -->
+            <figure class="drive-readout" id="drive-readout" hidden>
+              <canvas class="drive-readout-canvas" id="drive-readout-canvas" aria-hidden="true"></canvas>
+              <figcaption class="drive-readout-caption" id="drive-readout-caption"></figcaption>
+            </figure>
             <!-- The bar directly under the Monitor: transport, the edit tools, the zoom, the two
                  line mutes and the master volume. It **wraps** rather than squeezing or hiding —
                  this project has a recorded defect where three controls vanished behind media

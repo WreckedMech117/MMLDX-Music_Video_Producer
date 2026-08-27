@@ -1,4 +1,4 @@
-import { aiModPlan, alignLyricsKeptTranscription, api, applyRenderStatus, APPLY_DOCUMENTS_CONTROL, approvalControl, approvalNotice, assetNamePlan, assetsForTab, assetTab, assetTabEmpty, ASSET_NAME_HELP, ASSET_NAME_LABEL, ASSET_ROLE_LABELS, ASSET_TABS, assistantControl, assistantFillAllControl, assistantToast, ASSISTANT_EDIT_BLOCKED, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, batchReportToast, beatBandIdentity, beatMarkersControlPlan, characterSlotPlan, CITATION_MISSING_LABEL, clearDocumentConsent, clipEffectsChip, comfyOutputUrl, consistencyAnchorPlan, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, DOCUMENT_CONTROLS, effectBandChange, effectBandEdit, effectBandStripDrag, effectBandStripHit, effectBandStripPlan, effectBandToggle, effectBindingsBody, effectBindingsSet, effectControlKey, effectControlTarget, effectCopyBody, effectCopyReport, effectDropTarget, effectMoveOffered, effectNudgeDirection, effectNudgeTarget, effectParameterDefinition, effectParameterReadout, effectParameterValue, effectSliderFill, effectsPanelModel, effectsRefusalNotice, effectStackAdd, effectStackChanged, effectStackMove, effectStackRemove, effectStackSetParameter, effectStackToggle, effectStackWrite, EFFECT_BAND_CLOSED, EFFECT_BAND_ID, EFFECT_PARAMETER_ID, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, expansionReport, generateAllPlan, hasActiveRenderJobs, INSTRUMENTAL_NOTE, jobTarget, markReadyControl, markReadyNotice, monitorPreviewView, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, PLACEHOLDER_PROMPT, prefillControl, PREVIEW_UNPLAYABLE, previewAdoption, randomSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, RENDER_POLL_INTERVAL_MS, resolveShotMode, shotBoundaries, shotCitations, shotEffectStack, shotExpansionToast, shotInspectorReadiness, shotLabel, shotModeOptionLabel, shotPreviewWanted, shotPromptCell, shotSpecificationProblems, shotTab, shotTabAfterKey, shotTabStrip, shotTakeUrl, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SHOT_TABS, SINGING_STATES, snapSeconds, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songOrderRanks, songRefusalMessage, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, tagLyricLine, threadHtml, unsavedWorkPending, unsavedWorkQuestion, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, vocalTaggingPlan, vocalTypeSpec, VOCAL_TYPES, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE } from "./api.js";
+import { aiModPlan, alignLyricsKeptTranscription, api, applyRenderStatus, APPLY_DOCUMENTS_CONTROL, approvalControl, approvalNotice, assetNamePlan, assetsForTab, assetTab, assetTabEmpty, ASSET_NAME_HELP, ASSET_NAME_LABEL, ASSET_ROLE_LABELS, ASSET_TABS, assistantControl, assistantFillAllControl, assistantToast, ASSISTANT_EDIT_BLOCKED, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, batchReportToast, beatBandIdentity, beatMarkersControlPlan, characterSlotPlan, CITATION_MISSING_LABEL, clearDocumentConsent, clipEffectsChip, comfyOutputUrl, consistencyAnchorPlan, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, DOCUMENT_CONTROLS, driveReadoutPlan, driveReadoutView, driveReadoutWanted, effectBandChange, effectBandEdit, effectBandStripDrag, effectBandStripHit, effectBandStripPlan, effectBandToggle, effectBindingsBody, effectBindingsSet, effectControlKey, effectControlTarget, effectCopyBody, effectCopyReport, effectDropTarget, effectMoveOffered, effectNudgeDirection, effectNudgeTarget, effectParameterDefinition, effectParameterReadout, effectParameterValue, effectSliderFill, effectsPanelModel, effectsRefusalNotice, effectStackAdd, effectStackChanged, effectStackMove, effectStackRemove, effectStackSetParameter, effectStackToggle, effectStackWrite, EFFECT_BAND_CLOSED, EFFECT_BAND_ID, EFFECT_PARAMETER_ID, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, expansionReport, generateAllPlan, hasActiveRenderJobs, INSTRUMENTAL_NOTE, jobTarget, markReadyControl, markReadyNotice, monitorPreviewView, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, PLACEHOLDER_PROMPT, prefillControl, PREVIEW_UNPLAYABLE, previewAdoption, randomSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, RENDER_POLL_INTERVAL_MS, resolveShotMode, shotBoundaries, shotCitations, shotEffectStack, shotExpansionToast, shotInspectorReadiness, shotLabel, shotModeOptionLabel, shotPreviewWanted, shotPromptCell, shotSpecificationProblems, shotTab, shotTabAfterKey, shotTabStrip, shotTakeUrl, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SHOT_TABS, SINGING_STATES, snapSeconds, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songOrderRanks, songRefusalMessage, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, tagLyricLine, threadHtml, unsavedWorkPending, unsavedWorkQuestion, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, vocalTaggingPlan, vocalTypeSpec, VOCAL_TYPES, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE } from "./api.js";
 import { ASSEMBLE_RUNNING, EXPORT_PRESETS, EXPORT_PRESET_DEFAULT, assemblyControl, assemblyProgress, effectiveOffset, latestAssemblyExport, monitorShowsTake, monitorState, newShotFromPlan, renderProgressByTarget, renderingFlag, shotRenderState, takeAnchorControl, takeAudioControl, takesStripRows, trimNudgeControl } from "./api.js";
 import { EXPAND_ALL_PROMPTS_CONFIRM, EXPAND_ALL_PROMPTS_RUNNING, EXPAND_ALL_PROMPTS_TIMELINE_CONTROL, EXPAND_ALL_PROMPTS_TIMELINE_LABEL, NOTICE_KINDS, expansionSweepLines } from "./api.js";
 // Generate All Empty: the cuts bar's second batch door, beside Expand All Prompts. Its whole
@@ -2783,10 +2783,12 @@ function effectBandHtml(key, band) {
   const needs = (band.needs || []).length || band.unwritten
     ? `<div class="effect-band-needs" id="${id("needs")}">${(band.needs || []).map((line) => `<p>${escapeHtml(line)}</p>`).join("")}${band.unwritten ? `<p>${escapeHtml(band.unwritten)}</p>` : ""}</div>`
     : `<div class="effect-band-needs" id="${id("needs")}" hidden></div>`;
-  // What is still absent from this panel, and it is an exhaustive claim -- the strip above is why
-  // it now names one thing where it named two.
-  const pending = band.pending
-    ? `<p class="effect-band-pending" id="${id("pending")}">${escapeHtml(band.pending)}</p>` : "";
+  // Where this binding's envelope is drawn. This slot held an exhaustive claim about what the
+  // panel was still missing -- two absences, then one; the drive readout was the last of them and
+  // it is under the Monitor now, so the claim is gone and a pointer stands in its place. The
+  // readout's own facts are in its own caption and are deliberately not repeated here.
+  const readout = band.readout
+    ? `<p class="effect-band-readout" id="${id("readout")}">${escapeHtml(band.readout)}</p>` : "";
   const remove = band.remove?.shown
     ? `<button type="button" class="quiet-button full effect-band-remove" id="${id("remove")}" title="${escapeHtml(band.remove.title)}" ${band.remove.disabled ? "disabled" : ""}>${escapeHtml(band.remove.label)}</button>`
     : "";
@@ -2795,7 +2797,7 @@ function effectBandHtml(key, band) {
   // seventh accent, and one that is a refusal about a parameter the music can never reach takes
   // an inert edge. Browser QA on 2026-08-27 found the refusal wearing the reactive colour, which
   // is the one thing DESIGN 1 closed the palette to prevent.
-  return `<div class="effect-band" id="effect-band-panel-${key}" data-state="${escapeHtml(band.state)}" role="group" aria-label="${escapeHtml(band.legend || "")}">${note}${analyze}${strip}${drive}${controls}${gate}${needs}${pending}${remove}</div>`;
+  return `<div class="effect-band" id="effect-band-panel-${key}" data-state="${escapeHtml(band.state)}" role="group" aria-label="${escapeHtml(band.legend || "")}">${note}${analyze}${strip}${drive}${controls}${gate}${needs}${readout}${remove}</div>`;
 }
 
 // The card's grip (DESIGN 4.2), drawn **only where there is somewhere to go**. C2 left it out on
@@ -3503,6 +3505,10 @@ function bindEffectBand(inspector, shot, card, row) {
     // `effectBandToggle`'s answer, not this handler's.
     effectBand = effectBandToggle(effectBand, shotId, card.index, row.name);
     renderShotInspector();
+    // Which binding the readout draws is *this* decision — the parameter whose panel is open —
+    // so the picture under the Monitor follows the press that opened it. Nothing is fetched: the
+    // compiled bindings for this Shot are already in hand, and this only chooses among them.
+    syncDriveReadout();
     $("#effect-bind-" + key, $("#shot-inspector"))?.focus?.();
   });
   const band = row.band;
@@ -5476,6 +5482,7 @@ function updateTimelinePlayhead() {
     : projectDuration();
   $("#song-playhead").style.left = `${duration ? (state.playhead / duration) * 100 : 0}%`;
   syncMonitor();
+  syncDriveReadout();
 }
 
 // How far the Monitor's video may drift from the master clock before it is snapped back.
@@ -5649,6 +5656,190 @@ function showPreviewLayer(name) {
 // the clock; the element keeps driving the playhead with its output silenced.
 let songLineMuted = false;
 let videoLineMuted = false;
+
+// ------------------------------------------------------------------------------------------
+// The Drive readout (story 10.3). The envelope moving a bound parameter, under the Monitor.
+//
+// **Nothing here decides anything.** Which binding is drawn, which pixel is which second, where
+// the rest line falls, which runs of samples the Trigger Floor shut and where the playhead lands
+// are all `api.js`'s answers; this measures one box, asks for a plan, and strokes what comes back.
+// And it computes no drive: the values are the compiled `sendcmd` numbers the server handed over,
+// which is R-27 and the reason this readout can be a test artifact rather than a second renderer.
+// ------------------------------------------------------------------------------------------
+
+//: The compiled bindings this browser is holding, against the key that fetched them and the Shot
+//: they belong to -- `monitorPreviews`' shape, and for its reason: nothing is persisted, because a
+//: compiled drive is derived and a derived thing that outlives what it describes is the stale flag
+//: AD-23 refused to store.
+let driveHeld = null;
+//: The key of the read in flight, "" when none. One slot, so a Director moving quickly supersedes
+//: their own request and a reply to anything but the newest key is dropped.
+let driveRequestKey = "";
+//: The key the last read was refused for, so a Shot whose drive cannot be compiled is not re-asked
+//: about on every playhead tick for the rest of the session. `previewProblem`'s bargain.
+let driveProblemKey = "";
+
+// Ask for this Shot's compiled bindings, once per set of inputs that would compile a different
+// script. `driveReadoutWanted` decides whether to ask at all -- an unbound Shot never does, because
+// the read hashes the whole master to decide whether the measurement is still current.
+async function requestDriveReadout(shotId, key) {
+  driveRequestKey = key;
+  const projectId = state.project.id;
+  let answer = null;
+  try {
+    answer = await api.shotDrive(projectId, shotId);
+  } catch (error) {
+    // Silent, and deliberately: this is a read nobody asked for by pressing anything, and a toast
+    // for it would put an error on screen for the act of selecting a Shot. The readout is simply
+    // absent, which is the same thing it is for every other reason it cannot be drawn.
+    if (driveRequestKey === key) driveProblemKey = key;
+  }
+  if (driveRequestKey !== key || state.project?.id !== projectId) return;
+  driveRequestKey = "";
+  if (answer) {
+    driveHeld = { projectId, shotId, key, answer };
+    driveProblemKey = "";
+  }
+  syncDriveReadout();
+}
+
+// The readout, painted from the plan `api.js` handed back.
+//
+// Three strokes and the middle one is the point: the rest line first, so a silenced run reads as a
+// run *along a line* rather than as an absence of drawing; then each segment of the envelope in
+// the token its own `silenced` flag names -- `--dim` where the Trigger Floor was shut, `--blue`
+// where it was open -- so a silenced passage looks silenced rather than merely low, which is the
+// readout's whole reason for existing; then the `--acid` playhead already on the timeline, drawn
+// through the picture so the envelope and the frames share one axis.
+//
+// The tokens are read off the canvas's own computed style rather than written out, so the palette
+// stays where the palette is. No eighth accent.
+function drawDriveReadout(canvas, plan) {
+  const context = canvas?.getContext ? canvas.getContext("2d") : null;
+  if (!context || !plan?.shown) return;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.max(1, Math.round(plan.width * dpr));
+  canvas.height = Math.max(1, Math.round(plan.height * dpr));
+  context.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const style = window.getComputedStyle(canvas);
+  const token = (name) => String(style.getPropertyValue(name) || "").trim();
+  const dim = token("--dim") || "#5a6161";
+  const blue = token("--blue") || "#5b9bd5";
+  const acid = token("--acid") || "#c6f24e";
+  context.clearRect(0, 0, plan.width, plan.height);
+  // The ground under every passage the Trigger Floor shut, laid down first so the envelope draws
+  // over it. **A colour alone cannot carry this state**: below the floor a `punch` drive is
+  // exactly zero, so a silenced run's own line lies on the rest hairline in the same token, and
+  // "the floor shut this" would look identical to the bare datum under a passage nobody measured.
+  // A band has width, is read where the passage is, and grows as the Director raises the Floor.
+  context.save();
+  context.globalAlpha = 0.55;
+  context.fillStyle = dim;
+  for (const span of plan.silence) {
+    context.fillRect(span.from, plan.ground, Math.max(1, span.to - span.from), plan.height - plan.ground);
+  }
+  context.restore();
+  // A filled envelope as well as a stroked one. A 30 Hz drive over a four-second window is a
+  // thicket of one-pixel spikes, and an unfilled polyline of it reads as noise at any height this
+  // row can afford; the fill is what makes "firing on the hits" a shape rather than a texture. It
+  // is the same two tokens at a low alpha, so the palette gains nothing.
+  for (const segment of plan.segments) {
+    const colour = segment.silenced ? dim : blue;
+    context.save();
+    context.globalAlpha = 0.28;
+    context.fillStyle = colour;
+    context.beginPath();
+    context.moveTo(segment.points[0].x, plan.rest);
+    for (const point of segment.points) context.lineTo(point.x, point.y);
+    context.lineTo(segment.points[segment.points.length - 1].x, plan.rest);
+    context.closePath();
+    context.fill();
+    context.restore();
+    context.strokeStyle = colour;
+    context.lineWidth = 1;
+    context.beginPath();
+    segment.points.forEach((point, index) => {
+      const y = Math.min(plan.rest, point.y + 0.5);
+      if (index === 0) context.moveTo(point.x, y);
+      else context.lineTo(point.x, y);
+    });
+    context.stroke();
+  }
+  // The rest line **after** the envelope, not before it: the fill's own bottom edge *is* this
+  // line, so drawn first it is painted over along its whole width and the picture loses the datum
+  // a silenced run is read against. Caught by the pixel census on 2026-08-27, which counted ten
+  // `--dim` pixels where a full-width hairline should have left more than a thousand — the same
+  // failure the spectrum strip's baseline made one slice ago, where a 1px bar was swallowed whole.
+  context.strokeStyle = dim;
+  context.lineWidth = 1;
+  context.beginPath();
+  context.moveTo(0, plan.rest);
+  context.lineTo(plan.width, plan.rest);
+  context.stroke();
+  if (plan.playhead === null) return;
+  context.strokeStyle = acid;
+  context.lineWidth = 1;
+  context.beginPath();
+  context.moveTo(Math.round(plan.playhead) + 0.5, 0);
+  context.lineTo(Math.round(plan.playhead) + 0.5, plan.height);
+  context.stroke();
+}
+
+// The readout, decided and drawn for whatever Shot is selected now.
+//
+// **The selected Shot, not the one under the playhead** (UX-DR7): the readout spans the *selected*
+// Shot's window, and the playhead is drawn through it only while it is inside that window. A line
+// pinned to an edge would say the picture is at its start when it is somewhere else entirely.
+//
+// **Absent, not empty** (FX-22). Every path that cannot draw hides the whole figure, so the grid
+// row collapses and the Monitor and the tracks take the space back: a Shot with no binding, a
+// binding on a card the Director switched off, a song whose measurement has gone, a stack the
+// export refuses, and the moments before the first read lands.
+function syncDriveReadout() {
+  const figure = $("#drive-readout");
+  if (!figure) return;
+  const canvas = $("#drive-readout-canvas");
+  const caption = $("#drive-readout-caption");
+  const hide = () => { figure.hidden = true; };
+  const shot = state.project ? selectedShot() : null;
+  if (!shot) return hide();
+  const wanted = driveReadoutWanted(shot, state.project?.song);
+  if (!wanted.wanted) return hide();
+  // The project as well as the key. Two projects can hold a Shot with the same id, the same
+  // window and the same stack -- a duplicated plan, a project copied to try a second cut -- and
+  // their keys are then identical while their songs are not. Holding the project the answer came
+  // from is what stops one project's envelope being drawn under another's Monitor.
+  const held = driveHeld?.projectId === state.project.id ? driveHeld : null;
+  if (held?.key !== wanted.key
+    && driveRequestKey !== wanted.key
+    && driveProblemKey !== wanted.key) {
+    requestDriveReadout(shot.id, wanted.key);
+  }
+  // The values in hand describe another Shot or another look. Kept rather than drawn: a picture of
+  // the previous Shot's envelope under this Shot's Monitor is the one thing worse than no picture.
+  if (held?.key !== wanted.key) return hide();
+  const view = driveReadoutView(held.answer, {
+    catalogue: effectCatalogue,
+    // The panel the Director has open, and only while it belongs to this Shot. With none open the
+    // readout draws the first binding in composed-chain order, and says so.
+    open: effectBand?.shotId === shot.id ? effectBand : null,
+  });
+  if (!view.shown) return hide();
+  // Unhidden *before* the box is measured: a canvas inside a `hidden` element measures zero wide,
+  // and a plan built at zero width is a correctly-sized empty box that every structural assertion
+  // would pass over. The spectrum strip's own lesson, one slice ago.
+  figure.hidden = false;
+  figure.setAttribute("aria-label", view.title);
+  if (caption) caption.textContent = view.caption;
+  const rect = canvas?.getBoundingClientRect?.() || { width: 0, height: 0 };
+  drawDriveReadout(canvas, driveReadoutPlan({
+    binding: view.binding,
+    seconds: view.seconds,
+    width: rect.width,
+    height: rect.height,
+    playhead: state.playhead - (Number(shot.start) || 0),
+  }));
+}
 
 function syncMonitor() {
   const video = $("#monitor-video");

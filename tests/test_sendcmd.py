@@ -47,6 +47,7 @@ from music_video_producer.effects import (
     StageContext,
     band_series,
     build_effect_stages,
+    drive_readout,
     drive_series,
     sendcmd_script,
 )
@@ -1094,3 +1095,177 @@ def test_a_mistargeted_command_is_accepted_and_ignored(tmp_path: Path):
     )
     assert plain.returncode == 0, plain.stderr
     assert frames_of(aimed_wrong) == frames_of(undriven)
+
+
+# ------------------------------------------------------------------------------------------
+# The Drive readout's numbers (story 10.3, R-27).
+#
+# The readout draws the compiled `sendcmd` values themselves rather than a curve derived a second
+# way, and the form that guarantee takes here is not a test but a **shared walk**: `drive_samples`
+# produces the numbers and `sendcmd_script` formats them into lines. So the assertions below are
+# about the join — that rendering the readout's own samples through the filter's own option
+# arithmetic reproduces the script character for character, and that the set of bindings the
+# readout draws is exactly the set that compiles a script.
+# ------------------------------------------------------------------------------------------
+
+
+def rendered_from(readout, binding_values: dict[str, object], target: str) -> str:
+    """The `sendcmd` text a readout's samples say ffmpeg will be handed.
+
+    Written out here rather than borrowed from the compiler, deliberately: this is the only test
+    in this file that is allowed to know the line format twice, because the claim being checked is
+    that the *drawn series* and the *script text* are the same numbers. A helper that called the
+    compiler to build the expectation would compare the compiler with itself.
+    """
+    parameter = next(
+        declared
+        for declared in EFFECT_CATALOGUE[readout.effect_id].parameters
+        if declared.name == readout.parameter
+    )
+    context = StageContext(width=EXPORT_WIDTH, height=EXPORT_HEIGHT, slot=0,
+                           driven=True, labels={parameter.drive.filter_name: "b0"})
+    lines = []
+    for sample in readout.samples:
+        stamp = f"{sample.at:.6f}".rstrip("0").rstrip(".") or "0"
+        for option, argument in zip(
+            parameter.drive.options, parameter.drive.compute(sample.value, context), strict=True
+        ):
+            lines.append(f"{stamp} {target} {option} {argument};")
+    return "\n".join(lines) + "\n"
+
+
+def test_the_readout_draws_the_very_lines_the_script_carries():
+    """R-27's whole claim, as one comparison: the drawn series **is** the argv.
+
+    The same stack is put through `build_effect_stages` — the call the preview and the export both
+    make — and through `drive_readout`, and the readout's samples are rendered back into
+    `sendcmd`'s grammar. Byte for byte, that is the script the compiler wrote. There is no second
+    engine here to drift, because the walk is one function; what this pins is that the numbers the
+    browser is handed are the numbers on the lines and not something adjacent to them.
+    """
+    stack = [
+        bound("temperature", "amount", {"amount": 0.2}, depth=0.6,
+              band_centre=0.0, band_width=0.2)
+    ]
+    script = stages(stack).scripts[0]
+    readouts = drive_readout(stack, envelope=ENVELOPE, clip_seconds=2.0)
+
+    assert len(readouts) == 1
+    assert rendered_from(readouts[0], stack[0]["bindings"][0], script.target) == script.text
+
+
+def test_the_readout_names_the_card_and_the_parameter_it_belongs_to():
+    """A Shot may carry more than one binding, so an unnamed envelope is a picture that lies about
+    which parameter it describes. The identity travels with the numbers."""
+    readouts = drive_readout(
+        [bound("temperature", "amount", {"amount": 0.2})],
+        envelope=ENVELOPE,
+        clip_seconds=2.0,
+    )
+
+    assert (readouts[0].effect_id, readouts[0].parameter, readouts[0].index) == (
+        "temperature", "amount", 0)
+
+
+def test_the_readout_comes_back_in_the_order_the_scripts_are_written():
+    """Composed-chain order, not stored order — the order ffmpeg is handed the scripts (AD-31).
+
+    The stack below is stored Grade first and Texture second, which is the reverse of the order
+    the chain composes them in. A readout list in stored order would name the wrong binding as
+    *the first one the export drives*, which is the sentence the caption makes when no band panel
+    is open.
+    """
+    stack = [
+        bound("exposure", "amount", {"amount": 0.2}),
+        bound("soft_focus", "sigma", {"sigma": 4.0}),
+    ]
+    readouts = drive_readout(stack, envelope=ENVELOPE, clip_seconds=2.0)
+    compiled = stages(stack).scripts
+
+    assert [(item.effect_id, item.index) for item in readouts] == [
+        ("soft_focus", 1), ("exposure", 0)]
+    # And the same order the scripts really came back in, so the two can never be read differently.
+    assert [item.filename.split("-")[0] for item in compiled] == ["soft_focus", "exposure"]
+
+
+def test_a_binding_on_a_switched_off_card_draws_nothing_because_it_drives_nothing():
+    """A disabled card composes no stage and compiles no script (`test_a_disabled_effect_composes
+    _no_stage_and_no_script`), so there is nothing for a readout to draw. Drawing one anyway would
+    be a picture of a look the export will not produce, which is the one thing FX-22 forbids."""
+    stack = [bound("temperature", "amount", {"amount": 0.2}, enabled=False)]
+
+    assert stages(stack).scripts == ()
+    assert drive_readout(stack, envelope=ENVELOPE, clip_seconds=2.0) == ()
+
+
+def test_the_readout_marks_the_ticks_the_trigger_floor_shut():
+    """*Silenced*, not merely low — the readout's whole reason for existing (FX-22).
+
+    A floor of 0.5 over this envelope's low band shuts every tick but the two hits, and the flags
+    are read off the **band level** rather than off the drive: a `punch` envelope decays to nothing
+    two ticks after a hit in a passage the floor never touched, and calling that silenced would put
+    the dim colour on the wrong seconds.
+    """
+    readout = drive_readout(
+        [bound("temperature", "amount", {"amount": 0.2}, depth=0.6, band_centre=0.0,
+               band_width=0.2, floor=0.5)],
+        envelope=ENVELOPE,
+        clip_seconds=2.0,
+    )[0]
+
+    # The low band is 0.1, 0.9, 0.2, 0.1, 0.8, 0.1, 0.3, 0.1 — two ticks above 0.5.
+    assert [sample.silenced for sample in readout.samples] == [
+        True, False, True, True, False, True, True, True]
+    # And the flag is not "the drive is zero" wearing another name. Under `sustain` the same floor
+    # over the same band leaves ticks that are **below the floor and still driving**, because the
+    # gate holds through a dip — so a readout that inferred silence from the value would put the
+    # dim colour on seconds the music is still moving.
+    held = drive_readout(
+        [bound("temperature", "amount", {"amount": 0.2}, drive="sustain", depth=0.6,
+               band_centre=0.0, band_width=0.2, floor=0.5, hold=0.0, sustain=5.0)],
+        envelope=ENVELOPE,
+        clip_seconds=2.0,
+    )[0]
+    still_driving = [
+        sample for sample in held.samples if sample.silenced and sample.value != held.rest
+    ]
+    assert still_driving, [dataclasses.astuple(sample) for sample in held.samples]
+
+
+def test_the_readouts_two_ends_are_the_compilers_own_clamp_and_not_the_catalogues_bound():
+    """`rest` and `reach` are where the parameter sits and where a full drive takes it, each
+    already clamped — so a picture drawn between them is drawn between values the export can
+    really produce. Exposure runs -1..1 and a resting 0.8 with a depth of 0.6 reaches 1, not 1.4.
+    """
+    readout = drive_readout(
+        [bound("exposure", "amount", {"amount": 0.8}, depth=0.6)],
+        envelope=ENVELOPE,
+        clip_seconds=2.0,
+    )[0]
+
+    assert (readout.rest, readout.reach) == (0.8, 1.0)
+    assert max(sample.value for sample in readout.samples) <= 1.0
+
+
+def test_a_binding_that_pulls_its_parameter_down_reaches_below_where_it_rests():
+    """Depth is signed, so `reach` below `rest` is an ordinary state and not an error."""
+    readout = drive_readout(
+        [bound("exposure", "amount", {"amount": 0.2}, depth=-0.5)],
+        envelope=ENVELOPE,
+        clip_seconds=2.0,
+    )[0]
+
+    assert readout.reach < readout.rest
+    assert min(sample.value for sample in readout.samples) < readout.rest
+
+
+def test_the_readout_refuses_without_an_envelope_in_the_compilers_own_words():
+    """The same refusal `sendcmd_script` raises, because it is the same walk raising it."""
+    with pytest.raises(EffectRefusal) as refused:
+        drive_readout(
+            [bound("temperature", "amount", {"amount": 0.2})],
+            envelope=None,
+            clip_seconds=2.0,
+        )
+
+    assert "temperature's amount" in str(refused.value)

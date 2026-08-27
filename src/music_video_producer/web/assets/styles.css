@@ -332,7 +332,37 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
    horizontal scrollbar at the foot of them was the first thing to go. Two `fr` rows degrade
    together at any height instead, tracks weighted slightly heavier because they are what is being
    edited, and the ⛶ button is still there when the picture is the thing to look at. */
-.timeline-main { display: grid; grid-template-rows: minmax(120px, 1fr) auto minmax(140px, 1.25fr); min-width: 0; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; background: var(--surface-0); }
+.timeline-main { display: grid; grid-template-rows: minmax(120px, 1fr) auto auto minmax(140px, 1.25fr); min-width: 0; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; background: var(--surface-0); }
+/* The Drive readout, between the Monitor and the transport bar. A **fourth** row rather than
+   an overlay on the picture: it shares the Monitor's time axis and must not cover the frames
+   being judged, and `auto` means the row is exactly zero high while the readout is `hidden` —
+   so a Shot with no binding gives the picture and the tracks back every pixel of it, which is
+   FX-22's *absent, not empty* said in the grid rather than only in the markup.
+   The `[hidden]` rule is not redundant: a `display` here would beat the attribute and draw an
+   empty box on every unbound Shot, which is exactly the regression this row is arranged to
+   avoid. */
+/* **Each child is placed on its own track by name**, and that is not tidiness.
+   `hidden` takes the readout out of the flow entirely, so with auto-placement the three remaining
+   children fell into tracks 1-3 -- and `#timeline-scroll`, which is the tracks viewport, landed in
+   the readout's own `auto` track while the `minmax(140px, 1.25fr)` track meant for it sat empty.
+   Measured in the browser on 2026-08-27: the Monitor collapsed from 218px to its 120px floor on
+   every Shot with no binding, which is every Shot in every project until one is bound. Every
+   automated gate passed over it; the census that caught it was measuring something else. */
+.timeline-main > .timeline-monitor { grid-row: 1; }
+.timeline-main > .drive-readout { grid-row: 2; }
+.timeline-main > .timeline-transport { grid-row: 3; }
+.timeline-main > .timeline-scroll { grid-row: 4; }
+.drive-readout { display: grid; gap: 3px; margin: 0; padding: 5px 10px 6px; border-bottom: 1px solid var(--line); background: var(--surface-0); }
+.drive-readout[hidden] { display: none; }
+/* 34px of canvas. Tall enough that a transient reads as a spike rather than as a thickening of
+   the rest line, short enough that the two `fr` rows either side of it — the picture and the
+   tracks — give up about 27px each at this viewport. `display: block` because an inline canvas
+   sits on the text baseline and leaves a descender's worth of gap under it. */
+.drive-readout-canvas { display: block; width: 100%; height: 34px; }
+/* The canvas's equivalent, not a note beside it: the canvas is `aria-hidden` and every fact it
+   draws is in this line. `--muted` and not `--dim`, because it is the only reading a screen
+   reader gets and the dim token is what the picture uses for a silenced passage. */
+.drive-readout-caption { margin: 0; color: var(--muted); font: 10px Consolas, monospace; line-height: 1.4; }
 .monitor-fullscreen { position: absolute; right: 10px; bottom: 10px; z-index: 2; width: 34px; height: 30px; border: 1px solid var(--line-strong); border-radius: 4px; background: #000a; color: var(--ink); cursor: pointer; opacity: 0; transition: opacity .15s; }
 .timeline-monitor:hover .monitor-fullscreen { opacity: 1; }
 .timeline-monitor:fullscreen { background: #000; }
@@ -976,7 +1006,7 @@ dialog p { color: var(--muted); line-height: 1.5; }
    to draw. A sentence, not an empty box. */
 .effect-band-undrawn { margin: 0 0 7px; color: var(--muted); font-size: 10px; line-height: 1.45; }
 /* What this panel is still missing -- the drive readout, and nothing else now. Quiet, at --dim. */
-.effect-band-pending { margin: 6px 0; color: var(--dim); font-size: 10px; line-height: 1.45; }
+.effect-band-readout { margin: 6px 0; color: var(--dim); font-size: 10px; line-height: 1.45; }
 .effect-band-analyze, .effect-band-remove { min-height: 26px; margin-top: 4px; font-size: 11px; font-weight: 400; }
 /* The picker: a grouped list under Consolas family headers, opened from `+ Effect`. No
    thumbnails -- an effect is a name and a set of bounds, and a picture of one would be a picture

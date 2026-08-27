@@ -7083,6 +7083,70 @@ class ShotEffectsResponse(BaseModel):
     effects: list[EffectSpec] = Field(default_factory=list)
 
 
+class ShotDriveBinding(BaseModel):
+    """One Parameter Binding's compiled drive over one Shot's window — the Drive readout's whole
+    subject, and R-27's ruling as a wire shape.
+
+    **These are the numbers the `sendcmd` script carries**, not a curve derived from a band
+    series a second time. `at` is the clip-local second each command is stamped with and `values`
+    is the number each command's argument is formatted from; both come off `effects.drive_samples`,
+    which is the same walk `effects.sendcmd_script` writes its lines from. A picture drawn from
+    these is the argv, which is the only form of FX-22's *"the signal drawn is the same one the
+    export will use"* that cannot drift.
+
+    **The per-frame `bands` array stays on disk** (AD-20, R-27). It is about 98 % of a 469 KB
+    sidecar, and shipping it so a browser could compute this itself is the second *renderer*
+    R-27 refused by name: the picture and the export could then disagree while every automated
+    gate passed.
+
+    `silenced` is per tick and is the band level against the Director's own Trigger Floor —
+    *silenced*, not merely low. It is here rather than inferred from `values` because the drive
+    cannot answer it: a `sustain` binding holds through a dip well under its floor, and a `punch`
+    envelope decays to nothing in a passage that never approached it.
+
+    `rest` and `reach` are the two ends the picture is measured between: where a shut gate leaves
+    the parameter, and where a full drive takes it, each already clamped into the parameter's own
+    declared range by the compiler. `reach` may sit below `rest`, because depth is signed. They
+    are the compiler's clamp and not the catalogue's bound restated — a client that scaled to the
+    bound would draw a flat line for every binding whose depth is small.
+
+    `index` is the card's position in the stored stack, which is how a client matches a drawn
+    envelope to the band panel it belongs to. The list arrives in composed-chain order.
+    """
+
+    index: int
+    effect: str
+    parameter: str
+    rest: float
+    reach: float
+    at: list[float] = Field(default_factory=list)
+    values: list[float] = Field(default_factory=list)
+    silenced: list[bool] = Field(default_factory=list)
+
+
+class ShotDriveResponse(BaseModel):
+    """What `GET .../shots/{id}/drive` answers: the seconds the readout spans, and one entry per
+    binding that would compile a script for it.
+
+    **An empty list is the whole of every absence**, and that is FX-22's *absent, not empty*:
+    a Shot carrying no binding, a Shot whose only bound card is switched off, a song with no
+    current measurement, and a stored stack the validator refuses all answer the same way, because
+    the readout's only question is *is there a compiled drive to draw*. Which absence it is, and
+    what to do about it, is the band panel's sentence and is already answered there — a second
+    account of it here would be the two-sources-for-one-question shape this application refuses.
+
+    `seconds` is the clip the drive was compiled over: `clip_frames_on_grid` at `ASSEMBLY_FPS`,
+    which is the Shot's window measured the way the preview measures it, so the readout's time
+    axis is the axis of the picture above it rather than a rounding of the manifest's own float.
+    It is served because nothing on the client can compute it — the frame grid is the export's
+    arithmetic — and it is the denominator every `at` is drawn against.
+    """
+
+    shot_id: str
+    seconds: float = 0.0
+    bindings: list[ShotDriveBinding] = Field(default_factory=list)
+
+
 def wake_joiner(future: asyncio.Future[None]) -> None:
     """Release one waiting preview request. Runs on that request's own event loop.
 

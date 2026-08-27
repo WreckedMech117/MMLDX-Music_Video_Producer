@@ -6655,17 +6655,22 @@ export const EFFECT_BAND_LEGEND = "{label} · band";
 //: 10.2 and the accessibility floor requires both, so a panel that read as finished here would be
 //: claiming the canvas had been decided against.
 //:
-//: **Made exact 2026-08-27, once `hold` and `sustain` landed**, and **narrowed the same day when
-//: the strip landed.** The sentence has always been an exhaustive claim -- it says *only* -- and
-//: `test_the_panel_names_exactly_what_it_is_still_missing` holds it against the stories
-//: themselves. It named two absences while the band was three numbers; the spectrum strip is now
-//: drawn above these boxes, so the drive readout (story 10.3) is the whole of what is left, and
-//: the constant is renamed with the claim rather than kept as a name that says *strip pending*
-//: over a panel that has one. A label outliving the state it describes is what the `STALE` chip
-//: shipped as, one epic ago.
-export const EFFECT_BAND_READOUT_PENDING =
-  "The drive this band produces has no readout yet, and that is the only thing this panel is "
-  + "still missing.";
+//: **Made exact 2026-08-27, once `hold` and `sustain` landed**, narrowed the same day when the
+//: spectrum strip landed, and **emptied of its claim when the drive readout landed.** The sentence
+//: was an exhaustive claim -- it said *only* -- and it named two absences, then one, and now none:
+//: this panel is not missing anything. The constant is renamed with the claim each time rather
+//: than kept as a name that says *pending* over a panel with nothing pending, because a label
+//: outliving the state it describes is what the `STALE` chip shipped as, one epic ago.
+//:
+//: What is left is a **pointer, not a second account**. The readout is under the Monitor, in the
+//: other half of this panel, and it draws *this* binding while this panel is open -- which is a
+//: fact about where to look and is nowhere else on screen. Its numbers are not repeated here: the
+//: peak and whether it fires at all are stated in the readout's own caption, immediately beneath
+//: the canvas they describe, because a canvas whose equivalent lives in a panel that is shut most
+//: of the time has no equivalent at all (UX-DR15). Saying them twice is the defect browser QA
+//: found in the strip's first pass, where one absence was explained under another.
+export const EFFECT_BAND_READOUT_NOTE =
+  "The envelope this binding produces is drawn under the Monitor while this panel is open.";
 
 //: Every setting the panel draws, in the order it draws them.
 //:
@@ -7467,7 +7472,7 @@ export function effectBandPanel(parameter, spec, {
     ...shut, shown: true, legend: EFFECT_BAND_LEGEND.replace("{label}", label),
     parameter: name, label, note, analyze,
     drive: { shown: false, options: [] }, remove: { shown: false }, written: Boolean(binding),
-    pending: "", strip: { shown: false, note: "", bands: [], edges: [] },
+    readout: "", strip: { shown: false, note: "", bands: [], edges: [] },
   });
   const offer = measurement?.offer
     ? { ...silent, shown: true }
@@ -7555,7 +7560,12 @@ export function effectBandPanel(parameter, spec, {
       ? `${String(measurement?.reason || "")} ${EFFECT_BAND_UNRESOLVABLE_NOTE}`.trim()
       : "",
     analyze: state === "unresolvable" ? offer : silent,
-    pending: EFFECT_BAND_READOUT_PENDING,
+    // Where the envelope is drawn, said only where there is one to look at. A binding that has not
+    // been written yet compiles nothing, and an `unresolvable` one has no measurement to compile
+    // against -- both would be a panel pointing at an empty half of the screen, which is the
+    // control-that-appears-to-do-nothing failure said in prose. The panel already names each of
+    // those absences with the action that fixes it, immediately above.
+    readout: binding && state !== "unresolvable" ? EFFECT_BAND_READOUT_NOTE : "",
     // The strip is drawn from the **whole-song** per-band average and nothing else (AD-26): one
     // array, computed once at analysis, identical in every Shot's panel -- which is what makes
     // copying a stack carry its bindings meaningfully, because the band the Director chose
@@ -7618,6 +7628,298 @@ export function effectBandPanel(parameter, spec, {
       disabled: Boolean(locked),
     },
     written: Boolean(binding),
+  };
+}
+
+// ------------------------------------------------------------------------------------------
+// The Drive readout (story 10.3, FX-22, UX-DR7).
+//
+// A canvas beneath the Monitor, spanning the selected Shot's window, drawing the envelope that is
+// moving a bound parameter -- so a Director can tell whether it is firing on the hits or
+// flickering on noise.
+//
+// **What it draws is the compiled `sendcmd` values, and nothing here computes one** (R-27). The
+// server hands over `effects.drive_samples`' own output -- the numbers the script's lines are
+// formatted from -- and everything below maps those numbers onto pixels. There is no band series
+// in this file, no drive model, no floor arithmetic and no gate: R-27 rejected shipping the raw
+// bands and deriving the drive here by name, because a second *renderer* lets the picture and the
+// export disagree while every automated gate in this repository passes. The one weight curve this
+// file does own is the spectrum strip's, which is a different signal and has a cross-engine test
+// standing over it for exactly that reason.
+//
+// So the division is sharp: `api.js` decides which binding is drawn, which pixel is which second,
+// where the rest line falls and which samples sit below the Trigger Floor; `app.js` strokes what
+// comes back.
+// ------------------------------------------------------------------------------------------
+
+//: Which binding the readout names, as the Director's own words for it: the effect's label and the
+//: parameter's, from the catalogue that is already on this page.
+//:
+//: **A readout that did not say which binding it draws would be a picture lying about which
+//: parameter it describes**, and a Shot may carry several. That is this epic's recurring failure
+//: -- a `STALE` chip that outlived its state, a refusal wearing the reactive accent -- in a new
+//: place, so the label is drawn whether there is one binding or four.
+export const DRIVE_READOUT_LABEL = "{effect} · {parameter}";
+
+//: Where the drive peaks, said in text, because the canvas is `aria-hidden` and every canvas in
+//: this application has a non-canvas equivalent (UX-DR15). The time is seconds into the Shot's own
+//: window -- the axis the picture is drawn on -- and the percentage is of the binding's own reach,
+//: which is what "how hard is this firing" means for a depth the Director chose.
+export const DRIVE_READOUT_PEAK = "peaks {seconds}s in, at {percent}% of its depth.";
+
+//: And whether it fires at all, which is the other fact UX-DR7 requires in text. **Not the same
+//: sentence with a zero in it**: a binding that never leaves its resting value is a band, a floor
+//: or a depth that wants changing, and saying "peaks at 0%" would report that as a measurement
+//: rather than as the thing to act on.
+export const DRIVE_READOUT_SILENT =
+  "never rises off its resting value in this shot's window, so the picture does not move here.";
+
+//: What the readout says when the Shot carries more than one binding. The UX says *the* Drive
+//: envelope, singular, and one canvas draws one signal -- two envelopes over one axis is a picture
+//: that has to be decoded before it can be read. So the readout draws one and names the way to the
+//: others, which is a gesture the Director already has: opening a parameter's band panel draws
+//: that parameter's envelope.
+export const DRIVE_READOUT_OTHERS =
+  "{count} more on this shot — open a parameter's band panel to draw its envelope instead.";
+
+//: The readout's own accessible name, on the figure rather than on the canvas: the canvas is
+//: `aria-hidden` and announces nothing, and the caption beneath it carries every fact it draws.
+export const DRIVE_READOUT_TITLE = "Drive readout";
+
+//: A pixel of headroom at the top and a row for the rest line at the foot, both learned on the
+//: spectrum strip's own canvas on 2026-08-27: drawn to the full box, a sample at full drive lands
+//: on row zero with half its stroke outside the canvas, and a hairline at `height` is half outside
+//: it at the other end. A measured signal drawing as nothing at all is the one thing this picture
+//: must not do.
+const DRIVE_READOUT_HEADROOM = 1;
+const DRIVE_READOUT_BASELINE = 1;
+
+//: How thick the ground under a silenced passage is drawn.
+//:
+//: **A colour alone could not carry this state and the first pass proved it.** Below the floor a
+//: `punch` drive is exactly zero, so a silenced run's own line lies *on* the rest hairline in the
+//: same token — and "the floor shut this passage" then looks identical to the bare datum under a
+//: passage nobody measured. Four pixels of ground is the state as a *region*: it has width, it is
+//: read where the passage is, and raising the Floor grows it, which is what the Director's own
+//: workflow asks for (EXPERIENCE: "raises Floor until the quiet verse passage drops to `--dim`").
+const DRIVE_READOUT_GROUND = 4;
+
+// Every finite number in a served array, or `[]` for one this cannot read whole -- `bandNumbers`'
+// rule, said for the readout's arrays. All or nothing: a compiled series with one string in it is
+// not a drive seven-eighths drawn, it is an answer nobody can vouch for, and drawing the readable
+// part would invent the rest.
+function driveNumbers(value) {
+  if (!Array.isArray(value)) return [];
+  const kept = value.filter((item) => typeof item === "number" && Number.isFinite(item));
+  return kept.length === value.length ? kept : [];
+}
+
+// Whether this Shot wants a readout at all, and the key that decides when to ask again.
+//
+// **A Shot with no binding never asks**, which is the client half of the route's own rule: reading
+// the measurement hashes the whole master and parses a ~405 KB sidecar, and every Shot in every
+// project carries no binding until one is bound. A card the Director has switched off compiles no
+// script and drives nothing, so it does not count as bound here either -- the same rule the route
+// and the chain both apply.
+//
+// The key is everything the compiled values depend on: the window the drive is compiled over, the
+// stack as it would be written (which carries the bindings *and* the resting values they move
+// from), and the song the envelope was taken of. A change to any of them is a different envelope;
+// a change to anything else is not, and must not cost a request.
+export function driveReadoutWanted(shot, song = null) {
+  const stack = shotEffectStack(shot);
+  const driven = stack.some(
+    (spec) => (spec?.bindings || []).length && spec?.enabled !== false,
+  );
+  if (!driven) return { wanted: false, key: "" };
+  return {
+    wanted: true,
+    key: JSON.stringify([
+      String(shot?.id ?? ""),
+      Number(shot?.start) || 0,
+      Number(shot?.duration) || 0,
+      effectStackWrite(stack).effects,
+      String(song?.analysis?.song_fingerprint || ""),
+    ]),
+  };
+}
+
+// Which of a Shot's bindings the readout draws, and how many it is not drawing.
+//
+// **The open band panel decides it, and the chain's first binding decides it otherwise.** The
+// question the readout answers is *"the envelope that is moving a parameter"*, and the parameter a
+// Director is looking at is the one whose panel they opened; with no panel open there is no such
+// parameter, and the first binding in composed-chain order is the first one the export drives.
+// Both are stated in the caption, so the picture never has to be guessed at.
+//
+// A binding whose series is empty is not drawable and is not counted: a compiled series of no
+// samples is a clip with no commands in it.
+export function driveReadoutPick(bindings = [], open = null) {
+  const drawable = (bindings || []).filter((entry) => (entry?.values || []).length > 0);
+  if (!drawable.length) return { shown: false, binding: null, others: 0 };
+  const wanted = drawable.find(
+    (entry) => Number(entry?.index) === Number(open?.index)
+      && String(entry?.parameter ?? "") === String(open?.parameter ?? ""),
+  );
+  return { shown: true, binding: wanted || drawable[0], others: drawable.length - 1 };
+}
+
+// Everything the readout draws, from one compiled binding and one measured box.
+//
+// **The two ends are the compiler's own clamp, not the catalogue's bound.** `rest` is where a shut
+// gate leaves the parameter and `reach` is where a full drive takes it, each already clamped into
+// the parameter's declared range by the compiler -- so the picture spans exactly what this binding
+// can produce. Drawing against the parameter's whole range instead would draw a flat line along
+// the foot for every binding whose depth is small, which is most of them, and the readout exists
+// to answer *is this firing, and where*.
+//
+// `reach` below `rest` is a binding pulling its parameter *down*, and it draws the same way: the
+// rest line is the foot and full drive is the top, whichever direction the value moves in. The
+// caption says which parameter, and the card's own slider says where it rests.
+//
+// The line is cut into **segments at every crossing of the Trigger Floor**, because that is the
+// one decision the drawing must not make for itself: a passage the floor shut is drawn `--dim` and
+// a passage that is merely quiet is drawn `--blue`, and telling them apart is the readout's whole
+// reason for existing. The segments overlap by one sample, so the stroke is continuous across a
+// crossing rather than a picture with gaps in it.
+export function driveReadoutPlan({
+  binding = null, seconds = 0, width = 0, height = 0, playhead = null,
+} = {}) {
+  const at = driveNumbers(binding?.at);
+  const values = driveNumbers(binding?.values);
+  const silenced = Array.isArray(binding?.silenced) ? binding.silenced.map(Boolean) : [];
+  const span = Number(seconds);
+  const box = Number(width);
+  const tall = Number(height);
+  const absent = {
+    shown: false, points: [], segments: [], rest: 0, width: box, height: tall, playhead: null,
+    fires: false,
+  };
+  if (!at.length || at.length !== values.length || at.length !== silenced.length) return absent;
+  if (!(span > 0) || !(box > 0) || !(tall > 0)) return absent;
+  // `typeof`, not `Number()`: `Number(null)` is a perfectly finite zero, and a binding whose two
+  // ends did not survive the wire would then be drawn against a range this file invented. Caught
+  // by the contract test that feeds it a `null` end.
+  const rest = binding?.rest;
+  const reach = binding?.reach;
+  if (typeof rest !== "number" || !Number.isFinite(rest)) return absent;
+  if (typeof reach !== "number" || !Number.isFinite(reach)) return absent;
+  const roof = Math.max(1, tall - DRIVE_READOUT_HEADROOM - DRIVE_READOUT_BASELINE);
+  const base = tall - DRIVE_READOUT_BASELINE;
+  const travel = reach - rest;
+  const points = at.map((second, index) => {
+    const drive = travel === 0
+      ? 0
+      : Math.min(1, Math.max(0, (values[index] - rest) / travel));
+    return {
+      x: (Math.min(span, Math.max(0, second)) / span) * box,
+      y: base - drive * roof,
+      drive,
+      silenced: silenced[index],
+    };
+  });
+  const segments = [];
+  for (const point of points) {
+    const last = segments[segments.length - 1];
+    if (!last || last.silenced !== point.silenced) {
+      // The overlap: a new run starts on the previous run's last sample, so the two are joined by
+      // a stroke rather than separated by the width of one tick.
+      segments.push({
+        silenced: point.silenced,
+        points: last ? [last.points[last.points.length - 1], point] : [point],
+      });
+      continue;
+    }
+    last.points.push(point);
+  }
+  // The same `typeof` rule, and for the same reason: `null` is the *absence* of a playhead — the
+  // Director is looking at another Shot — and `Number(null)` would pin a line to this one's first
+  // frame and claim the picture is at its start.
+  const head = playhead;
+  const inside = typeof head === "number" && Number.isFinite(head) && head >= 0 && head <= span;
+  return {
+    shown: true,
+    width: box,
+    height: tall,
+    points,
+    segments,
+    // Where the Trigger Floor is shut, as ground rather than as a line: one span per silenced run,
+    // in pixels, for the drawing to lay a `--dim` bar along. See `DRIVE_READOUT_GROUND`.
+    silence: segments
+      .filter((run) => run.silenced)
+      .map((run) => ({ from: run.points[0].x, to: run.points[run.points.length - 1].x })),
+    ground: Math.max(0, base - DRIVE_READOUT_GROUND),
+    // The rest line: where the envelope sits when nothing is firing, drawn as a `--dim` hairline so
+    // a silenced run reads as a run *along a line* rather than as an absence of drawing. Half a
+    // pixel up from the foot, so a 1px stroke lands wholly on the canvas.
+    rest: base - 0.5,
+    // The `--acid` playhead, and `null` while it is outside this Shot -- the readout spans the
+    // selected Shot's window and the playhead does not have to be in it. A line pinned to an edge
+    // would say the picture is at its start or its end when it is somewhere else entirely.
+    playhead: inside ? (head / span) * box : null,
+    fires: points.some((point) => point.drive > 0),
+  };
+}
+
+// The two facts UX-DR7 requires in text beside the canvas: where the drive peaks, and whether it
+// fires at all.
+//
+// **Both are read off the compiled values**, which is what makes them the same claim the picture
+// makes rather than a second account of it. The peak is the sample furthest from the resting
+// value -- furthest, not highest, because a binding may pull its parameter down.
+export function driveReadoutFacts(binding, catalogue = null) {
+  const values = driveNumbers(binding?.values);
+  const at = driveNumbers(binding?.at);
+  const definition = effectDefinition(catalogue, binding?.effect);
+  const parameter = effectParameterDefinition(catalogue, binding?.effect, binding?.parameter);
+  const label = DRIVE_READOUT_LABEL
+    .replace("{effect}", definition?.label || String(binding?.effect ?? ""))
+    .replace("{parameter}", parameter?.label || String(binding?.parameter ?? ""));
+  const rest = Number(binding?.rest);
+  const reach = Number(binding?.reach);
+  const travel = reach - rest;
+  let best = -1;
+  let peak = 0;
+  for (let index = 0; index < values.length; index += 1) {
+    const drive = travel === 0 ? 0 : Math.min(1, Math.max(0, (values[index] - rest) / travel));
+    if (drive > peak) { peak = drive; best = index; }
+  }
+  if (best < 0 || peak <= 0) return { label, fires: false, note: DRIVE_READOUT_SILENT };
+  return {
+    label,
+    fires: true,
+    peak,
+    seconds: at[best],
+    note: DRIVE_READOUT_PEAK
+      .replace("{seconds}", Number(at[best] ?? 0).toFixed(1))
+      .replace("{percent}", String(Math.round(peak * 100))),
+  };
+}
+
+// The whole readout as one object: whether it is drawn at all, what it says, and the binding a plan
+// is built from. Everything `app.js` needs, and no decision left for it to make.
+//
+// **Absent, not empty** (FX-22). A Shot with no binding, a Shot whose bound card is switched off, a
+// song with no current measurement and a stack the export refuses all arrive here as an empty list,
+// and every one of them draws nothing at all -- no zero-height canvas, no empty box, no flat line.
+// Which absence it is, and the action that fixes it, is the band panel's sentence and is already
+// answered there.
+export function driveReadoutView(answer, { catalogue = null, open = null } = {}) {
+  const picked = driveReadoutPick(answer?.bindings, open);
+  if (!picked.shown) return { shown: false, caption: "", binding: null, others: 0, seconds: 0 };
+  const facts = driveReadoutFacts(picked.binding, catalogue);
+  const others = picked.others
+    ? " " + DRIVE_READOUT_OTHERS.replace("{count}", String(picked.others))
+    : "";
+  return {
+    shown: true,
+    binding: picked.binding,
+    others: picked.others,
+    seconds: Number(answer?.seconds) || 0,
+    label: facts.label,
+    fires: facts.fires,
+    caption: `${facts.label} — ${facts.note}${others}`,
+    title: DRIVE_READOUT_TITLE,
   };
 }
 
@@ -8956,6 +9258,12 @@ export const api = {
   // stale flag and no cached geometry; the answer's `fingerprint` names the clip and is the
   // whole of how this side tells one picture from another.
   shotPreview: (projectId, shotId) => request(`/api/projects/${projectId}/shots/${shotId}/preview`, { method: "POST" }),
+  // One Shot's Parameter Bindings, compiled -- the numbers the `sendcmd` scripts carry, which is
+  // what the Drive readout draws (R-27). A read: nothing is written on any path, and it renders
+  // nothing. No body, for `shotPreview`'s reason -- everything the compile is decided from is
+  // already in the manifest, and a client that sent its own copy of the stack could ask for a
+  // picture of a binding nobody has saved.
+  shotDrive: (projectId, shotId) => request(`/api/projects/${projectId}/shots/${shotId}/drive`),
   // Deletion, each with its own server-side guard: the project asks for its confirm flag,
   // the asset refuses while cited, the job settles its record as it cancels on ComfyUI.
   deleteProject: (id) => request(`/api/projects/${id}?confirm_delete=true`, { method: "DELETE" }),

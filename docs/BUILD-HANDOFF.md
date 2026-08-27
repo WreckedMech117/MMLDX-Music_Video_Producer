@@ -116,6 +116,35 @@ and then left in a commit subject is a number nobody will find.**
   layout fault when it is a scroll distance. `panelBelowFold` and `railScrollHeight` are recorded
   by `tests/e2e_band_panel.py` so the density is a number to argue with rather than a screenshot to
   notice.
+- **The Drive readout is 63px under the Monitor — 34px of canvas, 14px of caption — and it costs
+  the Monitor 28px and the tracks 35px.** Measured in a real browser 2026-08-27 at 1280x1024, by
+  hiding the figure and re-measuring at the same instant: the Monitor is 218.2px with it and
+  246.2px without, the tracks 272.8px and 307.8px. **Comparing against another Shot, or against an
+  earlier moment on the same one, is not a measurement of this row** — it answered a 98px
+  difference, because the inspector's own height moves with it.
+- **A `hidden` grid child does not hold its track, and that collapsed the Monitor on every unbound
+  Shot.** `.timeline-main`'s four rows were auto-placed, so hiding the readout let the tracks
+  viewport fall into the readout's own `auto` track while the `minmax(140px, 1.25fr)` track meant
+  for it sat empty, and the Monitor dropped to its 120px floor — on every Shot in every project
+  that carries no binding, which is nearly all of them. Every automated gate passed over it. Each
+  child of `.timeline-main` now names its own `grid-row`.
+- **A canvas hairline drawn before a filled envelope is a hairline that is not there.** The
+  readout's rest line was drawn first and the envelope's fill, whose bottom edge *is* that line,
+  painted it out along its whole width: 10 `--dim` pixels where 1,119 belong. The spectrum strip
+  made the same mistake one slice earlier with a 1px bar and a curve's baseline. Draw the datum
+  last, and **count the pixels** — the census is what saw it.
+- **Below the Trigger Floor a `punch` drive is exactly zero, so colour alone cannot mark a silenced
+  passage.** Its own line lies *on* the rest hairline in the same token, so "the floor shut this"
+  and "nobody measured here" draw identically. The readout lays a 4px `--dim` ground bar under
+  every silenced run instead — a state with width, which grows as the Director raises the Floor.
+  Removing the bar left every assertion in the QA script passing until the census learned to count
+  the bar's own row separately.
+- **The Drive readout's read is 16.3 ms on a 202-second master, and 1.8 ms for a Shot with no
+  binding.** Measured 2026-08-27 through `GET .../shots/{id}/drive` in-process, medians of 20:
+  **1.79 ms unbound, 16.25 ms bound**, with a 4.8 KB payload for a 4-second Shot (4.2 KB at 8
+  seconds of song, 8.4 KB at an 8-second Shot). The cost is the same SHA-256 of the song plus the
+  sidecar read the preview pays, and it is gated on `stack_is_driven` for the same reason — an
+  unbound Shot must not pay it merely by being selected. Two orders inside FX-NFR-6's one second.
 - **`band_width`'s minimum draws a region 3.2px wide, not 4.4.** The strip's canvas is **183px** on
   this rail — not the ~220px story 10.2's spec estimated — so the minimum band is under four pixels
   and has no interior at all. Both edge handles keep about 8.6px of grip there, because each is
@@ -123,6 +152,16 @@ and then left in a commit subject is a number nobody will find.**
   every pixel the handles do not, the ground outside the region included. At the minimum width
   *and* zero softness the softness handle has three pixels left, which is below the floor, so it is
   withdrawn and the panel names the box that still sets it.
+- **The browser harnesses are not in `pytest`, and one of them was broken for four slices before
+  anyone noticed.** `pyproject.toml` sets `testpaths = ["tests"]` and pytest's default
+  `python_files = test_*.py`, so every `tests/e2e_*.py` harness is **outside the suite** — a green
+  `uv run pytest -q` says nothing about any of them. `e2e_effects_tab.py` failed from Epic 10's
+  first slice (an exact-equality predicate on a stack entry the wire now carries `bindings: []`
+  on) and four consecutive slices reported green gates over it. **Run the harnesses that touch what
+  you changed, and say which you ran** — the list is in `docs/OPERATIONS.md`, and a harness missing
+  from that list is a gate nobody can find. This is Epic 9's flaky-release-gate lesson in its other
+  form: there, a gate that failed under load and passed alone; here, a gate that was never in the
+  gate.
 - **A bound Shot's preview cache hit is 20.5 ms, not 2.1 ms — and only a bound Shot pays it.**
   Measured 2026-08-27 on a 3-minute master (7.9 MB) with a 326 KB envelope sidecar: **2.08 ms
   unbound, 20.46 ms bound** on a cache hit, and 74 ms for a bound first render. The cost is the

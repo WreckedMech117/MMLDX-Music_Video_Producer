@@ -41,6 +41,7 @@ from music_video_producer.assembly import (
     ASSEMBLY_OFFSET_OVERRUN_REFUSAL,
     EXPORT_PRESETS,
     PREVIEW_PRESET,
+    clip_frames_on_grid,
 )
 from music_video_producer.comfy import ComfyError
 from music_video_producer.config import Settings
@@ -1719,3 +1720,245 @@ def test_a_shot_later_in_the_song_previews_its_own_stretch_of_the_measurement(tm
     # Both are clip-local and both address the same labelled stage: only the values differ.
     for text in later.values():
         assert text.startswith("0 eq@b0 brightness "), text[:60]
+
+
+# ------------------------------------------------------------------------------------------
+# The Drive readout's route (story 10.3, R-27).
+#
+# `GET .../shots/{id}/drive` serves the compiled `sendcmd` values so the readout beneath the
+# Monitor can draw them. The headline assertion is the one that could not be made any other way:
+# the served numbers are compared against **the script file the preview render really handed
+# ffmpeg**, read off disk after the render. A test that compared the route against the compiler
+# would be comparing the compiler with itself; this compares it against the argv.
+# ------------------------------------------------------------------------------------------
+
+
+def written_commands(previews: Path) -> list[tuple[float, float]]:
+    """Every `(second, value)` in the one compiled script beside the rendered clip, parsed.
+
+    Parsed rather than reconstructed. Reproducing `_number`'s formatting here to build an expected
+    string would be a second copy of the thing under test; reading the file back and pulling the
+    numbers out of it is the comparison the acceptance criterion actually asks for.
+    """
+    scripts = sorted(previews.glob("*.cmds"))
+    assert len(scripts) == 1, scripts
+    out: list[tuple[float, float]] = []
+    for line in scripts[0].read_text(encoding="utf-8").splitlines():
+        if not line:
+            continue
+        stamp, target, option, value = line.rstrip(";").split()
+        assert (target, option) == ("eq@b0", "brightness"), line
+        out.append((float(stamp), float(value)))
+    return out
+
+
+def test_the_drive_readout_serves_the_very_script_the_render_was_handed(tmp_path: Path):
+    """R-27's ruling, checked against the file on disk.
+
+    The preview render writes its compiled `sendcmd` script beside the clip and runs ffmpeg with
+    that directory as its working directory, so the `.cmds` file read below is literally what the
+    filter graph consumed. Every timestamp and every value the readout is served appears on those
+    lines, in that order, and nothing else does — which is what makes the picture the argv rather
+    than an illustration of it.
+
+    **The alternative this closes is invisible.** A browser handed the raw band series and left to
+    model the drive itself would draw a curve that could differ from the export's in the band
+    weighting, the running average, the release, the gate or the clamp, with the suite green, ruff
+    clean, the export correct and the screen wrong.
+    """
+    client, _store, _comfy, _app = make_client(tmp_path)
+    project_id = a_measured_project_with_a_graded_shot(client, tmp_path)
+    assert bind_exposure(client, project_id).status_code == 200
+    rendered = client.post(f"/api/projects/{project_id}/shots/shot_a/preview")
+    assert rendered.status_code == 200, rendered.text
+    previews = tmp_path / "projects" / project_id / "media" / "previews"
+    handed = written_commands(previews)
+
+    answer = client.get(f"/api/projects/{project_id}/shots/shot_a/drive")
+
+    assert answer.status_code == 200, answer.text
+    body = answer.json()
+    assert body["shot_id"] == "shot_a"
+    assert len(body["bindings"]) == 1
+    served = body["bindings"][0]
+    assert (served["effect"], served["parameter"], served["index"]) == ("exposure", "amount", 0)
+    # Every line, in order. `round` to six places because that is the precision the script's own
+    # formatter writes at, and a float that survives a decimal round trip is the same number.
+    assert [round(second, 6) for second in served["at"]] == [second for second, _ in handed]
+    assert [round(value, 6) for value in served["values"]] == [value for _, value in handed]
+    # And it is a real drive rather than a flat line, so the comparison above has something in it.
+    assert len(handed) > 24
+    assert len({value for _, value in handed}) > 2
+    # The two ends the readout is drawn between: where a shut gate leaves the parameter, and where
+    # a full drive takes it. Both are on the wire because nothing on the client can clamp.
+    assert served["rest"] == pytest.approx(0.2)
+    assert served["reach"] == pytest.approx(1.0)
+    # The window is the frame grid's, not the manifest's float — the axis of the picture above it.
+    assert body["seconds"] == pytest.approx(
+        clip_frames_on_grid(0.0, 4.0) / ASSEMBLY_FPS)
+
+
+def test_the_readouts_window_is_the_frame_grids_and_not_the_manifests_float(tmp_path: Path):
+    """The axis the readout is drawn against is the export's, not the manifest's.
+
+    **This test exists because a mutation survived.** The first version of the assertion above
+    checked `seconds` against the frame grid on a Shot whose window was exactly 4.0 s -- where the
+    grid and the stored float are the same number, so replacing one with the other changed nothing
+    and the guard passed over the defect. The fixture made it impossible, which is the failure mode
+    this repository has recorded fourteen times across this epic's earlier slices.
+
+    A window of 4.03 s is 96.72 frames, which the grid rounds to 97: the clip the export cuts is
+    4.041666 s long and the drive is compiled over *that*. Drawn against 4.03 instead, every
+    command would sit a fraction of a frame late by the end of the Shot, and the last one would be
+    outside the picture the Monitor is showing.
+    """
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id = a_measured_project_with_a_graded_shot(client, tmp_path)
+    assert bind_exposure(client, project_id).status_code == 200
+    project = store.get(project_id)
+    project.shots[0].duration = 4.03
+    store.save(project)
+    grid = clip_frames_on_grid(0.0, 4.03) / ASSEMBLY_FPS
+    assert grid != pytest.approx(4.03), "the fixture cannot tell the two windows apart"
+    rendered = client.post(f"/api/projects/{project_id}/shots/shot_a/preview")
+    assert rendered.status_code == 200, rendered.text
+    handed = written_commands(tmp_path / "projects" / project_id / "media" / "previews")
+
+    body = client.get(f"/api/projects/{project_id}/shots/shot_a/drive").json()
+
+    assert body["seconds"] == pytest.approx(grid)
+    served = body["bindings"][0]
+    # And the compiled series really is the longer one: every line the render was handed, and no
+    # more. A window of 4.03 s would have stopped one tick earlier.
+    assert [round(second, 6) for second in served["at"]] == [second for second, _ in handed]
+    assert max(served["at"]) > 4.03
+
+
+def test_a_shot_with_no_binding_is_absent_rather_than_empty(tmp_path: Path):
+    """FX-22. A Shot carrying no binding answers an empty list, and the readout is not drawn at
+    all — no zero-height canvas, no empty box, no flat line where an envelope would be."""
+    client, _store, _comfy, _app = make_client(tmp_path)
+    project_id = a_measured_project_with_a_graded_shot(client, tmp_path)
+
+    answer = client.get(f"/api/projects/{project_id}/shots/shot_a/drive")
+
+    assert answer.status_code == 200, answer.text
+    assert answer.json()["bindings"] == []
+
+
+def test_an_unbound_shot_never_reads_the_measurement(tmp_path: Path):
+    """The cost rule, as a property rather than a comment.
+
+    Deciding whether a measurement is current hashes the whole master and parses a ~405 KB
+    sidecar, and this route is read whenever a Shot is selected — so a Shot carrying no binding,
+    which is every Shot in every project until one is bound, must not pay it. The sidecar reader is
+    replaced by one that raises: the unbound Shot still answers 200, and the bound one still
+    compiles, so the skip is real and is not simply "nothing was bound anyway".
+    """
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id = a_measured_project_with_a_graded_shot(client, tmp_path)
+    reads: list[str] = []
+    original = store.read_song_envelope
+
+    def counted(*args, **kwargs):
+        reads.append("read")
+        return original(*args, **kwargs)
+
+    store.read_song_envelope = counted  # type: ignore[method-assign]
+    assert client.get(f"/api/projects/{project_id}/shots/shot_a/drive").status_code == 200
+    assert reads == []
+
+    assert bind_exposure(client, project_id).status_code == 200
+    bound_answer = client.get(f"/api/projects/{project_id}/shots/shot_a/drive")
+    assert bound_answer.status_code == 200, bound_answer.text
+    assert bound_answer.json()["bindings"], bound_answer.text
+    assert reads, "a bound Shot must read the measurement it is compiled against"
+
+
+def test_a_binding_on_a_card_the_director_switched_off_draws_nothing(tmp_path: Path):
+    """A disabled card composes no stage and compiles no script, so the export drives nothing —
+    and a readout for it would be a picture of a look the render will not produce."""
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id = a_measured_project_with_a_graded_shot(client, tmp_path)
+    assert bind_exposure(client, project_id).status_code == 200
+    assert client.get(f"/api/projects/{project_id}/shots/shot_a/drive").json()["bindings"]
+
+    project = store.get(project_id)
+    project.shots[0].effects[0].enabled = False
+    store.save(project)
+
+    assert client.get(f"/api/projects/{project_id}/shots/shot_a/drive").json()["bindings"] == []
+
+
+def test_a_song_whose_measurement_has_gone_leaves_the_readout_absent(tmp_path: Path):
+    """Story 10.4's state at this route. The binding is retained and reported unresolvable by the
+    band panel, which already names the absence and offers the remedy; the readout has nothing
+    compiled to draw and says so by not being there. Re-measuring brings it back."""
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id = a_measured_project_with_a_graded_shot(client, tmp_path)
+    assert bind_exposure(client, project_id).status_code == 200
+
+    project = store.get(project_id)
+    project.song.analysis.song_fingerprint = "12-notthesongthatisonthedisk"
+    store.save(project)
+
+    gone = client.get(f"/api/projects/{project_id}/shots/shot_a/drive")
+    assert gone.status_code == 200, gone.text
+    assert gone.json()["bindings"] == []
+    # The binding is not dropped: it is still on the card, and the measurement brings it back.
+    assert store.get(project_id).shots[0].effects[0].bindings
+    assert client.post(f"/api/projects/{project_id}/song/analyze").status_code == 200
+    assert client.get(f"/api/projects/{project_id}/shots/shot_a/drive").json()["bindings"]
+
+
+def test_two_bindings_come_back_in_chain_order_each_naming_its_own_card(tmp_path: Path):
+    """A Shot may carry more than one binding, and the readout draws one — so the list has to say
+    which card each envelope belongs to, and in the order the export drives them. Soft Focus is a
+    Texture card and composes ahead of the Exposure it is stored after."""
+    client, _store, _comfy, _app = make_client(tmp_path)
+    project_id = a_measured_project_with_a_graded_shot(client, tmp_path)
+    stacked = client.put(
+        f"/api/projects/{project_id}/shots/shot_a/effects",
+        json={"effects": [
+            {"effect": "exposure", "parameters": {"amount": 0.2}},
+            {"effect": "soft_focus", "parameters": {"sigma": 4.0}},
+        ]},
+    )
+    assert stacked.status_code == 200, stacked.text
+    assert bind_exposure(client, project_id).status_code == 200
+    focused = client.put(
+        f"/api/projects/{project_id}/shots/shot_a/effects/1/bindings",
+        json={"effect": "soft_focus", "bindings": [
+            {"parameter": "sigma", "drive": "punch", "depth": 2.0}]},
+    )
+    assert focused.status_code == 200, focused.text
+
+    served = client.get(f"/api/projects/{project_id}/shots/shot_a/drive").json()["bindings"]
+
+    assert [(item["effect"], item["index"]) for item in served] == [
+        ("soft_focus", 1), ("exposure", 0)]
+
+
+def test_the_drive_route_writes_nothing(tmp_path: Path):
+    """A read in the strong sense: the manifest is byte-identical afterwards, and no clip, script
+    or cache entry appears. AD-23's rule for the preview, applied to the route beside it."""
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id = a_measured_project_with_a_graded_shot(client, tmp_path)
+    assert bind_exposure(client, project_id).status_code == 200
+    manifest = store.project_dir(project_id) / "project.json"
+    before = manifest.read_bytes()
+    media = tmp_path / "projects" / project_id / "media"
+    listed = sorted(str(path.relative_to(media)) for path in media.rglob("*")) if media.exists() else []
+
+    assert client.get(f"/api/projects/{project_id}/shots/shot_a/drive").status_code == 200
+
+    assert manifest.read_bytes() == before
+    after = sorted(str(path.relative_to(media)) for path in media.rglob("*")) if media.exists() else []
+    assert after == listed
+
+
+def test_the_drive_route_404s_for_a_shot_that_is_not_there(tmp_path: Path):
+    client, _store, _comfy, _app = make_client(tmp_path)
+    project_id = a_measured_project_with_a_graded_shot(client, tmp_path)
+
+    assert client.get(f"/api/projects/{project_id}/shots/nobody/drive").status_code == 404

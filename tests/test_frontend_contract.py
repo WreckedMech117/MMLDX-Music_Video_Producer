@@ -23378,6 +23378,27 @@ BAND_WRITTEN = {"parameter": "amount", "drive": "punch", "depth": 0.5}
 
 BAND_ROUTE = "/api/projects/p1/shots/shot_a/effects/0/bindings"
 
+#: The Drive readout's read, which a bound Shot issues whenever it is selected or its look moves
+#: (story 10.3). It is a `GET`, it writes nothing on any path, and it is proven read-only where
+#: that can be proven -- `test_the_drive_route_writes_nothing` compares the manifest byte for byte.
+DRIVE_ROUTE = "/api/projects/p1/shots/shot_a/drive"
+
+
+def apart_from_the_drive_read(requests: list[dict]) -> list[dict]:
+    """Every request but the readout's own, so an assertion about what a *gesture wrote* keeps
+    saying what it always said.
+
+    Named rather than filtered by method, because "no GET" is not the claim and never was: the
+    claim is that pressing a drive, opening a locked panel or releasing a drag sends exactly the
+    writes it is supposed to send. The readout's read is a consequence of the Shot being bound,
+    not of the gesture, and it is asserted about here so that a *second* unexpected request still
+    fails the test it always failed.
+    """
+    for item in requests:
+        if item["path"] == DRIVE_ROUTE:
+            assert item["method"] == "GET" and item["body"] is None, item
+    return [item for item in requests if item["path"] != DRIVE_ROUTE]
+
 
 def band_reply(shot: dict) -> dict:
     return {"id": "p1", "jobs": [], "song": EFFECTS_SONG, "assets": [], "messages": [],
@@ -23389,7 +23410,7 @@ def band_exports() -> dict:
       import { EFFECT_BAND_NEEDS_DRIVE, EFFECT_BAND_NEEDS_DEPTH, EFFECT_BAND_UNWRITTEN,
                EFFECT_BAND_UNCHANGED, EFFECT_BAND_UNDRIVABLE_NOTE, EFFECT_BAND_NEEDS_MEASUREMENT,
                EFFECT_BAND_UNRESOLVABLE_NOTE, EFFECT_BAND_UNREAD_NOTE,
-               EFFECT_BAND_READOUT_PENDING, EFFECT_BAND_STRIP_UNDRAWN,
+               EFFECT_BAND_READOUT_NOTE, EFFECT_BAND_STRIP_UNDRAWN,
                EFFECT_BAND_STRIP_CROWDED, EFFECT_STRIP_TARGETS,
                EFFECT_BAND_REMOVE_LABEL, EFFECT_BAND_DRIVE_ONLY_NOTE,
                EFFECT_BAND_DRIVE_ONLY_HELP, EFFECT_BAND_DRIVE_ONLY_KEPT,
@@ -23402,7 +23423,7 @@ def band_exports() -> dict:
         unwritten: EFFECT_BAND_UNWRITTEN, unchanged: EFFECT_BAND_UNCHANGED,
         undrivable: EFFECT_BAND_UNDRIVABLE_NOTE, needsMeasurement: EFFECT_BAND_NEEDS_MEASUREMENT,
         unresolvable: EFFECT_BAND_UNRESOLVABLE_NOTE, unread: EFFECT_BAND_UNREAD_NOTE,
-        pending: EFFECT_BAND_READOUT_PENDING, undrawn: EFFECT_BAND_STRIP_UNDRAWN,
+        readout: EFFECT_BAND_READOUT_NOTE, undrawn: EFFECT_BAND_STRIP_UNDRAWN,
         crowded: EFFECT_BAND_STRIP_CROWDED, targets: EFFECT_STRIP_TARGETS,
         remove: EFFECT_BAND_REMOVE_LABEL,
         driveOnly: EFFECT_BAND_DRIVE_ONLY_NOTE, driveOnlyHelp: EFFECT_BAND_DRIVE_ONLY_HELP,
@@ -23548,7 +23569,8 @@ def test_a_fresh_band_panel_chooses_no_drive_and_writes_nothing_until_both_decis
           await flush();
         """,
     )
-    assert [(item["method"], item["path"]) for item in written["requests"]] == [
+    assert [(item["method"], item["path"])
+            for item in apart_from_the_drive_read(written["requests"])] == [
         ("PUT", BAND_ROUTE)
     ], written["requests"]
     assert json.loads(written["requests"][0]["body"]) == {
@@ -23602,8 +23624,10 @@ def test_the_band_panels_bounds_are_the_servers_and_never_this_files():
         assert float(attribute(tag, "value")) == setting["default"], setting["name"]
     # Exposure's amount runs -1..1, so a binding may move it by at most its own span either way.
     assert bounds(inputs["depth"]) == (-2.0, 2.0), inputs["depth"]
-    # And the panel names exactly what it is still missing rather than reading as finished.
-    assert escape_for_markup(said["pending"]) in panel["effects"]
+    # And it points at no readout, because nothing is written yet and nothing is compiled: the
+    # sentence that used to stand here named what the panel was still missing, and the drive
+    # readout was the last of those.
+    assert escape_for_markup(said["readout"]) not in panel["effects"]
 
 
 def test_a_binding_survives_every_other_gesture_on_its_card():
@@ -23755,7 +23779,7 @@ def test_an_undrivable_parameter_refuses_in_the_catalogues_own_sentence():
         # that cannot be written, which is the control-that-does-nothing R-24 rejects by name.
         assert f'id="effect-band-{key}-drive-punch"' not in panel["effects"]
         assert f'id="effect-band-{key}-band_centre"' not in panel["effects"]
-        assert panel["requests"] == []
+        assert apart_from_the_drive_read(panel["requests"]) == []
         # And it is a fact about ffmpeg, not about the song: no `[Analyze song]` is offered.
         assert f'id="effect-band-{key}-analyze"' not in panel["effects"]
 
@@ -23794,7 +23818,7 @@ def test_a_song_with_no_measurement_keeps_the_glyph_and_names_which_absence_it_i
         assert escape_for_markup(said["analyze"]) in panel["effects"]
         # Nothing to bind with, so nothing on screen that pretends to bind.
         assert 'id="effect-band-0-amount-drive-punch"' not in panel["effects"]
-        assert panel["requests"] == []
+        assert apart_from_the_drive_read(panel["requests"]) == []
 
     # No song at all, and a song whose render has not landed: named, and no button.
     for song, sentence in ((None, said["unsonged"]),
@@ -23883,7 +23907,7 @@ def test_an_unresolvable_binding_is_drawn_as_unresolvable_and_never_as_an_error(
     assert 'aria-pressed="true"' in effects, "the stored drive is not shown as chosen"
     # A state, not an error.
     assert "effect-row-refused" not in effects
-    assert panel["requests"] == []
+    assert apart_from_the_drive_read(panel["requests"]) == []
 
 
 def test_the_open_band_panel_and_a_number_being_typed_into_it_survive_a_rebuild():
@@ -23965,7 +23989,7 @@ def test_a_locked_shot_draws_the_band_panel_readable_and_every_control_disabled(
     # Said once for the tab, not once per panel: the notice above the stack is the sentence, and
     # the panel adds none of its own.
     assert effects.count('<p class="control-reason" id="effects-locked">') == 1, effects
-    assert panel["requests"] == []
+    assert apart_from_the_drive_read(panel["requests"]) == []
 
 
 def test_the_sustain_gates_two_timings_are_reachable_only_under_the_drive_that_reads_them():
@@ -24127,24 +24151,30 @@ def test_a_timing_the_punch_drive_ignores_is_still_carried_through_every_write()
     assert written == {**tuned, "drive": "punch"}, written
 
 
-def test_the_panel_names_exactly_what_it_is_still_missing():
-    """The sentence under the band inputs is an exhaustive claim, so it is checked as one.
+def test_the_panel_claims_nothing_is_missing_and_every_absence_it_claimed_is_drawn():
+    """The sentence under the band inputs was an exhaustive claim, and it is now empty of one.
 
-    **Narrowed by story 10.2 rather than deleted, which is what an exhaustive claim is for.** It
-    named two absences while the Band was three numbers -- the spectrum strip and the drive
-    readout. The strip is now drawn above those numbers, so the sentence names the readout and
-    nothing else, and the claim is checked from both ends: it must say *only*, it must not still
-    be claiming a strip this panel has, and the canvas must actually be in the markup. A slice
-    that added a third absence without editing this would leave a false statement on screen, which
-    is what the `STALE` label shipped as one epic ago.
+    **Narrowed twice and then emptied, which is what an exhaustive claim is for.** It named two
+    absences while the Band was three numbers -- the spectrum strip and the drive readout -- then
+    one when the strip landed, and story 10.3 draws the last of them. So the claim is checked from
+    both ends the way it always was: the sentence may no longer say anything is *missing* or
+    *pending*, and each of the two things it once named has to really be in the markup. A slice
+    that emptied the sentence without landing the canvas would leave a panel reading as finished
+    over a panel that is not, which is what the `STALE` label shipped as one epic ago; a slice
+    that found a *new* absence is expected to say so here rather than to delete this test.
     """
     said = band_exports()
 
-    assert "only thing" in said["pending"], said["pending"]
-    assert "readout" in said["pending"], said["pending"]
-    assert "spectrum strip" not in said["pending"], (
-        "the panel still says the strip is missing, and it is drawn above the sentence")
-    # Every control story 10.1 names is reachable, which is what makes the claim true today.
+    for banned in ("missing", "pending", "no readout", "not yet"):
+        assert banned not in said["readout"].lower(), (
+            "the panel still claims something is absent", said["readout"])
+    # It points at the readout instead, which is a fact about *where to look* and is nowhere else
+    # on screen -- and it does not restate the readout's own numbers, which live in its caption.
+    assert "Monitor" in said["readout"], said["readout"]
+    for banned in ("peak", "%"):
+        assert banned not in said["readout"].lower(), (
+            "the panel is repeating the readout's own facts", said["readout"])
+    # Every control story 10.1 names is reachable, which is what made the claim true.
     panel = drawn_effects_panel(
         band_shot(), song=EFFECTS_SONG, measurement=EFFECTS_MEASURED,
         extra="""
@@ -24156,10 +24186,28 @@ def test_the_panel_names_exactly_what_it_is_still_missing():
         assert f'id="effect-band-0-amount-{control}"' in panel, control
     for mode in EFFECT_CATALOGUE["drives"]:
         assert f'id="effect-band-0-amount-drive-{mode}"' in panel, mode
-    # And the strip is really there, which is the half of the claim that would otherwise be a
-    # sentence saying the canvas exists over a panel that has none.
+    # The strip is really there, which is the half of the claim that would otherwise be a sentence
+    # saying the canvas exists over a panel that has none.
     assert '<canvas class="effect-band-strip" id="effect-band-0-amount-strip"' in panel, panel
     assert 'aria-hidden="true"' in panel.split('class="effect-band-strip"', 1)[1][:120], panel
+    # And so is the readout, in the markup the workspace ships, `aria-hidden` with its caption
+    # beside it -- the other absence the sentence used to name.
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    assert '<canvas class="drive-readout-canvas" id="drive-readout-canvas" aria-hidden="true">' in markup
+    assert '<figcaption class="drive-readout-caption" id="drive-readout-caption">' in markup
+    # It ships `hidden`: absent, not empty, for every Shot that carries no binding.
+    assert '<figure class="drive-readout" id="drive-readout" hidden>' in markup
+    # A panel whose binding is written and resolvable is the only one that says it at all, because
+    # an unwritten binding compiles nothing and there is nothing under the Monitor to point at.
+    written = drawn_effects_panel(
+        band_shot(bindings=[BAND_WRITTEN]), song=EFFECTS_SONG, measurement=EFFECTS_MEASURED,
+        extra="""
+          await fire('#effect-bind-0-amount:click', {});
+          await flush();
+        """,
+    )["effects"]
+    assert escape_for_markup(said["readout"]) in written, written
+    assert escape_for_markup(said["readout"]) not in panel, panel
 
 
 # --------------------------------------------------------------------------------------
@@ -24541,7 +24589,8 @@ def test_a_drag_on_the_strip_writes_once_on_release_and_the_boxes_agree_all_the_
     assert read["pressed"]["sent"] == 0, read["pressed"]
     assert read["during"]["sent"] == 0, read["during"]
     # One write on release, at the bindings route, carrying the band the strip was left showing.
-    assert [(item["method"], item["path"]) for item in read["requests"]] == [
+    assert [(item["method"], item["path"])
+            for item in apart_from_the_drive_read(read["requests"])] == [
         ("PUT", BAND_ROUTE)
     ], read["requests"]
     written = json.loads(read["requests"][0]["body"])["bindings"]
@@ -24594,7 +24643,8 @@ def test_two_effects_on_one_shot_listen_to_different_bands_through_the_real_gest
 
     # The second card's panel opened on the second card's own band, not the first card's.
     assert read["shown"] == "0.9", read["shown"]
-    assert [(item["method"], item["path"]) for item in read["requests"]] == [
+    assert [(item["method"], item["path"])
+            for item in apart_from_the_drive_read(read["requests"])] == [
         ("PUT", second)
     ], read["requests"]
     body = json.loads(read["requests"][0]["body"])
@@ -24679,7 +24729,6 @@ def test_a_measured_song_carrying_no_spectrum_says_so_instead_of_drawing_an_empt
     # And the panel is otherwise entirely itself: the three boxes, the drive, and what is missing.
     for control in BAND_CONTROL_ORDER:
         assert f'id="effect-band-0-amount-{control}"' in panel, control
-    assert escape_for_markup(said["pending"]) in panel
 
     # The strip is absent in every absence the panel already handles, and so is that sentence -- a
     # canvas under a refusal would offer a choice that cannot be written, and a sentence about a
@@ -24714,3 +24763,360 @@ def test_a_measured_song_carrying_no_spectrum_says_so_instead_of_drawing_an_empt
     )["effects"]
     assert '<canvas class="effect-band-strip"' in locked, locked
     assert 'data-locked="true"' in locked, ("a locked strip is drawn as operable", locked)
+
+
+# --------------------------------------------------------------------------------------
+# The Drive readout (story 10.3, R-27, UX-DR7).
+#
+# The canvas is a drawing and none of its decisions is: which binding is drawn, which pixel is
+# which second, where the rest line falls, which runs of samples the Trigger Floor shut, where the
+# playhead lands and what the caption says are all `api.js`'s, and every one of them is executed
+# below with no DOM at all.
+#
+# **And none of them is a drive.** R-27 rejected shipping the raw band series and modelling the
+# drive in the browser by name, because a second *renderer* lets the picture and the export
+# disagree while every automated gate in this repository passes. What the server sends is what the
+# `sendcmd` script carries, and the last test in this block is the one that holds the client to
+# arithmetic no richer than a straight line.
+# --------------------------------------------------------------------------------------
+
+#: One compiled binding as the route serves one: eight ticks over a two-second window, resting at
+#: 0.2 and reaching 0.8, with the first three ticks below the Director's Trigger Floor. Small
+#: enough that every pixel below can be arrived at with a pencil.
+DRIVE_SERVED = {
+    "shot_id": "shot_a",
+    "seconds": 2.0,
+    "bindings": [{
+        "index": 0, "effect": "exposure", "parameter": "amount",
+        "rest": 0.2, "reach": 0.8,
+        "at": [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75],
+        "values": [0.2, 0.2, 0.2, 0.8, 0.5, 0.2, 0.35, 0.2],
+        "silenced": [True, True, True, False, False, False, False, False],
+    }],
+}
+
+#: The readout's box as the timeline really gives it: full width of the Monitor column, 34px tall.
+DRIVE_BOX = {"width": 200, "height": 34}
+
+#: The catalogue with a **second** drivable effect in it, on `EFFECT_CATALOGUE_RUNS`' precedent:
+#: the shared fixture carries one drivable parameter, and "which binding is this?" cannot be asked
+#: of a Shot whose two envelopes would be labelled identically. Soft Focus is a real Texture card
+#: and its `sigma` is drivable (R-25's measured subset), so it also composes *ahead* of the Grade
+#: card below it -- which is what makes the chain-order answer observable.
+DRIVE_CATALOGUE = {
+    **EFFECT_CATALOGUE,
+    "effects": [
+        *EFFECT_CATALOGUE["effects"],
+        {
+            "effect": "soft_focus", "family": "texture", "label": "Soft focus",
+            "parameters": [{
+                "name": "sigma", "label": "Sigma", "kind": "number", "default": 0.0,
+                "minimum": 0.0, "maximum": 20.0, "integer": False, "choices": [],
+                "drive_reason": "",
+            }],
+        },
+    ],
+}
+
+
+def drive_plan(body: str) -> dict:
+    """Run the readout's pure functions against the compiled fixture and report their answers."""
+    return run_module("""
+      import { driveReadoutPlan, driveReadoutPick, driveReadoutFacts, driveReadoutView,
+               driveReadoutWanted }
+        from './src/music_video_producer/web/assets/api.js';
+      const SERVED = __SERVED__;
+      const BOX = __BOX__;
+      const CATALOGUE = __CATALOGUE__;
+      const plan = (over = {}) => driveReadoutPlan({
+        binding: SERVED.bindings[0], seconds: SERVED.seconds, ...BOX, ...over,
+      });
+      __BODY__
+    """.replace("__SERVED__", json.dumps(DRIVE_SERVED))
+       .replace("__BOX__", json.dumps(DRIVE_BOX))
+       .replace("__CATALOGUE__", json.dumps(DRIVE_CATALOGUE))
+       .replace("__BODY__", body))
+
+
+def test_the_readout_maps_the_compiled_seconds_onto_pixels_and_nothing_else():
+    """Which pixel is which second, and which row is which value.
+
+    Both are read straight off what the server compiled: `at` against the clip the drive was
+    compiled over, and `value` against the two ends the compiler clamped -- resting at the foot,
+    full drive at the roof. A pixel of headroom at the top and a row for the rest line at the
+    bottom, both learned on the spectrum strip's own canvas: drawn to the full box, a sample at
+    full drive lands on row zero with half its stroke outside the canvas.
+    """
+    read = drive_plan("""
+      const drawn = plan();
+      console.log(JSON.stringify({
+        shown: drawn.shown, rest: drawn.rest, height: drawn.height,
+        points: drawn.points.map((point) => [point.x, point.y, point.drive]),
+        fires: drawn.fires,
+      }));
+    """)
+
+    assert read["shown"] is True
+    # Eight ticks over two seconds across 200px: the first at x=0 and the last at 1.75s.
+    assert [point[0] for point in read["points"]] == [0, 25, 50, 75, 100, 125, 150, 175]
+    # 0.2 rests, 0.8 reaches: the fourth tick is full drive and the fifth is exactly half.
+    # `approx` because the ends are the compiler's own floats and 0.3/0.6 is not 0.5 in binary --
+    # a pixel is not decided at that precision and a test that demanded it would be asserting
+    # about IEEE 754 rather than about the drawing.
+    assert [point[2] for point in read["points"]] == pytest.approx([0, 0, 0, 1, 0.5, 0, 0.25, 0])
+    # 34px tall, one row for the rest line and one of headroom: a resting sample sits on 33 and a
+    # full one on 1, so nothing is drawn outside the canvas at either end.
+    assert [point[1] for point in read["points"]] == pytest.approx([33, 33, 33, 1, 17, 33, 25, 33])
+    assert read["rest"] == 32.5
+    assert read["fires"] is True
+
+
+def test_the_readout_cuts_the_line_where_the_trigger_floor_opens_and_shuts():
+    """*Silenced*, not merely low -- the readout's whole reason for existing.
+
+    The split is `api.js`'s and not the canvas's, so "which pixels are dim" is a testable answer
+    rather than a branch inside a drawing loop. The runs **overlap by one sample**, so the stroke
+    is continuous across a crossing instead of a picture with a tick-wide gap in it.
+    """
+    read = drive_plan("""
+      const drawn = plan();
+      console.log(JSON.stringify({
+        segments: drawn.segments.map((run) => ({
+          silenced: run.silenced, xs: run.points.map((point) => point.x),
+        })),
+      }));
+    """)
+
+    assert [run["silenced"] for run in read["segments"]] == [True, False]
+    assert read["segments"][0]["xs"] == [0, 25, 50]
+    # The open run begins on the closed run's last sample, so the two are joined by a stroke.
+    assert read["segments"][1]["xs"] == [50, 75, 100, 125, 150, 175]
+
+
+def test_a_passage_below_the_floor_is_told_apart_from_one_merely_low():
+    """The distinction the whole feature rests on, and it is not derivable from the values.
+
+    Two samples both sitting at the resting value: one the floor shut, one the music simply did
+    not reach. They draw in different tokens, and the only thing that can say which is which is
+    the flag the compiler sent -- a client inferring silence from a value equal to `rest` would
+    paint the second one dim and tell the Director their floor is doing something it is not.
+    """
+    read = drive_plan("""
+      const drawn = plan();
+      const resting = drawn.points.filter((point) => point.drive === 0);
+      console.log(JSON.stringify({
+        resting: resting.map((point) => [point.x, point.silenced]),
+      }));
+    """)
+
+    assert read["resting"] == [[0, True], [25, True], [50, True], [125, False], [175, False]]
+
+
+def test_the_playhead_is_drawn_only_while_it_is_inside_this_shots_window():
+    """The `--acid` playhead already on the timeline, drawn through the readout so the envelope and
+    the picture read against one axis -- and **absent** when the playhead is elsewhere.
+
+    The readout spans the *selected* Shot's window and the Monitor follows the playhead, so the two
+    genuinely come apart. A line pinned to an edge would say the picture is at its start when it is
+    somewhere else entirely.
+    """
+    read = drive_plan("""
+      console.log(JSON.stringify({
+        start: plan({ playhead: 0 }).playhead,
+        middle: plan({ playhead: 1 }).playhead,
+        end: plan({ playhead: 2 }).playhead,
+        before: plan({ playhead: -0.4 }).playhead,
+        after: plan({ playhead: 2.4 }).playhead,
+        absent: plan({ playhead: null }).playhead,
+      }));
+    """)
+
+    assert read["start"] == 0
+    assert read["middle"] == 100
+    assert read["end"] == 200
+    assert read["before"] is None
+    assert read["after"] is None
+    assert read["absent"] is None
+
+
+def test_a_compiled_series_this_cannot_read_whole_draws_nothing():
+    """`served_measurement`'s own rule, said on this side of the wire: all or nothing.
+
+    A compiled drive with one string in it, or whose three arrays do not agree on how many ticks
+    there are, is not a picture seven-eighths drawn -- it is an answer nobody can vouch for, and
+    drawing the readable part would invent the rest. `shown: false` is the readout being absent,
+    which is what the figure's `hidden` attribute then is.
+    """
+    read = drive_plan("""
+      const at = SERVED.bindings[0].at;
+      const values = SERVED.bindings[0].values;
+      const silenced = SERVED.bindings[0].silenced;
+      const of = (binding) => driveReadoutPlan({ binding, seconds: 2, ...BOX }).shown;
+      console.log(JSON.stringify({
+        ragged: of({ ...SERVED.bindings[0], values: values.slice(1) }),
+        strung: of({ ...SERVED.bindings[0], values: [...values.slice(1), 'x'] }),
+        unflagged: of({ ...SERVED.bindings[0], silenced: [] }),
+        empty: of({ ...SERVED.bindings[0], at: [], values: [], silenced: [] }),
+        unended: of({ ...SERVED.bindings[0], rest: null }),
+        whole: of(SERVED.bindings[0]),
+        noBox: driveReadoutPlan({ binding: SERVED.bindings[0], seconds: 2, width: 0, height: 34 }).shown,
+        noSpan: driveReadoutPlan({ binding: SERVED.bindings[0], seconds: 0, ...BOX }).shown,
+      }));
+    """)
+
+    assert read["whole"] is True
+    for absent in ("ragged", "strung", "unflagged", "empty", "unended", "noBox", "noSpan"):
+        assert read[absent] is False, absent
+
+
+def test_the_readout_says_which_binding_it_draws_and_follows_the_open_panel():
+    """A Shot may carry more than one binding, and one canvas draws one signal.
+
+    So which one is a decision, it is made here, and the answer is said in words: the parameter
+    whose band panel the Director opened, and the first binding in composed-chain order when none
+    is open. An unlabelled envelope where two exist is a picture that lies about which parameter it
+    describes, which is this epic's recurring failure in a new place.
+    """
+    read = run_module("""
+      import { driveReadoutPick, driveReadoutView }
+        from './src/music_video_producer/web/assets/api.js';
+      const SERVED = __SERVED__;
+      const CATALOGUE = __CATALOGUE__;
+      const two = { ...SERVED, bindings: [
+        { ...SERVED.bindings[0], index: 1, effect: 'soft_focus', parameter: 'sigma',
+          rest: 4, reach: 8 },
+        SERVED.bindings[0],
+      ] };
+      const view = (open) => driveReadoutView(two, { catalogue: CATALOGUE, open });
+      console.log(JSON.stringify({
+        first: view(null),
+        opened: view({ index: 0, parameter: 'amount' }),
+        elsewhere: view({ index: 7, parameter: 'nothing' }),
+        alone: driveReadoutView(SERVED, { catalogue: CATALOGUE, open: null }),
+        none: driveReadoutView({ shot_id: 'shot_a', seconds: 2, bindings: [] },
+                               { catalogue: CATALOGUE }),
+      }));
+    """.replace("__SERVED__", json.dumps(DRIVE_SERVED))
+       .replace("__CATALOGUE__", json.dumps(DRIVE_CATALOGUE)))
+
+    # With no panel open it draws the first binding the export drives, and names it.
+    assert read["first"]["binding"]["effect"] == "soft_focus"
+    assert read["first"]["label"] == "Soft focus · Sigma"
+    assert read["first"]["others"] == 1
+    assert "1 more on this shot" in read["first"]["caption"]
+    # Open a panel and the readout follows it -- the parameter the Director is looking at.
+    assert read["opened"]["binding"]["effect"] == "exposure"
+    assert read["opened"]["label"] == "Exposure · Amount"
+    # A panel open on a parameter that carries no binding falls back rather than drawing nothing.
+    assert read["elsewhere"]["binding"]["effect"] == "soft_focus"
+    # One binding says nothing about others, and still says which one it is.
+    assert read["alone"]["others"] == 0
+    assert "more on this shot" not in read["alone"]["caption"]
+    assert read["alone"]["label"] == "Exposure · Amount"
+    # And no binding at all is **absent, not empty**.
+    assert read["none"]["shown"] is False
+
+
+def test_the_readout_states_its_peak_and_whether_it_fires_at_all_in_text():
+    """UX-DR7's accessibility floor: the canvas is `aria-hidden`, so every fact it draws is said in
+    text beside it -- where the drive peaks, and whether it fires at all.
+
+    **Not the same sentence with a zero in it.** A binding that never leaves its resting value is a
+    band, a floor or a depth that wants changing, and "peaks at 0%" would report that as a
+    measurement rather than as the thing to act on.
+    """
+    read = run_module("""
+      import { driveReadoutFacts, DRIVE_READOUT_SILENT }
+        from './src/music_video_producer/web/assets/api.js';
+      const SERVED = __SERVED__;
+      const CATALOGUE = __CATALOGUE__;
+      const still = { ...SERVED.bindings[0], values: SERVED.bindings[0].values.map(() => 0.2) };
+      const pulled = { ...SERVED.bindings[0], reach: -0.3,
+                       values: [0.2, 0.2, 0.2, -0.3, 0.2, 0.2, 0.2, 0.2] };
+      console.log(JSON.stringify({
+        firing: driveReadoutFacts(SERVED.bindings[0], CATALOGUE),
+        still: driveReadoutFacts(still, CATALOGUE),
+        pulled: driveReadoutFacts(pulled, CATALOGUE),
+        silent: DRIVE_READOUT_SILENT,
+      }));
+    """.replace("__SERVED__", json.dumps(DRIVE_SERVED))
+       .replace("__CATALOGUE__", json.dumps(DRIVE_CATALOGUE)))
+
+    assert read["firing"]["fires"] is True
+    assert read["firing"]["seconds"] == 0.75
+    assert read["firing"]["peak"] == 1
+    assert "0.8s in" in read["firing"]["note"]
+    assert "100%" in read["firing"]["note"]
+    assert read["still"]["fires"] is False
+    assert read["still"]["note"] == read["silent"]
+    assert "%" not in read["still"]["note"]
+    # A binding pulling its parameter *down* fires exactly as hard: the peak is the furthest
+    # sample from the resting value, not the highest one.
+    assert read["pulled"]["fires"] is True
+    assert read["pulled"]["peak"] == 1
+
+
+def test_a_shot_with_no_binding_asks_for_no_readout_at_all():
+    """The client half of the route's own cost rule.
+
+    Deciding whether a measurement is current hashes the whole master and parses a ~405 KB
+    sidecar. A Shot carrying no binding -- every Shot in every project until one is bound -- must
+    not pay it merely by being selected, and neither must one whose only bound card the Director
+    has switched off, because a disabled card compiles no script and drives nothing.
+    """
+    read = run_module("""
+      import { driveReadoutWanted } from './src/music_video_producer/web/assets/api.js';
+      const binding = { parameter: 'amount', drive: 'punch', depth: 0.5 };
+      const card = (over = {}) => ({ effect: 'exposure', enabled: true,
+                                     parameters: { amount: 0.2 }, ...over });
+      const shot = (effects) => ({ id: 'shot_a', start: 0, duration: 4, effects });
+      const song = { analysis: { song_fingerprint: '12-abc' } };
+      console.log(JSON.stringify({
+        bare: driveReadoutWanted(shot([]), song),
+        graded: driveReadoutWanted(shot([card()]), song),
+        bound: driveReadoutWanted(shot([card({ bindings: [binding] })]), song),
+        off: driveReadoutWanted(shot([card({ bindings: [binding], enabled: false })]), song),
+        moved: driveReadoutWanted(
+          { ...shot([card({ bindings: [binding] })]), start: 4 }, song),
+        remeasured: driveReadoutWanted(shot([card({ bindings: [binding] })]),
+                                       { analysis: { song_fingerprint: '12-xyz' } }),
+        deeper: driveReadoutWanted(
+          shot([card({ bindings: [{ ...binding, depth: 0.6 }] })]), song),
+        rested: driveReadoutWanted(
+          shot([card({ parameters: { amount: 0.3 }, bindings: [binding] })]), song),
+      }));
+    """)
+
+    for quiet in ("bare", "graded", "off"):
+        assert read[quiet]["wanted"] is False, quiet
+        assert read[quiet]["key"] == "", quiet
+    assert read["bound"]["wanted"] is True
+    # Every input the compiled values depend on moves the key, and nothing else does.
+    for moved in ("moved", "remeasured", "deeper", "rested"):
+        assert read[moved]["key"] != read["bound"]["key"], moved
+
+
+def test_the_readouts_drawing_takes_every_coordinate_from_the_plan():
+    """R-27 held against the file that does the drawing.
+
+    `drawDriveReadout` is handed a plan and strokes it. It may not reach into the served series,
+    and it may not do arithmetic of its own on a value -- the moment it does, there are two things
+    that decide where a sample sits and the picture can stop being the argv. So the drawing reads
+    only `plan.` fields, and neither it nor the sync around it mentions the compiled arrays at all.
+
+    The palette is closed as well: three tokens, read off the canvas's own computed style, and no
+    eighth accent.
+    """
+    source = APP_JS.read_text(encoding="utf-8")
+    drawing = source.split("function drawDriveReadout(", 1)[1].split("\n}\n", 1)[0]
+
+    for banned in (".values", ".at", ".silenced[", "Math.exp", "Math.pow", "rest -", "reach"):
+        assert banned not in drawing, (banned, drawing)
+    for token in ('token("--dim")', 'token("--blue")', 'token("--acid")'):
+        assert token in drawing, token
+    assert "--red" not in drawing and "--amber" not in drawing and "--acid" in drawing
+    # And nothing in this file models a drive: the band weight, the running average, the release
+    # and the gate are the compiler's, and none of their arithmetic appears here.
+    for banned in ("DRIVE_SOFTNESS", "DRIVE_RELEASE", "DRIVE_TRANSIENT", "band_series",
+                   "drive_series"):
+        assert banned not in source, banned

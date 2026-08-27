@@ -194,7 +194,62 @@ return {
   note: sentence('.effect-band-note'),
   gate: sentence('.effect-band-gate'),
   needs: sentence('.effect-band-needs'),
-  pending: sentence('.effect-band-pending'),
+  readout: sentence('.effect-band-readout'),
+  // The Drive readout, which is **not** in this rail: it is a figure under the Monitor, in the
+  // other half of the timeline panel. Measured here because the two are one feature -- the panel
+  // points at it and it draws the panel's binding -- and because "the canvas is drawn" is only a
+  // fact if the pixels are counted. A canvas that threw halfway through, or one measured at zero
+  // width inside a `hidden` figure, is a correctly-sized empty box that every structural
+  // assertion in this file would pass over.
+  drive: (() => {
+    const figure = document.querySelector('#drive-readout');
+    const canvas = document.querySelector('#drive-readout-canvas');
+    const monitor = document.querySelector('#timeline-monitor');
+    const main = document.querySelector('.timeline-main');
+    const painted = (() => {
+      if (!canvas || !canvas.getContext || !canvas.width) return null;
+      const data = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
+      let lit = 0, blue = 0, dim = 0, acid = 0, rest = 0, silenced = 0, ground = 0;
+      for (let index = 0; index < data.length; index += 4) {
+        const [r, g, b, a] = [data[index], data[index+1], data[index+2], data[index+3]];
+        if (!a) continue;
+        const row = Math.floor((index / 4) / canvas.width);
+        lit += 1;
+        if (g - b > 60) acid += 1;
+        else if (b - r > 30) blue += 1;
+        else if (Math.abs(r - g) < 12 && Math.abs(g - b) < 12) {
+          dim += 1;
+          // The rest line lives in the bottom two rows and runs the whole width. Counted apart
+          // from the dim *above* it, because they are two different claims: the hairline is the
+          // datum a silenced run is read against, and a silenced run is a passage the Trigger
+          // Floor shut. A census that added them together could not tell a drawing that lost the
+          // line from one that lost the silence.
+          if (row >= canvas.height - 2) rest += 1;
+          else silenced += 1;
+          // The ground bar's own row, counted on its own. A silenced *transition* paints a dim
+          // wedge here for a handful of columns whatever else is drawn, so a census that only
+          // counted dim-above-the-line could not tell the ground bar from that wedge -- and
+          // removing the bar entirely left every assertion in this file passing. A long passage
+          // the floor shut has no height of its own to draw (a `punch` drive below the floor is
+          // exactly zero), so this row is the only evidence that it is marked at all.
+          if (row === canvas.height - 4) ground += 1;
+        }
+      }
+      return { width: canvas.width, height: canvas.height, lit, blue, dim, acid, rest, silenced, ground };
+    })();
+    return {
+      hidden: figure ? figure.hasAttribute('hidden') : null,
+      label: figure ? figure.getAttribute('aria-label') : null,
+      figure: box(figure),
+      canvas: box(canvas),
+      canvasHidden: canvas ? canvas.getAttribute('aria-hidden') : null,
+      caption: box(document.querySelector('#drive-readout-caption')),
+      monitor: box(monitor),
+      main: box(main),
+      rows: main ? getComputedStyle(main).gridTemplateRows : '',
+      painted,
+    };
+  })(),
   crowded: sentence('.effect-band-crowded'),
   undrawn: sentence('.effect-band-undrawn'),
   strip: box(strip),
@@ -441,6 +496,20 @@ def shot(driver, state: str) -> None:
         str(artifact_dir() / f"{NAME}-{state}.png"))
 
 
+def readout_shot(driver, state: str) -> None:
+    """The Drive readout on its own — the canvas and its caption. A 34px strip inside a whole-panel
+    screenshot is not something a person can judge a drawing from, and this drawing is the slice."""
+    driver.find_element(By.ID, "drive-readout").screenshot(
+        str(artifact_dir() / f"{NAME}-{state}.png"))
+
+
+def monitor_shot(driver, state: str) -> None:
+    """The Monitor with the readout under it, which is the layout question this slice raises: a
+    fourth row in `.timeline-main` takes its height from the picture and the tracks."""
+    driver.find_element(By.CSS_SELECTOR, ".timeline-main").screenshot(
+        str(artifact_dir() / f"{NAME}-{state}.png"))
+
+
 def strip_shot(driver, state: str) -> None:
     """The canvas on its own, because 183x36 inside a 280px panel screenshot is not something a
     person can judge a drawing from -- and this drawing is the whole slice."""
@@ -564,7 +633,10 @@ def main() -> None:
                     driver, driver.find_element(By.ID, item["id"]), f"the {item['text']} drive")
             # The sentences are readable at this width rather than a column of single words.
             assert fresh["needs"]["width"] > 150, ("the needs block is a narrow column", fresh)
-            assert fresh["pending"]["text"], "the panel does not say what it is still missing"
+            assert fresh["readout"] is None, (
+                "an unwritten binding points at a readout that compiles nothing", fresh["readout"])
+            assert fresh["drive"]["hidden"] is True, (
+                "the readout is drawn for a shot whose binding is not written", fresh["drive"])
             # The strip is drawn on a fresh, unwritten binding too: the Band is a thing a Director
             # looks at *while* deciding, not a picture that appears once it has been decided.
             assert fresh["strip"] and fresh["painted"], (
@@ -592,6 +664,8 @@ def main() -> None:
             assert stack(server.base_url, project_id)[0].get("bindings") in (None, []), (
                 "the drive press alone wrote a binding at a depth nobody chose")
             result["after_the_drive"] = {"modes": chosen["modes"], "needs": chosen["needs"]}
+            # No readout yet: the binding is not written, so nothing is compiled to draw.
+            assert chosen["drive"]["hidden"] is True, chosen["drive"]
             shot(driver, "03-drive-chosen")
 
             # --- 5. The depth completes it, and the glyph turns --blue -----------------------
@@ -623,6 +697,162 @@ def main() -> None:
             assert bound["panelCount"] == 1, bound
             assert bound["remove"] and "Remove binding" in bound["remove"]["text"], bound["remove"]
             assert bound["needs"]["height"] == 0 or not bound["needs"]["text"], bound["needs"]
+
+
+            # --- 5c. The Drive readout, under the Monitor (story 10.3) ----------------------
+            #
+            # The panel above is where the binding is made; this is where it is *seen*. The census
+            # is the point, exactly as it is for the strip: a canvas that threw halfway through
+            # drawing, or one measured at zero width inside a figure that was still `hidden` when
+            # it was painted, is a correctly-sized empty box and every structural assertion here
+            # would pass over it. So the pixels are counted and the three tokens are told apart.
+            drawn_readout = look(driver)["drive"]
+            assert drawn_readout["hidden"] is False, (
+                "the readout is not drawn for a bound shot", drawn_readout)
+            assert drawn_readout["canvasHidden"] == "true", (
+                "the canvas is in the accessibility tree, where it announces nothing (UX-DR15)",
+                drawn_readout["canvasHidden"])
+            assert drawn_readout["painted"], "nothing is painted on the readout"
+            # Both halves of the picture: the envelope in `--blue`, and the rest line in `--dim`
+            # running the whole width beneath it. Either alone is a drawing that has lost what it
+            # exists to show — and the line is counted separately from the dim *above* it precisely
+            # because the first pass drew the line **before** the envelope's fill and had it
+            # painted out along its whole width, which a single `dim > 50` would have passed.
+            assert drawn_readout["painted"]["blue"] > 50, drawn_readout["painted"]
+            assert drawn_readout["painted"]["rest"] > drawn_readout["canvas"]["width"] * 0.8, (
+                "the rest line is missing or painted over", drawn_readout["painted"])
+            # Nothing is silenced yet: this binding's floor is 0, so the gate never shuts and no
+            # ground is laid. A handful of pixels is the blue stroke and the acid line blending to
+            # something grey where they cross; a real silenced run is hundreds of pixels of band.
+            assert drawn_readout["painted"]["silenced"] < 20, drawn_readout["painted"]
+            assert drawn_readout["painted"]["ground"] < 20, drawn_readout["painted"]
+            # It sits immediately beneath the Monitor and spans the same width, so the envelope and
+            # the picture read against one axis rather than two.
+            assert drawn_readout["figure"]["top"] >= drawn_readout["monitor"]["bottom"] - 1, (
+                drawn_readout["figure"], drawn_readout["monitor"])
+            assert abs(drawn_readout["figure"]["width"]
+                       - drawn_readout["monitor"]["width"]) < 2, drawn_readout
+            assert drawn_readout["figure"]["top"] - drawn_readout["monitor"]["bottom"] < 4, (
+                "the readout is not immediately beneath the Monitor", drawn_readout)
+            # The canvas's non-canvas equivalent, immediately under it and carrying every fact it
+            # draws: which binding, and where the drive peaks or that it never fires (UX-DR7).
+            caption = drawn_readout["caption"]["text"]
+            assert "Exposure" in caption and "Amount" in caption, (
+                "the readout does not say which binding it is drawing", caption)
+            assert ("peaks" in caption) or ("never rises" in caption), caption
+            assert drawn_readout["caption"]["top"] >= drawn_readout["canvas"]["bottom"] - 1, (
+                drawn_readout["caption"], drawn_readout["canvas"])
+            assert not clipped(driver, driver.find_element(By.ID, "drive-readout-caption")), (
+                "the readout's caption is cut off", drawn_readout["caption"])
+            result["readout"] = {
+                "figure": drawn_readout["figure"], "canvas": drawn_readout["canvas"],
+                "caption": drawn_readout["caption"], "painted": drawn_readout["painted"],
+                "monitor": drawn_readout["monitor"], "main": drawn_readout["main"],
+                "rows": drawn_readout["rows"], "label": drawn_readout["label"],
+                "text": caption,
+            }
+            readout_shot(driver, "04c-readout-canvas")
+            monitor_shot(driver, "04c-monitor-and-readout")
+
+            # The `--acid` playhead, drawn through the picture — and **absent** while the playhead
+            # is outside this Shot's window, because the readout spans the *selected* Shot and the
+            # Monitor follows the clock. A line pinned to an edge would claim the picture is at its
+            # start when it is somewhere else entirely.
+            assert drawn_readout["painted"]["acid"] > 0, (
+                "the playhead is not drawn through the readout", drawn_readout["painted"])
+            driver.execute_script(
+                "document.querySelector('#master-audio').currentTime = 6.5;"
+                "document.querySelector('#master-audio').dispatchEvent(new Event('timeupdate'));")
+            settle(driver, "#drive-readout", quiet_ms=350)
+            moved = look(driver)["drive"]
+            assert moved["hidden"] is False, moved
+            assert moved["painted"]["acid"] == 0, (
+                "the playhead is drawn on a shot the clock is not inside", moved["painted"])
+            assert moved["painted"]["blue"] > 50, (
+                "the envelope went with the playhead", moved["painted"])
+            result["readout"]["playhead_outside"] = moved["painted"]
+            readout_shot(driver, "04d-readout-playhead-outside")
+            driver.execute_script(
+                "document.querySelector('#master-audio').currentTime = 0;"
+                "document.querySelector('#master-audio').dispatchEvent(new Event('timeupdate'));")
+            settle(driver, "#drive-readout", quiet_ms=350)
+
+            # **A passage below the Trigger Floor draws `--dim`, distinguishably from one merely
+            # low** — the readout's whole reason for existing, and the acceptance criterion that
+            # cannot be checked from the markup at all.
+            #
+            # The floor is **swept rather than guessed**: which value shuts the gate on part of this
+            # song and not all of it is a fact about the audio, and a number picked by eye would
+            # silently become "everything is dim" the first time the fixture's song changed.
+            silencing = None
+            for floor in ("0.05", "0.1", "0.2", "0.35", "0.5"):
+                type_into(driver, "effect-band-0-amount-floor", floor)
+                driver.find_element(By.ID, "shot-tab-effects").click()
+                settle(driver, "#shot-inspector", quiet_ms=500)
+                wait_for_stack(
+                    server.base_url, project_id,
+                    lambda entries, want=float(floor): (
+                        entries[0]["bindings"][0].get("floor") == want),
+                    f"the floor {floor} did not reach the manifest",
+                )
+                settle(driver, "#drive-readout", quiet_ms=400)
+                painted = look(driver)["drive"]["painted"]
+                if painted["ground"] > 200 and painted["blue"] > 50:
+                    silencing = {"floor": floor, "painted": painted}
+                    break
+                open_effects(driver)
+            assert silencing, (
+                "no trigger floor between 0.05 and 0.5 silences part of this song's drive without "
+                "silencing all of it, so the dim/blue distinction could not be looked at")
+            # Both on screen at once, which is what "distinguishably" means: a silenced passage in
+            # `--dim` beside a firing one in `--blue`, and the rest line still under both.
+            assert silencing["painted"]["rest"] > drawn_readout["canvas"]["width"] * 0.8, silencing
+            result["readout"]["silenced"] = silencing
+            readout_shot(driver, "04f-readout-silenced")
+            open_effects(driver)
+            type_into(driver, "effect-band-0-amount-floor", "0")
+            driver.find_element(By.ID, "shot-tab-effects").click()
+            settle(driver, "#shot-inspector", quiet_ms=500)
+            open_effects(driver)
+
+            # **What the readout costs the Monitor**, which is the number this slice has to be
+            # honest about: a fourth row in `.timeline-main` takes its height from the two `fr`
+            # rows either side of it. Measured on **this** Shot against the same Shot before the
+            # binding existed, so nothing else about the layout has moved. Recorded rather than
+            # asserted at a threshold, because the right number is a judgement — and a number
+            # nobody wrote down is how it grows.
+            #
+            # Measured by hiding the figure and measuring again **at the same instant**, then
+            # restoring it — the only way to isolate this row from everything else that moves
+            # the panel's height. Comparing against another Shot, or against an earlier moment
+            # on this one, measures the inspector's own height as well: it answered a 98px
+            # difference for a row that is nothing like that tall.
+            cost = driver.execute_script("const figure = document.querySelector('#drive-readout');\nconst monitor = document.querySelector('#timeline-monitor');\nconst tracks = document.querySelector('#timeline-scroll');\nconst height = (node) => (node ? node.getBoundingClientRect().height : 0);\nconst before = {monitor: height(monitor), tracks: height(tracks), readout: height(figure)};\nfigure.hidden = true;\nconst after = {monitor: height(monitor), tracks: height(tracks)};\nfigure.hidden = false;\nreturn {before, after};")
+            result["readout"]["cost"] = {
+                "readout_height": round(cost["before"]["readout"], 1),
+                "monitor_with": round(cost["before"]["monitor"], 1),
+                "monitor_without": round(cost["after"]["monitor"], 1),
+                "tracks_with": round(cost["before"]["tracks"], 1),
+                "tracks_without": round(cost["after"]["tracks"], 1),
+            }
+            assert cost["before"]["monitor"] < cost["after"]["monitor"], (
+                "the readout took no height from the Monitor, so it is drawn over something",
+                cost)
+
+            # And it is **absent, not empty**, on a Shot that carries no binding: the figure is
+            # `hidden` and its grid row is exactly zero high.
+            select_clip(driver, wait, LOCKED)
+            settle(driver, "#drive-readout", quiet_ms=350)
+            unbound = look(driver)["drive"]
+            assert unbound["hidden"] is True, (
+                "a shot with no binding draws a readout", unbound)
+            assert unbound["figure"]["height"] == 0, unbound["figure"]
+            assert unbound["canvas"]["height"] == 0, unbound["canvas"]
+            result["readout"]["unbound_figure"] = unbound["figure"]
+            monitor_shot(driver, "04e-monitor-unbound")
+            select_clip(driver, wait, SHOT)
+            open_effects(driver)
+            settle(driver, "#shot-inspector", quiet_ms=350)
 
             # --- 5b. `sustain` brings its own two timings alive, and `punch` keeps them ------
             #
@@ -819,12 +1049,11 @@ def main() -> None:
                 drawn["strip"], drawn["inputs"])
             assert drawn["stripTitle"] and "Hz" in drawn["stripTitle"], drawn["stripTitle"]
             # The sentence that used to stand where the canvas now is names one absence, not two.
-            assert "spectrum strip" not in drawn["pending"]["text"], drawn["pending"]
-            assert "readout" in drawn["pending"]["text"], drawn["pending"]
+            assert "missing" not in (drawn["readout"] or {}).get("text", ""), drawn["readout"]
             assert drawn["crowded"] is None or not drawn["crowded"]["text"], drawn["crowded"]
             result["strip"] = {
                 "box": drawn["strip"], "painted": drawn["painted"], "title": drawn["stripTitle"],
-                "pending": drawn["pending"]["text"],
+                "readout": (drawn["readout"] or {}).get("text", ""),
                 "panel": drawn["panel"], "panelBelowFold": drawn["panelBelowFold"],
                 "railScrollHeight": drawn["railScrollHeight"],
                 "railClientHeight": drawn["railClientHeight"], "railScroll": drawn["railScroll"],

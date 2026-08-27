@@ -422,7 +422,13 @@ def main() -> None:
             settle(driver, "#shot-inspector", quiet_ms=500)
             wait_for_stack(
                 server.base_url, project_id,
-                lambda stack: stack == [{"effect": "grain", "enabled": True, "parameters": {}}],
+                # `bindings` is on the wire since Epic 10 and is `[]` on every unbound card, so
+                # the equality is written against the three keys this gesture is about. This
+                # assertion was an exact match on the whole entry and had been failing since
+                # the field landed — found 2026-08-27 while running this gate beside the band
+                # panel's, and confirmed to fail identically at `77bec26` with no other change.
+                lambda stack: stack == [
+                    {"effect": "grain", "enabled": True, "parameters": {}, "bindings": []}],
                 "adding Grain from the picker did not write the stack")
             driver.find_element(By.ID, "effect-add").click()
             settle(driver, "#shot-inspector", quiet_ms=300)

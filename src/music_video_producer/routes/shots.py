@@ -72,6 +72,8 @@ from ..app import (
     AudioRestoreResponse,
     SelectTakeRequest,
     ShotBindingsRequest,
+    ShotDriveBinding,
+    ShotDriveResponse,
     ShotEffectsCopyRefusal,
     ShotEffectsCopyRequest,
     ShotEffectsCopyResponse,
@@ -98,12 +100,14 @@ from ..app import (
     shot_enhancement_in_flight,
     shot_is_approved,
     shot_render_in_flight,
+    stack_is_driven,
     stored_effect_stack,
 )
+from ..assembly import ASSEMBLY_FPS, clip_frames_on_grid
 from ..batch import PENDING_SUBMISSION_PROMPT_ID, accept_submission, prompt_is_missing, shot_label
 from ..comfy import ComfyError
 from ..director import DirectorError, DirectorUnavailable
-from ..effects import EffectRefusal, validate_stack
+from ..effects import EffectRefusal, drive_readout, validate_stack
 from ..h3_prompt import check as h3_check
 from ..h3_prompt import normalize_audio_fields
 from ..models import Project, RenderJob, VisionInspectionRecord, resolve_shot_mode, song_audio_tag
@@ -137,6 +141,7 @@ def register(ctx: RouterContext) -> None:
     resolve_song_path = ctx.resolve_song_path
     settings = ctx.settings
     settle_unsubmitted_jobs = ctx.settle_unsubmitted_jobs
+    song_envelope_report = ctx.song_envelope_report
     store = ctx.store
 
     @app.put("/api/projects/{project_id}/shots", response_model=Project)
@@ -911,6 +916,98 @@ def register(ctx: RouterContext) -> None:
         # make every other card's storage depend on a write that was not about it.
         shot.effects[index].bindings = [dict(binding) for binding in request.bindings]
         return store.save(project)
+
+    @app.get(
+        "/api/projects/{project_id}/shots/{shot_id}/drive",
+        response_model=ShotDriveResponse,
+    )
+    def read_shot_drive(project_id: str, shot_id: str) -> ShotDriveResponse:
+        """One Shot's compiled Parameter Bindings, as the numbers the Drive readout draws.
+
+        **R-27, as a route.** The readout draws the compiled `sendcmd` values themselves rather
+        than a curve derived a second way, so this serves what `effects.drive_samples` produced —
+        the same walk `effects.sendcmd_script` writes its lines from, sharing one function rather
+        than agreeing by test. The alternative R-27 rejected by name was shipping the raw band
+        series and computing the drive in the browser, which is a second *renderer*: the picture
+        and the export could disagree while every automated gate in this repository passed.
+
+        **`SERVED_ENVELOPE_KEYS`' standing rule, applied to a route instead of a key.** A
+        consumer is necessary and not sufficient. This exists because nothing else can answer the
+        question: only the compiler knows what a binding compiles to, the per-frame `bands` array
+        is about 98 % of a 469 KB sidecar and stays on disk (AD-20), and everything else the
+        readout needs — the Shot's window, the stack, the binding's own numbers — is already on
+        the wire in the project read and is deliberately not repeated here.
+
+        **Nothing is written, on any path.** It is a read of a manifest and a sidecar; there is no
+        `store.save` here and no state derived from the answer.
+
+        **The measurement is read only for a Shot that would compile something**, which is the
+        preview route's own rule and for its reason: the verdict hashes the whole master and
+        parses a ~405 KB sidecar, and an unbound Shot — every Shot in every project until one is
+        bound — must not pay it merely by being selected.
+
+        **Every absence is an empty list, deliberately** (FX-22's *absent, not empty*). No
+        binding, a bound card the Director switched off, a song whose measurement has gone, and a
+        stored stack `validate_stack` refuses all answer the same way, because the readout's only
+        question is whether there is a compiled drive to draw. *Which* absence it is, and the
+        action that fixes it, is the band panel's sentence and is already answered there and on
+        `GET /timeline/snap-targets`; a second account of it here would be two sources for one
+        question, which is exactly what the merged measurement read exists to prevent.
+
+        A sync `def`, so FastAPI runs it in the threadpool: `song_envelope_report` hashes the
+        whole master to decide whether the measurement is still current, and a multi-megabyte read
+        has no business on the event loop. `snap-targets` is a sync `def` for the same reason.
+        """
+        project = get_project(project_id)
+        shot = next((item for item in project.shots if item.id == shot_id), None)
+        if not shot:
+            raise HTTPException(status_code=404, detail="Shot not found")
+        # The clip the drive is compiled over, resolved exactly as the preview resolves it: the
+        # frames this Shot's window really lands on, over the grid rate. Never `shot.duration`,
+        # which is the manifest's float and is what the export rounds *from* — a readout drawn
+        # against it would put its last command a fraction of a frame outside the picture above.
+        frames = clip_frames_on_grid(shot.start, shot.start + shot.duration)
+        seconds = frames / ASSEMBLY_FPS
+        stack = [spec.model_dump() for spec in shot.effects]
+        answer = ShotDriveResponse(shot_id=shot.id, seconds=seconds)
+        if not stack_is_driven(stack):
+            return answer
+        report = song_envelope_report(project_id, project)
+        envelope = report.get("envelope") if report.get("present") else None
+        if not isinstance(envelope, dict):
+            return answer
+        try:
+            readouts = drive_readout(
+                stack,
+                envelope=envelope,
+                luts=discovered_looks(),
+                shot_start=shot.start,
+                clip_seconds=seconds,
+            )
+        except EffectRefusal:
+            # A stored stack the export refuses — a hand-edited manifest, a look whose `.cube` has
+            # gone. The effects panel names that fault where the Director can act on it, and the
+            # preview refuses it in the export's own words. A readout has nothing to add and
+            # nothing to draw, and turning a read into a 422 would put a toast on the screen for
+            # merely selecting the Shot.
+            return answer
+        return ShotDriveResponse(
+            shot_id=shot.id,
+            seconds=seconds,
+            bindings=[
+                ShotDriveBinding(
+                    index=readout.index,
+                    effect=readout.effect_id,
+                    parameter=readout.parameter,
+                    rest=readout.rest,
+                    reach=readout.reach,
+                    at=[sample.at for sample in readout.samples],
+                    values=[sample.value for sample in readout.samples],
+                    silenced=[sample.silenced for sample in readout.samples],
+                )
+                for readout in readouts
+            ],
+        )
 
     @app.post(
         "/api/projects/{project_id}/shots/{shot_id}/effects/copy",

@@ -298,6 +298,8 @@ __all__ = [
     "SEAM_SEED_PER_SECOND",
     "SHARPEN_MATRIX",
     "ChoiceParameter",
+    "DriveReadout",
+    "DriveSample",
     "DriveScript",
     "EffectDefinition",
     "EffectRefusal",
@@ -314,6 +316,8 @@ __all__ = [
     "build_effect_stages",
     "cube_text",
     "discover_luts",
+    "drive_readout",
+    "drive_samples",
     "drive_series",
     "exported_look",
     "fingerprint_size",
@@ -3132,6 +3136,40 @@ def _sustain_series(
     return tuple(out)
 
 
+def _binding_levels(
+    envelope: Mapping[str, Any] | None, binding: ParameterBinding
+) -> tuple[float, tuple[float, ...], tuple[float, ...]]:
+    """The analysis rate, one binding's band level per tick, and the drive that level produces.
+
+    Three answers from one computation, because two callers need different parts of it and
+    computing it twice is how they would come to disagree. `binding_drive` wants the drive alone.
+    The readout wants the level as well — *is the band under the Trigger Floor here?* is a
+    question about the **level**, and the drive cannot answer it: a `sustain` binding holds
+    through a dip that is well below its floor, and a `punch` binding's envelope decays to
+    nothing in a passage that never went near it. So "the drive is zero" and "the floor shut this
+    one" are two different states, and only the level tells them apart.
+    """
+    rate, _ = _envelope_bands(envelope)
+    levels = band_series(
+        envelope,
+        centre=binding.band_centre,
+        width=binding.band_width,
+        softness=binding.band_softness,
+    )
+    return (
+        rate,
+        levels,
+        drive_series(
+            levels,
+            drive=binding.drive,
+            floor=binding.floor,
+            hold=binding.hold,
+            sustain=binding.sustain,
+            analysis_rate=rate,
+        ),
+    )
+
+
 def binding_drive(
     envelope: Mapping[str, Any] | None, binding: ParameterBinding
 ) -> tuple[float, ...]:
@@ -3141,20 +3179,170 @@ def binding_drive(
     likeness of it, because FX-22 asks that the readout be the signal the export will use and not
     an illustration of one.
     """
-    rate, _ = _envelope_bands(envelope)
-    return drive_series(
-        band_series(
-            envelope,
-            centre=binding.band_centre,
-            width=binding.band_width,
-            softness=binding.band_softness,
-        ),
-        drive=binding.drive,
-        floor=binding.floor,
-        hold=binding.hold,
-        sustain=binding.sustain,
-        analysis_rate=rate,
-    )
+    return _binding_levels(envelope, binding)[2]
+
+
+@dataclass(frozen=True, slots=True)
+class DriveSample:
+    """One tick of a compiled drive: when a command fires, what value it carries, and whether the
+    Trigger Floor was shut at that moment.
+
+    **These are the numbers `sendcmd_script` writes**, taken from the same walk that writes them
+    rather than derived a second way — `at` is the clip-local second the line is stamped with and
+    `value` is the number the line's argument is formatted from. That is R-27 as a data structure:
+    the readout is handed the argv's own numbers, so there is no second renderer to drift from
+    the first.
+
+    `silenced` is the one thing here the script text does not carry, and it is not a second
+    opinion about the drive: it is the band level against the Director's own floor, which is what
+    FX-22's *"a silenced passage looks silenced rather than merely low"* is about. See
+    `_binding_levels` for why the drive alone cannot say it.
+    """
+
+    at: float
+    value: float
+    silenced: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DriveReadout:
+    """One binding's compiled drive over one clip, with the two ends the picture is measured
+    between.
+
+    `rest` is the value a shut gate leaves the parameter at — the resting value, clamped into the
+    parameter's own range — and `reach` is the value a full drive takes it to, clamped the same
+    way. **Both are the compiler's own clamp**, not a bound restated: a depth that would push a
+    parameter past its maximum reaches the maximum and no further, so a readout drawn between
+    these two ends is drawn between the values the export can actually produce. `reach` may sit
+    **below** `rest`, because depth is signed.
+
+    `index` is the card's position in the *stored* stack, which is how a client matches a drawn
+    envelope to the panel it belongs to. It is not the chain slot: the readouts come back in
+    composed-chain order, which is the order the scripts are handed to ffmpeg.
+    """
+
+    effect_id: str
+    parameter: str
+    index: int
+    rest: float
+    reach: float
+    samples: tuple[DriveSample, ...]
+
+
+def drive_samples(
+    envelope: Mapping[str, Any] | None,
+    binding: ParameterBinding,
+    *,
+    resting: float,
+    song_start: float,
+    clip_seconds: float,
+) -> tuple[DriveSample, ...]:
+    """The tick walk `sendcmd_script` writes its lines from, as numbers rather than as text.
+
+    **Extracted so there is one of it.** Story 10.3's readout draws the compiled values and R-27
+    is explicit that it may not compute them a second way; the strongest available form of that
+    is not a test but a shared function, so the picture and the script are one walk with two
+    renderings — the script formats each value through the filter's own option arithmetic, and
+    the readout draws it. A value that appears here appears in the argv, and the reverse.
+
+    Everything about the walk is `sendcmd_script`'s and is documented there: clip-local times, a
+    first line at zero carrying the tick that covers `song_start`, the last measured value held
+    past the end of the analysis, and the clamp into the parameter's own declared range.
+
+    Refuses in the catalogue's own words when there is no envelope to read or no clip to compile
+    against, which is where `sendcmd_script` used to refuse and is the same sentence.
+    """
+    rate, levels, drive = _binding_levels(envelope, binding)
+    if rate <= 0:
+        raise EffectRefusal(
+            BINDING_NO_ENVELOPE_REFUSAL.format(
+                effect=binding.effect_id, parameter=binding.parameter
+            )
+        )
+    if clip_seconds <= 0:
+        raise EffectRefusal(
+            BINDING_NO_CLIP_REFUSAL.format(
+                effect=binding.effect_id, parameter=binding.parameter
+            )
+        )
+    parameter = _bound_parameter(binding)
+    low = float(parameter.minimum)
+    high = float(parameter.maximum)
+    first = max(0, math.floor(song_start * rate))
+    last = math.ceil((song_start + clip_seconds) * rate)
+    samples: list[DriveSample] = []
+    for tick in range(first, last):
+        moment = tick / rate
+        if moment >= song_start + clip_seconds:
+            break
+        # The drive is the song's, so a clip sitting past the last analysed tick holds the last
+        # measured value rather than falling to nothing — an envelope is `ceil`ed to whole
+        # analysis frames and a Shot may legitimately end after the last one.
+        held = min(tick, len(drive) - 1) if drive else -1
+        level = drive[held] if held >= 0 else 0.0
+        band = float(levels[held]) if held >= 0 and held < len(levels) else 0.0
+        samples.append(
+            DriveSample(
+                at=max(0.0, moment - song_start),
+                value=min(high, max(low, resting + binding.depth * level)),
+                silenced=band < binding.floor,
+            )
+        )
+    return tuple(samples)
+
+
+def drive_readout(
+    stack: Iterable[Mapping[str, Any]],
+    *,
+    envelope: Mapping[str, Any] | None,
+    luts: Sequence[LutEntry] = (),
+    shot_start: float = 0.0,
+    clip_seconds: float = 0.0,
+) -> tuple[DriveReadout, ...]:
+    """Every binding a stack carries, compiled over one clip, in composed-chain order.
+
+    **The same walk `build_effect_stages` makes**, family by family and skipping what the Director
+    has switched off — so what comes back is exactly the set of bindings that would compile a
+    `sendcmd` script for this clip, in the order those scripts are written. A binding on a
+    disabled card compiles nothing and drives nothing, and it is therefore not drawn: a readout
+    for a card that is off would be a picture of a look the export will not produce, which is the
+    one thing FX-22 forbids.
+
+    **It asks for no geometry, and that is deliberate rather than convenient.** `StageContext`
+    exists so a *filter option* can be written for the grid it will run on; the value a command
+    carries is decided before any of that, by `drive_samples`, and it is the same number at every
+    delivery size. Composing a whole chain here to reach it would make the readout depend on
+    every take's dimensions — an ffprobe per approved Shot — for a picture that would come out
+    identical.
+    """
+    resolved = validate_stack(stack, luts=luts)
+    readouts: list[DriveReadout] = []
+    for family in FAMILY_ORDER:
+        for index, effect in enumerate(resolved):
+            if not effect.enabled or effect.family != family:
+                continue
+            for binding in effect.bindings:
+                parameter = _bound_parameter(binding)
+                resting = float(effect.values[binding.parameter])
+                low = float(parameter.minimum)
+                high = float(parameter.maximum)
+                readouts.append(
+                    DriveReadout(
+                        effect_id=effect.effect_id,
+                        parameter=binding.parameter,
+                        index=index,
+                        rest=min(high, max(low, resting)),
+                        reach=min(high, max(low, resting + binding.depth)),
+                        samples=drive_samples(
+                            envelope,
+                            binding,
+                            resting=resting,
+                            song_start=shot_start,
+                            clip_seconds=clip_seconds,
+                        ),
+                    )
+                )
+    return tuple(readouts)
 
 
 @dataclass(frozen=True, slots=True)
@@ -3234,40 +3422,26 @@ def sendcmd_script(
 
     Refuses, in the catalogue's own words, when there is no envelope to read or no clip to
     compile against. Neither is reachable from a stack that carries no binding.
+
+    **The walk itself is `drive_samples`', and this function is its formatter.** Story 10.3's
+    readout draws the compiled values, and R-27 forbids computing them a second way; sharing the
+    walk rather than testing two copies of it is what makes the picture and the argv one thing.
+    Every line below is one sample rendered through the filter's own option arithmetic.
     """
-    rate, _ = _envelope_bands(envelope)
-    if rate <= 0:
-        raise EffectRefusal(
-            BINDING_NO_ENVELOPE_REFUSAL.format(
-                effect=binding.effect_id, parameter=binding.parameter
-            )
-        )
-    if clip_seconds <= 0:
-        raise EffectRefusal(
-            BINDING_NO_CLIP_REFUSAL.format(
-                effect=binding.effect_id, parameter=binding.parameter
-            )
-        )
-    drive = binding_drive(envelope, binding)
+    samples = drive_samples(
+        envelope,
+        binding,
+        resting=resting,
+        song_start=song_start,
+        clip_seconds=clip_seconds,
+    )
     parameter = _bound_parameter(binding)
     compute = parameter.drive.compute or _drive_plain
-    low = float(parameter.minimum)
-    high = float(parameter.maximum)
-    first = max(0, math.floor(song_start * rate))
-    last = math.ceil((song_start + clip_seconds) * rate)
     lines: list[str] = []
-    for tick in range(first, last):
-        moment = tick / rate
-        if moment >= song_start + clip_seconds:
-            break
-        # The drive is the song's, so a clip sitting past the last analysed tick holds the last
-        # measured value rather than falling to nothing — an envelope is `ceil`ed to whole
-        # analysis frames and a Shot may legitimately end after the last one.
-        level = drive[min(tick, len(drive) - 1)] if drive else 0.0
-        value = min(high, max(low, resting + binding.depth * level))
-        at = _number(max(0.0, moment - song_start))
+    for sample in samples:
+        at = _number(sample.at)
         for option, argument in zip(
-            parameter.drive.options, compute(value, context), strict=True
+            parameter.drive.options, compute(sample.value, context), strict=True
         ):
             lines.append(f"{at} {target} {option} {argument};")
     return "\n".join(lines) + "\n"
