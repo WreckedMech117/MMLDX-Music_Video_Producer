@@ -573,7 +573,12 @@ def test_the_chain_the_route_renders_is_the_chain_it_names_the_clip_after(tmp_pa
     Both call sites are watched, because they are separate name lookups: `app` holds its own
     reference to `build_effect_stages` and `effects` calls its module global from inside
     `preview_fingerprint`. A later epic that gives the preview a `clip_offset`, a different
-    geometry or a different `luts` in one place and not the other fails here."""
+    geometry or a different `luts` in one place and not the other fails here.
+
+    **The stack carries a pixel-denominated card**, because that is the argument this route was
+    getting wrong: `reference_width` is the *export's* width, not the preview's, and without it
+    Soft Focus, Sharpen, Bloom, Pixelate and Pixel Shuffle all render at twice their relative
+    size in the Monitor while the stage text stays byte-identical."""
     from music_video_producer import app as app_module
     from music_video_producer import effects as effects_module
 
@@ -581,7 +586,12 @@ def test_the_chain_the_route_renders_is_the_chain_it_names_the_clip_after(tmp_pa
     project_id, _shots_dir = project_with_two_approved_takes(client, tmp_path)
     written = client.put(
         f"/api/projects/{project_id}/shots/shot_a/effects",
-        json={"effects": [{"effect": "saturation", "parameters": {"amount": 1.4}}]},
+        json={
+            "effects": [
+                {"effect": "saturation", "parameters": {"amount": 1.4}},
+                {"effect": "pixelate", "parameters": {"size": 16}},
+            ]
+        },
     )
     assert written.status_code == 200, written.text
 
@@ -612,6 +622,14 @@ def test_the_chain_the_route_renders_is_the_chain_it_names_the_clip_after(tmp_pa
     )
     assert kwargs["clip_offset"] == 0.0
     assert kwargs["shot_seconds"] == 4.0
+    # And the grid the stack's pixel counts were written for is the **export's**, which is the
+    # one argument here that is deliberately not the preview's own. Asserted as the relationship
+    # the route promises rather than as a number: the preview's width is `preview_side` of this,
+    # so passing the preview's own width, or nothing at all, fails.
+    reference = kwargs["reference_width"]
+    half = reference // 2
+    assert kwargs["width"] == max(2, half - (half % 2))
+    assert reference > kwargs["width"]
 
 
 def test_a_deleted_cache_costs_a_re_render_and_nothing_else(tmp_path: Path):

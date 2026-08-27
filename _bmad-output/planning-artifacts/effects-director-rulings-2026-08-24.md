@@ -204,12 +204,30 @@ export is stable only because its input is not.
 The criterion is satisfiable, and satisfied, one level down: with no effects, `trim_args` builds
 the byte-identical command it always built.
 `test_the_default_preset_is_draft_and_draft_is_what_this_application_already_built`
-(`tests/test_assembly.py:515`) pins that argv against the written-out `TODAYS_TRIM_ARGV` constant;
+(in `tests/test_assembly.py`) pins that argv against the written-out `TODAYS_TRIM_ARGV` constant;
 it predates the epic (`611594b`, 2026-08-20) and `d8b8afb` did not touch it — that commit changed
 five files and `tests/test_assembly.py` is none of them. Slice B added its own
 `test_a_shot_with_no_effects_builds_exactly_what_this_application_builds_today`
-(`tests/test_effects.py:215`), which passes empty stage groups and asserts the same argv written
+(in `tests/test_effects.py`), which passes empty stage groups and asserts the same argv written
 out rather than derived.
+
+> **Citations corrected 2026-08-26, and the *form* corrected with them.** This paragraph used to
+> cite `tests/test_effects.py:215`. **The test has never been at line 215.** It was at 265, then
+> 267, was at 271 when Epic 9's retrospective checked it on 2026-08-26, and is at **272** by the
+> end of that same day — it moved again between the finding and the fix. The companion citation
+> was checked rather than assumed and *was* right: `test_the_default_preset_is_draft…` sat at
+> `tests/test_assembly.py:515` exactly.
+>
+> Being right was luck of timing, not accuracy of method, and both line numbers are now gone.
+> **In a tree that moves this fast a line number is the wrong citation:** it decays silently, it
+> cannot be verified by `grep`, and a stale one sends a reader to an unrelated assertion that
+> looks close enough to believe. A test's full name is unique, stable across every edit above it,
+> and locatable with one search. Cite the file and the name; cite a line only for something that
+> has no name.
+>
+> The mechanism this ruling states is unaffected — the tests exist, they pin what R-20 says they
+> pin, and both were re-run. What was invented was the instance, which is the failure this
+> project's own memory records under *"verify named instances in reviews"*.
 
 **The ruling:** slice C asserts argv identity for the empty stack and never compares exported mp4
 bytes. A determinism claim about rendered output is asserted on raw frames off the filter graph —

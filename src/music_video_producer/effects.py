@@ -5,9 +5,14 @@ reason is that a fingerprint is only useful if every writer and every reader com
 same way. Two hashes that disagree do not report "stale" — they report it inconsistently,
 which is worse than not checking at all.
 
-Today there is exactly one: `song_fingerprint`. The module is created now, holding only that,
-because the Song Envelope needs it and the later effects work (grades, chains, previews) will
-add its siblings here rather than inventing a second convention.
+`song_fingerprint` is where the module started and is no longer most of what it does. This
+opening sentence read *"Today there is exactly one: `song_fingerprint`. The module is created
+now, holding only that"* until 2026-08-26, by which point the file had passed 2,500 lines and its own
+`---` divider fifteen lines below said so. The prediction that sentence made was the right one
+and it came true: the later effects work put its siblings here rather than inventing a second
+convention, so the module now holds the fingerprints (`song_fingerprint`, `preview_fingerprint`),
+the LUT folder, the effect catalogue, the composers and the chain builder. Read the divider
+below for the second half of the job; what follows immediately is still about the first.
 
 **Content, never mtime.** A modification time changes when a file is copied, restored from a
 backup, or synced — and does *not* change when a file is edited in place with the timestamp
@@ -211,6 +216,7 @@ __all__ = [
     "PRE_PAD_FAMILIES",
     "PRE_SCALE_FAMILIES",
     "SEAM_SEED_PER_SECOND",
+    "SHARPEN_MATRIX",
     "ChoiceParameter",
     "EffectDefinition",
     "EffectRefusal",
@@ -860,15 +866,14 @@ Parameter = NumberParameter | ChoiceParameter | LutParameter
 
 @dataclass(frozen=True, slots=True)
 class StageContext:
-    """What a composer is allowed to know: the geometry the **export** chose, and the file
-    argument for every look the stack named.
+    """What a composer is allowed to know: the geometry being composed for, the geometry the
+    stored look is written against, and the file argument for every look the stack named.
 
-    The dimensions are the export's, never the take's, and they describe the **delivery grid** a
-    treatment stage is being composed for rather than the frame it will be handed. The difference
-    matters and is easy to read past: `scale=W:H:force_original_aspect_ratio=decrease` fits the
-    take *inside* that grid, so a 4:3 take into a 16:9 export arrives at a treatment stage 810
-    wide, not 1056 — `pad` is what makes it the export's size, and `pad` comes after every
-    treatment.
+    The dimensions are never the take's, and they describe the **delivery grid** a treatment stage
+    is being composed for rather than the frame it will be handed. The difference matters and is
+    easy to read past: `scale=W:H:force_original_aspect_ratio=decrease` fits the take *inside*
+    that grid, so a 4:3 take into a 16:9 export arrives at a treatment stage 810 wide, not
+    1056 — `pad` is what makes it the export's size, and `pad` comes after every treatment.
 
     So these numbers are the right thing to compose a *look* against — `chroma_split` stores a
     fraction and turns it into pixels here, so the same stored look ships the same split at any
@@ -877,6 +882,35 @@ class StageContext:
 
     Geometry composers run before `scale` and therefore address the take's pixels through ffmpeg's
     own `iw`/`ih`, which is why none of them read these numbers at all.
+
+    **`reference_width` is the width the stack's *pixel-denominated* parameters mean**, and it is
+    the answer to a defect the fraction above only ever solved for one effect. Five parameters in
+    this catalogue are a count of pixels rather than a fraction of anything — Soft Focus' sigma,
+    Bloom's radius, Pixelate's and Pixel Shuffle's block, and the unsharp kernel Sharpen is
+    written around — and a count of pixels covers twice as much of the frame when the frame is
+    half the size. Measured 2026-08-26 through the real chain: `pixelate size=32` gave **60**
+    blocks across at 1920 and **30** at 960, and `soft_focus sigma=8` spread the same edge over
+    1.458 % of the frame at 1920 and **2.917 %** at 960. The preview composes at half the
+    export's grid (`app.preview_side`), so five of twenty-five effects were showing a Director
+    twice the look the export would ship, against a story that promises the preview differs from
+    the export "in nothing else".
+
+    Storing those five as fractions would have closed it too, and it is deliberately not what
+    happened: a stored `size: 32` would then mean something new, every manifest already holding
+    one would need migrating, and the **export's argv would move** — which is the one thing this
+    correction may not do. So the number goes on meaning exactly what it meant, and the *chain*
+    honours the grid it is composed for: `pixel_scale` is `width / reference_width`, and the five
+    composers multiply by it.
+
+    Zero — the default — means "these dimensions **are** the reference", which is every caller
+    that composes at the size the look was written for: the export, `exported_look`'s probe, and
+    every test that names one geometry. `pixel_scale` is then exactly `1.0`, the five composers
+    multiply by nothing, and the text is character for character what it has always been.
+
+    It is a width alone rather than a pair because the scale it expresses is uniform — the
+    preview halves both axes — and because `chroma_split` already reads only the width for the
+    same reason: one number cannot describe two different scales, and an anamorphic preview is
+    not a thing this application makes.
 
     **`clip_offset` and `shot_seconds` are where this clip sits inside its Shot**, and they are
     the reason a time-dependent stage does not replay itself at a seam. See the module
@@ -899,6 +933,20 @@ class StageContext:
     clip_offset: float = 0.0
     shot_seconds: float = 0.0
     slot: int = 0
+    reference_width: int = 0
+
+    @property
+    def pixel_scale(self) -> float:
+        """What one pixel of the stored look is worth on the grid being composed for.
+
+        Exactly `1.0` — the identity, not a float that rounds to it — whenever no reference was
+        named or the reference is this very grid, which is every export. `_at_reference` and
+        `_pixels_at_reference` short-circuit on that value, so a chain composed at the size its
+        numbers were written for is byte-identical to the chain this module has always built.
+        """
+        if self.reference_width <= 0 or self.reference_width == self.width:
+            return 1.0
+        return self.width / self.reference_width
 
 
 @dataclass(frozen=True, slots=True)
@@ -922,6 +970,48 @@ def _number(value: float) -> str:
     """
     text = f"{float(value):.6f}".rstrip("0").rstrip(".")
     return "0" if text in ("", "-0") else text
+
+
+def _at_reference(value: float, context: StageContext) -> float:
+    """One pixel-denominated parameter, as many pixels as it is worth on *this* grid.
+
+    A continuous count — a blur's sigma — so nothing is rounded and nothing is floored: half of
+    a sigma of 8 is a sigma of 4, and half of a sigma of 0.5 is a sigma of 0.25, which is still
+    a blur. The identity value each of these composers tests is tested on the **stored** number
+    rather than on this one, so which effects compose a stage is the same answer at every
+    geometry — a preview that dropped a card the export runs would be the defect this closes,
+    wearing different clothes.
+    """
+    scale = context.pixel_scale
+    return float(value) if scale == 1.0 else float(value) * scale
+
+
+def _pixels_at_reference(value: float, context: StageContext, *, floor: int) -> int:
+    """One pixel-denominated parameter that must be a whole number of pixels, on *this* grid.
+
+    A block size, where a half is not a thing a filter can be given. Rounded to the nearest whole
+    pixel and floored at what the filter will take, and — like `_at_reference` — returning the
+    stored number untouched when the grid is the one it was written for, so an export's argv is
+    the argv it has always been rather than the argv a round trip through `round` produces.
+    """
+    scale = context.pixel_scale
+    if scale == 1.0:
+        return int(value)
+    return max(floor, round(float(value) * scale))
+
+
+def _odd_pixels_at_reference(value: int, context: StageContext, *, low: int, high: int) -> int:
+    """The same, for a parameter ffmpeg insists is an **odd** number of pixels.
+
+    `unsharp`'s matrix is the only one: it takes 3 to 23, odd, and refuses everything else. So the
+    scaled width is pulled to the nearest odd number and clamped into the filter's own range,
+    which is why a 5-pixel kernel at half the grid is 3 rather than 2.5 or 2.
+    """
+    scale = context.pixel_scale
+    if scale == 1.0:
+        return int(value)
+    scaled = round((float(value) * scale - 1.0) / 2.0) * 2 + 1
+    return max(low, min(high, scaled))
 
 
 def _message_number(value: float) -> str:
@@ -1000,6 +1090,13 @@ BRANCH_LEG_FORMAT = "format=yuv420p"
 #: every pixel in a legal-range picture and a threshold of 1 at 255 above every one of them.
 MIN_LUMA_CODE = 16
 MAX_LUMA_CODE = 235
+
+#: The width of Sharpen's unsharp matrix, in pixels, at the grid the look was written for. The one
+#: pixel-denominated number in this catalogue that is *not* a parameter — a Director sets the
+#: amount, and this is the size of the neighbourhood the amount is applied over. Named rather than
+#: inlined because it is scaled for a smaller grid like every other pixel count here, and a number
+#: that moves with the geometry should not be a literal buried in a format string.
+SHARPEN_MATRIX = 5
 
 #: How a clip's offset within its Shot is turned into a seed step, for the one stage that has no
 #: expression to offset. A millisecond is finer than a frame at every rate this application
@@ -1241,18 +1338,37 @@ def _compose_vignette(values: Mapping[str, Any], context: StageContext) -> tuple
 
 
 def _compose_soft_focus(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
-    """A Gaussian defocus. Sigma zero is the identity, and composes to nothing."""
+    """A Gaussian defocus. Sigma zero is the identity, and composes to nothing.
+
+    **The sigma is a count of pixels**, so it is worth half as much of the frame on a grid half
+    the size and it is scaled to the grid being composed for (`StageContext.reference_width`).
+    Measured through the real chain: `sigma=8` spread a step edge over 1.458 % of the frame at
+    1920 and 2.917 % at 960 before this, and 1.458 % at both after.
+    """
     if float(values["sigma"]) == 0.0:
         return ()
-    return (f"gblur=sigma={_number(values['sigma'])}",)
+    return (f"gblur=sigma={_number(_at_reference(values['sigma'], context))}",)
 
 
 def _compose_sharpen(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
     """Unsharp mask on luma. Negative amounts soften, which is why the range crosses zero, and
-    zero itself is the identity: no stage."""
+    zero itself is the identity: no stage.
+
+    **The pixel-denominated number here is the matrix, not the parameter.** `amount` is a
+    strength and means the same at any size; the 5x5 kernel is the thing measured in pixels, and
+    the halo it rings a step edge with was 4 pixels wide at every grid — 0.208 % of the frame at
+    1920 and 0.417 % at 960. So it is the matrix that scales, and it scales the way `unsharp`
+    will take it: odd, and never outside the filter's own 3..23.
+    """
     if float(values["amount"]) == 0.0:
         return ()
-    return (f"unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount={_number(values['amount'])}",)
+    matrix = _odd_pixels_at_reference(SHARPEN_MATRIX, context, low=3, high=23)
+    return (
+        (
+            f"unsharp=luma_msize_x={matrix}:luma_msize_y={matrix}"
+            f":luma_amount={_number(values['amount'])}"
+        ),
+    )
 
 
 def _compose_banding_suppression(
@@ -1289,6 +1405,14 @@ def _compose_bloom(values: Mapping[str, Any], context: StageContext) -> tuple[st
     The untouched copy is the **top** input, so `intensity` mixes from the picture toward the
     bloomed picture and an intensity of zero is exactly the picture. Zero is the default and
     composes to no stage at all.
+
+    **The radius is a count of pixels** and is scaled to the grid being composed for, exactly as
+    Soft Focus' sigma is and for the same reason: measured through the real chain, `radius=40`
+    bled its glow 3.958 % of the way across the frame at 1920 and 7.917 % at 960 before this.
+    The threshold is not scaled — it is a luma code, and a highlight is the same brightness
+    however large the frame is. Neither is `intensity`, which decides whether there is a stage at
+    all, so this branch is emitted at exactly the same geometries it always was and the frame
+    guard cannot move.
     """
     intensity = float(values["intensity"])
     if intensity == 0.0:
@@ -1298,7 +1422,7 @@ def _compose_bloom(values: Mapping[str, Any], context: StageContext) -> tuple[st
     )
     leg = (
         rf"lutyuv=y=if(gt(val\,{threshold})\,val\,0):u=0:v=0,"
-        f"gblur=sigma={_number(values['radius'])}"
+        f"gblur=sigma={_number(_at_reference(values['radius'], context))}"
     )
     return (
         _branch_stage(
@@ -1456,9 +1580,20 @@ def _compose_pixelate(values: Mapping[str, Any], context: StageContext) -> tuple
 
     The mode is written out rather than left to the filter's default, so the stage text is this
     application's decision and stays put if a later ffmpeg changes its mind about the default.
+
+    **The block is a count of pixels**, which is the whole of the finding this scaling closes:
+    measured through the real chain, `size=32` laid **60** blocks across the frame at 1920 and
+    **30** at 960, so a Director judging a mosaic in the Monitor was judging one twice as coarse
+    as the export would ship. The stored number goes on meaning what it means — the export's argv
+    does not move — and the block is scaled to the grid being composed for instead.
+
+    The identity is tested on the **composed** pixels rather than on the stored ones, which is
+    `chroma_split`'s rule applied to the other pixel-denominated parameter: a block that has been
+    scaled down to a single pixel quantises nothing, and a `pixelize=w=1:h=1` that changes no
+    pixel is exactly the no-op this module refuses to emit.
     """
-    size = int(values["size"])
-    if size == 1:
+    size = _pixels_at_reference(values["size"], context, floor=1)
+    if size <= 1:
         return ()
     return (f"pixelize=w={size}:h={size}:mode=avg",)
 
@@ -1577,11 +1712,18 @@ def _compose_pixel_shuffle(values: Mapping[str, Any], context: StageContext) -> 
     `shufflepixels` negotiates `yuv444p`, which is a format the rest of the chain does not use,
     so the branch is pinned — read `BRANCH_LEG_FORMAT` for why that is a fact about the
     *untouched* copy rather than about the shuffled one.
+
+    **The block is a count of pixels** and is scaled to the grid being composed for, as
+    `pixelate`'s is: measured through the real chain, `block=32` shuffled in granules covering
+    1.667 % of the frame at 1920 and 3.333 % at 960. Its floor here is one pixel rather than the
+    catalogue's minimum of two, because the floor is a fact about what the *filter* will take and
+    the minimum is a fact about what a Director may store. `amount` is what decides whether there
+    is a branch at all and it is not scaled, so the frame guard cannot move.
     """
     amount = float(values["amount"])
     if amount == 0.0:
         return ()
-    block = int(values["block"])
+    block = _pixels_at_reference(values["block"], context, floor=1)
     leg = (
         f"shufflepixels=mode=block:width={block}:height={block}"
         f":seed={_number(values['seed'])}"
@@ -2209,6 +2351,7 @@ def build_effect_stages(
     luts: Sequence[LutEntry] = (),
     clip_offset: float = 0.0,
     shot_seconds: float = 0.0,
+    reference_width: int = 0,
 ) -> EffectStages:
     """A stack, the export's geometry and the clip's place in its Shot in; the stages out.
 
@@ -2230,6 +2373,14 @@ def build_effect_stages(
     every caller that composes a whole Shot at once wants — the preview, and every clip of a
     Shot no later Shot nests inside. The one thing the defaults cannot do is compose Slow Zoom,
     which refuses by name rather than dividing by a length nobody gave it.
+
+    **`reference_width` is for a caller composing at a size the stack was not written for**, and
+    the preview is the only one there is: it renders at half the delivery grid, and the five
+    pixel-denominated parameters in this catalogue would otherwise cover twice as much of its
+    frame as the export will ship. Passed the export's width, the five scale and everything else
+    composes exactly as it always did. Left at its default, nothing scales at all — which is what
+    every export, every look record and every test naming one geometry gets, so the argv this
+    module has always built is the argv it still builds. See `StageContext.reference_width`.
 
     **The branch guard is prepended here rather than by a composer** (see the module docstring).
     It is a property of the chain and not of any effect in it: one framesync filter anywhere
@@ -2279,6 +2430,7 @@ def build_effect_stages(
                 clip_offset=clip_offset,
                 shot_seconds=shot_seconds,
                 slot=slot,
+                reference_width=reference_width,
             )
             slot += 1
             target.extend(EFFECT_CATALOGUE[effect.effect_id].compose(effect.values, context))
@@ -2464,6 +2616,7 @@ def preview_fingerprint(
     transition: Any = None,
     width: int,
     height: int,
+    reference_width: int = 0,
 ) -> str:
     """The name of the Preview Clip for one state of one Shot: a SHA-256 over the eight
     inputs of `PREVIEW_FINGERPRINT_INPUTS`, in that order.
@@ -2521,8 +2674,14 @@ def preview_fingerprint(
     preview's own, which is already two of the eight inputs. `clip_offset` is zero and the span
     is `window_duration`: a preview is always a whole Shot from its own first frame, never one
     half of a resolved overlap, so both are read off inputs this already hashes rather than taken
-    on trust from a caller. A stack that does not compose — an unknown effect, a look whose
-    `.cube` has gone — raises `EffectRefusal` here rather than returning a name. Its one caller
+    on trust from a caller. `reference_width` is the **export's** width and the only argument
+    here that is not the preview's own: it is what tells the five pixel-denominated composers
+    that this grid is half the one their numbers were written for, and it is not a ninth
+    fingerprint input because the chain it produces already is one — two geometries that scale a
+    block differently compose different text and therefore name different clips, which is exactly
+    what the eighth slot's `geometry` was already saying. A stack that does not compose — an
+    unknown effect, a look whose `.cube` has gone — raises `EffectRefusal` here rather than
+    returning a name. Its one caller
     composes the same chain from the same arguments a few lines earlier and has already refused
     in the catalogue's own words, so that path is unreachable from the route; a direct caller
     gets that sentence rather than a name for a picture that cannot be made.
@@ -2542,6 +2701,7 @@ def preview_fingerprint(
         luts=luts,
         clip_offset=0.0,
         shot_seconds=window_duration,
+        reference_width=reference_width,
     )
     fields = (
         _canonical(take),

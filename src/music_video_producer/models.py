@@ -756,9 +756,25 @@ class Shot(BaseModel):
     #
     # A disabled entry is kept rather than dropped: switching a card off is not deleting it, and
     # the parameters a Director dialled in have to survive being turned off and on again. It is
-    # validated exactly as an enabled one is (see `effects.validate_stack`) so a bad value cannot
-    # sit in the manifest waiting for the moment somebody re-enables it, and it contributes no
-    # stage to the chain.
+    # validated as an enabled one is (see `effects.validate_stack`) so a bad value cannot sit in
+    # the manifest waiting for the moment somebody re-enables it, and it contributes no stage to
+    # the chain.
+    #
+    # **With one exception, which this comment used to deny** (corrected 2026-08-26; it read
+    # "validated exactly as an enabled one is"). `effects._validate_lut` gates one of its two
+    # checks on `enabled`: *is a look named* is asked either way, because an unnamed look is a
+    # wrong spec whether the card is on or off, but *is that look still in the folder* is asked
+    # only of an enabled card. A disabled card applies no grade, so refusing an export over a
+    # `.cube` a switched-off card happens to name would let one deleted file brick every project
+    # that ever held that card. Everything else -- parameter bounds, integer-ness, unknown
+    # parameters, unknown keys, unknown effect ids -- is checked on a disabled entry exactly as
+    # on an enabled one.
+    #
+    # **AD-27's property survives the carve-out**, which is why the hole is a false sentence
+    # rather than a gap: a disabled card composes no stage, so no unvalidated LUT id can reach a
+    # filter string from here; and re-enabling one is a write through
+    # `PUT .../shots/{id}/effects`, which revalidates the whole stack against the folder as
+    # discovered at that moment. The id is checked at the instant it can first matter.
     effects: list[EffectSpec] = Field(default_factory=list)
 
     @field_validator("mode", mode="before")

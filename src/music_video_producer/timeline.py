@@ -1986,14 +1986,24 @@ def shot_expansion_input(project: Project, shot: Shot) -> dict[str, Any]:
     they are real: pass one has already run, and a cut that lands well needs to know what it is
     cutting from.
 
-    **The lyric sheet is sent whole, and labelled as whole.** The Director asked for "the song's
-    words for this window", and that cannot be built: nothing in this project aligns lyrics to
-    time — `song_section` is an empty branch for exactly that reason, there is no BPM or section
-    field on any model, and the analyser does not exist. Sending the whole sheet under a key that
-    claimed it was this window's words would be a fabrication of precisely the kind this codebase
-    keeps catching. So it goes as `lyrics`, with `song_fraction` beside it as the honest signal of
-    where in the song this Shot sits, and the specialist's prompt is what tells the model the
-    sheet is not aligned.
+    **The lyric sheet is sent whole, and labelled as whole** — and the reason recorded here until
+    2026-08-26 was that per-window words *could not be built*: no alignment, no BPM, no sections,
+    no analyser. **Every clause of that is now false.** Epic 8 shipped `audio.py`; `SongAnalysis`
+    carries a BPM, `Project.sections` carries sections, `Song.lyric_words` carries per-word
+    `(text, start, end)`, and `song_section` is no longer an empty branch. A reader correcting that
+    paragraph would reasonably conclude the behaviour should change with it.
+
+    **It should not, and the real reason is the stronger one.** Measured twice on 2026-08-19:
+    handed the words for a window, the model plants them in the *wrong* windows — and worse, those
+    planted words then fight the audio reference that is actually driving the mouth, so a shot
+    lip-syncs to a verse it is not singing. Alignment was never the obstacle. Giving a model text
+    it will treat as an instruction, in a pipeline where a different input already governs the
+    performance, is.
+
+    So the sheet still goes as `lyrics`, whole and labelled whole, with `song_fraction` beside it
+    as the honest signal of where in the song this Shot sits, and the specialist's prompt is what
+    tells the model the sheet is not aligned. See `docs/LLM-DIRECTOR.md`, which carries the
+    measurement, so this decision survives the next rewrite of this paragraph.
     """
     payload: dict[str, Any] = {
         "creative_brief": project.creative_brief,

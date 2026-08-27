@@ -56,7 +56,7 @@ Binding, read-only. Not re-derived.
 | **AD-15** — standing boundary policies | ComfyUI untouched; local model only |
 | **AD-16** (effects) — new `Shot` fields written only by dedicated routes, adopted in `replace_project` | The idiom AD-41 and AD-36 follow verbatim |
 | **AD-21** (effects) — validity derived by comparison, never a stored flag | Same discipline as AD-37 |
-| **AD-25** (effects) — `audio.py` exists and is pure | AD-40 composes it without importing it into `director.py` |
+| **AD-25** (effects) — `audio.py` exists as a leaf module: it imports the standard library and numpy, nothing from this package, and reaches outside itself only to decode audio through ffmpeg. *("and is pure" corrected 2026-08-26 — `audio.py` shells out to `subprocess.run`, which AD-25's own Rule has always said; the leaf-module property is what this row was relying on.)* | AD-40 composes it without importing it into `director.py` |
 | Consistency Conventions (schema evolution, state mutation, IDs, tests) | Apply verbatim. New fields defaulted; every mutation through `store.save` |
 
 No AD below contradicts or weakens an inherited one.

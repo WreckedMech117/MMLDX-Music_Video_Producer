@@ -52,6 +52,8 @@ from music_video_producer.effects import (
     FAMILY_ORDER,
     FAMILY_STYLIZE,
     FAMILY_TEXTURE,
+    LOOK_PROBE_HEIGHT,
+    LOOK_PROBE_WIDTH,
     PRE_PAD_FAMILIES,
     PRE_SCALE_FAMILIES,
     PREVIEW_FINGERPRINT_INPUTS,
@@ -61,6 +63,7 @@ from music_video_producer.effects import (
     LutEntry,
     LutParameter,
     NumberParameter,
+    StageContext,
     build_effect_stages,
     cube_text,
     discover_luts,
@@ -2635,3 +2638,250 @@ def test_slow_zoom_ramps_across_a_seam_as_one_move_and_never_samples_outside(tmp
     assert 1500 <= white[0] <= 1700
     assert white[-1] > 3 * white[0]
     assert all(later >= earlier - 8 for earlier, later in itertools.pairwise(white))
+
+
+# ------------------------------------------------------------------------------------------
+# The grid a look is composed for, against the grid its numbers were written for.
+# ------------------------------------------------------------------------------------------
+
+
+#: The five parameters in this catalogue denominated in **pixels** rather than in a fraction of
+#: anything, written out by hand rather than derived from the catalogue: a table that grew a sixth
+#: pixel-denominated parameter and did not scale it must fail here, and it cannot if this list is
+#: computed from the same table the code reads.
+#:
+#: Each row is the effect, the stack that exercises it, the stage at 1920 wide, and the stage the
+#: same stored numbers must compose to on a 960-wide grid. Sharpen's scaled number is its
+#: **matrix** and not its parameter — `amount` is a strength and means the same at any size.
+PIXEL_DENOMINATED = (
+    (
+        "soft_focus",
+        {"sigma": 8},
+        "gblur=sigma=8",
+        "gblur=sigma=4",
+    ),
+    (
+        "sharpen",
+        {"amount": 1.5},
+        "unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=1.5",
+        "unsharp=luma_msize_x=3:luma_msize_y=3:luma_amount=1.5",
+    ),
+    (
+        "bloom",
+        {"intensity": 0.5, "threshold": 0.7, "radius": 40},
+        (
+            "split=2[fx0a][fx0b];[fx0b]lutyuv=y=if(gt(val\\,169)\\,val\\,0):u=0:v=0,"
+            "gblur=sigma=40[fx0c];[fx0a][fx0c]blend=all_mode=screen:all_opacity=0.5"
+        ),
+        (
+            "split=2[fx0a][fx0b];[fx0b]lutyuv=y=if(gt(val\\,169)\\,val\\,0):u=0:v=0,"
+            "gblur=sigma=20[fx0c];[fx0a][fx0c]blend=all_mode=screen:all_opacity=0.5"
+        ),
+    ),
+    (
+        "pixelate",
+        {"size": 32},
+        "pixelize=w=32:h=32:mode=avg",
+        "pixelize=w=16:h=16:mode=avg",
+    ),
+    (
+        "pixel_shuffle",
+        {"amount": 0.5, "block": 32, "seed": 9},
+        (
+            "format=yuv420p,split=2[fx0a][fx0b];[fx0b]shufflepixels=mode=block"
+            ":width=32:height=32:seed=9,format=yuv420p[fx0c];"
+            "[fx0c][fx0a]blend=all_mode=normal:all_opacity=0.5"
+        ),
+        (
+            "format=yuv420p,split=2[fx0a][fx0b];[fx0b]shufflepixels=mode=block"
+            ":width=16:height=16:seed=9,format=yuv420p[fx0c];"
+            "[fx0c][fx0a]blend=all_mode=normal:all_opacity=0.5"
+        ),
+    ),
+)
+
+
+def test_a_parameter_denominated_in_pixels_is_scaled_to_the_grid_it_is_composed_for():
+    """Story 9.2 promises the preview is the export's picture "differing in nothing else", and
+    for these five it was not: they are counts of pixels, the preview composes at half the
+    export's grid, and a count of pixels covers twice as much of a frame half the size.
+
+    The expectations are written out by hand, not halved by arithmetic here, because a test that
+    scaled its own expectation would agree with a composer that scaled the wrong way.
+    """
+    for effect_id, parameters, at_export, at_preview in PIXEL_DENOMINATED:
+        stack = [effect(effect_id, **parameters)]
+        export = build_effect_stages(stack, width=1920, height=1080, shot_seconds=4.0)
+        preview = build_effect_stages(
+            stack, width=960, height=540, reference_width=1920, shot_seconds=4.0
+        )
+        assert export.treatment[-1] == at_export, effect_id
+        assert preview.treatment[-1] == at_preview, effect_id
+        # And the preview composed *without* the reference is the export's own text at half the
+        # size, which is the defect stated as a test: the number buys nothing on its own.
+        unaware = build_effect_stages(stack, width=960, height=540, shot_seconds=4.0)
+        assert unaware.treatment[-1] == at_export, effect_id
+
+
+def test_the_grid_a_look_was_written_for_composes_the_text_it_always_composed():
+    """The export's argv may not move, which is the constraint the whole scaling is built around.
+
+    A reference that is absent, zero, or this very grid all mean "these numbers are already the
+    right ones", and every one of them has to be the identity — not a float that rounds to it,
+    because `round(32 * 1.0)` and `int(32)` are the same number while `_number(8 * 1.0000001)`
+    and `_number(8)` are not the same string.
+    """
+    for effect_id, parameters, at_export, _ in PIXEL_DENOMINATED:
+        stack = [effect(effect_id, **parameters)]
+        for width, height in ((1920, 1080), (1056, 608), (640, 360)):
+            plain = build_effect_stages(stack, width=width, height=height, shot_seconds=4.0)
+            for reference in (0, width):
+                same = build_effect_stages(
+                    stack, width=width, height=height,
+                    reference_width=reference, shot_seconds=4.0,
+                )
+                assert same == plain, (effect_id, width, reference)
+        assert build_effect_stages(
+            stack, width=1920, height=1080, reference_width=1920, shot_seconds=4.0
+        ).treatment[-1] == at_export, effect_id
+
+    # A context that names no reference scales nothing, whatever grid it describes — pinned on the
+    # dataclass itself because `exported_look` builds its probe context by hand and would be the
+    # only thing to notice a default that had moved, and only for an effect that composed away.
+    for width, height in ((1920, 1080), (1056, 608), (LOOK_PROBE_WIDTH, LOOK_PROBE_HEIGHT)):
+        assert StageContext(width=width, height=height).pixel_scale == 1.0
+        assert StageContext(width=width, height=height, reference_width=width).pixel_scale == 1.0
+
+
+def test_every_other_effect_composes_the_same_text_at_every_grid():
+    """The scaling reaches the five and nothing else. Twenty of the twenty-five are a fraction, a
+    ratio of `iw`/`ih`, an angle or a luma code, and every one of them must be untouched by the
+    grid it is composed for — `chroma_split` excepted, which reads the width because it stores a
+    fraction and is the pattern the five are now following.
+    """
+    scaled = {name for name, *_ in PIXEL_DENOMINATED} | {"chroma_split"}
+    exercised = {
+        "punch_in": {"zoom": 1.4},
+        "slow_zoom": {"zoom": 1.5, "direction": "out"},
+        "handheld_shake": {"amplitude": 0.03, "frequency": 3.5},
+        "dutch_tilt": {"angle": -8.5},
+        "mirror": {"axis": "both"},
+        "grain": {"strength": 18, "seed": 12345},
+        "vignette": {"angle": 0.9},
+        "banding_suppression": {"threshold": 0.02},
+        "exposure": {"amount": 0.2},
+        "contrast": {"amount": 1.6},
+        "saturation": {"amount": 0.4},
+        "temperature": {"amount": -0.35},
+        "tint": {"amount": 0.3},
+        "lift_gamma_gain": {"lift": 0.05, "gamma": 1.4, "gain": -0.1},
+        "monochrome": {"amount": 0.75},
+        "posterize": {"levels": 6},
+        "edge_treatment": {"strength": 0.6, "low": 0.12, "high": 0.35},
+        "scanlines": {"strength": 0.45, "lines": 120},
+    }
+    assert set(exercised) | scaled | {"lut_look"} == set(EFFECT_CATALOGUE)
+    for effect_id, parameters in exercised.items():
+        stack = [effect(effect_id, **parameters)]
+        export = build_effect_stages(stack, width=1920, height=1080, shot_seconds=4.0)
+        preview = build_effect_stages(
+            stack, width=960, height=540, reference_width=1920, shot_seconds=4.0
+        )
+        assert export == preview, effect_id
+
+
+def test_the_look_record_is_the_same_effects_however_the_preview_composes_them():
+    """`exported_look` probes at a delivery larger than anything this application produces and
+    names no reference, so the scaling cannot reach it. Checked because the record drops an
+    effect that composes no stage, and a scaled block that falls to a single pixel does exactly
+    that — on the *preview's* chain, which is not what a job record describes."""
+    for effect_id, parameters, *_ in PIXEL_DENOMINATED:
+        stack = [effect(effect_id, **parameters)]
+        assert [entry.split(":", 1)[0] for entry in exported_look(stack)] == [effect_id]
+    # The one case where a scaled block really does compose nothing, and it stays out of the
+    # preview's chain rather than out of the record: a two-pixel block on a half-size grid is one
+    # pixel, and `pixelize=w=1:h=1` changes no pixel at all.
+    smallest = [effect("pixelate", size=2)]
+    assert build_effect_stages(smallest, width=1920, height=1080).treatment == (
+        "pixelize=w=2:h=2:mode=avg",
+    )
+    assert build_effect_stages(
+        smallest, width=960, height=540, reference_width=1920
+    ).treatment == ()
+    assert [entry.split(":", 1)[0] for entry in exported_look(smallest)] == ["pixelate"]
+
+
+def test_a_pixelated_frame_carries_the_same_blocks_across_at_both_delivery_sizes(tmp_path: Path):
+    """The finding's own measurement, run as a test: one stack, two geometries, blocks counted.
+
+    This is the check the epic did not have. The only test driving a chain through the preview's
+    half geometry used `slow_zoom`, every term of which is a ratio of `iw`/`ih` — structurally
+    unable to see a parameter denominated in pixels — so five effects shipped rendering at twice
+    their relative size in the Monitor with nothing able to notice.
+
+    Counted off the real picture rather than off the stage text, because the stage text was
+    byte-identical at both geometries and *that was the defect*. The frame count and the frame
+    size are asserted at both, because a treatment may not resize a frame and may not drop one:
+    the assembled video matches the song within one frame whatever the look is.
+    """
+    export = (640, 360)
+    preview = (320, 180)
+    # Every column a different luma, so a block quantiser leaves runs a count can find.
+    sources = {}
+    for width, height in (export, preview):
+        source = tmp_path / f"cells-{width}.mp4"
+        assert (
+            ffmpeg(
+                "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:d=1:r=24",
+                "-frames:v", "6", "-vf", "geq=lum=mod(X*3+Y*5\\,255):cb=128:cr=128",
+                "-pix_fmt", "yuv420p", str(source),
+            ).returncode
+            == 0
+        ), width
+        sources[(width, height)] = source
+
+    def block_width(clip: Path, width: int, height: int) -> int:
+        """How many pixels wide one block of the rendered picture is.
+
+        The commonest run of equal luma along a row, rather than a count of the runs or their
+        divisor. Neither of those survives the encode: two neighbouring blocks whose averages
+        land on the same code read as one run of two blocks (two of the forty do at 640 wide),
+        and x264 at draft CRF splits a few blocks into pieces at 320. The mode is unmoved by
+        both — 38 runs of 16 at 640, 36 of 8 at 320, measured 2026-08-26.
+        """
+        raw = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", clip.as_posix(), "-frames:v", "1",
+             "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+            capture_output=True, check=False,
+        ).stdout
+        row = np.frombuffer(raw, dtype=np.uint8).reshape(height, width)[height // 2]
+        edges = [0, *(1 + np.flatnonzero(row[1:] != row[:-1])).tolist(), width]
+        lengths = [right - left for left, right in itertools.pairwise(edges)]
+        return max(set(lengths), key=lengths.count)
+
+    counted = {}
+    for width, height in (export, preview):
+        built = build_effect_stages(
+            [effect("pixelate", size=16)],
+            width=width, height=height, reference_width=export[0], shot_seconds=4.0,
+        )
+        dest = tmp_path / f"pixelated-{width}.mp4"
+        assert (
+            subprocess.run(
+                trim_args(
+                    sources[(width, height)], dest, frames=6, width=width, height=height,
+                    geometry_stages=built.geometry, treatment_stages=built.treatment,
+                ),
+                capture_output=True, check=False,
+            ).returncode
+            == 0
+        ), width
+        assert frame_grid(dest) == (width, height, 6), width
+        counted[width] = block_width(dest, width, height)
+
+    # Sixteen pixels of the export's own frame, and eight of a frame half as wide — which is the
+    # same block either time: forty across. Before this the preview drew twenty, because sixteen
+    # pixels is twice as wide a share of a 320-wide frame.
+    assert counted[export[0]] == 16
+    assert counted[preview[0]] == 8
+    assert export[0] / counted[export[0]] == preview[0] / counted[preview[0]] == 40

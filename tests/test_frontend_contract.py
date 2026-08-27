@@ -22107,6 +22107,78 @@ def test_the_copy_route_refuses_whole_rather_than_half_applying(tmp_path: Path):
     assert client.get(f"/api/projects/{project_id}/shots/b/effects").json()["effects"] == []
 
 
+def test_the_copy_route_counts_the_stack_it_is_about_to_multiply(tmp_path: Path):
+    """The third write door, and the one it was missing from until 2026-08-26.
+
+    `SHOT_EFFECT_STACK_LIMIT` guards `replace_shot_effects` and `_adopt_shot_effects` -- three
+    guards over four routes, since `PUT /api/projects/{id}` and `PUT .../shots` both arrive at
+    the second -- and this route validated its source stack without ever counting it.
+    `validate_stack` answers "is every card composable", one card at a time, so 985 composable
+    cards are 985 valid answers.
+
+    Measured before the fix: from a hand-edited 985-card Shot this route answered **200** and
+    planted 985 cards on a clean Shot, N Shots at a time, while the identical stack through
+    `PUT .../effects` answered **422**. That is the oversized state -- a `-vf` past the 32,767
+    characters Windows allows a command line, reported as a missing ffmpeg -- made propagable by
+    the one route whose whole purpose is to propagate a stack.
+
+    The stack is planted through the store rather than through a route, because every route now
+    refuses it; a hand-edited manifest is exactly the state this cap exists for, and the one this
+    codebase explicitly designs for.
+    """
+    from music_video_producer.app import SHOT_EFFECT_STACK_LIMIT, SHOT_EFFECTS_TOO_MANY_REFUSAL
+    from music_video_producer.models import EffectSpec
+    from music_video_producer.store import ProjectStore
+
+    client = copy_client(tmp_path)
+    project_id = copy_fixture(client, locked_third=False)
+    store = ProjectStore(tmp_path)
+    path = f"/api/projects/{project_id}/shots/a/effects/copy"
+
+    def plant(count: int) -> list[dict]:
+        project = store.get(project_id)
+        for shot in project.shots:
+            shot.effects = (
+                [EffectSpec(effect="grain", parameters={"strength": 10}) for _ in range(count)]
+                if shot.id == "a"
+                else []
+            )
+        store.save(project)
+        return [{"effect": "grain", "parameters": {"strength": 10}} for _ in range(count)]
+
+    oversized = plant(985)
+    refused = client.post(path, json={"targets": ["b"]})
+
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["detail"] == SHOT_EFFECTS_TOO_MANY_REFUSAL.format(
+        limit=SHOT_EFFECT_STACK_LIMIT, count=985
+    )
+    # Nothing was written: the target still holds what it held, which is nothing.
+    assert store.get(project_id).shots[1].effects == []
+    # And the two doors now agree about one stack, which is the whole of the finding: the
+    # identical cards through the editing route are refused in the identical words.
+    through_the_write = client.put(
+        f"/api/projects/{project_id}/shots/b/effects", json={"effects": oversized}
+    )
+    assert through_the_write.status_code == 422, through_the_write.text
+    assert through_the_write.json()["detail"] == refused.json()["detail"]
+
+    # One over is refused and names its own count, so the sentence is about this stack.
+    plant(SHOT_EFFECT_STACK_LIMIT + 1)
+    just_over = client.post(path, json={"targets": ["b"]})
+    assert just_over.status_code == 422, just_over.text
+    assert just_over.json()["detail"] == SHOT_EFFECTS_TOO_MANY_REFUSAL.format(
+        limit=SHOT_EFFECT_STACK_LIMIT, count=SHOT_EFFECT_STACK_LIMIT + 1
+    )
+
+    # The limit is a limit and not one less than one: a stack of exactly this many copies.
+    plant(SHOT_EFFECT_STACK_LIMIT)
+    at_the_cap = client.post(path, json={"targets": ["b"]})
+    assert at_the_cap.status_code == 200, at_the_cap.text
+    assert at_the_cap.json()["effects"] == SHOT_EFFECT_STACK_LIMIT
+    assert len(store.get(project_id).shots[1].effects) == SHOT_EFFECT_STACK_LIMIT
+
+
 def test_a_copy_whose_every_target_is_locked_saves_nothing_at_all(tmp_path: Path):
     """Nothing was written, so the manifest is not touched -- `updated_at` is what every
     optimistic-concurrency check in this application reads, and a save for a write that did not
@@ -22227,6 +22299,48 @@ def test_the_reorder_and_copy_controls_draw_no_transition_colour_and_no_second_a
         assert banned not in rules, banned
 
 
+def test_the_two_keyboard_contracts_of_the_shot_inspector_are_executed():
+    """The pair of pure key decisions the Effects work produced, run rather than read.
+
+    **This is the test the inline version could not have.** Until 2026-08-26 the Alt+Arrow
+    direction was a ternary inside `bindEffectsPanel`'s `keydown` listener, in a closure created
+    per card inside a function that takes a rendered `inspector` element -- so the only way to ask
+    it what `ArrowUp` means was to build a DOM, draw a stack, focus a card and dispatch a
+    synthetic `KeyboardEvent`, and then read the *consequence* (a write of a reordered stack)
+    rather than the answer. Every key it does not answer to -- `ArrowLeft`, `Home`, a letter, an
+    event with no `key` at all -- was unassertable, because a handler that returns early returns
+    nothing to look at. Moved beside its sibling in `api.js` it is a function of one argument, and
+    the whole of its contract fits below.
+
+    `shotTabAfterKey` is here with it because it is the identical mapping on the other axis, made
+    in the same epic, and because until now nothing executed it either.
+    """
+    seen = run_module("""
+      import { effectNudgeDirection, shotTabAfterKey }
+        from './src/music_video_producer/web/assets/api.js';
+      const keys = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'Enter',
+                    ' ', 'a', 'arrowup', '', null, undefined];
+      console.log(JSON.stringify({
+        nudge: keys.map((key) => effectNudgeDirection(key)),
+        tab: keys.map((key) => shotTabAfterKey('info', key)),
+        wrapped: [shotTabAfterKey('info', 'ArrowLeft'), shotTabAfterKey('effects', 'ArrowRight')],
+      }));
+    """)
+
+    # Up is towards the top of the drawn stack, which is the direction `effectNudgeTarget` reads
+    # as "the previous card of this family". Down is the other one. Nothing else is a direction.
+    assert seen["nudge"] == [-1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    # Index 9 is `arrowup`: case matters, so a key reported in the wrong one moves nothing
+    # rather than being guessed at.
+    assert seen["nudge"][9] == 0
+    # The tab strip answers to the *horizontal* pair and to Home/End, and to nothing the card
+    # nudge answers to: one gesture per axis, and neither can be mistaken for the other.
+    assert seen["tab"] == ["", "", "effects", "effects", "info", "effects",
+                           "", "", "", "", "", "", ""]
+    # Wrapping, per the ARIA tabs pattern: from either end an arrow lands on the other tab.
+    assert seen["wrapped"] == ["effects", "info"]
+
+
 def test_the_effects_panel_does_not_re_decide_which_moves_are_legal():
     """Source-level companion to the executed tests above: `app.js` applies the decision.
 
@@ -22239,12 +22353,18 @@ def test_the_effects_panel_does_not_re_decide_which_moves_are_legal():
     candidates = app_js_block("function effectDragCandidates(inspector, model, stack, from) {")
     body = without_comments(binder) + without_comments(drag) + without_comments(candidates)
 
+    assert "effectNudgeDirection(event.key)" in body
     assert "effectNudgeTarget(stack(), effectCatalogue, card.index, direction)" in body
     assert "effectMoveOffered(stack, effectCatalogue, from, card.index)" in body
     assert "effectDropTarget(effectDrag.candidates, moved.clientY)" in body
     assert "card.handle.draggable" in body
-    # No second opinion about families, ranks or which card may move, in any spelling.
-    for redecided in ("family", "FAMILY", "rank", "shot.locked", "familySize"):
+    # No second opinion about families, ranks, which card may move or which key moves it, in any
+    # spelling. `ArrowUp`/`ArrowDown` joined this list on 2026-08-26: the direction was decided by
+    # a ternary here while the *same epic* put the identical mapping for the tab strip in `api.js`
+    # as `shotTabAfterKey`, so one keyboard contract was executable and its twin was not.
+    for redecided in (
+        "family", "FAMILY", "rank", "shot.locked", "familySize", "ArrowUp", "ArrowDown",
+    ):
         assert redecided not in body, redecided
 
 

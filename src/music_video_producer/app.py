@@ -2319,11 +2319,15 @@ def _adopt_shot_effects(
         # It answers "is every card composable", one card at a time, and a thousand composable
         # cards are a thousand valid answers -- so the cap that `replace_shot_effects` applies
         # before it calls the validator has to be applied before this call too. Without it this
-        # branch was the wider of two doors past `SHOT_EFFECT_STACK_LIMIT`: measured at 985 cards
-        # on an invented shot id it builds a 34,686-character `-vf`, past the 32,767 Windows
+        # branch was the widest of the **three** doors past `SHOT_EFFECT_STACK_LIMIT` -- this one,
+        # `replace_shot_effects` and `copy_shot_effects`, which is three guards over four routes
+        # because `PUT /api/projects/{id}` and `PUT .../shots` both arrive here. Measured at 985
+        # cards on an invented shot id it builds a 34,686-character `-vf`, past the 32,767 Windows
         # allows a command line, and the export then reports a working ffmpeg as missing. The
         # editing route was capped in the same session this branch was widened to keep a Split's
-        # look, and the cap did not come with it.
+        # look, and the cap did not come with it; the copy route went four more days uncapped,
+        # which is P4 of Epic 9's retrospective happening while the sentence describing it was
+        # being written.
         if len(stack) > SHOT_EFFECT_STACK_LIMIT:
             raise HTTPException(
                 status_code=422,
@@ -7775,10 +7779,19 @@ def _compose_effect_chains(
 def _oversized_stack_refusals(subject: ExportSubject) -> list[str]:
     """Every Shot carrying more effects than one command line can hold, named by its label.
 
-    The cap is enforced on both write doors — `replace_shot_effects` before it validates, and
-    `_adopt_shot_effects` before it validates a stack arriving on a Shot the store does not hold.
+    The cap is enforced at all **three** write doors, each before it validates:
+    `replace_shot_effects`, `_adopt_shot_effects` on a stack arriving on a Shot the store does not
+    hold, and `copy_shot_effects` on the source stack it is about to multiply. That is three
+    guards over four routes — `_adopt_shot_effects` is what `PUT /api/projects/{id}` and
+    `PUT .../shots` both go through — and the third of them was missing until 2026-08-26, which is
+    how a hand-edited 985-card Shot could answer 200 through `POST .../effects/copy` and 422
+    through `PUT .../effects` on the identical stack. This docstring said "both write doors… so no
+    client reaches this" for the whole of that window, which is worse than the hole: a false
+    invariant is one the next reader builds on.
+
     So no client reaches this. A **manifest edited by hand** does, and so does one written before
-    either cap existed, and the failure it produces is the least useful in the application: the
+    any of the caps existed, and the failure it produces is the least useful in the application:
+    the
     chain becomes one `-vf` argument, Windows refuses a command line past 32,767 characters, and
     the `FileNotFoundError` that comes back used to be reported as a missing ffmpeg. Measured
     2026-08-25: 985 grain cards build 32,725 characters and export, 1,200 build 40,060 and do not.
@@ -7788,9 +7801,9 @@ def _oversized_stack_refusals(subject: ExportSubject) -> list[str]:
     Director with two oversized Shots is told about both at once.
 
     The bound is the same constant the write routes use. A cap that lived at two of three doors
-    would be the shape this project has now counted twelve times. Said once per Shot, like its
-    sibling: a Shot with a later one nested inside it resolves into two clips carrying one id,
-    and an oversized stack is oversized once.
+    would be the shape this project has now counted twelve times — and it did, for four days, at
+    the copy route. Said once per Shot, like its sibling: a Shot with a later one nested inside it
+    resolves into two clips carrying one id, and an oversized stack is oversized once.
     """
     refusals: list[str] = []
     seen: set[str] = set()
@@ -13001,8 +13014,12 @@ def create_app(
           what resolves, mention the rest — is the half-applied write this route exists against.
         - The source among its own targets is refused, because it is a miscounted target set and
           the same miscount silently drops real targets.
-        - The source's own stack is validated **once**, before a byte reaches any target, so a
-          manifest hand-edited into something uncomposable cannot be multiplied across the plan.
+        - The source's own stack is **counted** against `SHOT_EFFECT_STACK_LIMIT` and then
+          validated, **once**, before a byte reaches any target — so a manifest hand-edited into
+          something uncomposable, or into something no command line can hold, cannot be
+          multiplied across the plan. The count comes first for the reason the other two doors
+          put it first: `validate_stack` asks whether each card composes and never how many there
+          are, so a thousand valid cards are a thousand valid answers.
 
         Only then is anything written, and `store.save` is the last statement — so every refusal
         above leaves the manifest untouched, which is what "nothing was written" has to mean at a
@@ -13056,6 +13073,23 @@ def create_app(
                 ),
             )
         stack = [spec.model_dump() for spec in source.effects]
+        # Capped before it is validated, which is `replace_shot_effects`' order and
+        # `_adopt_shot_effects`' order, for `validate_stack`'s reason: it answers "is every card
+        # composable" one card at a time, and 985 composable cards are 985 valid answers. This
+        # route was the **third** door and the only uncapped one, and it is the worst place for
+        # the hole to be: measured 2026-08-26, a hand-edited 985-card Shot copied 200 and planted
+        # 985 cards on a clean Shot, N Shots at a time, where the identical stack through
+        # `PUT .../effects` answered 422. The source stack was validated and never counted.
+        #
+        # The source's own count, not the target's: a copy replaces, so what lands on every
+        # target is exactly this list and there is nothing else to add it to.
+        if len(stack) > SHOT_EFFECT_STACK_LIMIT:
+            raise HTTPException(
+                status_code=422,
+                detail=SHOT_EFFECTS_TOO_MANY_REFUSAL.format(
+                    limit=SHOT_EFFECT_STACK_LIMIT, count=len(stack)
+                ),
+            )
         try:
             # Once, for the whole copy. The looks are resolved only for a stack that names one,
             # which is `replace_shot_effects`' rule: an empty stack cannot name a LUT, and
@@ -13358,11 +13392,22 @@ def create_app(
         # grid a treatment is composed for — `chroma_split` stores a fraction and turns it into
         # pixels there — so composing against the export's size and rendering at half of it would
         # show a split twice as wide, relative to the frame, as the export will ship.
+        #
+        # And `reference_width` is the export's, which is the other half of the same sentence.
+        # Five parameters in the catalogue are a *count of pixels* rather than a fraction, so the
+        # geometry above is not enough on its own: measured 2026-08-26 through the real chain,
+        # `pixelate size=32` laid 60 blocks across the frame at 1920 and 30 at 960, and
+        # `soft_focus sigma=8` spread an edge over 1.458 % of the frame at 1920 and 2.917 % at
+        # 960. Naming the grid those numbers were written for is what lets the five scale to this
+        # one. The export passes nothing, keeps a scale of exactly 1, and its argv does not move —
+        # a stored `size: 32` still means 32 pixels at delivery, which is the one thing this
+        # correction may not change. See `effects.StageContext.reference_width`.
         try:
             stages = build_effect_stages(
                 stack,
                 width=width,
                 height=height,
+                reference_width=delivery[0],
                 luts=looks,
                 # A preview is the whole Shot, from its own first frame: it is never one half of
                 # a resolved overlap, so its offset inside its Shot is zero and the span a ramp
@@ -13402,6 +13447,11 @@ def create_app(
             ),
             width=width,
             height=height,
+            # The same grid the chain above was composed against, for the same reason: the name
+            # is taken over the composed chain, and a chain composed with a different reference
+            # is a different chain. Passing one here and not there would name the clip after a
+            # picture this route did not render.
+            reference_width=delivery[0],
         )
         previews_root = store.media_dir(project_id) / "previews"
         relative = f"previews/{fingerprint}.mp4"

@@ -95,8 +95,36 @@ Binding, read-only. Not re-derived here.
 - **Rule:** `effects.py` exposes one pure function that takes a Shot's Effect Stack and the export geometry and returns the ordered filter-stage list `assembly.trim_args` splices in. Family order is fixed and not the Director's to reorder:
 
   ```
-  trim → GEOMETRY → scale → TEXTURE → GRADE → STYLIZE → pad → fps → setsar → format
+  trim → [BRANCH_FRAME_GUARD] → GEOMETRY → scale → TEXTURE → GRADE → STYLIZE → pad → fps → setsar → format
   ```
+
+  > **Amended 2026-08-26 — the enumeration above predated story 9.7 and omitted a shipped stage.**
+  > It used to read `trim → GEOMETRY → scale → …`. `BRANCH_FRAME_GUARD` (`effects.py`, the literal
+  > `tpad=stop=1:stop_mode=clone`) is **prepended to the geometry group by `build_effect_stages`
+  > whenever any composed stage is a filtergraph rather than a filter** — that is, whenever
+  > anything in the stack branches — and is absent from every linear chain. It is written in
+  > brackets because it is conditional, not optional: no Director chooses it and no effect owns it.
+  >
+  > **Why it exists, measured 2026-08-26 against this project's ffmpeg 7.0.** Any framesync filter
+  > — `blend`, `overlay`, every two-input filter there is — reports end-of-file at the *last
+  > frame's* presentation timestamp rather than one frame's duration past it, so the `fps` stage
+  > that closes every chain emits one frame fewer than it was handed: **48 frames in, 47 out**,
+  > with `1 frames dropped` in ffmpeg's own accounting, at every branch count from one to four.
+  > The loss is a property of the graph's end, not of how many branches are in it, which is why
+  > one guard covers a chain with four. It cannot be repaired downstream either: with
+  > `setpts=PTS-STARTPTS` upstream — which every clip at a non-zero offset gets — frame durations
+  > are zeroed, so a frame cloned *after* the branch inherits the previous timestamp and `fps`
+  > discards it as a duplicate. The guard therefore sits at the head of the whole chain, the last
+  > point at which a frame still carries the duration the decoder gave it. **It is a count fix and
+  > not a picture change:** a branch composed at its identity values, guard and all, is
+  > bit-identical to the same chain with no effects at all — 20 of 20 frames at `inf` PSNR — and
+  > `trim_args` always closes with `-frames:v`, which caps the count from above.
+  >
+  > **The predicate is load-bearing and was itself corrected.** `EffectStages.branched` scans for a
+  > *bare* semicolon under ffmpeg's own quoting grammar, not for a semicolon anywhere: a look
+  > dropped in the folder as `warm;cool.cube` composes `lut3d=file='C\:/looks/warm;cool.cube'…`,
+  > which was giving a linear chain the guard. Measured: a 12-frame source asked for 24 renders 12
+  > frames without the guard and **13** with it.
 
   Within a family, order is the Director's. **Geometry precedes `scale`** so a punch-in samples the take's own pixels. **Every treatment precedes `pad`**, so the letterbox bars stay clean: measured 2026-08-21 on a 4:3 source into a 16:9 target, texture after `pad` leaves the bar at RGB `(1,1,5)` and before `pad` at `(0,0,0)`. This closes the PRD's open question 1 and confirms its FX-9 assumption. The frontend never composes a filter string; it sends specs.
 
@@ -140,13 +168,28 @@ Binding, read-only. Not re-derived here.
 
 - **Binds:** FX-20, FX-NFR-5, NFR-1 (inherited)
 - **Prevents:** a dragged slider spawning a render per pixel, and a late render playing over a newer one
-- **Rule:** At most one preview render is in flight per project. A new request cancels the in-flight one; a render whose fingerprint no longer matches the current state is discarded rather than played. Preview never enters the `RenderJob` queue, never touches ComfyUI, and never blocks an export or a Batch — it is local ffmpeg work like assembly, under the same busy discipline the assemble route already applies.
+- **Rule:** At most one preview render is in flight per project. A new request cancels the in-flight one; a render whose fingerprint no longer matches the current state is discarded rather than played. Preview never enters the `RenderJob` queue, never touches ComfyUI, and **never blocks an export or a Batch** — it is local ffmpeg work like assembly, but it is *not* held by assembly's busy discipline.
 
-### AD-25 — Two new modules, both pure, both pinned
+> **Amended 2026-08-26 — this Rule contradicted itself, and the code shipped one half.**
+> The sentence used to end *"never blocks an export or a Batch — it is local ffmpeg work like assembly, under the same busy discipline the assemble route already applies"*. Those two clauses cannot both hold: the assemble route's busy discipline is exactly what would make a preview wait on an export. The second clause is struck. `render_shot_preview` (`app.py`) takes **no busy check, no job record, no entry in `live_assemblies`, and nothing on ComfyUI** — stated in the route's own docstring under *"This route neither blocks an export nor waits on one"*. The reason is the measured cost: a preview is a transcode of a file that already exists, 78.7 ms median and 2.0 ms on a cache hit (`23a00c8`), so a Director rationed by a queue would be paying a render's price for a transcode's work. Concurrency is bounded instead by AD-24's own supersede rule — at most one in flight per project — not by a shared gate.
+
+### AD-25 — Two new modules, both leaf modules, both pinned
 
 - **Binds:** all of FX-1..FX-25
 - **Prevents:** effect and analysis logic accreting into `app.py` where it cannot be tested by comparison
-- **Rule:** `audio.py` — envelope extraction; its only I/O is an ffmpeg decode to `s16le` on **stdout** (this sentence said stdin and was wrong); **amended 2026-08-24 by Director ruling R-8** — `numpy` is a declared dependency. The evidence that made it acceptable: `git show cab8038 -- uv.lock` adds no new `[[package]]` block, because numpy was already locked transitively through `faster-whisper`. Nothing new installs; a declaration made an existing fact honest. FX-NFR-4's literal reading no longer holds. `effects.py` — filter-stage construction, `sendcmd` generation, and transition-segment argv; entirely pure. Both follow the standing naming convention (one lowercase noun) and neither imports `app.py`, `batch.py`, or `assembly.py`. Routes stay thin delegators.
+- **Rule:** `audio.py` — envelope extraction; its only I/O is an ffmpeg decode to `s16le` on **stdout** (this sentence said stdin and was wrong); **amended 2026-08-24 by Director ruling R-8** — `numpy` is a declared dependency. The evidence that made it acceptable: `git show cab8038 -- uv.lock` adds no new `[[package]]` block, because numpy was already locked transitively through `faster-whisper`. Nothing new installs; a declaration made an existing fact honest. FX-NFR-4's literal reading no longer holds. `effects.py` — filter-stage construction, `sendcmd` generation, and transition-segment argv. Both follow the standing naming convention (one lowercase noun) and neither imports `app.py`, `batch.py`, or `assembly.py`. Routes stay thin delegators.
+
+> **Amended 2026-08-26 — "entirely pure" was never true of `effects.py`, and the code is the half that is right.** This sentence used to end *"; entirely pure"*. Counted 2026-08-26, the module holds **eleven filesystem call sites across five functions** — the retrospective that found this said six, and the count matters less than the shape, which is that every one of them is in one of the two jobs a filter string cannot do for itself: reading the bytes a fingerprint is *of*, and finding the LUT files a grade names.
+>
+> | Site | Function | Why it is there |
+> |---|---|---|
+> | `source.open("rb")` | `song_fingerprint` | Content, never mtime — the digest *is* a read of the file |
+> | `mkdir`, `exists`, `write_text`, `replace`, `unlink` | `write_default_luts` | Generates the starter pack into an empty folder, via a `os.getpid()`-named `.partial` and a rename |
+> | `path.open("rb")` | `_looks_like_a_cube` | A truncated cube carries a valid header, so only counting data lines can reject one |
+> | `exists`, `iterdir`, `is_file` | `discover_luts` | The folder *is* the catalogue |
+> | `entry.path.is_file()` | `build_effect_stages` | Refuse a deleted look by name, with nothing half-built behind it |
+>
+> The I/O is well isolated and has to live somewhere; what was wrong was the claim, not the placement. **The guarantee this AD actually makes, and the one to hold the module to:** every function that produces *text* — a filter stage, a chain, a `sendcmd` script, an argv — is a pure function of its arguments, deterministic, and asserted in the tests by string comparison. Disk is read to answer *does this input exist and what is in it*, never to decide what the text says. The one place the two meet is `build_effect_stages`, which resolves every LUT file **before** it composes anything, so the read is a precondition and not a step in the composition. The stronger property that did survive verification is the import rule: `effects.py` imports the standard library and nothing else from this package — no `models`, no `assembly` — so the chain builder still knows nothing about a clip, a Shot or a manifest.
 
 ### AD-26 — The spectrum strip draws a whole-song average, stored once
 
@@ -176,7 +219,9 @@ Binding, read-only. Not re-derived here.
 
 - **Binds:** FX-20, FX-NFR-3
 - **Prevents:** a preview that letterboxes differently from the export, so a grade is judged on a frame the export will not produce
-- **Rule:** Preview geometry is **half the dimensions `assembly_plan` would choose for this project** — the largest-area approved take — not half the previewed take's own dimensions. A Shot whose aspect differs from the export target therefore previews *with* its letterbox padding, exactly as it will be delivered. The export geometry is computed by the same function for both paths. When no export geometry is derivable (no approved takes yet), preview falls back to the take's own dimensions and **says so** rather than silently choosing a different frame.
+- **Rule:** Preview geometry is **half the dimensions `assembly_plan` would choose for this project** — the largest-area approved take — not half the previewed take's own dimensions. A Shot whose aspect differs from the export target therefore previews *with* its letterbox padding, exactly as it will be delivered. The export geometry is computed by the same function for both paths. When no export geometry is derivable, preview **refuses by name** rather than silently choosing a different frame.
+
+> **Amended 2026-08-26 — the fallback this Rule specified was argued down during the build and the argument never reached here.** The sentence read *"When no export geometry is derivable (no approved takes yet), preview falls back to the take's own dimensions and **says so**"*. The parenthetical is the flaw: **the case it names cannot occur.** The previewed Shot's own take is approved, so whenever it is readable it is in the plan and the export geometry is derivable — there is no "no approved takes yet" state in which something is nonetheless being previewed. The only reachable path is a take nothing can measure, and rendering that at a guessed size fails in ffmpeg a moment later with a worse sentence. `app.py` therefore answers 422 with `PREVIEW_NO_GEOMETRY_REFUSAL`, naming the Shot and the measurement that failed, and the reasoning was recorded in that constant's own comment. **The property this Rule exists to protect is unchanged and is better served:** nothing silently chooses a different frame. A refusal that names the measurement is the honest form of "it fell back and said so".
 
 ### AD-30 — The outgoing Shot owns a paired transition
 

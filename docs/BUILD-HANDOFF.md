@@ -84,9 +84,32 @@ On this machine, 1056×608 source, 24 fps, nine-stage filter chain:
 - **`sendcmd=f=` breaks on an absolute Windows path.** The drive-letter colon parses as a filter option separator and fails with `No option name near 'frame'` — naming a filter that is not the problem. Run ffmpeg with cwd set to the script's directory and pass a bare relative filename.
 - **Listing the looks folder reads every `.cube` to its end, and that is not free.** A truncated LUT carries its `LUT_3D_SIZE` header on line 1, so no header or size heuristic can tell a half-copied 33-cube from a whole one — only counting the data lines against `N³` can, and that means reading the file. Measured 2026-08-25 on the 48-file, 44.2 MB pack: **221 ms cold, 23 ms warm** (a header-only sniff was ~1 ms). The cost buys a refusal by name instead of `Error initializing filters` at export. **Do not call `discover_luts` per request** — read it once and hold it, or the folder is re-read on every keystroke that opens a picker.
 
+### Effects, measured during Epic 9
+
+Both figures below existed only in commit messages until 2026-08-26 and could not be found by a
+`grep` over the planning artifacts. That is Epic 8's retro item R1 recurring: **a number measured
+and then left in a commit subject is a number nobody will find.**
+
+- **A preview is 78.7 ms, not a second.** Median from the change that invalidates a preview to a
+  playable clip, against FX-NFR-6's one-second budget — **2.0 ms on a cache hit**, and the join
+  that lets a duplicate request wait on the render already in flight costs **0.74 µs** on the
+  ordinary path. Measured in `23a00c8`. **Take dimensions must stay memoised:** AD-29 makes preview
+  geometry a fact about the whole project, and without the memo every preview on a twenty-shot
+  project paid **538 ms** re-probing takes. This is the number that justifies the preview route
+  taking no busy check — see AD-24.
+- **Effects cost the export nothing measurable.** Wall-clock for a no-effects export, the effects
+  build against a `git worktree` at the previous commit with its own `PYTHONPATH`, arms alternated
+  and pooled: **median 0.2556 s against 0.2545 s — +1.1 ms, +0.4 %**, p25 identical to four decimal
+  places, **n=160 per arm**. Measured in `0996128`. **Pooling was necessary rather than tidy:**
+  single 25-run rounds gave the *same* arm medians of 0.343 s and 0.266 s, so a short round on this
+  machine can manufacture a 30 % "regression" out of nothing. Alternate arms and pool before
+  believing an export timing here.
+
 ### Manifest sizing
 
-`project.json` is **110–190 KB** today and rides a **2-second poll**. A 3-minute Song Envelope at 30 Hz with 8 bands is **~750 KB** — four to seven times the whole manifest. It is a sidecar file (AD-20), never a manifest field. Apply the same test to anything else large.
+`project.json` is **110–190 KB** today and rides a **2-second poll**. A 3-minute Song Envelope at 30 Hz with 8 bands is **405 KB**, measured through the shipped extractor — two to four times the whole manifest, and 469 KB on a real 202-second master. It is a sidecar file (AD-20), never a manifest field. Apply the same test to anything else large.
+
+*Corrected 2026-08-26.* This line said **~750 KB**, "four to seven times the whole manifest". **Two earlier figures were wrong in opposite directions and neither should be requoted as live:** ~750 KB was AD-20's original estimate, and 1.13 MB came from a synthetic probe that filled more arrays with random floats than a real envelope carries. **405 KB is the measured one** (2026-08-24, ruling R-8). The sidecar conclusion is unchanged by the correction — the ratio moved, the decision did not. Since 2026-08-24 the browser is served only the part it reads (`beats`, `onsets`, `band_average`, `band_edges`); the per-frame series, 98 % of the file, never leaves disk. Epic 8's action item 18 said to correct this figure *everywhere* and reached `docs/project-context.md`, `docs/ROADMAP.md` and the effects `ARCHITECTURE-SPINE.md` — this file, the one a new session opens first, is the instance it missed.
 
 ---
 

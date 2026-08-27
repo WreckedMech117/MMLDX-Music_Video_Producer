@@ -270,9 +270,11 @@ So that a Shot stops looking like whatever the model happened to produce.
 **Given** the Grade family
 **When** its catalogue is offered
 **Then** it provides at minimum a LUT look, exposure, contrast, saturation, colour temperature, tint, lift/gamma/gain in some exposed form, and monochrome (FX-8)
-**And** every parameter is bounded and every default is a visual no-op
+**And** every parameter is bounded, and every default is a visual no-op **except `mirror`'s axis and `monochrome`'s amount** *(amended 2026-08-26)*
 **And** the same parameters on the same source produce the same output frame on every run
 **And** a LUT is referenced by catalogue id, never by a client-supplied path (AD-27).
+
+> **Amendment — the two-default carve-out, 2026-08-26.** This criterion read *"every parameter is bounded and every default is a visual no-op"* without qualification, and the code diverges from it deliberately at exactly two points. `mirror`'s `axis` defaults to `"horizontal"` and `monochrome`'s `amount` defaults to `1.0` — both visible changes the moment the card is added. The reason, recorded at the time in `spec-9-b-the-effects-chain.md` and never carried back into this epic until now: **both are effects whose *presence* is the request.** A mirror that mirrors nothing and a monochrome that is not monochrome are not states anybody adds a card to reach, so a strict no-op default would mean every Director's first action after adding either card is to undo the default. Verified 2026-08-26 against `EFFECT_CATALOGUE`: these are the only two, and every other parameter in all twenty-five effects defaults to a value that changes no pixel. The general rule stands and this is its enumerated exception — a *third* non-no-op default would be a defect, not a precedent.
 
 **Given** an `EffectSpec` arriving from the client
 **When** it is validated
@@ -308,7 +310,9 @@ So that I can judge a grade against the song instead of against my imagination.
 **Given** preview geometry must be chosen
 **When** a Preview Clip is rendered
 **Then** it is half the dimensions `assembly_plan` would choose for this project — the largest-area approved take — never half the previewed take's own dimensions, so a Shot whose aspect differs previews with the letterbox it will ship with (AD-29)
-**And** where no export geometry is derivable, preview falls back to the take's own dimensions and says so.
+**And** where no export geometry is derivable, preview **refuses by name** rather than falling back to the take's own dimensions *(amended 2026-08-26)*.
+
+> **Amendment — the fallback was specified, argued down in code, and never written back, 2026-08-26.** This criterion read *"preview falls back to the take's own dimensions and says so"*, restating AD-29. `render_shot_preview` raises a 422 carrying `PREVIEW_NO_GEOMETRY_REFUSAL` instead, and the argument was made in that constant's own comment rather than here: **the branch the fallback was written for is unreachable by any readable take.** The previewed Shot's take is itself approved, so whenever it can be measured it is in the plan and the export geometry *is* derivable. The only way to reach this branch is a take nothing can measure — and rendering that at a guessed size fails in ffmpeg a moment later with a worse sentence. So the refusal is the honest form of "it fell back and said so": it names the Shot, names the measurement that failed, and tells the Director to check the take plays. Nothing silently chooses a different frame, which is the property AD-29's clause existed to protect.
 
 **Given** the Effect Stack changes
 **When** the preview becomes out of date
@@ -341,9 +345,16 @@ So that I can hide the plastic sheen of generated footage and put motion where t
 > (Texture), and **edge treatment**, **scanline/CRT** and **pixel shuffle/sort** (Stylize). Each
 > needs either a *branched* filtergraph (`split`/`blend`) or the clip's own **duration**, and the
 > chain is a single comma-joined linear graph spliced into an argv that carries neither. They move
-> to **Story 9.7**, which is the change to what `trim_args` is handed; this story keeps the fifteen
-> a linear chain composes, all of which shipped in slice B. **9.3 is complete except for those
-> five, and they are blocked on 9.7 rather than on any work here.**
+> to **Story 9.7**, which is the change to what `trim_args` is handed; this story keeps the
+> **twenty** a linear chain composes, all of which shipped in slice B. **9.3 is complete except
+> for those five, and they are blocked on 9.7 rather than on any work here.**
+>
+> *Count corrected 2026-08-26.* This paragraph said "the fifteen", which was an arithmetic
+> error made while writing the split, not a change of scope. Counted in the shipped code:
+> `EFFECT_CATALOGUE` in `effects.py` declares **25** `EffectDefinition`s, five of them the ones
+> named above, so **20** remained with 9.3 — and 20 + 5 = 25 is the whole catalogue, which is
+> the check the wrong figure failed. `spec-9-b-the-effects-chain.md` recorded the right number
+> at the time (*"Twenty effects across all four families ship here"*); only the epic was wrong.
 
 **Acceptance Criteria:**
 
@@ -367,9 +378,11 @@ So that I can hide the plastic sheen of generated footage and put motion where t
 
 **Given** the chain builder composing any combination of families
 **When** the filter chain is produced
-**Then** the stage order is exactly `trim, GEOMETRY, scale, TEXTURE, GRADE, STYLIZE, pad, fps, setsar, format` (AD-17)
+**Then** the stage order is exactly `trim, [BRANCH_FRAME_GUARD,] GEOMETRY, scale, TEXTURE, GRADE, STYLIZE, pad, fps, setsar, format` (AD-17) *(amended 2026-08-26)*
 **And** a test asserts geometry precedes `scale`, so a punch-in samples the take's own pixels
 **And** a test asserts every treatment precedes `pad`, by sampling the letterbox bar of a padded export and requiring it to be pure black — measured 2026-08-21, texture after `pad` leaves it at RGB (1,1,5) and before `pad` at (0,0,0) (FX-9, AD-17).
+
+> **Amendment — one shipped stage was missing from the enumeration, 2026-08-26.** This line read `trim, GEOMETRY, scale, …`, written before story 9.7 existed. `build_effect_stages` prepends `BRANCH_FRAME_GUARD` (`tpad=stop=1:stop_mode=clone`) to the geometry group whenever any composed stage is a filtergraph rather than a filter — i.e. whenever anything in the stack branches — and omits it from every linear chain, hence the brackets. It is a **frame-count** correction and not a picture change: a framesync filter reports EOF at the last frame's timestamp, so the closing `fps` emits one frame fewer (48 in, 47 out, at every branch count from one to four), and the guard buys that frame back at the head of the chain where durations are still the decoder's. AD-17's own enumeration in `ARCHITECTURE-SPINE.md` was corrected the same day, with the measurements.
 
 **Given** any effect chain
 **When** it is built

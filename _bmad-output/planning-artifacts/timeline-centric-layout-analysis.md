@@ -6,6 +6,8 @@
 
 Sources read in full: `src/music_video_producer/web/index.html`, `src/music_video_producer/web/assets/app.js` (1,783 lines), `assets/api.js` (selected), `assets/state.js`, `assets/styles.css` (397 lines); `docs/ROADMAP.md`, `docs/OPERATIONS.md`, `docs/ARCHITECTURE.md`; `_bmad-output/planning-artifacts/epics.md`, `shot-modes-and-pre-generation-planning.md`, `ux-designs/ux-mvp-2026-08-16/{DESIGN,EXPERIENCE}.md`, `architecture/.../ARCHITECTURE-SPINE.md`, `_bmad-output/implementation-artifacts/sprint-status.yaml`.
 
+> **Stale claim flagged 2026-08-26, body left as the snapshot it is.** This document is a dated reading of the tree on 2026-08-18 and is deliberately not rewritten — but one of its readings has since become false and would mislead anyone who quoted it forward. Every statement below that **no song analyser exists** is wrong today: `Project.sections` landed 2026-08-19, `POST .../song/align-lyrics` times a lyric sheet's `[Tag]` blocks against a Whisper transcription and fills the Sections row, Epic 8's `audio.py` measures beats, onsets and BPM into a sidecar, and `b8dc162` draws the BPM on the Song page. The current statement is in `docs/ROADMAP.md` under "Beat/BPM analysis", which carries the clause-by-clause correction table.
+
 One path correction up front: the frontend is **not** `web/app.js` / `web/styles.css` — everything lives under `src/music_video_producer/web/assets/` (`app.js`, `api.js`, `state.js`, `styles.css`), with only `index.html` at `web/`. Every selector cited below is from those files as they exist today.
 
 ---

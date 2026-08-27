@@ -7106,6 +7106,22 @@ export function effectStackMove(stack, catalogue, from, to) {
   return { moved: true, index: slots[destination], stack: next };
 }
 
+// Which way `Alt+Up` or `Alt+Down` moves a card: `-1` up, `1` down, `0` for a key this gesture
+// does not answer to. Pure, so the keyboard contract is executed rather than inferred from the
+// shape of a handler -- the same reason `shotTabAfterKey` is a function and not a ternary inside
+// the tab strip's listener, and the same two lines of arithmetic.
+//
+// It lived in `app.js` until 2026-08-26, inside the `keydown` listener, where nothing could call
+// it: a decision reachable only by dispatching a synthetic event at a rendered card is a decision
+// no test can put a key into and read an answer out of. `api.js` owns pure decisions and `app.js`
+// draws and writes, and an inline ternary is that rule broken quietly rather than loudly.
+//
+// `0` for every other key, including `undefined`, because a handler must be able to hand this
+// whatever the browser gave it and get "not mine" back rather than a direction it invented.
+export function effectNudgeDirection(key) {
+  return key === "ArrowUp" ? -1 : key === "ArrowDown" ? 1 : 0;
+}
+
 // Which card `Alt+Up` or `Alt+Down` moves onto, or `-1` for a press this stack does not answer to.
 //
 // The neighbour is taken from the **drawn** order, so a key moves a card to where the Director can

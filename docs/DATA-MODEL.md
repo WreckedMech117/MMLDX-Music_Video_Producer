@@ -27,7 +27,14 @@ The recoverable source of truth is `data/projects/<project-id>/project.json`.
 
 Imported and generated songs have equal project status.
 
-`lyrics` and `caption` are stored exactly as supplied apart from leading and trailing whitespace: interior blank lines, indentation and section tags are the structure of a lyric sheet and are kept byte for byte. **Nothing parses, sections or interprets them.** A section tag in a supplied sheet looks like timing information and is not — it carries no timestamps — so no verse boundary, no BPM and no `song_section` is derived from it. That remains the song-analysis work that does not exist yet (`docs/ROADMAP.md`).
+`lyrics` and `caption` are stored exactly as supplied apart from leading and trailing whitespace: interior blank lines, indentation and section tags are the structure of a lyric sheet and are kept byte for byte. **Nothing parses, sections or interprets them *on the way in*.** A section tag in a supplied sheet carries no timestamps, so storing the sheet derives no verse boundary and no `song_section` from it: `lyrics` is text and stays text.
+
+**Corrected 2026-08-26.** This paragraph used to end *"no verse boundary, no BPM and no `song_section` is derived from it. That remains the song-analysis work that does not exist yet"*, and the second sentence is false. The sheet is never parsed at rest, but two routes read it on demand and one of them is what makes the tags useful:
+
+- `POST /api/projects/{id}/song/align-lyrics` transcribes the master with Whisper, times each `[Tag]` block against the words it heard, and writes `Song.lyric_words`, `Song.vocal_spans` and `Project.sections`. The tags do gain timestamps — measured against the audio, never inferred from the text.
+- `POST .../director/populate` (two-stage) asks the Director model for structure before shots, and writes `Project.sections` from the answer.
+
+BPM is separate again and also exists: `audio.py` estimates it into the `SongAnalysis` sidecar record. `timeline.song_section` reads `Project.sections` and returns the section holding a Shot's midpoint, or `None`. **The distinction this paragraph should be read for is unchanged and is the important one:** storage is byte-for-byte what was supplied, and every derived structure lives in its own field, written by its own route, so nothing about a lyric sheet is silently reinterpreted.
 
 The context edit route touches those two fields and nothing else: `path`, `duration`, `source` and `prompt_id` are not on its request model at all, so an edit can never move a project's timing spine or rewrite its provenance.
 

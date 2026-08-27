@@ -9,6 +9,8 @@ Everything below is graded against that sentence. Section 2 walks what exists; s
 
 ---
 
+> **Stale claim flagged 2026-08-26, body left as the snapshot it is.** This document is a dated reading of the tree on 2026-08-18 and is deliberately not rewritten — but one of its readings has since become false and would mislead anyone who quoted it forward. Every statement below that **no song analyser exists** is wrong today: `Project.sections` landed 2026-08-19, `POST .../song/align-lyrics` times a lyric sheet's `[Tag]` blocks against a Whisper transcription and fills the Sections row, Epic 8's `audio.py` measures beats, onsets and BPM into a sidecar, and `b8dc162` draws the BPM on the Song page. The current statement is in `docs/ROADMAP.md` under "Beat/BPM analysis", which carries the clause-by-clause correction table.
+
 ## 1. The short answer
 
 **The generation side of the milestone is nearly whole; the finishing side is nearly absent.** From an empty project, the shipped routes can today produce a 60 s generated track, Flux characters/settings/props, promoted reference sheets (characters *and* objects), a Director-planned 15-shot timeline, two-pass prompts in H3's documented format, and per-shot lip-synced renders windowed to the right seconds of the song. What cannot happen today: approving a take (FR-21 — no route writes `approved_output`), assembling approved takes into one video (FR-22 — no assembly code exists anywhere in `src/`), arming a plan in one act, or rendering any of the four keyframe/extend modes. The two biggest unlocks are **take approval + assembly** (they *are* the milestone's last mile) and **mode-aware readiness + a real batch path** (they make firing 15 shots one uneventful act instead of 15 hand-clicked ones).
