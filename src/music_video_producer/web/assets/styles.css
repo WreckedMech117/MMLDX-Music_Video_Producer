@@ -18,6 +18,16 @@
      drifts; --red itself is the text weight and is too loud for a whole border. */
   --red-edge: #7f3732;
   --cyan: #6bd0cc;
+  /* The palette's seventh and last accent, reserved since Epic 9 and defined here (DESIGN 1).
+     It means **transition, and reactive binding**, and nothing else, anywhere -- a bound
+     parameter's bind glyph and the left edge of its band panel. `--cyan` already means *approved*
+     and appears on the very clips a transition runs between, so overloading it was the option
+     this token exists instead of.
+     Never body text on `--bg`: it labels an edge or a glyph, and the state it carries is always
+     also carried in words -- the glyph's own accessible name says which of its six states it is
+     in, and the panel behind it says so at length. `--blue` is now closed; an eighth accent needs
+     DESIGN 1's argument made again from scratch. */
+  --blue: #5b9bd5;
   --radius: 7px;
   --rail: 94px;
   --topbar: 58px;
@@ -885,9 +895,70 @@ dialog p { color: var(--muted); line-height: 1.5; }
    note's own treatment at the panel's width: same edge, same muted text, so it reads as the same
    kind of statement as the marks it is about rather than as a second, louder one. */
 .effect-stack-note { margin: 10px 0 6px; padding: 2px 0 2px 9px; border-left: 2px solid var(--red-edge); color: var(--muted); font-size: 11px; line-height: 1.45; }
-/* The bind glyph ends every row and ships **inert** in --dim. --blue is the reactive-binding
-   colour and it is closed to Epic 10; nothing in this slice may draw it. */
-.effect-bind { flex: none; width: 15px; color: var(--dim); font-size: 13px; text-align: center; }
+/* The bind glyph ends every row (DESIGN 3): --dim when the parameter is not bound, --blue when it
+   is. A real button now, so `border`, `padding` and `background` are reset explicitly -- the
+   generic rules give every button in this application a surface and every input a 20px pill, and
+   the last control on this row that inherited them shipped as a bordered lozenge around a 3px
+   track and was caught only by looking.
+   It is never `disabled`: an undrivable parameter and an unmeasured song both keep the glyph and
+   answer with a reason, so there is no state in which it has nothing to say. */
+.effect-bind { flex: none; width: 15px; height: 16px; padding: 0; border: 0; border-radius: 3px; background: transparent; color: var(--dim); font-size: 13px; line-height: 1; text-align: center; }
+.effect-bind:hover { background: var(--surface-3); }
+.effect-bind[data-state="bound"], .effect-bind[data-state="unresolvable"] { color: var(--blue); }
+/* The band panel (DESIGN 4.4): --surface-2 inside 1px --line, bordered left in --blue to mark it
+   as reactive rather than static. It opens beneath the row it belongs to and spans the card, not
+   the control column -- this inspector is a 260px rail, and the refusal note beside it learned in
+   Epic 9 that an indent that looks tidy on paper leaves a sentence 130px wide and ten lines tall. */
+.effect-band { margin: -3px 9px 8px; padding: 8px 9px; border: 1px solid var(--line); border-left: 2px solid var(--blue); border-radius: 3px; background: var(--surface-2); }
+/* ...unless there is nothing reactive about it. A panel that refuses -- an ffmpeg filter that
+   takes no runtime commands, a song with no measurement, a measurement nobody has read back --
+   is not a Band, and wearing the reactive accent is exactly the overloading DESIGN 1 closed the
+   palette to prevent. Caught by looking, 2026-08-27. */
+.effect-band[data-state="undrivable"], .effect-band[data-state="unmeasured"], .effect-band[data-state="unread"] { border-left-color: var(--line-strong); }
+.effect-band-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+/* `label` is `display: grid` with a 12px bottom margin everywhere else in this application, which
+   here would stack the caption above its own input and space the five rows an inch apart. */
+.effect-band-label { display: block; flex: none; width: 66px; margin: 0; color: var(--muted); font-size: 11px; font-weight: 400; letter-spacing: 0; }
+/* And a bare `input` is 38px tall at 13px with 9px of padding: five of those inside a 260px rail
+   is a panel taller than the card it belongs to. */
+.effect-band-number { flex: 1; min-width: 0; height: 24px; padding: 2px 6px; border-radius: 3px; font: 11px Consolas, monospace; }
+/* The drive: two buttons, neither pressed on a fresh binding, because nothing infers a drive mode.
+   The `.segmented` idiom this application already uses for the library's tabs -- but the chosen
+   one takes --blue rather than --acid, because acid in this surface is the slider fill and the
+   active tab underline and nothing else (DESIGN 5), and because this *is* the reactive state. */
+.effect-band-modes { display: flex; flex: 1; min-width: 0; }
+.effect-band-mode { flex: 1; min-height: 24px; border: 1px solid var(--line); border-right: 0; padding: 0 6px; background: transparent; color: var(--muted); font-size: 11px; }
+.effect-band-mode:first-of-type { border-radius: 3px 0 0 3px; }
+.effect-band-mode:last-of-type { border-right: 1px solid var(--line); border-radius: 0 3px 3px 0; }
+.effect-band-mode:enabled:hover { background: var(--surface-3); color: var(--ink); }
+.effect-band-mode.chosen { border-color: var(--blue); background: var(--surface-3); color: var(--ink); }
+/* What the panel says instead of controls -- an undrivable parameter's own catalogue sentence, a
+   song with no measurement, a binding whose measurement went away. Plain --muted on the panel's
+   own surface: none of these is an error. A binding that cannot resolve is a state of the song,
+   not a fault in the stack, so it takes no --red and no --red-edge. */
+.effect-band-note { margin: 0 0 7px; color: var(--muted); font-size: 11px; line-height: 1.45; }
+/* What is still needed before anything is written. Same weight as the note above it: this is the
+   panel telling a Director what it is waiting for, not marking them wrong. */
+.effect-band-needs { margin: 2px 0 6px; padding-left: 8px; border-left: 2px solid var(--line-strong); }
+.effect-band-needs[hidden] { display: none; }
+.effect-band-needs p { margin: 0 0 4px; color: var(--muted); font-size: 11px; line-height: 1.45; }
+.effect-band-needs p:last-child { margin-bottom: 0; }
+/* A setting the chosen drive does not read: drawn, inert, with the reason under the pair rather
+   than repeated on each box. Muted rather than dim -- it is a sentence a Director acts on (choose
+   sustain and these come alive), not a footnote about what is missing. */
+.effect-band-gate { margin: 2px 0 6px; color: var(--muted); font-size: 11px; line-height: 1.45; }
+/* And the boxes it is about have to *look* dead. A number input's own disabled rendering is the
+   browser's, not this stylesheet's, and on a dark surface with an explicit background it is
+   nearly invisible -- so the state is stated here at the weight every other disabled control on
+   this card already takes. */
+.effect-band-number:disabled, .effect-band-mode:disabled { opacity: .5; cursor: not-allowed; }
+/* And the whole row with it. Dimming the box alone left its label at the same weight as the
+   working rows above, so at a glance the pair read as live -- caught by looking, 2026-08-27.
+   `.effect-card.effect-off` is the precedent: the unit that is inert is what recedes. */
+.effect-band-row.idle { opacity: .55; }
+/* The strip is the next slice and the panel says so, quietly, at --dim. */
+.effect-band-strip { margin: 6px 0; color: var(--dim); font-size: 10px; line-height: 1.45; }
+.effect-band-analyze, .effect-band-remove { min-height: 26px; margin-top: 4px; font-size: 11px; font-weight: 400; }
 /* The picker: a grouped list under Consolas family headers, opened from `+ Effect`. No
    thumbnails -- an effect is a name and a set of bounds, and a picture of one would be a picture
    of some other take. */

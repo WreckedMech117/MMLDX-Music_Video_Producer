@@ -261,6 +261,7 @@ from pathlib import Path
 from typing import Any
 
 __all__ = [
+    "BINDING_SETTINGS",
     "BINDING_SPEC_KEYS",
     "BRANCH_FRAME_GUARD",
     "BRANCH_LEG_FORMAT",
@@ -268,6 +269,7 @@ __all__ = [
     "DEFAULT_LUTS",
     "DEFAULT_LUT_SIZE",
     "DRIVE_MODES",
+    "DRIVE_ONLY_SETTINGS",
     "DRIVE_PUNCH",
     "DRIVE_REFERENCE_RATE",
     "DRIVE_SCRIPT_SUFFIX",
@@ -2644,7 +2646,7 @@ def _validate_lut(
 #: is the port's own: a band narrower than that weights nothing and the drive is a flat line
 #: dressed as a signal. `hold` and `sustain` are read only by the `sustain` drive and are stored
 #: on every binding anyway, so switching drive back and forth does not lose them.
-_BINDING_SETTINGS: tuple[tuple[str, float, float, float], ...] = (
+BINDING_SETTINGS: tuple[tuple[str, float, float, float], ...] = (
     ("band_centre", 0.25, 0.0, 1.0),
     ("band_width", 0.3, 0.02, 1.0),
     ("band_softness", 0.35, 0.0, 1.0),
@@ -2652,6 +2654,20 @@ _BINDING_SETTINGS: tuple[tuple[str, float, float, float], ...] = (
     ("hold", 0.8, 0.0, 10.0),
     ("sustain", 1.5, 0.0, 20.0),
 )
+
+#: Which drive reads a setting the other one ignores, for the one client that has to draw them.
+#:
+#: `hold` and `sustain` are the **sustain gate's own two timings** — how long its band must stay
+#: above the floor before it engages, and how long it survives a dip before it lets go — and
+#: `drive_series` reads neither under `punch`. Every other setting is read by both drives and is
+#: deliberately absent here: an entry means *only this drive*, so a mapping that grew a third
+#: key would narrow a control rather than needing one.
+#:
+#: **Served rather than inferred**, for `BINDING_SETTINGS`' own reason. A band panel drawing a
+#: live `Hold` box under a `punch` binding would be the control-that-does-nothing R-24 rejects by
+#: name, and a client that decided which drive reads what would be a second copy of this module's
+#: drive model — the shape R-15 refused for snapping and R-27 refused for the readout.
+DRIVE_ONLY_SETTINGS: dict[str, str] = {"hold": DRIVE_SUSTAIN, "sustain": DRIVE_SUSTAIN}
 
 
 def _binding_number(
@@ -2748,7 +2764,7 @@ def _validate_bindings(
             setting: _binding_number(
                 effect_id, name, setting, spec.get(setting, default), low, high
             )
-            for setting, default, low, high in _BINDING_SETTINGS
+            for setting, default, low, high in BINDING_SETTINGS
         }
         bindings.append(
             ParameterBinding(
@@ -3699,7 +3715,7 @@ def exported_bindings(
     identical `effects` list, and the record has to be able to tell them apart.
 
     The values are the **agreed** ones, every setting the Director never touched filled in from
-    `_BINDING_SETTINGS`, for `exported_look`'s reason: the stored form is sparse by design, so a
+    `BINDING_SETTINGS`, for `exported_look`'s reason: the stored form is sparse by design, so a
     record taken from it would go stale the moment a default was corrected and would be unreadable
     without the catalogue of the day it was written.
 
@@ -3714,7 +3730,7 @@ def exported_bindings(
         + _canonical(
             {
                 field: getattr(binding, field)
-                for field in ("drive", "depth", *(name for name, *_ in _BINDING_SETTINGS))
+                for field in ("drive", "depth", *(name for name, *_ in BINDING_SETTINGS))
             }
         )
         for family in FAMILY_ORDER

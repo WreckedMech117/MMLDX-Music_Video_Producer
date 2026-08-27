@@ -1,4 +1,4 @@
-import { aiModPlan, alignLyricsKeptTranscription, api, applyRenderStatus, APPLY_DOCUMENTS_CONTROL, approvalControl, approvalNotice, assetNamePlan, assetsForTab, assetTab, assetTabEmpty, ASSET_NAME_HELP, ASSET_NAME_LABEL, ASSET_ROLE_LABELS, ASSET_TABS, assistantControl, assistantFillAllControl, assistantToast, ASSISTANT_EDIT_BLOCKED, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, batchReportToast, beatBandIdentity, beatMarkersControlPlan, characterSlotPlan, CITATION_MISSING_LABEL, clearDocumentConsent, clipEffectsChip, comfyOutputUrl, consistencyAnchorPlan, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, DOCUMENT_CONTROLS, effectControlKey, effectControlTarget, effectCopyBody, effectCopyReport, effectDropTarget, effectMoveOffered, effectNudgeDirection, effectNudgeTarget, effectParameterDefinition, effectParameterReadout, effectParameterValue, effectSliderFill, effectsPanelModel, effectsRefusalNotice, effectStackAdd, effectStackChanged, effectStackMove, effectStackRemove, effectStackSetParameter, effectStackToggle, effectStackWrite, EFFECT_PARAMETER_ID, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, expansionReport, generateAllPlan, hasActiveRenderJobs, INSTRUMENTAL_NOTE, jobTarget, markReadyControl, markReadyNotice, monitorPreviewView, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, PLACEHOLDER_PROMPT, prefillControl, PREVIEW_UNPLAYABLE, previewAdoption, randomSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, RENDER_POLL_INTERVAL_MS, resolveShotMode, shotBoundaries, shotCitations, shotEffectStack, shotExpansionToast, shotInspectorReadiness, shotLabel, shotModeOptionLabel, shotPreviewWanted, shotPromptCell, shotSpecificationProblems, shotTab, shotTabAfterKey, shotTabStrip, shotTakeUrl, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SHOT_TABS, SINGING_STATES, snapSeconds, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songOrderRanks, songRefusalMessage, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, tagLyricLine, threadHtml, unsavedWorkPending, unsavedWorkQuestion, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, vocalTaggingPlan, vocalTypeSpec, VOCAL_TYPES, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE } from "./api.js";
+import { aiModPlan, alignLyricsKeptTranscription, api, applyRenderStatus, APPLY_DOCUMENTS_CONTROL, approvalControl, approvalNotice, assetNamePlan, assetsForTab, assetTab, assetTabEmpty, ASSET_NAME_HELP, ASSET_NAME_LABEL, ASSET_ROLE_LABELS, ASSET_TABS, assistantControl, assistantFillAllControl, assistantToast, ASSISTANT_EDIT_BLOCKED, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, batchReportToast, beatBandIdentity, beatMarkersControlPlan, characterSlotPlan, CITATION_MISSING_LABEL, clearDocumentConsent, clipEffectsChip, comfyOutputUrl, consistencyAnchorPlan, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, DOCUMENT_CONTROLS, effectBandChange, effectBandToggle, effectBindingsBody, effectBindingsSet, effectControlKey, effectControlTarget, effectCopyBody, effectCopyReport, effectDropTarget, effectMoveOffered, effectNudgeDirection, effectNudgeTarget, effectParameterDefinition, effectParameterReadout, effectParameterValue, effectSliderFill, effectsPanelModel, effectsRefusalNotice, effectStackAdd, effectStackChanged, effectStackMove, effectStackRemove, effectStackSetParameter, effectStackToggle, effectStackWrite, EFFECT_BAND_CLOSED, EFFECT_BAND_ID, EFFECT_PARAMETER_ID, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, expansionReport, generateAllPlan, hasActiveRenderJobs, INSTRUMENTAL_NOTE, jobTarget, markReadyControl, markReadyNotice, monitorPreviewView, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, PLACEHOLDER_PROMPT, prefillControl, PREVIEW_UNPLAYABLE, previewAdoption, randomSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, RENDER_POLL_INTERVAL_MS, resolveShotMode, shotBoundaries, shotCitations, shotEffectStack, shotExpansionToast, shotInspectorReadiness, shotLabel, shotModeOptionLabel, shotPreviewWanted, shotPromptCell, shotSpecificationProblems, shotTab, shotTabAfterKey, shotTabStrip, shotTakeUrl, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SHOT_TABS, SINGING_STATES, snapSeconds, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songOrderRanks, songRefusalMessage, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, tagLyricLine, threadHtml, unsavedWorkPending, unsavedWorkQuestion, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, vocalTaggingPlan, vocalTypeSpec, VOCAL_TYPES, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE } from "./api.js";
 import { ASSEMBLE_RUNNING, EXPORT_PRESETS, EXPORT_PRESET_DEFAULT, assemblyControl, assemblyProgress, effectiveOffset, latestAssemblyExport, monitorShowsTake, monitorState, newShotFromPlan, renderProgressByTarget, renderingFlag, shotRenderState, takeAnchorControl, takeAudioControl, takesStripRows, trimNudgeControl } from "./api.js";
 import { EXPAND_ALL_PROMPTS_CONFIRM, EXPAND_ALL_PROMPTS_RUNNING, EXPAND_ALL_PROMPTS_TIMELINE_CONTROL, EXPAND_ALL_PROMPTS_TIMELINE_LABEL, NOTICE_KINDS, expansionSweepLines } from "./api.js";
 // Generate All Empty: the cuts bar's second batch door, beside Expand All Prompts. Its whole
@@ -2549,6 +2549,22 @@ let effectDrag = null;
 //: here survives the two-second reload by construction rather than by being carried.
 let effectCopy = { shotId: "", open: false, ids: [] };
 
+//: Which parameter's band panel is open, and the half-made binding it is holding.
+//: `{shotId, index, parameter, values}` — **one triple, which is what makes "only one band panel
+//: is open at a time" true by construction** rather than by a rule somebody has to remember: there
+//: is nowhere for a second to be recorded, so opening one closes the last.
+//:
+//: In module state rather than on the panel's dataset, `effectCopy`'s shape and for its reason: it
+//: is *drawn from the model*, so it survives the two-second background reload without
+//: `captureInspectorEdit` having to carry it — while an in-progress *edit* inside it is carried by
+//: that mechanism exactly as an edit anywhere else in this inspector is.
+//:
+//: `values` is the draft: the numbers a Director has chosen for a binding that cannot be written
+//: yet, because nothing infers a drive mode and nothing invents a depth. It is dropped whenever the
+//: panel moves to another parameter — a half-made binding belongs to the row it was made on — and
+//: cleared once a write lands, so the panel then draws what the server stored.
+let effectBand = { ...EFFECT_BAND_CLOSED };
+
 //: The last copy's report, and the Shot it was about. Kept rather than left to a toast for
 //: `lastEffectsRefusal`'s reason: a toast is gone in four seconds and this one names the Shots
 //: that were left alone and how to unlock them.
@@ -2641,9 +2657,15 @@ function bindShotTabs(inspector) {
 // range tinted with `accent-color` would colour the thumb as well, and `--acid` on anything in
 // this surface that is not a slider fill or the active tab underline is closed (DESIGN section 5).
 //
-// The `〜` bind glyph ends every row and **ships inert**: `--dim`, no handler, `aria-hidden`,
-// because Epic 10 is what makes a binding exist and a control that looks live and is not is the
-// one thing this interface must never draw.
+// The `〜` bind glyph ends every row and is **live**: a real button, in the tab order, carrying
+// the state in `data-state` and the sentence in its accessible name, with `aria-expanded` saying
+// whether its band panel is open. It is never `disabled` and never hidden — an undrivable
+// parameter and an unmeasured song both keep it and answer with a reason, because a hidden control
+// teaches nothing about what this application can do.
+//
+// Every string, every state and the whole panel behind it come from `effectParameterRow`. Nothing
+// here decides whether a parameter can be driven, which absence a song is in, or what is still
+// needed before a binding can be written.
 //
 // A row `effectParameterRow` marked refused -- a stored value the export will refuse by name --
 // carries its class, its reason and its empty reading from the model. Nothing here decides that a
@@ -2652,11 +2674,12 @@ function bindShotTabs(inspector) {
 // colour.
 function effectRowHtml(card, row) {
   const key = effectControlKey(card.index, row.name);
-  const bind = `<span class="effect-bind" title="${escapeHtml(row.bindTitle)}" aria-hidden="true">${escapeHtml(row.bindGlyph)}</span>`;
+  const bind = `<button type="button" class="effect-bind" id="effect-bind-${key}" data-state="${escapeHtml(row.bind.state)}" title="${escapeHtml(row.bind.title)}" aria-label="${escapeHtml(row.bind.title)}" aria-expanded="${row.bind.open}" aria-controls="effect-band-panel-${key}">${escapeHtml(row.bind.glyph)}</button>`;
   const label = `<label class="effect-label" for="${EFFECT_PARAMETER_ID}${key}">${escapeHtml(row.label)}</label>`;
-  const note = row.note
+  const band = effectBandHtml(key, row.band);
+  const note = (row.note
     ? `<p class="effect-row-note" id="effect-note-${key}">${escapeHtml(row.note)}</p>`
-    : "";
+    : "") + band;
   const refused = row.refused
     ? ` aria-invalid="true" aria-describedby="effect-note-${key}"`
     : "";
@@ -2682,6 +2705,61 @@ function effectRowHtml(card, row) {
     return `<div class="effect-row ${row.className}">${label}<select class="effect-choice" id="${EFFECT_PARAMETER_ID}${key}"${refused} ${row.disabled ? "disabled" : ""}><option value="" ${row.value ? "" : "selected"}>No look chosen</option>${options}</select>${bind}</div>${note}`;
   }
   return `<div class="effect-row ${row.className}">${label}<select class="effect-choice" id="${EFFECT_PARAMETER_ID}${key}"${refused} ${row.disabled ? "disabled" : ""}>${options}</select>${bind}</div>${note}`;
+}
+
+// The band panel (DESIGN 4.4), opened inline beneath its parameter row and bordered left in
+// `--blue` to mark it as reactive rather than static.
+//
+// **The spectrum strip is not here and the panel says so.** What ships is the Band as the three
+// labelled numeric inputs the accessibility floor already requires of the canvas — centre, width
+// and softness — plus the drive, the floor, the depth and the removal. The strip and the Drive
+// readout are the next two slices; a panel that read as finished would be claiming the canvas had
+// been decided against rather than deferred.
+//
+// Every string, every bound, every `disabled` and the whole question of which of these parts is
+// drawn at all is `effectBandPanel`'s. An absence draws its sentence and no controls, because a
+// band selector under a refusal offers a choice that cannot be written.
+//
+// The inputs are `type="number"` and not sliders on purpose: these are the *readable* equivalent
+// of a canvas, and a range input announces a percentage of a track rather than the number a
+// Director is choosing. Each carries its own `min`, `max` and `step` from the server's bounds.
+function effectBandHtml(key, band) {
+  if (!band?.shown) return "";
+  const id = (part) => `${EFFECT_BAND_ID}${key}-${part}`;
+  const note = band.note
+    ? `<p class="effect-band-note" id="${id("note")}">${escapeHtml(band.note)}</p>` : "";
+  const analyze = band.analyze?.shown
+    ? `<button type="button" class="quiet-button full effect-band-analyze" id="${id("analyze")}" title="${escapeHtml(band.analyze.title)}">${escapeHtml(band.analyze.label)}</button>`
+    : "";
+  const drive = band.drive?.shown
+    ? `<div class="effect-band-row"><span class="effect-band-label" id="${id("drive-label")}">${escapeHtml(band.drive.label)}</span><span class="effect-band-modes" role="group" aria-labelledby="${id("drive-label")}">${band.drive.options.map((option) =>
+      `<button type="button" class="effect-band-mode${option.selected ? " chosen" : ""}" id="${id(`drive-${option.value}`)}" title="${escapeHtml(option.title)}" aria-pressed="${option.selected}" ${band.drive.disabled ? "disabled" : ""}>${escapeHtml(option.label)}</button>`).join("")}</span></div>`
+    : "";
+  // `idle` is `effectBandPanel`'s answer -- a setting the chosen drive does not read -- and it
+  // goes on the **row**, not the box. Browser QA on 2026-08-27 found the inert pair reading as
+  // live at a glance: only the number dimmed, while its label stayed the same weight as the
+  // working rows above it, so the row did not read as a unit. `.effect-card.effect-off` is the
+  // precedent, and it dims the whole card rather than its controls.
+  const controls = (band.controls || []).map((control) =>
+    `<div class="effect-band-row${control.idle ? " idle" : ""}"><label class="effect-band-label" for="${id(control.name)}">${escapeHtml(control.label)}</label><input class="effect-band-number" type="number" id="${id(control.name)}" title="${escapeHtml(control.title)}" min="${control.minimum}" max="${control.maximum}" step="${control.step}" value="${control.value === null ? "" : control.value}" ${control.disabled ? "disabled" : ""}></div>`).join("");
+  // Said once under the pair it is about, and only while it is true: a `sustain` binding sees its
+  // two timings live and no sentence about them at all. `effectBandPanel` decides both.
+  const gate = band.driveNote
+    ? `<p class="effect-band-gate" id="${id("gate")}">${escapeHtml(band.driveNote)}</p>` : "";
+  const needs = (band.needs || []).length || band.unwritten
+    ? `<div class="effect-band-needs" id="${id("needs")}">${(band.needs || []).map((line) => `<p>${escapeHtml(line)}</p>`).join("")}${band.unwritten ? `<p>${escapeHtml(band.unwritten)}</p>` : ""}</div>`
+    : `<div class="effect-band-needs" id="${id("needs")}" hidden></div>`;
+  const strip = band.stripNote
+    ? `<p class="effect-band-strip" id="${id("strip")}">${escapeHtml(band.stripNote)}</p>` : "";
+  const remove = band.remove?.shown
+    ? `<button type="button" class="quiet-button full effect-band-remove" id="${id("remove")}" title="${escapeHtml(band.remove.title)}" ${band.remove.disabled ? "disabled" : ""}>${escapeHtml(band.remove.label)}</button>`
+    : "";
+  // The state is on the panel as well as on its glyph, so the stylesheet can say what `--blue`
+  // means without this template deciding it: a panel that *is* the reactive surface takes the
+  // seventh accent, and one that is a refusal about a parameter the music can never reach takes
+  // an inert edge. Browser QA on 2026-08-27 found the refusal wearing the reactive colour, which
+  // is the one thing DESIGN 1 closed the palette to prevent.
+  return `<div class="effect-band" id="effect-band-panel-${key}" data-state="${escapeHtml(band.state)}" role="group" aria-label="${escapeHtml(band.legend || "")}">${note}${analyze}${drive}${controls}${gate}${needs}${strip}${remove}</div>`;
 }
 
 // The card's grip (DESIGN 4.2), drawn **only where there is somewhere to go**. C2 left it out on
@@ -2764,9 +2842,7 @@ function effectCopySectionHtml(section) {
 // An empty stack draws the picker and nothing else. There is deliberately no "no effects yet"
 // box: a placeholder shaped like a card is a thing pretending to be a stack.
 function effectsPanel(shot) {
-  const model = effectsPanelModel(shot, effectCatalogue, {
-    error: effectCatalogueError, project: state.project, copy: effectCopy,
-  });
+  const model = currentEffectsModel(shot);
   const refusal = effectsRefusalNotice(shot.id, lastEffectsRefusal);
   // The last copy's report, in the readiness idiom the refusal above already uses. Counts for
   // what landed and every refused Shot's own sentence, whole -- `effectCopyReport`'s division,
@@ -2980,9 +3056,66 @@ function startEffectDrag(inspector, model, shotId, from, event) {
 // it because "does this press add the section or take it off" is a question about the ticks as
 // they stand, and answering it from a stale model made the press a no-op after any hand tick.
 function currentEffectCopy(shot) {
+  return currentEffectsModel(shot).copy;
+}
+
+// The whole panel's model, from what this browser holds **now**.
+//
+// One call site for the four things that decide it — the catalogue and whether it arrived, the
+// project, the copy control's ticks, the open band panel and the song measurement — so a caller
+// that needs the model after a repaint cannot assemble it from three of the five. The measurement
+// is the merged snap-targets read (`state.songMeasurement`): the same one object the beat band and
+// the drag are drawn from, so the band panel cannot come to a different view of whether this song
+// has been analysed than the timeline has.
+function currentEffectsModel(shot) {
   return effectsPanelModel(shot, effectCatalogue, {
-    error: effectCatalogueError, project: state.project, copy: effectCopy,
-  }).copy;
+    error: effectCatalogueError,
+    project: state.project,
+    copy: effectCopy,
+    band: effectBand,
+    targets: state.songMeasurement,
+  });
+}
+
+// One Parameter Binding written, through **the only route that mints one**.
+//
+// Not `writeEffectStack`: a binding is minted here and carried everywhere else (AD-16), and the
+// stack write beside it may never invent one. The two therefore never share a body, which is also
+// what keeps this from becoming a second path that rebuilds a stack entry from its parts and drops
+// the `bindings` key on the way — this body carries nothing *but* bindings.
+//
+// The card's own effect id travels with the position, so a stack reordered since the panel was
+// drawn refuses by name rather than binding another card's parameter. The reply is the whole
+// Project and the draft is dropped, so the panel redraws from what was stored rather than from what
+// it hoped it sent.
+async function writeShotBinding(shotId, index, bindings) {
+  if (!requireProject()) return false;
+  const projectId = state.project.id;
+  const shot = state.project.shots.find((item) => item.id === shotId);
+  const spec = shotEffectStack(shot)[index];
+  if (!spec) return false;
+  let landed = false;
+  try {
+    const project = await api.saveShotBindings(
+      projectId, shotId, index, effectBindingsBody(spec, bindings));
+    // The Director moved to another project while this was in flight. The write landed on the
+    // server; applying its reply here would show one project's work under another's name.
+    if (state.project?.id !== projectId) return false;
+    state.project = project;
+    lastEffectsRefusal = null;
+    effectBand = { ...effectBand, values: null };
+    landed = true;
+  } catch (error) {
+    if (state.project?.id !== projectId) return false;
+    // The route's own sentence, kept and drawn above the stack — a binding refusal names the
+    // effect, the parameter and the ffmpeg filter that takes no runtime commands, and a toast is
+    // gone in four seconds.
+    lastEffectsRefusal = { shotId, message: error.message };
+    toast(error.message, "error");
+  }
+  // Either way: the clip's chip, the tab's count and every card redraw from what is stored.
+  renderTimeline();
+  return landed;
 }
 
 // The copy's button and its reason, repainted from the model without rebuilding the panel.
@@ -3118,8 +3251,79 @@ function bindEffectsPanel(inspector, shot, model) {
       }
       control.addEventListener("change", () => writeEffectParameter(shotId, stack(), target, control));
     }
+    for (const row of card.rows) bindEffectBand(inspector, shot, card, row);
   }
   bindEffectCopy(inspector, shot, model);
+}
+
+// The bind glyph and, where it is open, everything inside its band panel.
+//
+// **The glyph is bound on every row, in every state.** An undrivable parameter and an unmeasured
+// song both open the panel and read the reason there; a glyph that did nothing in those states
+// would be the inert control this slice exists to remove, and hiding it would teach a Director
+// that the feature does not exist rather than that this parameter cannot have it.
+//
+// A press rebuilds the inspector, and there is nothing under the pointer to lose: the glyph the
+// Director pressed is redrawn in the same place, so the focus is put back on its replacement --
+// `moveEffectCard`'s shape, and for its reason.
+function bindEffectBand(inspector, shot, card, row) {
+  const shotId = shot.id;
+  const key = effectControlKey(card.index, row.name);
+  const id = (part) => `#${EFFECT_BAND_ID}${key}-${part}`;
+  $("#effect-bind-" + key, inspector)?.addEventListener("click", () => {
+    // Which panel is open after this press -- including that opening another closes this one -- is
+    // `effectBandToggle`'s answer, not this handler's.
+    effectBand = effectBandToggle(effectBand, shotId, card.index, row.name);
+    renderShotInspector();
+    $("#effect-bind-" + key, $("#shot-inspector"))?.focus?.();
+  });
+  const band = row.band;
+  if (!band?.shown) return;
+  // The measurement's own remedy, run by the function the "Snap to" rows already run. One act,
+  // one implementation: a second analyze path here would be a second answer to "is one already
+  // running", and this one is guarded per project inside `runSongAnalysis`.
+  $(id("analyze"), inspector)?.addEventListener("click", () => { runSongAnalysis(); });
+  $(id("remove"), inspector)?.addEventListener("click", () => {
+    // FX-12: the parameter returns to its resting value with no residue. `effectBindingsSet` takes
+    // the entry out of the card's list and the route stores what is left, so nothing of the
+    // binding survives -- and the parameter's own stored number was never touched by any of this.
+    const stack = shotEffectStack(selectedShot() || shot);
+    writeShotBinding(shotId, card.index, effectBindingsSet(stack[card.index], row.name, null));
+  });
+  // One change inside the panel. **Whether it writes is `effectBandChange`'s answer**, not this
+  // handler's: a binding with no drive and no depth is a real, drawable state and must not reach
+  // the route as an incomplete body, and the change that completes it is the change that makes it.
+  //
+  // A change that is not yet writable rebuilds rather than repainting, and the focus is put back
+  // on the control that caused it -- `bindEffectCopy`'s Section button, and for its reason. A
+  // `change` has already committed by the time it fires, so there is no caret mid-number to lose;
+  // what would be lost by *not* rebuilding is the panel's own account of what is still needed.
+  const changed = (name, raw, control) => {
+    const plan = effectBandChange(band, effectCatalogue, name, raw);
+    const stack = shotEffectStack(selectedShot() || shot);
+    effectBand = { ...effectBand, values: plan.values };
+    if (plan.binding) {
+      writeShotBinding(
+        shotId, card.index, effectBindingsSet(stack[card.index], row.name, plan.binding));
+      return;
+    }
+    renderShotInspector();
+    $(control, $("#shot-inspector"))?.focus?.();
+  };
+  for (const option of band.drive?.options || []) {
+    const control = id(`drive-${option.value}`);
+    $(control, inspector)?.addEventListener("click", () => {
+      changed("drive", option.value, control);
+    });
+  }
+  for (const setting of band.controls || []) {
+    const control = id(setting.name);
+    const input = $(control, inspector);
+    // The input's own value, not the event's target: a `change` handler that read `event.target`
+    // would be reading whatever dispatched it, and this is the idiom every other control on this
+    // panel already uses.
+    input?.addEventListener("change", () => { changed(setting.name, input.value, control); });
+  }
 }
 
 // The copy control: the disclosure, the ticks, and the one button that writes.

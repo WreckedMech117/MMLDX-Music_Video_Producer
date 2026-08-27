@@ -81,9 +81,13 @@ from .director import (
     document_rejection,
 )
 from .effects import (
+    BINDING_SETTINGS,
+    DRIVE_MODES,
+    DRIVE_ONLY_SETTINGS,
     EFFECT_CATALOGUE,
     EFFECT_LUT_UNKNOWN_REFUSAL,
     FAMILY_ORDER,
+    NOT_A_NUMBER,
     ChoiceParameter,
     EffectRefusal,
     EffectStages,
@@ -6985,6 +6989,16 @@ class SnapTargetsResponse(BaseModel):
     beats: list[float] = Field(default_factory=list)
     measured: bool = False
     analysed: bool = False
+    #: **Why there is no measurement, and `""` where there is one** — `song_envelope_report`'s own
+    #: sentence, which this route already computed and used to throw away.
+    #:
+    #: `analysed: false` says *that* there is nothing; this says *which* nothing, and the three the
+    #: band panel acts on are three different remedies — never taken, taken from a track this song
+    #: no longer is, and a sidecar that will not read (R-11 derives every one at read time and
+    #: stores none). The alternative was a second client read of `GET /song/envelope`, which hashes
+    #: the whole master again: two reads of one measurement is what let the band and the drag
+    #: describe different states, and the merged read exists because of it.
+    reason: str = ""
     start: float = 0.0
     end: float = 0.0
     envelope: SnapTargetsEnvelope | None = None
@@ -7332,6 +7346,20 @@ class EffectParameterSpec(BaseModel):
     maximum: float | None = None
     integer: bool = False
     choices: list[str] = Field(default_factory=list)
+    #: **Why the music cannot reach this parameter, or `""` where it can** — the catalogue's own
+    #: clause off `NumberParameter.drive`, served rather than re-derived, because AD-27 says the
+    #: catalogue is the only thing entitled to decide and R-25/R-29 say the answer is a measured
+    #: property of the `(parameter -> filter option)` pair rather than of the family. A client
+    #: that decided drivability for itself would need the composers to do it.
+    #:
+    #: Empty is the *only* thing that means drivable, so there is one flag and not two: a
+    #: `drivable: bool` beside this could disagree with it, and the pair would then have to be
+    #: kept in step by hand at both ends of the wire.
+    #:
+    #: A choice and a look carry `NOT_A_NUMBER`'s clause, which is the same object
+    #: `effects._validate_bindings` substitutes for them — a band produces a number, and neither
+    #: is one. Carried whole and unparaphrased: the panel frames it, never rewrites it.
+    drive_reason: str = ""
 
 
 class EffectDefinitionSpec(BaseModel):
@@ -7357,6 +7385,34 @@ class EffectLookSpec(BaseModel):
     name: str
 
 
+class EffectBindingSettingSpec(BaseModel):
+    """One of a Parameter Binding's six *settings*, with the bounds it is refused outside.
+
+    `effects.BINDING_SETTINGS` owns these and this is derived from it, for the reason every other
+    bound on this response is derived rather than transcribed: Epic 9 shipped a defect where the
+    client ignored bounds the server was already sending, and the answer to that is not to teach
+    the client a second copy of them but to send the ones it must obey.
+
+    **Depth is deliberately not here.** Its bound is not a constant — it is the span of whatever
+    parameter the binding drives — so it is read off that parameter's own `minimum` and `maximum`,
+    which this response already carries. A `depth` entry with invented bounds would be the one
+    number on this panel that did not come from the thing that refuses it.
+    """
+
+    name: str
+    default: float
+    minimum: float
+    maximum: float
+    #: The one drive that reads this setting, or `""` for one both read. `effects.DRIVE_ONLY_SETTINGS`
+    #: owns it: `hold` and `sustain` are the sustain gate's own timings and `drive_series` reads
+    #: neither under `punch`.
+    #:
+    #: Served because the panel has to draw them and cannot answer this for itself. A live `Hold`
+    #: box under a `punch` binding is the control-that-does-nothing R-24 rejects by name; a client
+    #: that decided which drive reads what would be a second copy of this module's drive model.
+    drive: str = ""
+
+
 class EffectCatalogueResponse(BaseModel):
     """Every effect, every bound, and every discovered look — one read, so a picker is one request.
 
@@ -7373,6 +7429,17 @@ class EffectCatalogueResponse(BaseModel):
     families: list[str] = Field(default_factory=list)
     effects: list[EffectDefinitionSpec] = Field(default_factory=list)
     looks: list[EffectLookSpec] = Field(default_factory=list)
+    #: The two drives, in `effects.DRIVE_MODES`' own order, so the band panel's segmented control
+    #: is built from a served list rather than from two literals in JavaScript. There is no third
+    #: and a third would appear here without the panel being edited — which is the same bargain
+    #: `families` already makes with `FAMILY_ORDER`.
+    #:
+    #: **Neither is marked as a default and none can be**, which is FX-14 expressed on the wire: a
+    #: served `default_drive` would be exactly the inference the acceptance criterion forbids.
+    drives: list[str] = Field(default_factory=list)
+    #: The six settings a binding carries besides its parameter, its drive and its depth, with
+    #: their defaults and their bounds. See `EffectBindingSettingSpec`.
+    binding_settings: list[EffectBindingSettingSpec] = Field(default_factory=list)
 
 
 def effect_catalogue_report(looks: Sequence[LutEntry]) -> EffectCatalogueResponse:
@@ -7398,6 +7465,11 @@ def effect_catalogue_report(looks: Sequence[LutEntry]) -> EffectCatalogueRespons
                         minimum=parameter.minimum,
                         maximum=parameter.maximum,
                         integer=parameter.integer,
+                        # The catalogue's own clause, whole. `NumberParameter.drive` has no
+                        # default precisely so this can never be a guess: a parameter added
+                        # without a classification does not construct and the application does
+                        # not start.
+                        drive_reason=parameter.drive.reason,
                     )
                 )
             elif isinstance(parameter, ChoiceParameter):
@@ -7408,13 +7480,20 @@ def effect_catalogue_report(looks: Sequence[LutEntry]) -> EffectCatalogueRespons
                         kind="choice",
                         default=parameter.default,
                         choices=list(parameter.choices),
+                        # The same object `_validate_bindings` substitutes for anything that is
+                        # not a `NumberParameter`, so the sentence the panel shows and the one
+                        # the route would refuse with are the same string.
+                        drive_reason=NOT_A_NUMBER.reason,
                     )
                 )
             elif isinstance(parameter, LutParameter):
                 # Declares no default. See `EffectParameterSpec`.
                 parameters.append(
                     EffectParameterSpec(
-                        name=parameter.name, label=parameter.label, kind="lut"
+                        name=parameter.name,
+                        label=parameter.label,
+                        kind="lut",
+                        drive_reason=NOT_A_NUMBER.reason,
                     )
                 )
             else:
@@ -7438,6 +7517,17 @@ def effect_catalogue_report(looks: Sequence[LutEntry]) -> EffectCatalogueRespons
         families=list(FAMILY_ORDER),
         effects=definitions,
         looks=[EffectLookSpec(lut_id=entry.lut_id, name=entry.name) for entry in looks],
+        drives=list(DRIVE_MODES),
+        binding_settings=[
+            EffectBindingSettingSpec(
+                name=name,
+                default=default,
+                minimum=minimum,
+                maximum=maximum,
+                drive=DRIVE_ONLY_SETTINGS.get(name, ""),
+            )
+            for name, default, minimum, maximum in BINDING_SETTINGS
+        ],
     )
 
 

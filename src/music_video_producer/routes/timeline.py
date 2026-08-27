@@ -230,6 +230,21 @@ def register(ctx: RouterContext) -> None:
             "beats": targets.beats,
             "measured": targets.measured,
             "analysed": envelope is not None,
+            # **Why there is no measurement, in `song_envelope_report`'s own words** — the
+            # sentence this route already computed and threw away, and `""` where there is one.
+            #
+            # It is here rather than behind a second read of `GET /song/envelope` for the reason
+            # the `envelope` key below is here: that read hashes the whole master and parses the
+            # sidecar again, and two client reads of one measurement is what let the band and the
+            # drag describe different states (retrospective S3, S5). One computation, one answer.
+            #
+            # The band panel is the consumer that makes it necessary rather than merely useful.
+            # `analysed: false` tells a Director nothing they can act on, and never-taken,
+            # song-changed and sidecar-unreadable are three different remedies (R-11 derives all
+            # three at read time, and R-18's rows are the precedent for saying which). The
+            # timeline's own "Snap to" rows deliberately do not use it: they are about beats and
+            # have their own sentence about beats.
+            "reason": str(report.get("reason") or ""),
             "start": targets.start,
             "end": targets.end,
             # The drawing half, off the same `envelope` that `analysed` and the beat targets

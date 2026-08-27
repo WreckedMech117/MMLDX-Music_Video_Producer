@@ -21670,6 +21670,10 @@ def test_the_drag_snap_targets_route_serves_both_halves_and_neither_is_required(
     assert bare.status_code == 200, bare.text
     assert bare.json() == {
         "gaps": [], "beats": [], "measured": False, "analysed": False, "start": 0.0, "end": 0.0,
+        # **Which** absence, in `song_envelope_report`'s own words. `analysed: false` says only
+        # that there is nothing; a band panel offering `[Analyze song]` on a project with no song
+        # would be a button that cannot help.
+        "reason": SONG_ENVELOPE_WITHOUT_SONG,
         # Absent, and absent as `null` rather than as an empty object: a measurement that found
         # nothing is a different sentence from a song nobody has measured, and this key answers
         # the second the same way `analysed` does, from the same expression.
@@ -21928,11 +21932,15 @@ def test_the_snap_targets_shape_is_declared_and_drops_nothing(tmp_path: Path):
 
     songless = body("no song at all")
     assert songless == {"gaps": [], "beats": [], "measured": False, "analysed": False,
+                        "reason": SONG_ENVELOPE_WITHOUT_SONG,
                         "start": 0.0, "end": 0.0, "envelope": None}
 
     import_measured_song(client, project.id, bpm=120)
     analysed = body("measured and analysed")
     assert analysed["analysed"] is True and analysed["beats"] and analysed["envelope"]
+    # A measurement that is current has no absence to explain, and `reason` is empty rather than
+    # carrying the last thing that was wrong -- which is `song_envelope_report`'s own rule and R-11's.
+    assert analysed["reason"] == ""
 
     # Byte-identical to what the bare dict serialised to. Rebuilt from the same two functions the
     # handler calls, over the same stored project, and compared against the raw response — not
@@ -21947,6 +21955,7 @@ def test_the_snap_targets_shape_is_declared_and_drops_nothing(tmp_path: Path):
         "beats": targets.beats,
         "measured": targets.measured,
         "analysed": True,
+        "reason": "",
         "start": targets.start,
         "end": targets.end,
         "envelope": served_measurement(whole),
@@ -21964,6 +21973,11 @@ def test_the_snap_targets_shape_is_declared_and_drops_nothing(tmp_path: Path):
     half = body("transcribed, and the analysis no longer describes the file")
     assert half["measured"] is True and half["gaps"]
     assert half["analysed"] is False and half["beats"] == [] and half["envelope"] is None
+    # **Which absence it is, not merely that there is one.** The band panel acts on the difference
+    # -- a song that changed, a song nobody measured and a sidecar that will not read are three
+    # different remedies -- and the sentence is `song_envelope_report`'s own, carried whole rather
+    # than re-worded on the way through this route.
+    assert half["reason"] == SONG_ENVELOPE_SONG_CHANGED
 
     # A key `served_measurement` did not carry stays absent rather than becoming `[]`. Unreachable
     # through the route — `store.read_song_envelope` refuses a sidecar missing a required key — so
@@ -24429,6 +24443,14 @@ def test_the_effect_catalogue_is_one_read_and_never_re_reads_the_looks_folder(tm
             "maximum": 2.0,
             "integer": False,
             "choices": [],
+            # Written out for the reason the bounds beside it are: R-29 measured that driving both
+            # of `crop`'s dimensions aborts ffmpeg with a written-but-truncated file, and a zoom is
+            # never one dimension alone. A test that read this off the same table would pass just
+            # as happily for a table that had quietly reclassified it as drivable.
+            "drive_reason": (
+                "driving it would resize the frame partway through the clip, which ffmpeg "
+                "aborts on"
+            ),
         }
     ]
 
@@ -24455,6 +24477,93 @@ def test_the_effect_catalogue_is_one_read_and_never_re_reads_the_looks_folder(tm
         project_with_two_shots(client, "Graded"),
         [{"effect": "lut_look", "parameters": {"lut": ids[0]}}],
     ).status_code == 200
+
+
+def test_the_catalogue_serves_what_a_band_panel_needs_and_never_a_default_drive(tmp_path: Path):
+    """Drivability, the two drives and a binding's own bounds — served, never re-derived.
+
+    **A client cannot answer any of these for itself.** Whether the music can reach a parameter is
+    a measured property of the `(parameter -> filter option)` pair (R-25, R-29), read off the
+    composers; the bounds a binding is refused outside are `effects.BINDING_SETTINGS`; and the two
+    drives are `DRIVE_MODES`. A band panel that carried its own copy of any of them would be the
+    Epic 9 defect where the client ignored bounds the server was already sending, with the
+    additional twist that the client would be inventing the bound rather than ignoring it.
+
+    Every assertion below is against `effects.py` itself rather than against a written-out list,
+    because the property that matters is *coverage*: a parameter added without a `drive` does not
+    construct, and the point of serving the field is that such a parameter can never reach a panel
+    unclassified.
+
+    **And no default drive, which is FX-14 expressed on the wire.** A `default_drive` key would be
+    exactly the inference story 10.1's acceptance criterion forbids, so its absence is asserted
+    rather than assumed.
+    """
+    from music_video_producer.effects import (
+        BINDING_SETTINGS,
+        DRIVE_MODES,
+        DRIVE_ONLY_SETTINGS,
+        EFFECT_CATALOGUE,
+        NOT_A_NUMBER,
+        NumberParameter,
+    )
+
+    client, _store, _ = make_client(tmp_path)
+    served = client.get("/api/effects/catalogue").json()
+
+    assert served["drives"] == list(DRIVE_MODES) == ["punch", "sustain"]
+    assert "default_drive" not in served, "nothing may infer a drive mode"
+    assert served["binding_settings"] == [
+        {
+            "name": name,
+            "default": default,
+            "minimum": minimum,
+            "maximum": maximum,
+            # Which drive reads it, or `""` for one both read. The panel draws all six boxes and
+            # cannot answer this for itself: a live `Hold` under a `punch` binding is the
+            # control-that-does-nothing R-24 rejects by name.
+            "drive": DRIVE_ONLY_SETTINGS.get(name, ""),
+        }
+        for name, default, minimum, maximum in BINDING_SETTINGS
+    ]
+    # The sustain gate's own two timings, and nothing else. Named rather than derived, because
+    # story 10.1's criterion is about exactly these two -- `sustain` *"engages only after its band
+    # holds above a level for a hold time, and survives dips for a sustain time"* -- and a table
+    # that quietly widened would make the panel grey out a box every drive reads.
+    gated = {entry["name"]: entry["drive"] for entry in served["binding_settings"] if entry["drive"]}
+    assert gated == {"hold": "sustain", "sustain": "sustain"}, gated
+    assert set(gated.values()) <= set(served["drives"]), gated
+    # Depth is deliberately not among them: its bound is the span of whatever parameter it drives,
+    # which the parameter's own `minimum` and `maximum` already carry.
+    assert "depth" not in {setting["name"] for setting in served["binding_settings"]}
+
+    # Every parameter, classified — and the sentence is the catalogue's own, character for
+    # character, because the panel shows it whole and unparaphrased.
+    for definition in served["effects"]:
+        declared = EFFECT_CATALOGUE[definition["effect"]].parameters
+        for parameter, spec in zip(declared, definition["parameters"], strict=True):
+            wanted = (
+                parameter.drive if isinstance(parameter, NumberParameter) else NOT_A_NUMBER
+            ).reason
+            assert spec["drive_reason"] == wanted, (definition["effect"], spec["name"])
+            assert spec["name"] == parameter.name
+
+    # The two halves of R-25's and R-29's rulings, on the wire. Named rather than counted: these
+    # are the parameters a Director will meet a refusal on, and a table that quietly reclassified
+    # one would ship a bind glyph that stores a binding the export cannot honour.
+    reasons = {
+        (definition["effect"], spec["name"]): spec["drive_reason"]
+        for definition in served["effects"]
+        for spec in definition["parameters"]
+    }
+    assert reasons[("sharpen", "amount")] == "ffmpeg's unsharp filter takes no runtime commands"
+    assert reasons[("grain", "strength")] == "ffmpeg's noise filter takes no runtime commands"
+    assert reasons[("punch_in", "zoom")].startswith("driving it would resize the frame")
+    assert reasons[("lut_look", "lut")] == "it is not a number"
+    # And the half of R-25 that survived being checked: a branch's dial reaches `blend`, whose
+    # `all_opacity` *is* runtime-settable, so these two are drivable and must serve no reason.
+    assert reasons[("edge_treatment", "strength")] == ""
+    assert reasons[("pixel_shuffle", "amount")] == ""
+    assert reasons[("exposure", "amount")] == ""
 
 
 def test_the_director_chat_is_never_shown_a_shots_effect_stack(tmp_path: Path):

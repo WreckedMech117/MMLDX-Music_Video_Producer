@@ -102,6 +102,16 @@ and then left in a commit subject is a number nobody will find.**
   geometry a fact about the whole project, and without the memo every preview on a twenty-shot
   project paid **538 ms** re-probing takes. This is the number that justifies the preview route
   taking no busy check — see AD-24.
+- **The band panel is 503.6px in a 626px rail, with 212px below the fold — and the spectrum strip
+  still has to fit in it.** Measured in a real browser 2026-08-27, with seven numeric inputs, the
+  drive control and the panel's own notes. It was **553px** before a four-line gate note was split
+  so its second clause is drawn only when a gated setting actually holds a tuned value; that saved
+  49px, and prose was **37% of the panel** before it. Two consequences for story 10.2, which adds a
+  canvas to this same box: the strip's height is a budget rather than a preference, and the first
+  build overflowed so far that Selenium reported `element not interactable` — a Director meets that
+  as a control they cannot reach, and it reads like a layout fault when it is a scroll distance.
+  `panelBelowFold` and `railScrollHeight` are recorded by `tests/e2e_band_panel.py` so the density
+  is a number to argue with rather than a screenshot to notice.
 - **A bound Shot's preview cache hit is 20.5 ms, not 2.1 ms — and only a bound Shot pays it.**
   Measured 2026-08-27 on a 3-minute master (7.9 MB) with a 326 KB envelope sidecar: **2.08 ms
   unbound, 20.46 ms bound** on a cache hit, and 74 ms for a bound first render. The cost is the

@@ -183,6 +183,18 @@ let focused = "";
 const make = (selector) => ({
   selector, value: "", disabled: false, checked: false, textContent: "", innerHTML: "",
   className: "", title: "", src: "", min: "", max: "", required: false,
+  // The element's own id, and `contains`, which together are what make the focus-preserving
+  // rebuild *observable*. `captureInspectorEdit` asks exactly two questions -- does the focused
+  // element have an id, and is it inside this panel -- and with neither answerable here it
+  // returned `null` for every element in every test, so "an in-progress edit survives the
+  // two-second reload" was a guarantee nothing in this file could fail on.
+  //
+  // Neither changes anything that was passing: `document.activeElement` is undefined unless a test
+  // sets it, which is the same deliberate separation the `focus()` note below describes.
+  id: selector.startsWith("#") ? selector.slice(1) : "",
+  contains(node) {
+    return Boolean(node?.id) && String(this.innerHTML || "").includes('id="' + node.id + '"');
+  },
   dataset: {}, style: {}, files: [],
   elements: new Proxy({}, { get: (bag, name) => (bag[name] ||= make(selector + "[" + String(name) + "]")) }),
   classList: {
@@ -19848,6 +19860,15 @@ def test_the_queue_panel_ships_the_cancel_all_button_hidden_beside_the_batch_con
 #: A catalogue in exactly the shape `effect_catalogue_report` serves, small enough to reason
 #: about. The mirror test below feeds the *real* one through the same client functions, so this
 #: literal cannot drift into describing a wire shape the server does not send.
+#: The four reasons a parameter cannot be driven, spelled as `effects.py` spells them. Written out
+#: rather than imported, because the panel shows them **whole and unparaphrased** and a test that
+#: read them off the module would pass just as happily for a module that had reworded one.
+DRIVE_NO_COMMANDS = "ffmpeg's {filter} filter takes no runtime commands"
+DRIVE_RESIZES = (
+    "driving it would resize the frame partway through the clip, which ffmpeg aborts on"
+)
+DRIVE_NOT_A_NUMBER = "it is not a number"
+
 EFFECT_CATALOGUE = {
     "families": ["geometry", "texture", "grade", "stylize"],
     "effects": [
@@ -19856,30 +19877,69 @@ EFFECT_CATALOGUE = {
             "parameters": [{
                 "name": "zoom", "label": "Zoom", "kind": "number", "default": 1.0,
                 "minimum": 1.0, "maximum": 2.0, "integer": False, "choices": [],
+                "drive_reason": DRIVE_RESIZES,
             }],
         },
         {
             "effect": "grain", "family": "texture", "label": "Grain",
             "parameters": [
                 {"name": "strength", "label": "Strength", "kind": "number", "default": 0.0,
-                 "minimum": 0.0, "maximum": 60.0, "integer": False, "choices": []},
+                 "minimum": 0.0, "maximum": 60.0, "integer": False, "choices": [],
+                 "drive_reason": DRIVE_NO_COMMANDS.replace("{filter}", "noise")},
                 {"name": "seed", "label": "Seed", "kind": "number", "default": 0.0,
-                 "minimum": 0.0, "maximum": 65535.0, "integer": True, "choices": []},
+                 "minimum": 0.0, "maximum": 65535.0, "integer": True, "choices": [],
+                 "drive_reason": DRIVE_NO_COMMANDS.replace("{filter}", "noise")},
             ],
+        },
+        # The one drivable parameter in this catalogue, and it has to be here: Grain and Punch In
+        # are both out of Epic 10's subset (R-25, R-29), so a fixture without a Grade card could
+        # never draw an openable band panel at all -- which is exactly the shape of fixture that
+        # makes a defect impossible to observe.
+        {
+            "effect": "exposure", "family": "grade", "label": "Exposure",
+            "parameters": [{
+                "name": "amount", "label": "Amount", "kind": "number", "default": 0.0,
+                "minimum": -1.0, "maximum": 1.0, "integer": False, "choices": [],
+                "drive_reason": "",
+            }],
         },
         {
             "effect": "lut_look", "family": "grade", "label": "LUT Look",
             "parameters": [
                 {"name": "lut", "label": "Look", "kind": "lut", "default": None,
-                 "minimum": None, "maximum": None, "integer": False, "choices": []},
+                 "minimum": None, "maximum": None, "integer": False, "choices": [],
+                 "drive_reason": DRIVE_NOT_A_NUMBER},
                 {"name": "interp", "label": "Interpolation", "kind": "choice",
                  "default": "tetrahedral", "minimum": None, "maximum": None, "integer": False,
-                 "choices": ["nearest", "trilinear", "tetrahedral"]},
+                 "choices": ["nearest", "trilinear", "tetrahedral"],
+                 "drive_reason": DRIVE_NOT_A_NUMBER},
             ],
         },
     ],
     "looks": [{"lut_id": "kodak", "name": "Kodak 2383"}],
+    #: `effects.DRIVE_MODES` and `effects.BINDING_SETTINGS` as the wire carries them. Neither drive
+    #: is marked a default and there is nowhere for one to be marked, which is FX-14 on the wire.
+    "drives": ["punch", "sustain"],
+    #: `drive` names the one drive that reads a setting, or `""` for one both read.
+    #: `effects.DRIVE_ONLY_SETTINGS` owns it, and it is on the wire because the panel draws these
+    #: boxes and cannot answer for itself which drive would ever look at them.
+    "binding_settings": [
+        {"name": "band_centre", "default": 0.25, "minimum": 0.0, "maximum": 1.0, "drive": ""},
+        {"name": "band_width", "default": 0.3, "minimum": 0.02, "maximum": 1.0, "drive": ""},
+        {"name": "band_softness", "default": 0.35, "minimum": 0.0, "maximum": 1.0, "drive": ""},
+        {"name": "floor", "default": 0.0, "minimum": 0.0, "maximum": 1.0, "drive": ""},
+        {"name": "hold", "default": 0.8, "minimum": 0.0, "maximum": 10.0, "drive": "sustain"},
+        {"name": "sustain", "default": 1.5, "minimum": 0.0, "maximum": 20.0, "drive": "sustain"},
+    ],
 }
+
+#: The order the band panel draws its seven boxes in: the band and its floor, then depth, then the
+#: sustain gate's own two timings at the foot. Written out rather than derived from
+#: `EFFECT_BAND_DRAWN_SETTINGS`, because the grouping *is* the decision -- a test that read it off
+#: the same list would pass just as happily for a panel that had put the timings above depth.
+BAND_CONTROL_ORDER = [
+    "band_centre", "band_width", "band_softness", "floor", "depth", "hold", "sustain",
+]
 
 EFFECT_CATALOGUE_PATH = "/api/effects/catalogue"
 
@@ -19898,11 +19958,34 @@ def effects_shot(**overrides) -> str:
 
 #: One Parameter Binding as the wire carries it -- Exposure's amount driven by the lowest band.
 #: `effects._BINDING_SETTINGS` owns the shape; this is a value in it, not a second declaration.
-BOUND_AMOUNT = {"parameter": "amount", "band_centre": 0, "band_width": 1, "band_softness": 0, "drive": "punch", "trigger_floor": 0.0, "depth": 0.5}
+#: *Corrected 2026-08-27.* It carried `trigger_floor`, which `BINDING_SPEC_KEYS` does not declare
+#: and `BINDING_UNKNOWN_KEY_REFUSAL` refuses by name -- inert here, because this test only reads a
+#: request body, and wrong anyway: a fixture whose comment says "as the wire carries it" must carry
+#: what the wire takes. The setting is `floor`.
+BOUND_AMOUNT = {"parameter": "amount", "band_centre": 0, "band_width": 1, "band_softness": 0, "drive": "punch", "floor": 0.0, "depth": 0.5}
+
+
+#: A Song with audio on disk, as the workspace holds one. The band panel asks two things of it --
+#: is there a song, and has its render landed -- before it will look at a measurement at all, and
+#: `song: null` (the default below) is one of the absences it has to name.
+EFFECTS_SONG = {
+    "title": "The master", "path": "song.wav", "duration": 8.0,
+    "analysis": {"song_fingerprint": "abc"},
+}
+#: The merged snap-targets read for a song that has been measured. `analysed` is the only evidence
+#: this browser has and `reason` is the server's own sentence beside it; both come off one read, so
+#: the band panel and the timeline's marks cannot describe different states.
+EFFECTS_MEASURED = {"gaps": [], "beats": [1.0, 2.0], "measured": False, "analysed": True,
+                    "reason": "", "start": 0.0, "end": 8.0, "envelope": {"beats": [1.0, 2.0]}}
+
+
+def effects_unmeasured(reason: str) -> dict:
+    """The same read for a song carrying no measurement, with the server's sentence for why."""
+    return {**EFFECTS_MEASURED, "analysed": False, "reason": reason, "beats": [], "envelope": None}
 
 
 def effects_project(shots: str, project_id: str = "p1", sections: str = "",
-                    placed: str = "") -> str:
+                    placed: str = "", song: dict | None = None) -> str:
     """One Project as the workspace holds it.
 
     `sections` and `placed` are the Section target's two halves of the wire: the Director's own
@@ -19913,7 +19996,7 @@ def effects_project(shots: str, project_id: str = "p1", sections: str = "",
     is that fixture, and it is what fails if this client ever grows an opinion of its own.
     """
     return (
-        f"{{ id: '{project_id}', jobs: [], song: null, assets: [], messages: [], "
+        f"{{ id: '{project_id}', jobs: [], song: {json.dumps(song)}, assets: [], messages: [], "
         f"sections: [{sections}], shot_sections: {{{placed}}}, "
         f"shots: [{shots}] }}"
     )
@@ -19932,7 +20015,8 @@ def run_effects_workspace(body: str, responses: dict | None = None, catalogue=EF
 
 
 def drawn_effects_panel(shot: str, responses: dict | None = None, catalogue=EFFECT_CATALOGUE,
-                        extra: str = "") -> dict:
+                        extra: str = "", song: dict | None = None,
+                        measurement: dict | None = None) -> dict:
     """Select one Shot, draw the inspector, and report what the two panels ended up holding.
 
     The two panels are cut out of the inspector's own markup rather than read off two elements:
@@ -19942,7 +20026,8 @@ def drawn_effects_panel(shot: str, responses: dict | None = None, catalogue=EFFE
     drawn = run_effects_workspace(f"""
       const toasts = [];
       at('#toast-region').append = (item) => toasts.push(item.textContent);
-      state.project = {effects_project(shot)};
+      state.project = {effects_project(shot, song=song)};
+      state.songMeasurement = {json.dumps(measurement)};
       state.selectedShotId = 'shot_a';
       app.renderShotInspector();
       {extra}
@@ -21326,12 +21411,19 @@ def test_a_stack_holding_more_than_one_fault_says_so_above_the_stack():
     assert both["effects"].index("effects-stack-note") < both["effects"].index('id="effect-stack"')
 
 
-def test_the_bind_glyph_ships_inert_and_no_effects_control_draws_the_transition_colour():
-    """`--blue` is closed to transitions and reactive bindings, and neither exists in this slice.
+def test_the_bind_glyph_is_live_and_only_a_binding_draws_the_seventh_accent():
+    """`--blue` is defined by this slice, and it means *reactive* and nothing else.
 
-    The glyph is drawn now so the row's shape does not change under a Director when Epic 10 makes
-    it live -- but it is `--dim`, carries no handler, and is hidden from the accessibility tree,
-    because a control that looks live and is not is the one thing this interface must never draw.
+    The glyph shipped inert through Epic 9 -- `--dim`, `aria-hidden`, no handler -- with a comment
+    naming Epic 10 as what would make it live. It is a real button now: in the tab order, carrying
+    its state in `data-state` and its sentence in its accessible name, and announcing whether its
+    band panel is open. It is **never hidden and never disabled**, because an undrivable parameter
+    and an unmeasured song both keep it and answer with a reason.
+
+    The palette gains `--blue` and nothing else, and the only two things in this whole surface
+    entitled to reach for it are a *bound* parameter's glyph and the band panel's own left edge.
+    Every other rule is asserted to be exactly as blue-free as it was before, which is what stops
+    the seventh accent becoming a decoration the day after it is defined.
     """
     exports = effects_exports()
     styles = STYLES_CSS.read_text(encoding="utf-8")
@@ -21339,21 +21431,52 @@ def test_the_bind_glyph_ships_inert_and_no_effects_control_draws_the_transition_
         {"effect": "grain", "enabled": True, "parameters": {}},
     ]))
 
-    assert f'aria-hidden="true">{exports["bind"]}<' in panel["effects"]
+    assert f'aria-hidden="true">{exports["bind"]}<' not in panel["effects"], (
+        "the bind glyph is still hidden from the accessibility tree"
+    )
+    assert 'class="effect-bind" id="effect-bind-0-strength"' in panel["effects"]
+    assert f'>{exports["bind"]}</button>' in panel["effects"]
+    assert 'aria-expanded="false"' in panel["effects"]
+    # Every state the glyph can be in has a sentence, so a seventh cannot arrive unsentenced --
+    # which is the whole reason the states are a named list rather than a pair of booleans.
+    said = band_exports()
+    assert set(said["states"]) == set(said["titles"]), (said["states"], sorted(said["titles"]))
+    for state, sentence in said["titles"].items():
+        assert sentence.endswith("."), (state, sentence)
+        assert "Opens" in sentence, ("the glyph does not say what pressing it does", state)
+    assert "disabled" not in panel["effects"].split('id="effect-bind-0-strength"')[1].split(">")[0]
     # No token that does not exist -- the Epic 8 defect where a dropdown lost its background
-    # because a token was never declared -- and no `--blue` at all.
+    # because a token was never declared. `--blue` is one of them now, and it is the last.
     root = re.search(r":root\s*\{(.*?)\n\}", styles, re.DOTALL)
     assert root, "styles.css no longer declares its palette on :root"
-    assert "--blue" not in root.group(1)
+    assert "--blue:" in root.group(1), "this slice defines --blue on the palette"
+    declared = re.findall(r"^\s*(--[\w-]+):", root.group(1), re.MULTILINE)
+    assert len(declared) == len(set(declared)), declared
     effects_rules = "\n".join(
         line for line in styles.splitlines()
         if line.startswith((".effect", ".shot-tab", ".clip-fx", ".clip-chips",
                             ".shot-clip[data-chips]"))
     )
     assert effects_rules, "the effects surface has no rules"
-    assert "var(--blue" not in effects_rules
     for token in set(re.findall(r"var\((--[\w-]+)\)", effects_rules)):
         assert f"{token}:" in root.group(1), f"{token} is not a palette token"
+    # `--blue` in this surface is a bound glyph and the band panel's left edge, and nothing else.
+    # Enumerated rather than counted, so a rule that took it up would have to be added here in
+    # words -- which is the point at which somebody has to justify a third reactive thing.
+    blue = [line for line in effects_rules.splitlines() if "var(--blue" in line]
+    assert len(blue) == 3, blue
+    assert blue[0].startswith('.effect-bind[data-state="bound"]'), blue
+    assert blue[1].startswith(".effect-band "), blue
+    assert blue[2].startswith(".effect-band-mode.chosen "), blue
+    # And the panel takes it back where there is nothing reactive to mark. A refusal wearing the
+    # reactive accent is the overloading DESIGN 1 closed the palette against, and it was on screen
+    # on this slice's first browser pass.
+    inert = [line for line in effects_rules.splitlines()
+             if line.startswith(".effect-band[data-state=")]
+    assert len(inert) == 1, inert
+    for state in ("undrivable", "unmeasured", "unread"):
+        assert f'[data-state="{state}"]' in inert[0], state
+    assert "var(--line-strong)" in inert[0], inert
     # `--acid` in this surface is the slider fill and the active tab underline, and nothing else.
     acid = [line for line in effects_rules.splitlines() if "var(--acid" in line]
     assert len(acid) == 2, acid
@@ -23209,3 +23332,812 @@ def test_the_stale_label_is_a_corner_label_over_the_picture_and_the_layers_are_t
     # The palette is closed: no blue, no seventh accent, no gradient behind any of this.
     for banned in ("--blue", "linear-gradient", "box-shadow"):
         assert banned not in stale.group(0) + layer_rule.group(0), banned
+
+
+# --------------------------------------------------------------------------------------
+# Slice E3 -- the band panel.
+#
+# The bind glyph shipped inert through Epic 9 and this slice makes it live. Every gesture below is
+# *performed*: the glyph is pressed, the drive is pressed, the depth is typed, and the request read
+# is the one the workspace really issued at the real path with the real body. A source read would
+# prove the convention and never the behaviour, which is the lesson slice C2 paid for.
+#
+# The one thing the server cannot catch is the thing this section watches hardest: losing a
+# binding is indistinguishable from removing the bound card, because an `EffectSpec` has no id
+# (R-26). So the slider, the toggle, the reorder and a *different* card's removal are all driven
+# on a Shot that carries a binding, and every body they send is read.
+# --------------------------------------------------------------------------------------
+
+
+def band_shot(bindings=None, extra=(), **overrides) -> str:
+    """One Shot carrying an Exposure card -- the fixture's only drivable parameter.
+
+    Grain and Punch In are both outside Epic 10's measured subset (R-25, R-29) and are in this
+    catalogue to be *refused*; a fixture with no drivable parameter could never open a band panel
+    at all, which is the shape of fixture that makes a defect impossible to observe.
+    """
+    card = {"effect": "exposure", "enabled": True, "parameters": {"amount": 0.2}}
+    if bindings is not None:
+        card["bindings"] = bindings
+    return effects_shot(effects=[card, *extra], **overrides)
+
+
+#: A written Parameter Binding as this panel produces one: the three decisions, plus only those
+#: settings that differ from the catalogue's defaults. Sparse for `effectStackSetParameter`'s
+#: reason -- a corrected default has to be able to reach a manifest written before the correction.
+BAND_WRITTEN = {"parameter": "amount", "drive": "punch", "depth": 0.5}
+
+BAND_ROUTE = "/api/projects/p1/shots/shot_a/effects/0/bindings"
+
+
+def band_reply(shot: dict) -> dict:
+    return {"id": "p1", "jobs": [], "song": EFFECTS_SONG, "assets": [], "messages": [],
+            "sections": [], "shot_sections": {}, "shots": [shot]}
+
+
+def band_exports() -> dict:
+    return run_module("""
+      import { EFFECT_BAND_NEEDS_DRIVE, EFFECT_BAND_NEEDS_DEPTH, EFFECT_BAND_UNWRITTEN,
+               EFFECT_BAND_UNCHANGED, EFFECT_BAND_UNDRIVABLE_NOTE, EFFECT_BAND_NEEDS_MEASUREMENT,
+               EFFECT_BAND_UNRESOLVABLE_NOTE, EFFECT_BAND_UNREAD_NOTE, EFFECT_BAND_STRIP_PENDING,
+               EFFECT_BAND_REMOVE_LABEL, EFFECT_BAND_DRIVE_ONLY_NOTE,
+               EFFECT_BAND_DRIVE_ONLY_HELP, EFFECT_BAND_DRIVE_ONLY_KEPT,
+               EFFECT_BIND_STATES, EFFECT_BIND_TITLES,
+               EFFECT_BAND_DRAWN_SETTINGS, EFFECTS_LOCKED_NOTE, SNAP_ANALYZE_LABEL,
+               SNAP_TARGET_UNSONGED, SNAP_TARGET_UNRENDERED }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        needsDrive: EFFECT_BAND_NEEDS_DRIVE, needsDepth: EFFECT_BAND_NEEDS_DEPTH,
+        unwritten: EFFECT_BAND_UNWRITTEN, unchanged: EFFECT_BAND_UNCHANGED,
+        undrivable: EFFECT_BAND_UNDRIVABLE_NOTE, needsMeasurement: EFFECT_BAND_NEEDS_MEASUREMENT,
+        unresolvable: EFFECT_BAND_UNRESOLVABLE_NOTE, unread: EFFECT_BAND_UNREAD_NOTE,
+        strip: EFFECT_BAND_STRIP_PENDING, remove: EFFECT_BAND_REMOVE_LABEL,
+        driveOnly: EFFECT_BAND_DRIVE_ONLY_NOTE, driveOnlyHelp: EFFECT_BAND_DRIVE_ONLY_HELP,
+        driveOnlyKept: EFFECT_BAND_DRIVE_ONLY_KEPT,
+        states: EFFECT_BIND_STATES, titles: EFFECT_BIND_TITLES, locked: EFFECTS_LOCKED_NOTE,
+        drawn: EFFECT_BAND_DRAWN_SETTINGS, analyze: SNAP_ANALYZE_LABEL,
+        unsonged: SNAP_TARGET_UNSONGED, unrendered: SNAP_TARGET_UNRENDERED,
+      }));
+    """)
+
+
+def test_pressing_the_bind_glyph_opens_one_panel_beneath_its_own_row_and_closes_any_other():
+    """FX-12's density decision, driven: per parameter, collapsed, and exactly one open at a time.
+
+    The panel is asserted to sit **between its own row and the next row of the same card**, which
+    is the strongest available statement of "opens inline beneath that row" -- a panel drawn at the
+    foot of a card would be a panel about a parameter the Director has to remember, and would
+    satisfy any weaker assertion.
+
+    Only one, and the second press is on a row whose panel is a *refusal*: it still opens, because
+    the glyph on an undrivable parameter is not inert -- it is a control that answers with a
+    reason -- and it still closes the first, because there is one open record and it holds one
+    triple.
+    """
+    grain = [{"effect": "grain", "enabled": True, "parameters": {}}]
+    # Grain has two rows, so "beneath *that* row" is expressible: strength's panel has to land
+    # after strength's own control and before seed's.
+    between = drawn_effects_panel(
+        band_shot(extra=grain), song=EFFECTS_SONG, measurement=EFFECTS_MEASURED,
+        extra="""
+          await fire('#effect-bind-1-strength:click', {});
+          await flush();
+        """,
+    )["effects"]
+    assert between.count('class="effect-band"') == 1, between
+    assert (between.index('id="effect-param-1-strength"')
+            < between.index('effect-band-panel-1-strength')
+            < between.index('id="effect-param-1-seed"')), between
+
+    panel = drawn_effects_panel(
+        band_shot(extra=grain), song=EFFECTS_SONG, measurement=EFFECTS_MEASURED,
+        extra="""
+          await fire('#effect-bind-0-amount:click', {});
+          await flush();
+        """,
+    )
+    effects = panel["effects"]
+    assert effects.count('class="effect-band"') == 1, effects
+    assert 'id="effect-band-panel-0-amount"' in effects
+    assert 'aria-expanded="true"' in effects
+    assert effects.count('aria-expanded="true"') == 1, effects
+
+    # A second press, on a different card's row. One panel, and it is the new one.
+    moved = drawn_effects_panel(
+        band_shot(extra=grain), song=EFFECTS_SONG, measurement=EFFECTS_MEASURED,
+        extra="""
+          await fire('#effect-bind-0-amount:click', {});
+          await flush();
+          await fire('#effect-bind-1-strength:click', {});
+          await flush();
+        """,
+    )
+    assert moved["effects"].count('class="effect-band"') == 1, moved["effects"]
+    assert 'id="effect-band-panel-1-strength"' in moved["effects"]
+    assert 'id="effect-band-panel-0-amount"' not in moved["effects"]
+
+    # And pressing the open panel's own glyph closes it. Nothing is written by opening or closing,
+    # which is what makes the panel safe to look inside (FX-12: closing keeps the binding).
+    shut = drawn_effects_panel(
+        band_shot(), song=EFFECTS_SONG, measurement=EFFECTS_MEASURED,
+        extra="""
+          requests.length = 0;
+          await fire('#effect-bind-0-amount:click', {});
+          await flush();
+          await fire('#effect-bind-0-amount:click', {});
+          await flush();
+        """,
+    )
+    assert 'class="effect-band"' not in shut["effects"]
+    assert shut["requests"] == []
+
+
+def test_a_fresh_band_panel_chooses_no_drive_and_writes_nothing_until_both_decisions_are_made():
+    """FX-14 and story 10.1's AC, driven: **neither drive is preselected and nothing infers one.**
+
+    Depth is the same kind of decision and is treated as one: there is no number this panel could
+    put in that box that the Director did not choose, and a depth of zero is a binding that
+    silently does nothing. So a fresh panel is missing *two* things, says both, and sends nothing.
+
+    The request count is the assertion with teeth. A panel that wrote on the drive press alone
+    would look identical on screen and would store a binding at a depth nobody picked.
+    """
+    said = band_exports()
+    fresh = drawn_effects_panel(
+        band_shot(), song=EFFECTS_SONG, measurement=EFFECTS_MEASURED,
+        extra="""
+          requests.length = 0;
+          await fire('#effect-bind-0-amount:click', {});
+          await flush();
+        """,
+    )
+
+    effects = fresh["effects"]
+    assert effects.count('aria-pressed="false"') == 2, effects
+    assert 'aria-pressed="true"' not in effects
+    for line in (said["needsDrive"], said["needsDepth"], said["unwritten"]):
+        assert escape_for_markup(line) in effects, line
+    # The depth box is empty rather than sitting on a number the panel chose for the Director.
+    depth = re.search(r'<input[^>]*id="effect-band-0-amount-depth"[^>]*>', effects)
+    assert depth and 'value=""' in depth.group(0), depth
+    assert fresh["requests"] == []
+
+    # The drive alone still writes nothing, and the panel now names only what is left.
+    half = drawn_effects_panel(
+        band_shot(), song=EFFECTS_SONG, measurement=EFFECTS_MEASURED,
+        extra="""
+          await fire('#effect-bind-0-amount:click', {});
+          await flush();
+          requests.length = 0;
+          await fire('#effect-band-0-amount-drive-punch:click', {});
+          await flush();
+        """,
+    )
+    assert half["requests"] == [], half["requests"]
+    assert escape_for_markup(said["needsDepth"]) in half["effects"]
+    assert escape_for_markup(said["needsDrive"]) not in half["effects"]
+    assert half["effects"].count('aria-pressed="true"') == 1, half["effects"]
+
+    # And the change that completes it is the change that writes it -- at the bindings route, with
+    # the card's own effect id beside the position, and nothing else on the wire.
+    written = drawn_effects_panel(
+        band_shot(),
+        responses={BAND_ROUTE: {"body": band_reply(json.loads(band_shot(bindings=[BAND_WRITTEN])))}},
+        song=EFFECTS_SONG, measurement=EFFECTS_MEASURED,
+        extra="""
+          await fire('#effect-bind-0-amount:click', {});
+          await flush();
+          await fire('#effect-band-0-amount-drive-punch:click', {});
+          await flush();
+          requests.length = 0;
+          at('#effect-band-0-amount-depth').value = '0.5';
+          await fire('#effect-band-0-amount-depth:change', {});
+          await flush();
+        """,
+    )
+    assert [(item["method"], item["path"]) for item in written["requests"]] == [
+        ("PUT", BAND_ROUTE)
+    ], written["requests"]
+    assert json.loads(written["requests"][0]["body"]) == {
+        "effect": "exposure", "bindings": [BAND_WRITTEN]
+    }
+    # The reply is the whole Project, so the glyph reads bound from what was stored rather than
+    # from what this client hoped it sent -- and nothing is outstanding any more.
+    assert 'id="effect-bind-0-amount" data-state="bound"' in written["effects"]
+    assert escape_for_markup(said["unwritten"]) not in written["effects"]
+
+
+def test_the_band_panels_bounds_are_the_servers_and_never_this_files():
+    """Every bound on this panel comes off the wire, which is the Epic 9 defect closed by design.
+
+    The three band inputs and the floor take `binding_settings`' own minima, maxima and defaults;
+    depth takes the **parameter's** declared span in both directions, because its bound is not a
+    constant and could not be served as one. A client carrying its own copy of either would be
+    ignoring bounds the server was already sending -- with the extra twist that it would be
+    *inventing* the depth bound rather than merely ignoring it.
+    """
+    said = band_exports()
+    panel = drawn_effects_panel(
+        band_shot(), song=EFFECTS_SONG, measurement=EFFECTS_MEASURED,
+        extra="""
+          await fire('#effect-bind-0-amount:click', {});
+          await flush();
+        """,
+    )
+    inputs = {
+        item.group(1): item.group(0)
+        for item in re.finditer(
+            r'<input[^>]*id="effect-band-0-amount-(\w+)"[^>]*>', panel["effects"])
+    }
+
+    def attribute(tag: str, name: str) -> str:
+        found = re.search(rf'\b{name}="([^"]*)"', tag)
+        assert found, (name, tag)
+        return found.group(1)
+
+    def bounds(tag: str) -> tuple[float, float]:
+        # Compared as numbers, because JavaScript writes `0` where Python writes `0.0`, and a
+        # string comparison would be asserting about the renderer rather than about the bound.
+        return float(attribute(tag, "min")), float(attribute(tag, "max"))
+
+    assert list(inputs) == BAND_CONTROL_ORDER, inputs
+    for setting in EFFECT_CATALOGUE["binding_settings"]:
+        if setting["name"] not in inputs:
+            continue
+        tag = inputs[setting["name"]]
+        assert bounds(tag) == (setting["minimum"], setting["maximum"]), setting["name"]
+        assert float(attribute(tag, "value")) == setting["default"], setting["name"]
+    # Exposure's amount runs -1..1, so a binding may move it by at most its own span either way.
+    assert bounds(inputs["depth"]) == (-2.0, 2.0), inputs["depth"]
+    # And the panel names exactly what it is still missing rather than reading as finished.
+    assert escape_for_markup(said["strip"]) in panel["effects"]
+
+
+def test_a_binding_survives_every_other_gesture_on_its_card():
+    """The failure the server cannot catch, driven through four real gestures.
+
+    Losing a binding is indistinguishable from removing the bound card, because an `EffectSpec`
+    has no id (R-26) -- so `carried_bindings_refusal` can refuse a body that *invents* one and
+    nothing anywhere can refuse a body that drops one. One slider release would have destroyed the
+    Director's work and been answered 200.
+
+    Every gesture that writes a stack from this panel is performed on a Shot that carries a
+    binding, and every body is read. A path added later that rebuilds an entry from its parts fails
+    here rather than in a manifest.
+    """
+    bound = json.loads(band_shot(bindings=[BAND_WRITTEN], extra=[
+        {"effect": "lut_look", "enabled": True, "parameters": {"lut": "kodak"}},
+        {"effect": "grain", "enabled": True, "parameters": {"strength": 3.0}},
+    ]))
+    reply = band_reply(bound)
+    gestures = {
+        "the slider on the bound parameter itself": """
+          at('#effect-param-0-amount').value = '0.4';
+          await fire('#effect-param-0-amount:change', {});
+        """,
+        "the card's enable toggle": """
+          at('#effect-toggle-0').checked = false;
+          await fire('#effect-toggle-0:change', {});
+        """,
+        "a reorder inside the grade run": """
+          await fire('#effect-card-0:keydown',
+            { key: 'ArrowDown', altKey: true, preventDefault() {} });
+        """,
+        "removing a different card": """
+          await fire('#effect-remove-2:click', {});
+        """,
+    }
+    for what, gesture in gestures.items():
+        drawn = drawn_effects_panel(
+            json.dumps(bound),
+            responses={"/api/projects/p1/shots/shot_a/effects": {"body": reply}},
+            song=EFFECTS_SONG, measurement=EFFECTS_MEASURED,
+            extra=f"""
+              requests.length = 0;
+              {gesture}
+              await flush();
+            """,
+        )
+        assert drawn["requests"], what
+        body = json.loads(drawn["requests"][0]["body"])
+        carried = [
+            entry.get("bindings") for entry in body["effects"] if entry["effect"] == "exposure"
+        ]
+        assert carried == [[BAND_WRITTEN]], (what, body)
+        # And nothing else grew one: carrying is per card, off the card it was read from, and a
+        # `bindings: []` on a card that never had one would move every body this client sends.
+        for entry in body["effects"]:
+            if entry["effect"] != "exposure":
+                assert "bindings" not in entry, (what, entry)
+
+
+def test_remove_binding_leaves_nothing_of_it_and_the_parameter_where_it_was():
+    """FX-12: the parameter returns to its resting value **with no residue**.
+
+    Removing is an explicit control inside the panel and nothing else does it -- closing the panel
+    keeps the binding, and clearing the depth box leaves the stored binding alone and says so.
+    Asserted on the body, because "no residue" is a statement about the manifest.
+    """
+    said = band_exports()
+    bound = json.loads(band_shot(bindings=[BAND_WRITTEN]))
+    plain = json.loads(band_shot())
+    removed = drawn_effects_panel(
+        json.dumps(bound),
+        responses={BAND_ROUTE: {"body": band_reply(plain)}},
+        song=EFFECTS_SONG, measurement=EFFECTS_MEASURED,
+        extra="""
+          await fire('#effect-bind-0-amount:click', {});
+          await flush();
+          requests.length = 0;
+          await fire('#effect-band-0-amount-remove:click', {});
+          await flush();
+        """,
+    )
+
+    assert [(item["method"], item["path"]) for item in removed["requests"]] == [("PUT", BAND_ROUTE)]
+    assert json.loads(removed["requests"][0]["body"]) == {"effect": "exposure", "bindings": []}
+    # The parameter's own stored number was never part of any of this and is still on screen.
+    assert 'id="effect-param-0-amount"' in removed["effects"]
+    assert 'value="0.2"' in removed["effects"]
+    # The glyph has gone back to unbound, and the removal control went with the binding.
+    assert 'id="effect-bind-0-amount" data-state="free"' in removed["effects"]
+    assert escape_for_markup(said["remove"]) not in removed["effects"]
+
+    # Clearing the depth on a *stored* binding is not a removal, and the panel does not pretend it
+    # is: nothing is written, and what it says is that the stored binding is unchanged.
+    cleared = drawn_effects_panel(
+        json.dumps(bound), song=EFFECTS_SONG, measurement=EFFECTS_MEASURED,
+        extra="""
+          await fire('#effect-bind-0-amount:click', {});
+          await flush();
+          requests.length = 0;
+          at('#effect-band-0-amount-depth').value = '';
+          await fire('#effect-band-0-amount-depth:change', {});
+          await flush();
+        """,
+    )
+    assert cleared["requests"] == []
+    assert escape_for_markup(said["unchanged"]) in cleared["effects"]
+    assert escape_for_markup(said["unwritten"]) not in cleared["effects"]
+
+
+def test_an_undrivable_parameter_refuses_in_the_catalogues_own_sentence():
+    """R-25 and R-29, at the glyph: the refusal is the catalogue's clause, whole and unrephrased.
+
+    Two of the four reasons, on two real rows. The glyph is **present and never hidden** on both --
+    a hidden control teaches nothing about what this application can do, and the whole point of the
+    refusal is that it names the ffmpeg filter rather than leaving a Director to discover at render
+    time that their picture never moved.
+
+    The sentence is asserted against the fixture's literal spelling of `effects.py`'s clause, which
+    `test_the_catalogue_serves_what_a_band_panel_needs_and_never_a_default_drive` holds against the
+    module itself. Neither test alone would catch a reworded clause; the pair does.
+    """
+    said = band_exports()
+    cases = {
+        "1-lut": (DRIVE_NOT_A_NUMBER, "Look"),
+        "2-strength": (DRIVE_NO_COMMANDS.replace("{filter}", "noise"), "Strength"),
+    }
+    for key, (reason, label) in cases.items():
+        panel = drawn_effects_panel(
+            band_shot(extra=[
+                {"effect": "lut_look", "enabled": True, "parameters": {"lut": "kodak"}},
+                {"effect": "grain", "enabled": True, "parameters": {}},
+            ]),
+            song=EFFECTS_SONG, measurement=EFFECTS_MEASURED,
+            extra=f"""
+              requests.length = 0;
+              await fire('#effect-bind-{key}:click', {{}});
+              await flush();
+            """,
+        )
+        whole = said["undrivable"].replace("{label}", label).replace("{reason}", reason)
+        assert escape_for_markup(whole) in panel["effects"], (key, panel["effects"])
+        assert f'id="effect-bind-{key}" data-state="undrivable"' in panel["effects"]
+        # The panel carries the state too, so the stylesheet can keep `--blue` meaning *reactive*
+        # without this template deciding it: a panel saying the music can never reach this
+        # parameter must not wear the accent that means it can.
+        assert f'id="effect-band-panel-{key}" data-state="undrivable"' in panel["effects"]
+        # A refusal, and therefore no controls: a band selector under one would offer a choice
+        # that cannot be written, which is the control-that-does-nothing R-24 rejects by name.
+        assert f'id="effect-band-{key}-drive-punch"' not in panel["effects"]
+        assert f'id="effect-band-{key}-band_centre"' not in panel["effects"]
+        assert panel["requests"] == []
+        # And it is a fact about ffmpeg, not about the song: no `[Analyze song]` is offered.
+        assert f'id="effect-band-{key}-analyze"' not in panel["effects"]
+
+
+def test_a_song_with_no_measurement_keeps_the_glyph_and_names_which_absence_it_is():
+    """FX-15 and story 10.4's first criterion: the glyph is present, and the refusal is actionable.
+
+    **Which absence, not merely that there is one.** Never-taken, song-changed and
+    sidecar-unreadable are three different remedies and a Director can act on the difference, so
+    the server's own sentence is carried whole and this file adds only the clause saying why a band
+    cares. `[Analyze song]` is offered on each of them, because each is one a re-measurement fixes.
+
+    The two absences that are *not* about the measurement -- no song, and a generated song whose
+    render has not landed -- are named too, and neither offers the button: a press that cannot help
+    is worse than no press.
+    """
+    said = band_exports()
+    reasons = [
+        "No song analysis yet.",
+        ("The song changed after it was analyzed, so the stored analysis describes a track this "
+         "project no longer has."),
+        "The song analysis file is missing or unreadable, so there is nothing to serve.",
+    ]
+    for reason in reasons:
+        panel = drawn_effects_panel(
+            band_shot(), song=EFFECTS_SONG, measurement=effects_unmeasured(reason),
+            extra="""
+              requests.length = 0;
+              await fire('#effect-bind-0-amount:click', {});
+              await flush();
+            """,
+        )
+        assert escape_for_markup(f"{reason} {said['needsMeasurement']}") in panel["effects"], reason
+        assert 'id="effect-bind-0-amount" data-state="unmeasured"' in panel["effects"]
+        assert 'id="effect-band-0-amount-analyze"' in panel["effects"]
+        assert escape_for_markup(said["analyze"]) in panel["effects"]
+        # Nothing to bind with, so nothing on screen that pretends to bind.
+        assert 'id="effect-band-0-amount-drive-punch"' not in panel["effects"]
+        assert panel["requests"] == []
+
+    # No song at all, and a song whose render has not landed: named, and no button.
+    for song, sentence in ((None, said["unsonged"]),
+                           ({**EFFECTS_SONG, "path": ""}, said["unrendered"])):
+        absent = drawn_effects_panel(
+            band_shot(), song=song, measurement=None,
+            extra="""
+              requests.length = 0;
+              await fire('#effect-bind-0-amount:click', {});
+              await flush();
+            """,
+        )
+        assert escape_for_markup(f"{sentence} {said['needsMeasurement']}") in absent["effects"]
+        assert 'id="effect-band-0-amount-analyze"' not in absent["effects"]
+
+    # And a read that has not landed is **not** evidence of absence. `undefined` is not `false`,
+    # and a panel claiming the song is unmeasured for the length of a request would assert
+    # something nobody said -- `snapSelectorPlan`'s third row state, in this panel's words.
+    unread = drawn_effects_panel(
+        band_shot(), song=EFFECTS_SONG, measurement=None,
+        extra="""
+          await fire('#effect-bind-0-amount:click', {});
+          await flush();
+        """,
+    )
+    assert escape_for_markup(said["unread"]) in unread["effects"]
+    assert 'id="effect-bind-0-amount" data-state="unread"' in unread["effects"]
+    assert 'id="effect-band-0-amount-analyze"' not in unread["effects"]
+
+
+def test_the_analyze_button_in_the_band_panel_runs_the_measurement_the_snap_rows_run():
+    """One act, one implementation.
+
+    A second analyze path here would be a second answer to "is one already running", and the guard
+    that answers it lives inside `runSongAnalysis` -- keyed per project, because a Director who
+    switched projects mid-measurement must be able to start one on the project they are looking at.
+    """
+    fired = drawn_effects_panel(
+        band_shot(), song=EFFECTS_SONG,
+        measurement=effects_unmeasured("No song analysis yet."),
+        extra="""
+          await fire('#effect-bind-0-amount:click', {});
+          await flush();
+          requests.length = 0;
+          await fire('#effect-band-0-amount-analyze:click', {});
+          await flush();
+        """,
+    )
+    assert fired["requests"], "the press reached nothing"
+    first = fired["requests"][0]
+    assert (first["method"], first["path"]) == (
+        "POST", "/api/projects/p1/song/analyze"
+    ), fired["requests"]
+
+
+def test_an_unresolvable_binding_is_drawn_as_unresolvable_and_never_as_an_error():
+    """Story 10.4's Director-facing half, said where the Director is looking.
+
+    A song replaced after a binding was made leaves the binding pointing at a measurement that no
+    longer describes anything -- and the binding is **retained and reported unresolvable, never
+    dropped and never silently zeroed**. So the glyph stays lit rather than reverting to unbound:
+    dimming it would be the interface quietly disowning work that is still in the manifest.
+
+    Drawn as a *state*, not a fault. No refused row class: a stale envelope is a fact about the
+    song, and this card's red treatment is reserved for a stored value the export refuses by name.
+    """
+    said = band_exports()
+    reason = ("The song changed after it was analyzed, so the stored analysis describes a track "
+              "this project no longer has.")
+    panel = drawn_effects_panel(
+        band_shot(bindings=[BAND_WRITTEN]), song=EFFECTS_SONG,
+        measurement=effects_unmeasured(reason),
+        extra="""
+          requests.length = 0;
+          await fire('#effect-bind-0-amount:click', {});
+          await flush();
+        """,
+    )
+
+    effects = panel["effects"]
+    assert 'id="effect-bind-0-amount" data-state="unresolvable"' in effects
+    assert escape_for_markup(f"{reason} {said['unresolvable']}") in effects
+    # Retained, so its controls and its removal are all still there and all still operable.
+    assert 'id="effect-band-0-amount-drive-punch"' in effects
+    assert escape_for_markup(said["remove"]) in effects
+    assert 'aria-pressed="true"' in effects, "the stored drive is not shown as chosen"
+    # A state, not an error.
+    assert "effect-row-refused" not in effects
+    assert panel["requests"] == []
+
+
+def test_the_open_band_panel_and_a_number_being_typed_into_it_survive_a_rebuild():
+    """The focus-preserving rebuild extends to the band panel (the UX spine's own requirement).
+
+    This inspector is redrawn by a background reload every two seconds and by every reply nobody
+    awaited. Two different mechanisms carry the Director across it and both are asserted here: the
+    panel's *openness* survives because it is drawn from module state rather than mutated into the
+    DOM after the render, and the *edit inside it* survives through `captureInspectorEdit`, which
+    needs the control to keep its id across the rebuild.
+
+    A background poll that stole the caret mid-number is the defect here, and it is one no other
+    gate in this repository would see.
+    """
+    kept = run_effects_workspace(f"""
+      state.project = {effects_project(band_shot(), song=EFFECTS_SONG)};
+      state.songMeasurement = {json.dumps(EFFECTS_MEASURED)};
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      // On the tab the panel lives on, because the tab is the other half of what the rebuild has
+      // to carry: an edit restored into a hidden panel is an edit a browser refuses to focus.
+      await fire('#shot-tab-effects:click', {{}});
+      await fire('#effect-bind-0-amount:click', {{}});
+      await flush();
+      const box = at('#effect-band-0-amount-depth');
+      box.value = '0.31';
+      // The stub does not wire `focus()` to `activeElement` -- see the harness -- so the Director
+      // standing in the box is stated rather than simulated.
+      document.activeElement = box;
+      requests.length = 0;
+      app.renderShotInspector();
+      await flush();
+      console.log(JSON.stringify({{
+        open: at('#shot-inspector').innerHTML.includes('effect-band-panel-0-amount'),
+        focused: document.activeElement ? document.activeElement.id : '',
+        value: at('#effect-band-0-amount-depth').value,
+        tab: at('#shot-inspector').dataset.shotTab,
+        requests: requests.length,
+      }}));
+    """)
+
+    assert kept["open"] is True, "the band panel closed under a rebuild"
+    assert kept["focused"] == "effect-band-0-amount-depth", kept
+    assert kept["value"] == "0.31", kept
+    assert kept["tab"] == "effects", kept
+    assert kept["requests"] == 0
+
+
+def test_a_locked_shot_draws_the_band_panel_readable_and_every_control_disabled():
+    """FX-7 reaches the panel: every writing control disabled, the lock stated, the band readable.
+
+    The glyph itself stays live, because reading a binding is not writing one -- and a Director who
+    could not see what a locked Shot is bound to would have to unlock it to find out.
+
+    **The reason rides on each control rather than as a paragraph inside the panel**, which is
+    `effectCardModel`'s rule for the toggle and the remove beside it. Browser QA on 2026-08-27
+    found the tab's lock notice and the panel's own printing the identical sentence twice in one
+    view; the one that belongs to the whole tab is the one that stays.
+    """
+    said = band_exports()
+    panel = drawn_effects_panel(
+        band_shot(bindings=[BAND_WRITTEN], locked=True),
+        song=EFFECTS_SONG, measurement=EFFECTS_MEASURED,
+        extra="""
+          requests.length = 0;
+          await fire('#effect-bind-0-amount:click', {});
+          await flush();
+        """,
+    )
+
+    effects = panel["effects"]
+    assert 'id="effect-band-panel-0-amount"' in effects
+    assert escape_for_markup(said["remove"]) in effects
+    for control in (*BAND_CONTROL_ORDER, "drive-punch", "drive-sustain", "remove"):
+        tag = re.search(rf'<(?:input|button)[^>]*id="effect-band-0-amount-{control}"[^>]*>',
+                        effects)
+        assert tag and " disabled" in tag.group(0), control
+        assert escape_for_markup(said["locked"]) in tag.group(0), control
+    # Said once for the tab, not once per panel: the notice above the stack is the sentence, and
+    # the panel adds none of its own.
+    assert effects.count('<p class="control-reason" id="effects-locked">') == 1, effects
+    assert panel["requests"] == []
+
+
+def test_the_sustain_gates_two_timings_are_reachable_only_under_the_drive_that_reads_them():
+    """Story 10.1's own criterion, restored: `sustain` *"engages only after its band holds above a
+    level for a **hold time**, and survives dips for a **sustain time**"*.
+
+    Both were left out of this panel's first pass, which made that criterion unmeetable -- a
+    Director could choose `sustain` and could not reach either number it runs on. They are drawn
+    now, and they are **drawn in every state rather than appearing when the drive is chosen**: a
+    control that materialises when a Director changes a nearby one moves the row shape under them,
+    and a control absent under `punch` teaches nothing about what `sustain` would give them.
+
+    So under `punch` -- and on a fresh binding with no drive at all -- they are inert, each
+    carrying its own reason, with one sentence under the pair. Under `sustain` they are live and
+    the sentence is gone, because a panel narrating a working control would be noise.
+
+    **Which drive reads what is served, never decided here.** `effects.DRIVE_ONLY_SETTINGS` owns
+    it and `binding_settings` carries it, for the reason every other bound on this panel is
+    served: a second copy of this application's drive model living in JavaScript is the shape
+    R-15 refused for snapping and R-27 refused for the readout.
+    """
+    said = band_exports()
+
+    def boxes(effects: str) -> dict:
+        return {
+            item.group(1): item.group(0)
+            for item in re.finditer(
+                r'<input[^>]*id="effect-band-0-amount-(\w+)"[^>]*>', effects)
+        }
+
+    gated = {"hold": "Hold", "sustain": "Sustain"}
+    note = (said["driveOnly"]
+            .replace("{settings}", "Hold and Sustain")
+            .replace("{drive}", "sustain"))
+
+    # A fresh binding: no drive chosen, so nothing reads them yet and both say so.
+    fresh = drawn_effects_panel(
+        band_shot(), song=EFFECTS_SONG, measurement=EFFECTS_MEASURED,
+        extra="""
+          requests.length = 0;
+          await fire('#effect-bind-0-amount:click', {});
+          await flush();
+        """,
+    )
+    def rows(effects: str) -> list:
+        return re.findall(r'<div class="effect-band-row([^"]*)"', effects)
+
+    drawn = boxes(fresh["effects"])
+    assert set(gated) <= set(drawn), drawn
+    # The **row** carries it, not the box: dimming the number alone left the label at the working
+    # rows' weight, so the pair read as live at a glance. `.effect-card.effect-off` is the
+    # precedent -- the unit that is inert is the unit that recedes.
+    # Eight rows: the drive, the band's three, the floor, depth, and the gate's two.
+    assert rows(fresh["effects"]) == ["", "", "", "", "", "", " idle", " idle"], (
+        rows(fresh["effects"]))
+    for name, label in gated.items():
+        assert " disabled" in drawn[name], (name, drawn[name])
+        whole = said["driveOnlyHelp"].replace("{label}", label).replace("{drive}", "sustain")
+        assert escape_for_markup(whole) in drawn[name], (name, drawn[name])
+    assert escape_for_markup(note) in fresh["effects"]
+    # **The reassurance is earned, not standing.** On a fresh binding nothing has been set, so
+    # "switching back does not lose it" is a promise about nothing -- and it was four of the five
+    # lines that made the first pass of this panel 202px of prose in a 626px rail.
+    assert escape_for_markup(said["driveOnlyKept"]) not in fresh["effects"]
+    assert fresh["requests"] == []
+
+    # `punch` chosen: the same answer, because `punch` reads neither.
+    punched = drawn_effects_panel(
+        band_shot(bindings=[BAND_WRITTEN]), song=EFFECTS_SONG, measurement=EFFECTS_MEASURED,
+        extra="""
+          requests.length = 0;
+          await fire('#effect-bind-0-amount:click', {});
+          await flush();
+        """,
+    )
+    held = boxes(punched["effects"])
+    assert all(" disabled" in held[name] for name in gated), held
+    assert escape_for_markup(note) in punched["effects"]
+    # Still nothing tuned on this binding, so still no promise about keeping it.
+    assert escape_for_markup(said["driveOnlyKept"]) not in punched["effects"]
+
+    # A hold a Director set, on a binding whose drive no longer reads it: *now* the sentence is
+    # about something, and it is the one thing they want to know.
+    tuned = drawn_effects_panel(
+        band_shot(bindings=[{"parameter": "amount", "drive": "punch", "depth": 0.5, "hold": 2.5}]),
+        song=EFFECTS_SONG, measurement=EFFECTS_MEASURED,
+        extra="""
+          requests.length = 0;
+          await fire('#effect-bind-0-amount:click', {});
+          await flush();
+        """,
+    )
+    assert escape_for_markup(said["driveOnlyKept"]) in tuned["effects"]
+    assert 'value="2.5"' in boxes(tuned["effects"])["hold"], (
+        "the kept timing is not shown, so a Director cannot see it was kept")
+
+    # `sustain` chosen: live, and the sentence is gone.
+    sustained = drawn_effects_panel(
+        band_shot(bindings=[
+            {"parameter": "amount", "drive": "sustain", "depth": 0.4, "hold": 2.5},
+        ]),
+        song=EFFECTS_SONG, measurement=EFFECTS_MEASURED,
+        extra="""
+          requests.length = 0;
+          await fire('#effect-bind-0-amount:click', {});
+          await flush();
+        """,
+    )
+    live = boxes(sustained["effects"])
+    assert all(" disabled" not in live[name] for name in gated), live
+    assert rows(sustained["effects"]) == [""] * 8, rows(sustained["effects"])
+    assert escape_for_markup(note) not in sustained["effects"]
+    # The stored value is what the box holds, and the untouched one takes the served default.
+    assert 'value="2.5"' in live["hold"], live["hold"]
+    assert 'value="1.5"' in live["sustain"], live["sustain"]
+    # Bounded by `BINDING_SETTINGS`, not by numbers this file made up. Compared as numbers,
+    # because JavaScript writes `0` where Python writes `0.0`.
+    for setting in EFFECT_CATALOGUE["binding_settings"]:
+        if setting["name"] not in gated:
+            continue
+        tag = live[setting["name"]]
+        held = {
+            name: float(re.search(rf' {name}="([^"]*)"', tag).group(1))
+            for name in ("min", "max")
+        }
+        assert held == {"min": setting["minimum"], "max": setting["maximum"]}, (tag, setting)
+    # And each one's help is its own again, not the reason it was inert.
+    assert escape_for_markup("sustain drive engages") in live["hold"], live["hold"]
+
+
+def test_a_timing_the_punch_drive_ignores_is_still_carried_through_every_write():
+    """`BINDING_SETTINGS`' own promise, driven: *"stored on every binding anyway, so switching
+    drive back and forth does not lose them."*
+
+    A Director who tunes a hold under `sustain`, tries `punch`, and goes back must find their
+    timing as they left it. Nothing on the server can protect that -- the panel writes the whole
+    binding on every change -- so the carry is this client's, and it is asserted on the body of the
+    write that switches the drive rather than on the model that produced it.
+    """
+    tuned = {"parameter": "amount", "drive": "sustain", "depth": 0.4, "hold": 2.5, "sustain": 4.0}
+    tuned_shot = json.loads(band_shot(bindings=[tuned]))
+    switched = drawn_effects_panel(
+        json.dumps(tuned_shot),
+        responses={BAND_ROUTE: {"body": band_reply(tuned_shot)}},
+        song=EFFECTS_SONG, measurement=EFFECTS_MEASURED,
+        extra="""
+          await fire('#effect-bind-0-amount:click', {});
+          await flush();
+          requests.length = 0;
+          await fire('#effect-band-0-amount-drive-punch:click', {});
+          await flush();
+        """,
+    )
+
+    assert [(item["method"], item["path"]) for item in switched["requests"]] == [
+        ("PUT", BAND_ROUTE)
+    ], switched["requests"]
+    written = json.loads(switched["requests"][0]["body"])["bindings"][0]
+    assert written == {**tuned, "drive": "punch"}, written
+
+
+def test_the_panel_names_exactly_what_it_is_still_missing():
+    """The sentence under the band inputs is an exhaustive claim, so it is checked as one.
+
+    With `hold` and `sustain` drawn, story 10.1 is met by this panel and the only parts of the band
+    surface that do not exist are 10.2's spectrum strip and 10.3's drive readout. The sentence says
+    *only two things*, and a slice that added a third absence without editing it would leave a
+    false statement on screen -- which is what the `STALE` label shipped as, one epic ago.
+    """
+    said = band_exports()
+
+    assert "only two things" in said["strip"], said["strip"]
+    assert "spectrum strip" in said["strip"] and "readout" in said["strip"], said["strip"]
+    # Every control story 10.1 names is reachable, which is what makes the claim true today.
+    panel = drawn_effects_panel(
+        band_shot(), song=EFFECTS_SONG, measurement=EFFECTS_MEASURED,
+        extra="""
+          await fire('#effect-bind-0-amount:click', {});
+          await flush();
+        """,
+    )["effects"]
+    for control in BAND_CONTROL_ORDER:
+        assert f'id="effect-band-0-amount-{control}"' in panel, control
+    for mode in EFFECT_CATALOGUE["drives"]:
+        assert f'id="effect-band-0-amount-drive-{mode}"' in panel, mode
+    # And nothing canvas-shaped has quietly appeared, which would make the sentence false the
+    # other way round.
+    assert "<canvas" not in panel, panel

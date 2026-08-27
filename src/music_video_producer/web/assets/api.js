@@ -6533,14 +6533,664 @@ export function shotTabAfterKey(activeId, key) {
   return SHOT_TABS[(index + step + SHOT_TABS.length) % SHOT_TABS.length].id;
 }
 
-//: The bind glyph that ends every parameter row (DESIGN section 3): `--dim` when inert, `--blue`
-//: when bound to a Band. **It ships inert**, and there is no second state in this slice -- Epic 10
-//: builds the Band panel and makes it live. Drawn now rather than added later so the row's shape
-//: does not change under a Director between two versions, which is the same argument the disabled
-//: Effect makes about keeping its controls readable.
+//: The bind glyph that ends every parameter row (DESIGN section 3): `--dim` when the parameter is
+//: not bound, `--blue` when it is.
+//:
+//: **Live since Epic 10's third slice.** It shipped through Epic 9 as `--dim`, `aria-hidden` and
+//: handlerless, with a comment naming Epic 10 as what would make it live -- drawn early precisely
+//: so the row's shape does not move under a Director between two versions. It is now a real
+//: button on every row, and it is **never hidden**: a hidden control teaches nothing about what
+//: this application can do, which is why an undrivable parameter and an unmeasured song both keep
+//: their glyph and answer with a reason instead of with nothing.
 export const EFFECT_BIND_GLYPH = "〜";
-export const EFFECT_BIND_INERT_TITLE =
-  "Reactive bindings are not built yet. This parameter holds the value set here for the whole shot.";
+
+//: Every state one bind glyph can be in, in the order they are decided. Named rather than encoded
+//: as a pair of booleans because each carries a different sentence *and* a different thing behind
+//: the glyph, and because a test that enumerates them fails when a seventh arrives unsentenced.
+//:
+//: * `undrivable` -- the catalogue says the music cannot reach this parameter, whatever the song
+//:   is. Decided first, because it is true of a measured song too and the song is then beside the
+//:   point.
+//: * `unresolvable` -- bound, and the measurement that drives it is not current (story 10.4).
+//: * `bound` -- bound, and the drive resolves.
+//: * `unmeasured` -- drivable, and this song carries no measurement to drive it with.
+//: * `unread` -- drivable, and this browser has not been told whether the song is measured.
+//:   **Not the same as `unmeasured`**, and flattening the two is the defect `snapSelectorPlan`
+//:   and `songTempoCell` both exist around: `undefined` is not `false`, and a panel claiming a
+//:   song is unmeasured for the length of a request states something nobody said.
+//: * `free` -- drivable, measured, and not yet bound.
+export const EFFECT_BIND_STATES = [
+  "undrivable", "unresolvable", "bound", "unmeasured", "unread", "free",
+];
+
+//: What the glyph says in each of them. Every one names the parameter and says what pressing it
+//: does, because the glyph is the whole affordance -- there is no separate "make reactive" mode --
+//: and a control whose only label is a character has to carry its meaning in its accessible name.
+export const EFFECT_BIND_TITLES = {
+  free: "Drive {label} with the music instead of holding it at one number. Opens its band panel.",
+  bound: "{label} is driven by the music. Opens its band panel.",
+  unresolvable:
+    "{label} is driven by the music, and the measurement that drives it is not current. Opens "
+    + "its band panel.",
+  undrivable: "{label} cannot be driven by the music. Opens the reason.",
+  unmeasured: "This song carries no measurement, so nothing can be driven by it yet. Opens the "
+    + "reason and the measurement.",
+  unread: "Whether this song has been measured has not been read yet. Opens what is known.",
+};
+
+//: ------------------------------------------------------------------------------------------
+//: The band panel: what it says in each of its absences, and what it offers where it has
+//: something to offer.
+//:
+//: **The strip is not in this slice** (10.2 is). What ships is the Band as the three labelled
+//: numeric inputs the accessibility floor already requires of it -- centre, width and softness --
+//: plus the drive, the floor, the depth and the removal. Those inputs are the canvas's *equivalent*
+//: and were never its substitute, which is why the panel says so rather than reading as finished.
+//: ------------------------------------------------------------------------------------------
+
+//: Why the panel refuses a parameter the catalogue marks undrivable. **The reason clause is the
+//: catalogue's own, carried whole and unparaphrased** -- `sharpen.amount` says `unsharp` takes no
+//: runtime commands, a geometry parameter says driving it would resize the frame partway through
+//: the clip, a choice or a look says it is not a number. Every one of those is a fact about ffmpeg
+//: measured on this machine (R-25, R-29), and none of them is this file's to reword.
+//:
+//: **Not `BINDING_UNDRIVABLE_REFUSAL` itself**, which is `EFFECTS_LOCKED_NOTE`'s argument exactly:
+//: the route's sentence ends "Nothing was composed.", and nothing has been composed *or attempted*
+//: by opening a panel. Reporting a refusal that never happened is the one thing this surface has
+//: already decided it will not do. What travels whole is the clause that carries the fact.
+export const EFFECT_BAND_UNDRIVABLE_NOTE = "{label} cannot be driven by the music: {reason}.";
+
+//: What the panel says on a drivable parameter whose song carries no measurement (FX-15, story
+//: 10.4's first criterion). The **server's own absence sentence** comes first, whole: never-taken,
+//: song-changed, sidecar-unreadable and the rest are different remedies and a Director can act on
+//: the difference (R-11 derives each at read time; `analysis_absence_reason` and
+//: `song_envelope_report` write them). This file adds the clause that says why a band cares.
+export const EFFECT_BAND_NEEDS_MEASUREMENT = "Bands are read off that measurement.";
+
+//: The same, for a binding that already exists. **Drawn as unresolvable, not as an error**: the
+//: binding is retained with its stored values and comes back live, which is the whole of story
+//: 10.4's promise, and saying so where the Director is looking is what stops a stale envelope
+//: reading as lost work. The last clause is what the preview and the export actually do -- both
+//: refuse this Shot by name (`BINDING_WITHOUT_ENVELOPE_REFUSAL`) rather than rendering it undriven,
+//: because a `sendcmd` nobody compiled is silence and a picture that quietly stopped moving is
+//: worse than one that refused.
+export const EFFECT_BAND_UNRESOLVABLE_NOTE =
+  "This binding is kept exactly as it is, and analyzing the song again makes it live with its "
+  + "stored values — nothing is dropped or zeroed. Until then a preview and an export both refuse "
+  + "this shot rather than rendering it undriven.";
+
+//: What the panel says while this browser has not been told whether the song is measured. It
+//: claims nothing about the song, offers no action, and disappears the moment a read lands --
+//: `snapSelectorPlan`'s third row state, said in this panel's words.
+export const EFFECT_BAND_UNREAD_NOTE =
+  "This song's measurement has not been read yet, so this panel cannot yet say whether the music "
+  + "can drive this parameter.";
+
+//: The two decisions a fresh binding is missing, said as what is still needed rather than written
+//: as an incomplete binding (FX-14, story 10.1's AC). **Neither drive is preselected and none is
+//: inferred**, and depth is a decision for the same reason: a depth this panel chose would be a
+//: number the Director never picked, moving their picture by an amount nobody asked for.
+export const EFFECT_BAND_NEEDS_DRIVE = "Choose punch or sustain — nothing infers a drive mode.";
+//: Shortened after browser QA on 2026-08-27: the first wording also restated the bound, which the
+//: input's own `min`, `max` and tooltip already carry, and cost this 250px rail two more lines of
+//: a block that was already six.
+export const EFFECT_BAND_NEEDS_DEPTH =
+  "Set a depth — how far the music moves this parameter from where its slider sits. It may be "
+  + "negative.";
+//: Said under whichever of the two is missing, so the panel is honest about the manifest as well
+//: as about the binding. A Director who closes a half-made panel has lost nothing they had.
+export const EFFECT_BAND_UNWRITTEN = "Nothing is written until then, and this shot is untouched.";
+//: The same statement about a binding that already exists — a Director who cleared the depth on a
+//: stored binding has *not* removed it, and saying "this shot is untouched" there would be false.
+//: Removing is `Remove binding` and nothing else, which is FX-12's rule about closing the panel
+//: applied to emptying one of its inputs.
+export const EFFECT_BAND_UNCHANGED = "The stored binding is unchanged until then.";
+
+//: The panel's own heading, so the inputs are announced as one group rather than as five loose
+//: numbers on a row that already has a slider.
+export const EFFECT_BAND_LEGEND = "{label} · band";
+
+//: What the three band inputs are called and what each does. **They are the spectrum strip's
+//: equivalent, not a replacement for it**, and the note under them says so -- the strip is story
+//: 10.2 and the accessibility floor requires both, so a panel that read as finished here would be
+//: claiming the canvas had been decided against.
+//:
+//: **Made exact 2026-08-27, once `hold` and `sustain` landed.** The first wording said the strip
+//: and the readout were "still to come", which was true and vague -- it could have been read as a
+//: panel with an open-ended list of missing parts. With the gate's own timings drawn, those two
+//: canvases are the whole of what is absent, and saying *only* is a claim
+//: `test_the_panel_names_exactly_what_it_is_still_missing` holds against the stories themselves.
+export const EFFECT_BAND_STRIP_PENDING =
+  "The band is three numbers here. The spectrum strip that would draw it over the song, and the "
+  + "readout of the drive it produces, are the only two things this panel is still missing.";
+
+//: Every setting the panel draws, in the order it draws them.
+//:
+//: **All six, `hold` and `sustain` included.** They were left out of the first pass and that was
+//: an acceptance criterion unmet rather than a slice boundary: story 10.1 says `sustain` *"engages
+//: only after its band holds above a level for a hold time, and survives dips for a sustain
+//: time"*, and a Director who could not reach either had a drive with two numbers they could not
+//: choose. Restored 2026-08-27.
+//:
+//: The order here is the *shared* settings' order. A setting only one drive reads is grouped after
+//: depth by `effectBandPanel`, off the served `drive` field rather than off a position in this
+//: list -- so a third such setting would group itself.
+export const EFFECT_BAND_DRAWN_SETTINGS = [
+  "band_centre", "band_width", "band_softness", "floor", "hold", "sustain",
+];
+
+export const EFFECT_BAND_SETTING_LABELS = {
+  band_centre: "Centre",
+  band_width: "Width",
+  band_softness: "Softness",
+  floor: "Floor",
+  hold: "Hold",
+  sustain: "Sustain",
+};
+
+export const EFFECT_BAND_SETTING_HELP = {
+  band_centre:
+    "Where the band sits across the song's spectrum: 0 is the lowest frequency the analysis "
+    + "measured, 1 the highest.",
+  band_width: "How much of the spectrum the band listens to.",
+  band_softness: "How gradually the band's edges fall away, so it hears its neighbours a little.",
+  floor: "Below this level the drive contributes nothing, so a quiet passage leaves the parameter "
+    + "at rest.",
+  hold: "How long the band must stay above the floor before a sustain drive engages.",
+  sustain: "How long a sustain drive survives a dip before it lets go.",
+};
+
+//: What the panel says about a setting the chosen drive does not read.
+//:
+//: **The alternative was to hide them, and hiding is what this surface does not do.** A control
+//: that appears only once a Director changes a nearby one is a row shape moving under them, and a
+//: control absent under `punch` teaches nothing about what `sustain` would give them -- the same
+//: argument the bind glyph itself makes about shipping early. So they are drawn, inert, with the
+//: reason on each of them and this sentence under the pair, which is `EFFECTS_LOCKED_NOTE`'s
+//: posture and `effectHandleModel`'s: off with a sentence, never off with silence.
+//:
+//: `{settings}` is built from the labels and `{drive}` from the served field, so neither the names
+//: nor the drive is spelled out here. The second clause is the fact `BINDING_SETTINGS`' own
+//: docstring records: both are stored on every binding whichever drive is chosen, so a Director
+//: who tries `punch` and goes back finds their timings as they left them.
+export const EFFECT_BAND_DRIVE_ONLY_NOTE = "{settings}: read only by the {drive} drive.";
+
+//: The reassurance, and it is **drawn only once there is something to reassure about** -- when one
+//: of the gated settings holds a value that is not the catalogue's default.
+//:
+//: Measured on 2026-08-27's looking pass: a fresh panel came to 553px in a 626px rail with 202px
+//: of it prose, and this clause was four of those lines answering a question nobody had asked yet.
+//: On a fresh binding nothing has been set, so there is nothing to keep and the sentence is
+//: generic; on a binding whose hold a Director tuned before trying `punch`, it is the one thing
+//: they want to know. `BINDING_SETTINGS`' own docstring is where the fact comes from.
+//: Number-agnostic on purpose. "{settings} are kept" reads "Hold are kept" when one of the two
+//: was tuned, and a sentence that has to know how many things it is about is a sentence that will
+//: get it wrong the first time the count changes.
+export const EFFECT_BAND_DRIVE_ONLY_KEPT =
+  "What is set here is kept whichever drive is chosen, so switching back does not lose it.";
+
+//: The same fact on the control itself, because a control that is off with nothing on it says only
+//: that something is wrong.
+export const EFFECT_BAND_DRIVE_ONLY_HELP =
+  "{label} is read only by the {drive} drive. Choose {drive} to set it.";
+
+// The sentence under a pair of gated controls, or `""` when the chosen drive reads them.
+//
+// The second clause is appended only when one of them holds something other than the catalogue's
+// default -- because that is the only state in which "switching back does not lose them" is a
+// promise about anything. A fresh binding has nothing to keep and gets the short form.
+function driveNote(gated, settings) {
+  const idle = (gated || []).filter((entry) => entry.idle);
+  if (!idle.length) return "";
+  const named = joinLabels(idle.map((entry) => entry.label));
+  const note = EFFECT_BAND_DRIVE_ONLY_NOTE
+    .replace("{settings}", named)
+    .replace(/\{drive\}/g, idle[0].drive);
+  const held = idle.filter((entry) => {
+    const setting = (settings || []).find((item) => String(item?.name ?? "") === entry.name);
+    return bandNumber(entry.value) !== (bandNumber(setting?.default) ?? 0);
+  });
+  if (!held.length) return note;
+  return `${note} ${EFFECT_BAND_DRIVE_ONLY_KEPT}`;
+}
+
+// A list of setting names as the sentence above joins them. Two today, and the `and` before the
+// last is what English does with either count.
+function joinLabels(labels) {
+  const named = (labels || []).filter(Boolean);
+  if (named.length <= 1) return named[0] || "";
+  return `${named.slice(0, -1).join(", ")} and ${named[named.length - 1]}`;
+}
+
+//: Depth's own label and help. Its bound is **not** in `BINDING_SETTINGS` and cannot be: it is the
+//: span of whatever parameter the binding drives, read off that parameter's declared range, so a
+//: binding can never drive a parameter outside it (story 10.1's AC). Restating a bound in this
+//: file is the Epic 9 defect where the client ignored bounds the server was already sending.
+export const EFFECT_BAND_DEPTH_LABEL = "Depth";
+export const EFFECT_BAND_DEPTH_HELP =
+  "How far the music moves this parameter from its resting value. Bounded by the parameter's own "
+  + "range, and negative depth pulls it down.";
+
+//: The drive control and what each mode is. `punch` and `sustain` come off the catalogue's
+//: `drives`, in the server's order, so there is no copy of `DRIVE_MODES` in this file to drift --
+//: the bargain `families` already makes with `FAMILY_ORDER`.
+export const EFFECT_BAND_DRIVE_LABEL = "Drive";
+export const EFFECT_BAND_DRIVE_HELP = {
+  punch:
+    "Level above the band's own running average, so it flashes on hits instead of sitting pinned "
+    + "high on a limited master.",
+  sustain:
+    "A gate that engages once the band holds above the floor, and survives dips rather than "
+    + "chattering.",
+};
+
+//: Taking a binding off. An explicit control **inside** the panel, because closing the panel keeps
+//: the binding (FX-12): a Director who wants the parameter back at its number has to say so, and a
+//: disclosure that removed work when it closed would make the panel dangerous to open.
+export const EFFECT_BAND_REMOVE_LABEL = "Remove binding";
+export const EFFECT_BAND_REMOVE_HELP =
+  "Take the binding off {label}. The parameter returns to the value its slider holds and nothing "
+  + "of the binding stays on this shot.";
+
+//: How finely one band input divides its own range, before the step is rounded to one significant
+//: figure. `EFFECT_SLIDER_STEPS`' sibling and deliberately coarser: these are typed numbers rather
+//: than a dragged thumb, and a step of 0.005 on a 0-to-1 band is three digits nobody chooses.
+export const EFFECT_BAND_STEPS = 100;
+
+//: The closed record. One triple, which is what makes *"only one band panel is open at a time"*
+//: true by construction rather than by a rule somebody has to remember to apply: opening another
+//: parameter's panel replaces this, and there is nowhere for a second to be recorded.
+export const EFFECT_BAND_CLOSED = { shotId: "", index: -1, parameter: "", values: null };
+
+// Whether one row's band panel is the open one. Asked per row while the stack is drawn, so it is
+// a function rather than a comparison written out at each of the three sites that need it.
+export function effectBandOpen(open, shotId, index, name) {
+  return Boolean(open)
+    && String(open.shotId ?? "") === String(shotId ?? "")
+    && Number(open.index) === Number(index)
+    && String(open.parameter ?? "") === String(name ?? "");
+}
+
+// What pressing the glyph makes the open record. A press on the open panel's own glyph closes it;
+// a press anywhere else opens that row and, by holding one triple, closes whatever was open.
+//
+// **The draft is dropped on every move.** A half-made binding belongs to the parameter it was
+// being made for, and carrying its numbers onto the next row would offer a Director values they
+// chose against something else.
+export function effectBandToggle(open, shotId, index, name) {
+  if (effectBandOpen(open, shotId, index, name)) return { ...EFFECT_BAND_CLOSED };
+  return { shotId: String(shotId ?? ""), index: Number(index), parameter: String(name ?? ""), values: null };
+}
+
+// One card's binding for one parameter, or `null`. `EffectSpec.bindings` is sparse and keyed by
+// parameter name (R-26), which is the one key that survives a reorder, a copy, a split and a
+// duplicate -- so this is a lookup by name and never by position.
+export function effectBindingOf(spec, name) {
+  const held = Array.isArray(spec?.bindings) ? spec.bindings : [];
+  return held.find((entry) => String(entry?.parameter ?? "") === String(name ?? "")) || null;
+}
+
+// Whether this project's song carries a measurement a band could be read off, and the sentence
+// for when it does not.
+//
+// **Three states, not two**, and `unread` is the one a careless read loses -- `snapSelectorPlan`'s
+// rule, applied to the same served body. `analysed` off the merged snap-targets read is the only
+// evidence this browser has; `undefined` is a read that has not landed or was refused, and a panel
+// that answered "not measured" for the length of a request would assert something nobody said.
+//
+// `reason` is the **server's** sentence, off the same read, so the panel says *which* absence it
+// is: never-taken, song-changed and sidecar-unreadable are three different remedies (R-11). The
+// two absences the report cannot describe -- no song at all, and a generated song whose render has
+// not landed -- take the snap panel's own sentences, because they are the same fact about the same
+// song and two wordings of one fact is how they come to disagree.
+//
+// The offer is gated exactly as `snapSelectorPlan` gates it: only on a **known** absence, and only
+// where there is audio to measure. A button on a song nobody has rendered is a press that cannot
+// help, and a button on a working measurement is a re-measurement nobody asked for.
+export function effectBandMeasurement(project = null, report = null) {
+  const absent = (reason) => ({ state: "absent", reason, offer: false });
+  if (!project) return { state: "unread", reason: "", offer: false };
+  const song = project.song || null;
+  if (!song) return absent(SNAP_TARGET_UNSONGED);
+  if (!song.path) return absent(SNAP_TARGET_UNRENDERED);
+  const analysed = report?.analysed;
+  if (analysed === undefined || analysed === null) return { state: "unread", reason: "", offer: false };
+  if (analysed) return { state: "ready", reason: "", offer: false };
+  return { state: "absent", reason: String(report?.reason || ""), offer: true };
+}
+
+// Which of the six states this row's glyph is in. Decided here, in the order the states are
+// documented, so a template never asks a second question about a parameter it has already been
+// handed an answer about.
+export function effectBindState(parameter, spec, measurement) {
+  if (String(parameter?.drive_reason || "")) return "undrivable";
+  const bound = Boolean(effectBindingOf(spec, parameter?.name));
+  const absent = measurement?.state === "absent";
+  if (bound) return absent ? "unresolvable" : "bound";
+  if (absent) return "unmeasured";
+  return measurement?.state === "unread" ? "unread" : "free";
+}
+
+// The glyph itself: which state, what it says, and whether the row draws it as reactive.
+//
+// `bound` is what puts `--blue` on the glyph, and it is true of `unresolvable` as well: a binding
+// whose measurement went away is still a binding the Director made, and dimming it would be the
+// interface quietly disowning their work. Colour is never the only carrier -- the title says which
+// state it is, and the panel behind it says it at length.
+export function effectBindGlyph(parameter, spec, { measurement = null, open = false } = {}) {
+  const state = effectBindState(parameter, spec, measurement);
+  const label = parameter?.label || parameter?.name || "";
+  return {
+    glyph: EFFECT_BIND_GLYPH,
+    state,
+    bound: state === "bound" || state === "unresolvable",
+    open: Boolean(open),
+    title: (EFFECT_BIND_TITLES[state] || "").replace("{label}", label),
+  };
+}
+
+// One band number, or `null` for a field that is empty. **`Number(null)` is `0` and
+// `Number("")` is `0`**, so the obvious `Number.isFinite(Number(value))` calls an unset depth a
+// depth of zero — which is a binding that silently does nothing, written without the Director
+// choosing it. Every reading of a band number goes through here for that one reason.
+function bandNumber(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+// The step one band input takes, from its own bounds. Pure and shared by all six, so a setting
+// added to `BINDING_SETTINGS` draws a usable control without a table here naming it.
+function bandStep(minimum, maximum) {
+  const span = Number(maximum) - Number(minimum);
+  if (!(span > 0)) return 1;
+  return Number((span / EFFECT_BAND_STEPS).toPrecision(1));
+}
+
+// How far a binding may move this parameter: its own declared span, in both directions.
+//
+// **Read off the catalogue's `minimum` and `maximum` and nowhere else.** The server refuses a
+// depth outside `[-span, span]` and clamps every compiled value into the parameter's own range, so
+// this is the same bound said in the same terms -- not a second opinion, and not a constant.
+export function effectBandDepthBound(parameter) {
+  const minimum = Number(parameter?.minimum);
+  const maximum = Number(parameter?.maximum);
+  if (!Number.isFinite(minimum) || !Number.isFinite(maximum)) return 0;
+  const span = maximum - minimum;
+  return span > 0 ? span : 0;
+}
+
+// The values the panel is holding: the stored binding where there is one, the catalogue's defaults
+// where there is not, and the Director's in-progress draft over both.
+//
+// `drive` starts empty and `depth` starts `null`, and neither has a fallback. That is FX-14 as
+// arithmetic: there is no value this function could put there that would not be a drive mode or a
+// depth the Director never chose.
+export function effectBandValues(settings, binding = null, draft = null) {
+  const held = binding || {};
+  const wanted = draft || {};
+  // **A draft key that is present wins even when it is empty**, which is the difference between a
+  // panel that reports what the Director did and one that silently puts a number back. Clearing
+  // the depth on a stored binding leaves the box empty and the panel saying what is missing; a
+  // `??` chain would fall through to the stored value and read as an edit that was refused
+  // without a word -- the control-that-appears-to-do-nothing failure, wearing a number.
+  const drafted = (key) => Object.prototype.hasOwnProperty.call(wanted, key);
+  const values = {};
+  for (const setting of settings || []) {
+    const name = String(setting?.name ?? "");
+    if (!name) continue;
+    // A band setting has a rest that works, so an emptied one falls back to the catalogue's
+    // default rather than to nothing: there is no such thing as a band with no centre.
+    values[name] = (drafted(name) ? bandNumber(wanted[name]) : bandNumber(held[name]))
+      ?? bandNumber(setting?.default) ?? 0;
+  }
+  const drive = wanted.drive ?? held.drive;
+  values.drive = typeof drive === "string" ? drive : "";
+  // Depth has no rest. An emptied box is a decision the binding is missing, and it says so.
+  values.depth = drafted("depth") ? bandNumber(wanted.depth) : bandNumber(held.depth);
+  return values;
+}
+
+// What is still needed before a binding can be written, and whether it may be written at all.
+// Two sentences and no third: everything else on this panel has a rest that works.
+export function effectBandReady(values) {
+  const needs = [];
+  if (!values?.drive) needs.push(EFFECT_BAND_NEEDS_DRIVE);
+  if (bandNumber(values?.depth) === null) needs.push(EFFECT_BAND_NEEDS_DEPTH);
+  return { ready: needs.length === 0, needs };
+}
+
+// One Parameter Binding as the route takes it, **sparsely**.
+//
+// A setting equal to the catalogue's default is left out, which is `effectStackSetParameter`'s own
+// rule and for its reason: `EffectSpec.bindings` stores what the Director wrote, so a corrected
+// default has to be able to reach a manifest written before the correction. A stored value that is
+// *not* the default survives untouched -- including `hold` and `sustain`, which this slice does
+// not draw.
+//
+// The keys are written in `BINDING_SPEC_KEYS`' own order, so two identical bindings serialise
+// identically and a body can be compared as a string.
+export function effectBindingWrite(name, values, settings) {
+  const written = {
+    parameter: String(name ?? ""),
+    drive: String(values?.drive ?? ""),
+    depth: bandNumber(values?.depth),
+  };
+  for (const setting of settings || []) {
+    const key = String(setting?.name ?? "");
+    if (!key) continue;
+    const value = bandNumber(values?.[key]);
+    if (value === null || value === (bandNumber(setting?.default) ?? 0)) continue;
+    written[key] = value;
+  }
+  return written;
+}
+
+// What one change inside an open band panel does: the values the panel is left holding, and the
+// binding to write — or `null` for a change that leaves it not yet writable.
+//
+// **This is the "is this binding complete enough to write" decision**, made once and nowhere else.
+// A fresh binding with no drive and no depth is a real, drawable state and must never reach the
+// route as an incomplete body; the same panel a moment later, with both chosen, writes on the very
+// change that completed it. A handler that asked this question for itself would be the second
+// place that knew what a binding needs.
+//
+// `raw` is whatever the control handed over — a range's string, an emptied number input's `""` —
+// and an unreadable number clears the field rather than being coerced to zero, because a depth of
+// zero is a binding that does nothing and a Director who cleared a box did not ask for one.
+export function effectBandChange(panel, catalogue, name, raw) {
+  const settings = catalogue?.binding_settings || [];
+  const wanted = { ...(panel?.values || {}) };
+  if (String(name) === "drive") {
+    wanted.drive = String(raw ?? "");
+  } else {
+    wanted[String(name)] = bandNumber(raw);
+  }
+  const values = effectBandValues(settings, null, wanted);
+  const verdict = effectBandReady(values);
+  return {
+    values,
+    ready: verdict.ready,
+    binding: verdict.ready
+      ? effectBindingWrite(panel?.parameter, values, settings)
+      : null,
+  };
+}
+
+// One card's whole bindings list with this parameter's set, replaced in place, or removed.
+//
+// **In place**, so a card carrying two bindings does not reorder them because one was edited: the
+// route replaces the list wholesale, and a reordered list is a manifest diff nobody asked for.
+export function effectBindingsSet(spec, name, binding = null) {
+  const kept = (Array.isArray(spec?.bindings) ? spec.bindings : []).map((entry) => ({ ...(entry || {}) }));
+  const at = kept.findIndex((entry) => String(entry?.parameter ?? "") === String(name ?? ""));
+  if (!binding) return at < 0 ? kept : [...kept.slice(0, at), ...kept.slice(at + 1)];
+  if (at < 0) return [...kept, binding];
+  kept[at] = binding;
+  return kept;
+}
+
+// What the bindings route is sent. **The card's own effect id travels with the list**, because the
+// route is addressed by position *and* by the effect it drew there: a stack reordered since this
+// panel was drawn refuses by name rather than binding another card's parameter (R-26 rejected the
+// index alone for exactly that, because the binding would still resolve).
+//
+// One function builds the body, so no caller composes one -- `effectStackWrite`'s rule, and it is
+// what makes "which keys does this route see" answerable in one place.
+export function effectBindingsBody(spec, bindings) {
+  return {
+    effect: String(spec?.effect ?? ""),
+    bindings: (bindings || []).map((entry) => ({ ...(entry || {}) })),
+  };
+}
+
+// Everything one open band panel draws, in one object: the sentence it says, the action it offers,
+// the controls it has, what is still needed, and whether any of it may be operated.
+//
+// Every absence returns **early with its own sentence and no controls**, in the order the states
+// are decided. A panel that drew a band selector under a refusal would be offering a Director a
+// choice that cannot be written, which is the "control that appears to do nothing" R-24 rejects.
+export function effectBandPanel(parameter, spec, {
+  catalogue = null, measurement = null, locked = false, draft = null, open = false,
+} = {}) {
+  const label = parameter?.label || parameter?.name || "";
+  const name = String(parameter?.name ?? "");
+  const state = effectBindState(parameter, spec, measurement);
+  const shut = {
+    shown: false, state, note: "", controls: [], needs: [], ready: false, driveNote: "",
+  };
+  if (!open) return shut;
+  const settings = catalogue?.binding_settings || [];
+  const binding = effectBindingOf(spec, name);
+  const silent = { shown: false, label: SNAP_ANALYZE_LABEL, title: SNAP_ANALYZE_HELP, action: SNAP_ANALYZE_ACTION };
+  const said = (note, analyze = silent) => ({
+    ...shut, shown: true, legend: EFFECT_BAND_LEGEND.replace("{label}", label),
+    parameter: name, label, note, analyze,
+    drive: { shown: false, options: [] }, remove: { shown: false }, written: Boolean(binding),
+    stripNote: "",
+  });
+  const offer = measurement?.offer
+    ? { ...silent, shown: true }
+    : silent;
+  if (state === "undrivable") {
+    return said(EFFECT_BAND_UNDRIVABLE_NOTE
+      .replace("{label}", label)
+      .replace("{reason}", String(parameter?.drive_reason || "")));
+  }
+  if (state === "unread") return said(EFFECT_BAND_UNREAD_NOTE);
+  if (state === "unmeasured") {
+    const reason = String(measurement?.reason || "");
+    return said(reason ? `${reason} ${EFFECT_BAND_NEEDS_MEASUREMENT}` : EFFECT_BAND_NEEDS_MEASUREMENT, offer);
+  }
+  // Bound, and drivable: the panel is operable from here down. An `unresolvable` binding keeps
+  // every control -- it is real, stored work, and the one thing a Director may most want to do
+  // with it is take it off.
+  const values = effectBandValues(settings, binding, draft);
+  const verdict = effectBandReady(values);
+  const span = effectBandDepthBound(parameter);
+  // A control's reason travels with its `disabled`, which is `effectCardModel`'s rule for every
+  // other control on this card: a control that is off with no sentence on it says only that
+  // something is wrong. **The lock is not repeated as a paragraph inside the panel** -- browser QA
+  // on 2026-08-27 found the same sentence printed twice on one screen, above the stack and again
+  // under the band, and the tab's own notice is the one that belongs to the whole tab.
+  //
+  // `gate` is the drive that reads this setting and nothing else, or `""` for one both read. It
+  // comes off the served `binding_settings` (`effects.DRIVE_ONLY_SETTINGS`), never from a table
+  // here: which drive reads what is this application's drive model, and a second copy of it in
+  // JavaScript is the shape R-15 refused for snapping and R-27 refused for the readout.
+  //
+  // A gated setting the chosen drive does not read is **drawn and inert**, with its own reason --
+  // not hidden. Two reasons, and the second is the load-bearing one: a control that appears only
+  // when a Director changes a nearby one moves the row shape under them, and a control absent
+  // under `punch` teaches nothing about what `sustain` would give them.
+  const control = (key, minimum, maximum, help, gate = "") => {
+    const idle = Boolean(gate) && values.drive !== gate;
+    const label = EFFECT_BAND_SETTING_LABELS[key] || key;
+    return {
+      name: key,
+      label,
+      drive: gate,
+      idle,
+      title: locked
+        ? EFFECTS_LOCKED_NOTE
+        : idle
+          ? EFFECT_BAND_DRIVE_ONLY_HELP.replace(/\{label\}/g, label).replace(/\{drive\}/g, gate)
+          : help,
+      value: values[key],
+      minimum,
+      maximum,
+      step: bandStep(minimum, maximum),
+      disabled: Boolean(locked) || idle,
+    };
+  };
+  const drawn = EFFECT_BAND_DRAWN_SETTINGS
+    .map((key) => (settings || []).find((setting) => String(setting?.name ?? "") === key))
+    .filter(Boolean)
+    .map((setting) => control(
+      String(setting.name), Number(setting.minimum), Number(setting.maximum),
+      EFFECT_BAND_SETTING_HELP[String(setting.name)] || "",
+      String(setting.drive || ""),
+    ));
+  // Grouped by whether one drive owns them, off the served field rather than off a position in
+  // `EFFECT_BAND_DRAWN_SETTINGS`: the band and its floor first, then depth, then the gate's own
+  // timings at the foot where a Director reads them last and only when they matter.
+  const shared = drawn.filter((entry) => !entry.drive);
+  const gated = drawn.filter((entry) => entry.drive);
+  const depth = {
+    ...control("depth", -span, span, EFFECT_BAND_DEPTH_HELP),
+    label: EFFECT_BAND_DEPTH_LABEL,
+    // `null` rather than a number, and drawn as an empty input: there is no depth this panel is
+    // entitled to propose, and a prefilled one would be a value the Director never chose.
+    value: bandNumber(values.depth),
+  };
+  return {
+    shown: true,
+    state,
+    legend: EFFECT_BAND_LEGEND.replace("{label}", label),
+    parameter: name,
+    label,
+    // An unresolvable binding says so at length; a working one says nothing, because a panel that
+    // narrated its own ordinary state would bury the one that matters.
+    note: state === "unresolvable"
+      ? `${String(measurement?.reason || "")} ${EFFECT_BAND_UNRESOLVABLE_NOTE}`.trim()
+      : "",
+    analyze: state === "unresolvable" ? offer : silent,
+    stripNote: EFFECT_BAND_STRIP_PENDING,
+    controls: [...shared, depth, ...gated],
+    // Said once under the pair rather than once per box, because it is one fact about both --
+    // and drawn only while it is true, so a `sustain` binding sees its timings and no sentence
+    // about them. Empty where there is nothing gated at all, which is what a catalogue serving no
+    // `drive` on any setting would produce.
+    driveNote: driveNote(gated, settings),
+    drive: {
+      shown: true,
+      label: EFFECT_BAND_DRIVE_LABEL,
+      chosen: values.drive,
+      disabled: Boolean(locked),
+      // Neither is marked selected on a fresh binding, and the catalogue serves no default drive
+      // for one to be read out of.
+      options: (catalogue?.drives || []).map((mode) => ({
+        value: mode,
+        label: mode,
+        title: locked ? EFFECTS_LOCKED_NOTE : (EFFECT_BAND_DRIVE_HELP[mode] || ""),
+        selected: values.drive === mode,
+      })),
+    },
+    values,
+    ready: verdict.ready,
+    // Said whether or not a binding is stored, because a Director can clear the depth on a bound
+    // parameter too — and then the same two things are missing, with a different consequence.
+    needs: verdict.needs,
+    unwritten: verdict.ready ? "" : (binding ? EFFECT_BAND_UNCHANGED : EFFECT_BAND_UNWRITTEN),
+    remove: {
+      shown: Boolean(binding),
+      label: EFFECT_BAND_REMOVE_LABEL,
+      title: locked ? EFFECTS_LOCKED_NOTE : EFFECT_BAND_REMOVE_HELP.replace("{label}", label),
+      disabled: Boolean(locked),
+    },
+    written: Boolean(binding),
+  };
+}
 
 //: `+ Effect`, the picker's own control, and what it says.
 export const EFFECT_ADD_LABEL = "+ Effect";
@@ -6844,15 +7494,22 @@ export function effectParameterReadout(parameter, value) {
 // matters: a slider cannot sit outside its own track, so a refused number is drawn as no reading at
 // all, while a select can carry any value as an option of its own -- so it carries the stored one,
 // marked, and the row asserts nothing the manifest does not hold.
-export function effectParameterRow(parameter, spec, { looks = [], disabled = false } = {}) {
+export function effectParameterRow(parameter, spec, {
+  looks = [], disabled = false, catalogue = null, measurement = null, open = false, draft = null,
+} = {}) {
   const stored = (spec?.parameters || {})[parameter?.name];
   const base = {
     name: parameter?.name || "",
     label: parameter?.label || parameter?.name || "",
     kind: parameter?.kind || "number",
     disabled: Boolean(disabled),
-    bindGlyph: EFFECT_BIND_GLYPH,
-    bindTitle: EFFECT_BIND_INERT_TITLE,
+    // The glyph's state and its sentence, and the panel behind it. Both are decided here and
+    // neither is re-decided in a template: "what does the glyph say" and "which parameter's panel
+    // is open" are exactly the questions `api.js` owns.
+    bind: effectBindGlyph(parameter, spec, { measurement, open }),
+    band: effectBandPanel(parameter, spec, {
+      catalogue, measurement, locked: Boolean(disabled), draft, open,
+    }),
     // Every row carries these three whatever its kind, so the markup asks one question of every
     // row rather than asking it only of the kind that can currently answer yes.
     refused: false,
@@ -6968,6 +7625,12 @@ export function effectParameterValue(parameter, raw) {
 //: to agree on it: the markup that writes the id, the binding that finds the control, and the
 //: rebuild that has only a focused element's id to work back from.
 export const EFFECT_PARAMETER_ID = "effect-param-";
+
+//: The prefix every band-panel control's element id carries, and it is deliberately **not** a
+//: suffix of `EFFECT_PARAMETER_ID`: `effectControlTarget` parses that prefix off a focused
+//: element's id to repaint a slider, and a band input whose id started with it would be handed to
+//: `paintEffectSlider` as a parameter control that does not exist.
+export const EFFECT_BAND_ID = "effect-band-";
 
 //: Which card and which parameter one control belongs to. `index-name`, and the index is the
 //: card's position in the stack -- which is what a write indexes into, so the control and the
@@ -7206,7 +7869,9 @@ function effectHandleModel(place, { locked = false, label = "", family = "" } = 
 //
 // Every control's `disabled` comes from the lock and from nothing else, and the *reason* travels
 // with it: a control that is off with no sentence beside it says only that something is wrong.
-export function effectCardModel(spec, catalogue, index, { locked = false, place = null } = {}) {
+export function effectCardModel(spec, catalogue, index, {
+  locked = false, place = null, measurement = null, band = null, shotId = "",
+} = {}) {
   const definition = effectDefinition(catalogue, spec?.effect);
   const name = String(spec?.effect ?? "");
   const enabled = spec?.enabled !== false;
@@ -7244,8 +7909,19 @@ export function effectCardModel(spec, catalogue, index, { locked = false, place 
       disabled: locked,
       title: reason || `Remove ${label} from this shot's stack.`,
     },
-    rows: (definition?.parameters || []).map((parameter) =>
-      effectParameterRow(parameter, spec, { looks: catalogue?.looks || [], disabled: locked })),
+    // Whether *this* card's band panel is open is asked per row against the one open record, so
+    // "only one at a time" needs no enforcement anywhere: there is one triple and it names one row.
+    rows: (definition?.parameters || []).map((parameter) => {
+      const open = effectBandOpen(band, shotId, index, parameter?.name);
+      return effectParameterRow(parameter, spec, {
+        looks: catalogue?.looks || [],
+        disabled: locked,
+        catalogue,
+        measurement,
+        open,
+        draft: open ? band?.values || null : null,
+      });
+    }),
   };
 }
 
@@ -7521,17 +8197,25 @@ export function effectCopyReport(shotId, report) {
 // An empty stack draws **the picker and nothing else**. A placeholder card, or a "no effects yet"
 // box shaped like one, is a thing pretending to be a stack; the honest empty state of a list is
 // the control that adds to it.
-export function effectsPanelModel(shot, catalogue, { error = "", project = null, copy = null } = {}) {
+export function effectsPanelModel(shot, catalogue, {
+  error = "", project = null, copy = null, band = null, targets = null,
+} = {}) {
   const locked = Boolean(shot?.locked);
   const problem = error ? EFFECTS_CATALOGUE_UNAVAILABLE : "";
   const stack = shotEffectStack(shot);
+  // Decided once for the whole panel rather than per row: every band panel on this Shot is
+  // answering the same question about the same song, and asking it per parameter would let two
+  // rows disagree about whether the song is measured.
+  const measurement = effectBandMeasurement(project, targets);
   // Drawn in the order the chain composes them, which is what makes a family's run a thing on
   // screen -- and a run on screen is the only way a Director can see why a move across families is
   // not offered rather than experiencing it as the interface failing to respond.
   const cards = problem
     ? []
     : effectStackLayout(stack, catalogue).map((place) =>
-      effectCardModel(stack[place.index], catalogue, place.index, { locked, place }));
+      effectCardModel(stack[place.index], catalogue, place.index, {
+        locked, place, measurement, band, shotId: String(shot?.id ?? ""),
+      }));
   // The same cards again, grouped into their runs. One list of card objects, projected two ways:
   // `runs` is what the panel draws (a run is a box), `cards` is what the binding walks. A second
   // *derivation* would be a second opinion about which family a card is in; this is the same
@@ -7555,6 +8239,9 @@ export function effectsPanelModel(shot, catalogue, { error = "", project = null,
     problem,
     cards,
     runs,
+    // Carried out so the panel's one answer about the song is readable beside the rows that were
+    // drawn from it, and so the `[Analyze song]` press has something to ask before it fires.
+    measurement,
     // How many, and the sentence that stops the dead end from having to be discovered. Two is
     // where it begins: `EFFECT_STACK_REFUSED_NOTE` has the whole argument.
     faults,
@@ -7816,6 +8503,17 @@ export const api = {
   // like every other purpose-built shot action, so the panel redraws from what was stored rather
   // than from what it hoped it sent.
   saveShotEffects: (projectId, shotId, body) => request(`/api/projects/${projectId}/shots/${shotId}/effects`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify(body) }),
+  // **The only route that mints a Parameter Binding** (AD-16). Every other write may carry one it
+  // was handed and may never invent one, which is what keeps reactive filter configuration out of
+  // routes that never asked the Director for a band, a drive or a depth — so the band panel writes
+  // here and nowhere else, and the slider beside it goes on writing through `saveShotEffects`.
+  //
+  // Addressed by the card's position **and** the effect it drew there: an `EffectSpec` carries no
+  // id and a stack may hold two Blooms, so the position is what reaches the card and the id is
+  // what proves the stack has not been reordered since this panel was drawn (R-26). A stack edited
+  // underneath refuses by name rather than binding some other card's parameter. The body is
+  // `effectBindingsBody`'s, and the reply is the whole Project.
+  saveShotBindings: (projectId, shotId, index, body) => request(`/api/projects/${projectId}/shots/${shotId}/effects/${index}/bindings`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify(body) }),
   // One stack onto explicitly named Shots, in one request. **Not a loop of the write above**: a
   // client loop cannot report atomically and would half-apply on the first refusal, leaving the
   // Director with some shots graded, some not, and no single answer about which. The route

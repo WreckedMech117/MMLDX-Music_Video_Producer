@@ -618,7 +618,7 @@ class EffectSpec(BaseModel):
 
     A binding is stored the way `parameters` is stored and for the same reason: **as the Director
     wrote it**, sparse, `dict[str, Any]`, with the catalogue filling every default at the moment
-    it composes. `effects.BINDING_SPEC_KEYS` names the nine keys and `effects._BINDING_SETTINGS`
+    it composes. `effects.BINDING_SPEC_KEYS` names the nine keys and `effects.BINDING_SETTINGS`
     owns their bounds; a `ParameterBindingSpec` model here would be a second copy of both, and a
     corrected default could not reach a manifest that had frozen the old one.
 
