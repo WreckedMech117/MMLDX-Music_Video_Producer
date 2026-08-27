@@ -42,3 +42,29 @@ line-length = 100
 # Vendored agent tooling, not this project's source. Excluded so `ruff check .`
 # remains a meaningful gate on application code.
 extend-exclude = [".claude", "_bmad", "_bmad-output"]
+
+[tool.ruff.lint]
+# The one rule that would have seen `create_app` coming, chosen from measurement rather than
+# from taste. An empty `select` means ruff 0.16.3's defaults -- which are far wider than the
+# `E4,E7,E9,F` the retrospective assumed (`I001`, `B006`, `S110` and `BLE001` all fire without
+# being asked for, and this split had to satisfy every one of them) but contain no complexity
+# or size rule at all. That is how a factory function reached 7,882 lines with the gate green
+# the whole way.
+#
+# `C901` is the only default-off rule in this version that fires on the shape this repository
+# grows in. Measured on `create_app` across its own history: 78 at `3325eee` (2026-08-16), 594
+# at `9674aaa` the commit before this split, 342 after it. Everything else in the tree is an
+# order below: `routes/unsorted.py`'s `register` at 83, `routes/shots.py`'s at 71, and the
+# longest test script at 48. A statement count (`PLR0915`) cannot be used instead -- the
+# largest function in this repository by statements is a 740-statement end-to-end browser
+# script, so any threshold that spares it would spare anything.
+#
+# 400 sits between what the split achieved and what it removed: seventeen per cent of headroom
+# on `create_app` as it now stands, and well under the 594 it carried a day ago. It says the
+# next epic may not give back more than about a fifth of the ground this split gained, and it
+# needs no per-file carve-out for the file it is really about -- which would have been the
+# theatrical version of this rule.
+extend-select = ["C901"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 400
