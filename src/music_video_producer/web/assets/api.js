@@ -7602,11 +7602,26 @@ export function effectsRefusalNotice(shotId, refusal) {
 // same look and must not cost a manifest save.
 export function effectStackWrite(stack) {
   return {
-    effects: (stack || []).map((spec) => ({
-      effect: String(spec?.effect ?? ""),
-      enabled: spec?.enabled !== false,
-      parameters: { ...(spec?.parameters || {}) },
-    })),
+    effects: (stack || []).map((spec) => {
+      const written = {
+        effect: String(spec?.effect ?? ""),
+        enabled: spec?.enabled !== false,
+        parameters: { ...(spec?.parameters || {}) },
+      };
+      // **A Parameter Binding is carried, never re-sent as absent.** The server's rule on this
+      // route is *carry, never mint* (`carried_bindings_refusal`): a body may hold the bindings
+      // the Shot already holds and may not invent one. Dropping them is the other half of that,
+      // and it is the half a client gets wrong -- losing a binding is indistinguishable from
+      // removing the bound card, because an `EffectSpec` has no id (R-26), so nothing on the
+      // server can refuse it. One slider release would destroy the Director's work and answer 200.
+      //
+      // Carried **sparsely**, only when the card actually holds one, so every body this function
+      // has ever written stays byte-identical and `effectStackChanged` keeps its meaning: a card
+      // with no binding is written exactly as it was before 2026-08-27.
+      const bindings = Array.isArray(spec?.bindings) ? spec.bindings : [];
+      if (bindings.length) written.bindings = bindings.map((entry) => ({ ...(entry || {}) }));
+      return written;
+    }),
   };
 }
 

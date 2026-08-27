@@ -23,6 +23,7 @@ from fastapi.responses import FileResponse
 from ..app import (
     APPROVE_IN_FLIGHT_REFUSAL,
     APPROVE_NO_TAKE_REFUSAL,
+    BINDING_CARRIER_SHOT,
     ENHANCE_IN_FLIGHT_REFUSAL,
     ENHANCE_MISSING_TAKE_REFUSAL,
     ENHANCE_NO_TAKE_REFUSAL,
@@ -53,6 +54,10 @@ from ..app import (
     SELECT_TAKE_LOCKED,
     SELECT_TAKE_NOT_VIDEO,
     SELECT_TAKE_UNKNOWN,
+    SHOT_BINDINGS_ABSENT_REFUSAL,
+    SHOT_BINDINGS_CARD_MOVED_REFUSAL,
+    SHOT_BINDINGS_NO_SUCH_CARD_REFUSAL,
+    SHOT_BINDINGS_UNNAMED_CARD_REFUSAL,
     SHOT_EFFECT_STACK_LIMIT,
     SHOT_EFFECTS_ABSENT_REFUSAL,
     SHOT_EFFECTS_COPY_ONTO_ITSELF_REFUSAL,
@@ -66,6 +71,7 @@ from ..app import (
     UNAPPROVE_NOT_APPROVED_REFUSAL,
     AudioRestoreResponse,
     SelectTakeRequest,
+    ShotBindingsRequest,
     ShotEffectsCopyRefusal,
     ShotEffectsCopyRequest,
     ShotEffectsCopyResponse,
@@ -82,6 +88,7 @@ from ..app import (
     apply_expansions,
     assistant_reply,
     attempt_expansion,
+    carried_bindings_refusal,
     expand_shots,
     expansion_sweep_notices,
     expansion_write_refusal,
@@ -712,6 +719,15 @@ def register(ctx: RouterContext) -> None:
         "ffmpeg is not installed" — a false diagnosis of a fault a client caused. The bound is
         checked here rather than at the export so the refusal names the write that grew it.
 
+        **It writes the stack and never a Parameter Binding.** A binding lives inside an
+        `EffectSpec` and is minted only by `replace_shot_bindings` below (AD-16), so a body may
+        *carry* a binding this Shot already holds and may never invent or alter one — which is
+        `carried_bindings_refusal`, and both halves of it matter here. Carrying is what lets this
+        route go on being what the panel writes on every slider drag, card toggle and Story 9.4
+        reorder without the Director's own gesture destroying their own work; refusing to mint is
+        what keeps reactive filter configuration out of a route that never asked for a band, a
+        drive or a depth.
+
         **A look the catalogue does not know rescans the folder once and asks again.** A Director
         who drops `brand-new-look.cube` in and immediately grades with it was told "There is no
         look called 'brand-new-look' in the looks folder" — a sentence naming the folder as the
@@ -761,7 +777,139 @@ def register(ctx: RouterContext) -> None:
                 validate_stack(request.effects, luts=discovered_looks(rescan=True))
             except EffectRefusal as rescanned:
                 raise HTTPException(status_code=422, detail=str(rescanned)) from rescanned
+        # Carry, never mint. `stored_effect_stack` writes whatever the agreed spec carried, so
+        # without this the same body that reorders a card could also invent a Parameter Binding
+        # on it — filter automation written through a route that never asked the Director for a
+        # band, a drive or a depth, past the one place (`replace_shot_bindings`) that does.
+        #
+        # And *carry* rather than *drop*, which is the other half and the one that would have
+        # been quiet. This is the route the effects panel writes on every slider drag, every
+        # reorder and every card toggle; a rule that stripped the binding here would have the
+        # Director's own gesture destroy their own work with a 200, which is exactly the failure
+        # `_adopt_shot_effects` exists against, one level down. A binding the body carries is
+        # kept when this Shot already holds the identical binding — validated, so a client that
+        # merely round-tripped the sparse spec it read is not accused of inventing anything.
+        #
+        # What this cannot do, and what nothing server-side can: tell "the Director removed the
+        # bound card" from "the client forgot to send its bindings back". An `EffectSpec` has no
+        # id (R-26), so there is no key by which the two differ. Losing a binding is therefore
+        # reachable through a client that has never heard of the field — which is why the field's
+        # own panel, and the client that round-trips it, are the next slice rather than a later
+        # one.
+        uncarried = carried_bindings_refusal(
+            request.effects,
+            held=[spec.model_dump() for spec in shot.effects],
+            source=BINDING_CARRIER_SHOT,
+            luts=discovered_looks() if request.effects else (),
+        )
+        if uncarried:
+            raise HTTPException(status_code=422, detail=uncarried)
         shot.effects = stored_effect_stack(request.effects)
+        return store.save(project)
+
+    @app.put(
+        "/api/projects/{project_id}/shots/{shot_id}/effects/{index}/bindings",
+        response_model=Project,
+    )
+    def replace_shot_bindings(
+        project_id: str, shot_id: str, index: int, request: ShotBindingsRequest
+    ) -> Project:
+        """Write one effect card's Parameter Bindings — **the only route that mints one**.
+
+        AD-16 and story 10.1's acceptance criterion, as a route rather than as a promise. Every
+        other path a stack can arrive by — `PUT .../effects` beside this one, `PUT .../shots` and
+        `PUT /api/projects/{id}` through `_adopt_shot_effects`, `POST .../effects/copy` — may
+        carry a binding it was handed and may never invent one, and `carried_bindings_refusal` is
+        what makes that a property instead of a convention. This is where the other side of it is:
+        a Director says which card, which parameter, which band, which drive and how far, and
+        nothing else in this application can say any of it.
+
+        **Addressed by position plus the card's own effect id**, which is the least this can be
+        without being the thing R-26 rejected. An `EffectSpec` carries no id and a stack may hold
+        two Blooms, so `(effect, parameter)` is ambiguous; a bare index is unambiguous and
+        *silently wrong* the moment Story 9.4's reorder moves a card, which is the worse failure
+        because the binding still resolves. The client sends the position it drew and the effect
+        it drew there, and a stack edited since refuses by name
+        (`SHOT_BINDINGS_CARD_MOVED_REFUSAL`) rather than binding something else's parameter. The
+        stored binding is still keyed by parameter name alone, on the card — the index reaches
+        the card and is not kept.
+
+        The gates are `replace_shot_effects`' gates in `replace_shot_effects`' order, and for its
+        reasons: the Shot first, so a request naming nothing is a 404 rather than a lecture about
+        locks; the lock next, because it is a decision the Director made and it holds whatever the
+        body says, in that route's own sentence and at 422 rather than 409 (the Director's
+        2026-08-18 ruling — a lock clears by a deliberate act, never by waiting); a body naming no
+        bindings refused rather than read as an empty list; then the card; then the catalogue.
+
+        **Validation is `effects.validate_stack` over the whole stack with this card's bindings
+        substituted in**, not over the bindings alone, and that is the point of doing it this way:
+        the validator is the one thing between a client's numbers and an ffmpeg filter string
+        (AD-27), it already knows every binding's shape and bound, and it is what answers *can the
+        music drive this?* — in the catalogue's own words, naming the ffmpeg filter that takes no
+        runtime commands, or saying that ffmpeg aborts when both `crop` dimensions move. Those
+        sentences are carried whole. A binding on `sharpen.amount` is refused here and not
+        discovered at render time, because there is nothing to discover at render time: a
+        `sendcmd` to a filter that takes no commands is accepted, ignored and reported nowhere.
+
+        **Nothing is stored until every gate passes**, and `store.save` is the last statement, so
+        every refusal above leaves the manifest byte-identical.
+
+        The looks are resolved only for a stack that has something in it, which is
+        `replace_shot_effects`' rule and is free here: a card being bound is a card that exists,
+        so the stack is never empty by the time the folder could be read — but a stack that names
+        no look still costs nothing, because `validate_stack` only consults the listing for a
+        `LutParameter`.
+        """
+        project = get_project(project_id)
+        shot = next((item for item in project.shots if item.id == shot_id), None)
+        if not shot:
+            raise HTTPException(status_code=404, detail="Shot not found")
+        if shot.locked:
+            raise HTTPException(
+                status_code=422,
+                detail=SHOT_EFFECTS_LOCKED_REFUSAL.format(shot=shot_label(project, shot)),
+            )
+        if request.bindings is None:
+            raise HTTPException(
+                status_code=422,
+                detail=SHOT_BINDINGS_ABSENT_REFUSAL.format(shot=shot_label(project, shot)),
+            )
+        if not request.effect:
+            raise HTTPException(
+                status_code=422,
+                detail=SHOT_BINDINGS_UNNAMED_CARD_REFUSAL.format(
+                    shot=shot_label(project, shot)
+                ),
+            )
+        # `0 <= index`, spelled out rather than left to Python's own indexing: `-1` is a perfectly
+        # good list index and a perfectly bad thing for a client to have meant.
+        if index < 0 or index >= len(shot.effects):
+            raise HTTPException(
+                status_code=422,
+                detail=SHOT_BINDINGS_NO_SUCH_CARD_REFUSAL.format(
+                    shot=shot_label(project, shot), count=len(shot.effects), index=index
+                ),
+            )
+        if shot.effects[index].effect != request.effect:
+            raise HTTPException(
+                status_code=422,
+                detail=SHOT_BINDINGS_CARD_MOVED_REFUSAL.format(
+                    index=index,
+                    shot=shot_label(project, shot),
+                    held=shot.effects[index].effect,
+                    named=request.effect,
+                ),
+            )
+        stack = [spec.model_dump() for spec in shot.effects]
+        stack[index]["bindings"] = request.bindings
+        try:
+            validate_stack(stack, luts=discovered_looks() if stack else ())
+        except EffectRefusal as refusal:
+            raise HTTPException(status_code=422, detail=str(refusal)) from refusal
+        # Written onto the stored card rather than through `stored_effect_stack`, because this
+        # route changes one field of one entry and re-deriving the whole stack from a dump would
+        # make every other card's storage depend on a write that was not about it.
+        shot.effects[index].bindings = [dict(binding) for binding in request.bindings]
         return store.save(project)
 
     @app.post(

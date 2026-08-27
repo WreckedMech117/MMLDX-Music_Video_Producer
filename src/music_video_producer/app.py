@@ -90,8 +90,10 @@ from .effects import (
     LutEntry,
     LutParameter,
     NumberParameter,
+    ParameterBinding,
     build_effect_stages,
     discover_luts,
+    exported_bindings,
     exported_look,
     fingerprint_size,
     preview_fingerprint,
@@ -2287,6 +2289,22 @@ def _adopt_shot_effects(
     `PUT .../shots/{shot_id}/effects` is still the one route that *edits* a stack, and it is what
     keeps this field out of reach of anything a model can call — no tool schema declares it and
     the Director's context withholds it.
+
+    **A Parameter Binding lives inside `EffectSpec`, and it needed no matching helper of its own**
+    — which was worth checking rather than assuming, because a binding is nested one level deeper
+    than anything the `_adopt_*` family has guarded before, and `EffectSpec` carries no id for a
+    positional write to key against. Both branches above already answer it:
+
+    * An **existing** Shot's whole stack is taken off the store and the body is discarded, in both
+      directions. A binding riding inside that stack was therefore server-owned by this guard from
+      the moment the field existed. There is nothing to match, because nothing is merged.
+    * A **new** Shot's stack is validated and kept, for `SHOT_PLAN_CONTENT_FIELDS`' reason, and a
+      binding is part of the look that argument is about. What the binding adds is one further
+      question the stack alone did not raise — *where did this come from?* — because a stack may
+      legitimately be invented by a client and a binding may not (AD-16). That is
+      `carried_bindings_refusal`, below: carried from the stored project, or refused by name.
+
+    So the nested field costs one extra call on one branch, not a fourteenth adopt helper.
     """
     for shot in project.shots:
         was = stored.get(shot.id)
@@ -2316,8 +2334,9 @@ def _adopt_shot_effects(
                     limit=SHOT_EFFECT_STACK_LIMIT, count=len(stack)
                 ),
             )
+        luts = looks() if looks is not None else ()
         try:
-            validate_stack(stack, luts=looks() if looks is not None else ())
+            validate_stack(stack, luts=luts)
         except EffectRefusal as refusal:
             raise HTTPException(
                 status_code=422,
@@ -2325,6 +2344,42 @@ def _adopt_shot_effects(
                     shot=shot_label(project, shot), detail=refusal
                 ),
             ) from refusal
+        # Carry, never mint — the other half of the sentence above, for the field inside the
+        # field. A new Shot's stack is kept because Split and Duplicate produce one, and a
+        # binding is part of the look those two copy: `SHOT_PLAN_CONTENT_FIELDS` says the two
+        # halves of one shot are one shot's look, and a half that lost its binding would move
+        # differently from its own other half. So a binding the **project** already holds may
+        # ride onto the new id, and one it does not is refused by name with nothing saved. That
+        # keeps the door open to exactly the write a Director really makes and shut to a client
+        # inventing filter automation on a shot id nobody has seen before.
+        #
+        # Held across every stored Shot rather than one, because the whole point of a Split is
+        # that the new id did not exist a moment ago and the stack came off a sibling.
+        #
+        # Asked only of a stack that actually carries one, because answering it means validating
+        # every stored Shot's stack in the project: a Split of an ungraded or unbound look — which
+        # is every Split until a Director binds something — costs nothing at all.
+        uncarried = (
+            carried_bindings_refusal(
+                stack,
+                held=[
+                    spec.model_dump()
+                    for was_shot in stored.values()
+                    for spec in was_shot.effects
+                ],
+                source=BINDING_CARRIER_PROJECT,
+                luts=luts,
+            )
+            if any(spec.get("bindings") for spec in stack)
+            else ""
+        )
+        if uncarried:
+            raise HTTPException(
+                status_code=422,
+                detail=SHOT_BINDINGS_UNCARRIED_REFUSAL.format(
+                    shot=shot_label(project, shot), detail=uncarried
+                ),
+            )
         shot.effects = stored_effect_stack(stack)
 
 
@@ -6970,6 +7025,36 @@ class ShotEffectsRequest(BaseModel):
     effects: list[dict[str, Any]] | None = None
 
 
+class ShotBindingsRequest(BaseModel):
+    """The body of a Parameter Binding write: which card the client believes it is addressing,
+    and the whole of that card's bindings.
+
+    `bindings` is `list[dict[str, Any]]` and not a model, for `ShotEffectsRequest`'s reason and
+    the same two failures: bound as a model, pydantic would *ignore* `{"paramter": ...}` and store
+    a binding on nothing, or refuse it in words about a model no Director has heard of. So the
+    list arrives untouched and `effects.validate_stack` — which owns `BINDING_SPEC_KEYS`, the two
+    drive modes and every bound — is the first thing that looks at it (AD-27). It is the same
+    function the export runs again, so this route and the chain cannot come to different verdicts
+    about one binding.
+
+    **`None` is the default and not `[]`**, which is `ShotEffectsRequest.effects`' lesson applied
+    before it can be learned twice: `{"bindigns": [...]}` would otherwise bind to `[]`, clear the
+    Director's binding and answer 200. `[]` is how a binding comes off, and it stays explicit.
+
+    **`effect` is the card's identity, checked against the stored entry at `index`.** An
+    `EffectSpec` has no id and stack entries are positional (R-26), so an index alone is the one
+    thing R-26 rejected — correct until the Director drags a card, and then silently addressing a
+    different effect while still resolving. Naming the effect the client saw at that position
+    turns that silence into a refusal: the write either lands on the card the Director was looking
+    at or it lands on nothing. It is not an id and does not pretend to be one — two Blooms are
+    still two Blooms — but a binding can no longer cross a *family* boundary unnoticed, which is
+    the whole of what a stack reorder can do to an index.
+    """
+
+    effect: str | None = None
+    bindings: list[dict[str, Any]] | None = None
+
+
 class ShotEffectsResponse(BaseModel):
     """One Shot's stack, read back. `shot_id` is carried so a reply cannot be misfiled.
 
@@ -7377,15 +7462,108 @@ def stored_effect_stack(specs: Sequence[Mapping[str, Any]]) -> list[EffectSpec]:
     not — the validator reads "no parameters given" out of it and fills every default, so refusing
     it here would 500 on a body the validator had just agreed to. Copied rather than aliased, so
     the stored model never shares a mutable object with the request that carried it.
+
+    **`bindings` is stored exactly as `parameters` is, and this function is deliberately not where
+    a binding is judged.** It writes whatever the agreed spec carried, which is what makes it
+    usable by all three of its callers; *whether* a spec was entitled to carry a binding at all is
+    `carried_bindings_refusal`'s question, and every caller that is not the binding route asks it
+    first. Putting the judgement here instead would make the one route that mints a binding unable
+    to use the one function that stores a stack.
     """
     return [
         EffectSpec(
             effect=spec["effect"],
             enabled=bool(spec.get("enabled", True)),
             parameters=dict(spec.get("parameters") or {}),
+            bindings=[dict(binding) for binding in spec.get("bindings") or ()],
         )
         for spec in specs
     ]
+
+
+#: Who a write was entitled to have copied a binding from, filled into the sentence below. Two
+#: constants rather than two sentences, because there is one rule and it is stated once.
+BINDING_CARRIER_SHOT = "this shot"
+BINDING_CARRIER_PROJECT = "this project"
+
+
+#: Why a stack write that arrived carrying a Parameter Binding was refused: nothing it could have
+#: copied that binding *from* holds it, so the write was minting one.
+#:
+#: **This is AD-16 and story 10.1's "written only by the dedicated binding route", made a property
+#: of every other door rather than a promise about one.** The rule it states is *carry, never
+#: mint*, and both halves are load-bearing:
+#:
+#: * **Carry**, because a stack travels. `PUT .../effects` is how the panel reorders cards, and
+#:   `PUT .../shots` is how Split and Duplicate persist a copied stack; a binding that could not
+#:   ride along either would be destroyed by an ordinary gesture, which is this repository's most
+#:   frequently rediscovered defect wearing a new field's clothes. R-26 put the binding on the
+#:   card precisely so it would survive reorder, copy, split and duplicate for free.
+#: * **Never mint**, because an `EffectSpec` has no id and its entries are positional, so no route
+#:   but the binding route can be told *which* card a new binding belongs to without the
+#:   `(index, parameter)` ambiguity R-26 rejected. A generic write that could invent one would be
+#:   writing reactive filter configuration through a route that never asked the Director anything.
+#:
+#: Compared as `effects.ParameterBinding` — the **validated** binding, every default filled in by
+#: the catalogue — and never as stored JSON. The stored form is sparse on purpose
+#: (`stored_effect_stack`), so `{"parameter": "amount", "drive": "punch", "depth": 0.4}` and the
+#: same binding written out with all nine keys are one binding, and comparing text would call them
+#: two and refuse a client that had merely round-tripped what it read.
+BINDING_UNCARRIED_REFUSAL = (
+    "{effect}'s {parameter} arrives carrying a Parameter Binding that {source} does not already "
+    "hold, so nothing was saved. A binding is made, changed and taken off through the Shot's own "
+    "bindings route and through nothing else; every other write may carry a binding it was handed "
+    "and may never invent one."
+)
+
+
+def binding_census(
+    stack: Sequence[Mapping[str, Any]], *, luts: Sequence[LutEntry] = ()
+) -> Counter[ParameterBinding]:
+    """Every Parameter Binding one stack holds, agreed against the catalogue, as a multiset.
+
+    A multiset and not a set: two Blooms may legitimately carry the identical binding, and a set
+    would let a write turn one of them into two.
+
+    A stack the catalogue will not agree to holds **nothing** here rather than raising. That is
+    the conservative direction and it is deliberate: this function's answer is used as *what a
+    write was entitled to carry*, so a stored stack that has stopped composing — a hand-edited
+    manifest, a look deleted from the folder — entitles a write to carry nothing, and the refusal
+    a caller then reports is the catalogue's own, raised where the caller validates the body. It
+    is never used to decide that something is *allowed*.
+    """
+    try:
+        resolved = validate_stack(stack, luts=luts)
+    except EffectRefusal:
+        return Counter()
+    return Counter(binding for effect in resolved for binding in effect.bindings)
+
+
+def carried_bindings_refusal(
+    incoming: Sequence[Mapping[str, Any]],
+    *,
+    held: Sequence[Mapping[str, Any]],
+    source: str,
+    luts: Sequence[LutEntry] = (),
+) -> str:
+    """`""` when every binding in `incoming` was already in `held`; the refusal naming the first
+    one that was not, otherwise. See `BINDING_UNCARRIED_REFUSAL` for the rule and why.
+
+    Multiset subtraction, so a write that duplicates a binding it was handed is minting one and is
+    caught: `Counter` drops non-positive counts, which is exactly "carried at most as many times
+    as it was held".
+
+    The offender is chosen by name rather than by the order it arrived in, so one stack refuses
+    with one sentence however its entries were ordered — a refusal that moved when a card was
+    dragged would be a refusal a test could not assert.
+    """
+    minted = binding_census(incoming, luts=luts) - binding_census(held, luts=luts)
+    if not minted:
+        return ""
+    first = min(minted, key=lambda binding: (binding.effect_id, binding.parameter))
+    return BINDING_UNCARRIED_REFUSAL.format(
+        effect=first.effect_id, parameter=first.parameter, source=source
+    )
 
 
 #: Why one Shot's effects may not be written. Names the Shot as the timeline names it — a bare
@@ -7414,6 +7592,16 @@ SHOT_EFFECTS_UNCOMPOSABLE_REFUSAL = (
 )
 
 
+#: Why a whole-plan write was refused for its *bindings* rather than for its stack: a Shot it is
+#: adding carries a Parameter Binding no Shot in the stored project holds, so the write is minting
+#: one through a route that never asked for it.
+#:
+#: A second wrapper rather than a reuse of the sentence above, because that one says the stack
+#: "cannot be composed" and this stack composes perfectly well — the fault is where the binding
+#: came from, not what it says. `carried_bindings_refusal` supplies the whole of `{detail}`.
+SHOT_BINDINGS_UNCARRIED_REFUSAL = "{shot} is new to this plan, so nothing was saved. {detail}"
+
+
 #: Why a stack write that named no stack was refused, and how to say the thing it probably meant.
 #:
 #: `PUT .../effects {"efects": [...]}` used to answer 200 and store `[]`: pydantic ignores an
@@ -7430,6 +7618,44 @@ SHOT_EFFECTS_ABSENT_REFUSAL = (
     "This write named no effects at all, so {shot}'s look was left exactly as it was. An effect "
     'stack is sent as "effects": [...], and "effects": [] is how every effect comes off. '
     "Nothing was changed."
+)
+
+
+#: Why a binding write that named no bindings was refused. `SHOT_EFFECTS_ABSENT_REFUSAL`'s lesson,
+#: applied to the field one level down before it can cost anything: a misspelled key binds to the
+#: default, and a default of `[]` would clear a Director's binding and answer 200.
+SHOT_BINDINGS_ABSENT_REFUSAL = (
+    "This write named no bindings at all, so {shot}'s look was left exactly as it was. Bindings "
+    'are sent as "bindings": [...], and "bindings": [] is how a binding comes off. Nothing was '
+    "changed."
+)
+
+
+#: Why a binding write named a card that is not there. The count is in the sentence because the
+#: two ways to get here — a stale panel and an off-by-one — read completely differently once the
+#: reader knows how many cards the Shot actually has.
+SHOT_BINDINGS_NO_SUCH_CARD_REFUSAL = (
+    "{shot} has {count} effect cards, so there is nothing at position {index} to bind. Nothing "
+    "was changed. Reload the shot's effects and try again."
+)
+
+
+#: Why a binding write named the wrong card. The client sends the effect it believes sits at that
+#: position and this is what happens when it does not — a stack reordered or edited since the
+#: panel was drawn, which is the one failure R-26 rejected an index for, made loud.
+SHOT_BINDINGS_CARD_MOVED_REFUSAL = (
+    "Position {index} of {shot} holds {held}, not {named}, so nothing was changed. The effect "
+    "stack has been edited since this panel was drawn. Reload the shot's effects and try again."
+)
+
+
+#: Why a binding write named no effect at all. Separate from the sentence above because "you sent
+#: the wrong one" and "you sent none" have different remedies, and a client that omitted the field
+#: is a client that has not been written yet rather than one looking at a stale stack.
+SHOT_BINDINGS_UNNAMED_CARD_REFUSAL = (
+    "This write named no effect, so {shot}'s look was left exactly as it was. A binding write "
+    'says which card it is addressing — "effect": "bloom" beside the position — because an '
+    "effect stack can be reordered and a position on its own is not an identity."
 )
 
 
@@ -7546,6 +7772,35 @@ def _names_an_undiscovered_look(refusal: EffectRefusal) -> bool:
 ASSEMBLY_EFFECTS_REFUSAL = "{shot}: {detail}"
 
 
+#: Why a render — an export or a preview — refused a Shot whose look is driven by a measurement
+#: that is not there any more. Story 10.4's third acceptance criterion, and the *only* half of
+#: that story this slice ships: the bindings themselves are already retained by everything that
+#: writes them, and the Director-facing half (an inert glyph with `[Analyze song]` beside it) is a
+#: panel this slice does not build.
+#:
+#: **It refuses rather than rendering undriven, and the reason is that undriven is invisible.** A
+#: `sendcmd` aimed at a target that is not in the graph is discarded at rc 0 with no warning and
+#: byte-identical frames (R-25) — so an export that quietly dropped the drive would ship a picture
+#: that never moved, succeed, and say nothing; and a preview that did it would be Story 9.7's
+#: defect again, a clip that lies about the cut it is showing. Refusing is the only outcome that
+#: has a symptom.
+#:
+#: **It carries the verdict's own sentence** — `SONG_ENVELOPE_NOT_TAKEN`,
+#: `SONG_ENVELOPE_SONG_CHANGED`, `SONG_ENVELOPE_FILE_UNREADABLE`,
+#: `SONG_ENVELOPE_RECORD_DISAGREES` or `SONG_ANALYSIS_MEDIA_MISSING`, whichever
+#: `song_measurement_verdict` reached — rather than a wording of its own, because the difference
+#: between "never measured" and "measured, then the song was replaced" is the whole of what tells
+#: a Director what to do next, and this application already has one sentence for each.
+#:
+#: Both routes say it, whole and identical, for `SHOT_EFFECTS_LOCKED_REFUSAL`'s reason: a preview
+#: is the export's promise, so the two must not refuse the same state in two wordings.
+BINDING_WITHOUT_ENVELOPE_REFUSAL = (
+    "{shot} has a Parameter Binding and no current song analysis to drive it, so nothing was "
+    "rendered. {reason} Analyze the song again and the binding is live once more with its stored "
+    "values intact — nothing about it has been dropped or zeroed."
+)
+
+
 # ------------------------------------------------------------------------------------------
 # The export's pre-flight, as a registered list of checks (FX-24).
 #
@@ -7570,6 +7825,16 @@ ASSEMBLY_EFFECTS_REFUSAL = "{shot}: {detail}"
 # which is why it is handed an `ExportComposition` to fill in; a plan check gets no such thing
 # and can only report.
 # ------------------------------------------------------------------------------------------
+
+
+def _unmeasured_song() -> SongMeasurement:
+    """The verdict for a project nobody has asked about: no analysis, recorded as never taken.
+
+    `ExportSubject.measurement`'s default. It is a function rather than a stored instance because
+    `SongMeasurement` is declared further down this module — a default constructed here would
+    force the class up, for a value every caller that matters overrides.
+    """
+    return SongMeasurement(False, SONG_ENVELOPE_NOT_TAKEN, recorded=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -7600,6 +7865,17 @@ class ExportSubject:
     #: The export's own geometry and per-clip frame counts — `None` for every plan-stage check,
     #: which runs before it can exist.
     plan: AssemblyPlan | None = None
+    #: This project's Song Envelope verdict, **on demand**, for exactly `looks`' reason and at a
+    #: larger cost: answering it hashes the whole master and reads a ~405 KB sidecar off disk
+    #: (`song_measurement_verdict`), and an export whose Shots carry no Parameter Binding — which
+    #: is every export in every project until one is bound — must never pay either. So the field
+    #: is a callable, the route memoises it, and a check calls it only once it knows it has a
+    #: binding to judge.
+    #:
+    #: Defaulted to the unmeasured verdict rather than to `None`, so a caller that constructs a
+    #: subject without one (every existing test) reads "no analysis" instead of an attribute that
+    #: has to be tested for before it can be asked.
+    measurement: Callable[[], SongMeasurement] = _unmeasured_song
 
 
 @dataclass(slots=True)
@@ -7708,6 +7984,12 @@ def _compose_effect_chains(
     if plan is None or not subject.stacks:
         return []
     luts = subject.looks()
+    # The envelope, read once for the whole export and only when something is bound. The plan
+    # stage has already refused every Shot whose binding has no current measurement
+    # (`_binding_envelope_refusals`, and the route raises on its report), so `None` here is
+    # unreachable from a bound Shot — and `build_effect_stages` refuses by name rather than
+    # composing an inert `sendcmd` if that argument ever stops being true.
+    envelope = subject.measurement().envelope if _bound_shot_ids(subject) else None
     refusals: list[str] = []
     # Two sets and not one, because they answer different questions about the same Shot.
     # `reported` is "this Shot's refusal has been said"; `recorded` is "this Shot's look is in
@@ -7729,6 +8011,21 @@ def _compose_effect_chains(
                 luts=luts,
                 clip_offset=clip.start - clip.approved_start,
                 shot_seconds=clip.approved_duration,
+                # What a binding needs, and the one piece of arithmetic this epic adds. The
+                # drive's clock is the **song's** and the filter graph's is the **clip's**:
+                # `trim_args` prepends `setpts=PTS-STARTPTS` to every clip cut at an offset, so
+                # ffmpeg's `t` is zero at the first frame of each. `shot_start` is the Shot's own
+                # start in the song and `clip_offset` above is the seconds from the Shot's first
+                # frame to this clip's, so `build_effect_stages` adds them and gets `clip.start`
+                # — the song second this clip's first frame lands on — without either number
+                # meaning anything new. A Shot that was never split adds zero.
+                #
+                # `clip_seconds` is the frames ffmpeg is actually asked for over the grid rate,
+                # not `clip.duration`: the script must not compile a command past the last frame
+                # the trim will write, and `plan.frames` is the number that decides that.
+                envelope=envelope,
+                shot_start=clip.approved_start,
+                clip_seconds=plan.frames[index] / ASSEMBLY_FPS,
             )
         except EffectRefusal as refusal:
             if clip.shot_id not in reported:
@@ -7749,6 +8046,15 @@ def _compose_effect_chains(
             # so and the record is exact rather than conservative.
             f"{clip.shot_id}={entry}"
             for entry in exported_look(stack, luts=luts, width=plan.width, height=plan.height)
+        )
+        # FX-25's other reserved slot, filled by the epic that reserved it. What is recorded is
+        # the **agreed** binding — every setting filled in by the catalogue, formatted by the same
+        # `_canonical` the effects list uses — so a record read six months from now says what the
+        # export was actually driven by rather than what the sparse manifest happened to spell.
+        # Once per Shot, like the effects beside it: a binding is a fact about the card and not
+        # about which clip of a split Shot is being cut.
+        composition.look.bindings.extend(
+            f"{clip.shot_id}={entry}" for entry in exported_bindings(stack, luts=luts)
         )
     return refusals
 
@@ -7804,13 +8110,83 @@ def _oversized_stack_refusals(subject: ExportSubject) -> list[str]:
     return refusals
 
 
+def stack_is_driven(stack: Sequence[Mapping[str, Any]]) -> bool:
+    """Whether this stack will ask the music for anything: an **enabled** card with a binding.
+
+    The one question that decides whether a render needs the Song Envelope at all, and it is
+    asked before the envelope is read because reading one costs a SHA-256 of the whole master and
+    a ~405 KB sidecar. Every project answers `False` until a binding exists.
+
+    Read off the **stored** spec rather than off `validate_stack`, and truthily: a `bindings`
+    value the catalogue will not agree to is `_effect_stack_refusals`' business, said once, in the
+    catalogue's own words. What this must not do is answer `False` for a stack it could not read
+    and thereby let a bound Shot past the check that needs it.
+
+    A **disabled** card composes no stage, so nothing addressed it and nothing was driven — the
+    rule `exported_look` and `exported_bindings` already apply to the record, applied to the
+    question. Without it, a Shot whose bound card the Director had switched off would refuse its
+    own export over a measurement that could not have reached the picture.
+    """
+    return any(
+        spec.get("bindings") and spec.get("enabled", True) is not False for spec in stack
+    )
+
+
+def _bound_shot_ids(subject: ExportSubject) -> set[str]:
+    """Every Shot id in this export whose look is driven by the music. See `stack_is_driven`."""
+    return {
+        shot_id for shot_id, stack in subject.stacks.items() if stack_is_driven(stack)
+    }
+
+
+def _binding_envelope_refusals(subject: ExportSubject) -> list[str]:
+    """Every Shot whose look is driven by a measurement this project no longer has.
+
+    Story 10.4's export criterion, registered rather than written into the route so it joins the
+    one report everything else joins: a Director with an unapproved shot *and* a replaced song is
+    told both at once.
+
+    **The envelope is read at most once, and only when something is bound.** The verdict costs a
+    SHA-256 of the whole master plus a ~405 KB sidecar read, so the set above is computed first
+    and this returns before touching either when it is empty — which it is for every project until
+    a binding exists.
+
+    Said once per Shot, like both of its siblings: a Shot another nests inside is two clips here
+    and one missing analysis, and a Director told the same sentence twice is worse off.
+    """
+    bound = _bound_shot_ids(subject)
+    if not bound:
+        return []
+    verdict = subject.measurement()
+    if verdict.current:
+        return []
+    refusals: list[str] = []
+    seen: set[str] = set()
+    for clip in sorted(subject.clips, key=lambda item: item.start):
+        if clip.shot_id not in bound or clip.shot_id in seen:
+            continue
+        seen.add(clip.shot_id)
+        refusals.append(
+            BINDING_WITHOUT_ENVELOPE_REFUSAL.format(shot=clip.label, reason=verdict.reason)
+        )
+    return refusals
+
+
 #: **This is the list Epic 10 appends to.** A binding refusal — an envelope that was never
 #: measured, a parameter no effect declares — is a fact about the stack and the song, needs no
 #: geometry, and belongs here as a third entry with nothing else edited.
+#:
+#: *Appended to on 2026-08-27, as that comment said it would be.* The parameter half is
+#: `_effect_stack_refusals`' already — `validate_stack` learned bindings in slice E1, so a binding
+#: on a parameter no effect declares, or on one the catalogue marks undrivable, is refused there
+#: in the catalogue's own words with nothing new registered. What needed a fourth entry is the
+#: half `validate_stack` cannot see, because it is a fact about the *song* and not about the
+#: stack: an envelope that was never taken, or was taken from a track this project no longer has.
 EXPORT_PLAN_CHECKS: tuple[Callable[[ExportSubject], list[str]], ...] = (
     _window_refusals,
     _oversized_stack_refusals,
     _effect_stack_refusals,
+    _binding_envelope_refusals,
 )
 
 #: Every check that needs the export's own geometry, and may build what the export then runs.
@@ -8592,6 +8968,13 @@ MANIFEST_WRITE_GUARDS: dict[str, str] = {
     "replace_documents": WRITE_GUARD_LAST_WRITER_WINS,
     "replace_sampling_profile": WRITE_GUARD_LAST_WRITER_WINS,
     "replace_sections": WRITE_GUARD_LAST_WRITER_WINS,
+    # Beside its sibling and classified the same way, for the same reason: it is one Director,
+    # one panel, one card. What a second writer could take from it is one binding, and the
+    # Director is looking at the control that lost it — a compare-and-swap here would refuse a
+    # write nobody else is racing for, on a route where the remedy is to click again anyway.
+    # The narrow-write half of the Director's 2026-08-20 ruling; the *generic* routes are the
+    # ones that had to be gated, and both of them are.
+    "replace_shot_bindings": WRITE_GUARD_LAST_WRITER_WINS,
     "replace_shot_effects": WRITE_GUARD_LAST_WRITER_WINS,
     "replace_song_vocal_type": WRITE_GUARD_LAST_WRITER_WINS,
     "select_shot_take": WRITE_GUARD_LAST_WRITER_WINS,
@@ -9207,6 +9590,7 @@ def create_app(
         args: list[str],
         on_progress: Callable[[int], None] | None = None,
         on_start: Callable[[asyncio.subprocess.Process], None] | None = None,
+        cwd: Path | None = None,
     ) -> tuple[int, str, str]:
         """One ffmpeg/ffprobe invocation, event loop left free. Returns (rc, stdout, stderr).
 
@@ -9235,6 +9619,27 @@ def create_app(
         process, so a supersede that arrives during the render always finds a handle — and the
         window before this line is closed by the preview's own publish gate rather than here,
         because a subprocess that has not been spawned yet cannot be killed by anyone.
+
+        **`cwd` is what makes a `sendcmd` script reachable, and `None` — the default — is what
+        every other invocation here gets: this process's own directory, exactly as before.** A
+        drive script is passed to ffmpeg as a *bare relative filename* and read against the
+        process's working directory (R-30, `effects.DriveScript.filename`). That is a choice
+        rather than an escape from a parser bug: re-measured 2026-08-27, a plain forward-slash
+        absolute path renders fine and AD-22's stated cause was false. It stays relative because a
+        generated name is `[a-z0-9_.-]` and needs no escaping at all, and because an absolute path
+        inside the composed chain is an absolute path inside `preview_fingerprint`'s fourth
+        input — a project directory that moved would then invalidate every preview it owns.
+
+        Two callers pass one, and they are the two this application renders with: the export,
+        whose scripts go beside `clips.txt` in its own `workdir`, and the preview, whose scripts
+        go in `previews/`. Every probe and every unbound render passes nothing, so the argv *and*
+        the environment of a Shot with no bindings are what they were.
+
+        `Path` rather than `str` so a caller cannot pass a directory that does not exist without
+        the type saying what it is; `create_subprocess_exec` raises `NotADirectoryError` for one
+        that is missing, which is not a `FileNotFoundError` and is deliberately not caught below —
+        it means this application failed to write a file it was about to read, which is a fault in
+        this application and not a fact about the environment.
         """
         try:
             process = await asyncio.create_subprocess_exec(
@@ -9242,6 +9647,7 @@ def create_app(
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
             )
         except FileNotFoundError as missing:
             # `FileNotFoundError` carries two very different faults on Windows and this handler
@@ -10564,6 +10970,47 @@ def create_app(
         # chain to name the clip, and the two must be composed from one set of arguments or the
         # name stops describing the picture — which is the whole of the defect this closes.
         looks = discovered_looks() if stack else ()
+        # The Song Envelope, for a Shot that carries a Parameter Binding and for no other. The
+        # verdict hashes the whole master and reads a ~405 KB sidecar, and a preview is measured
+        # in tens of milliseconds — so an unbound Shot must not pay it, and every unbound Shot's
+        # fingerprint must come out of exactly the arguments it came out of before. It is read
+        # *before* the cache is consulted rather than after, for the reason the chain is:
+        # a preview whose drive has stopped resolving has to refuse today, even though the clip
+        # rendered yesterday is still sitting in the cache and is still a perfectly good picture
+        # of a look this project can no longer render.
+        envelope: dict[str, Any] | None = None
+        if stack_is_driven(stack):
+            # A song whose file has gone is a *reason*, not a 404: `song_measurement_verdict`
+            # already answers `SONG_ANALYSIS_MEDIA_MISSING` for a path it cannot `stat`, and that
+            # sentence sends a Director somewhere useful where "Song media was not found" would
+            # read as a fault in the preview. So the resolver's refusal becomes a path that does
+            # not exist and the verdict says the rest.
+            try:
+                source_song = (
+                    resolve_song_path(project_id, project.song)
+                    if project.song
+                    else store.project_dir(project_id) / "song-that-was-never-imported"
+                )
+            except HTTPException:
+                source_song = store.project_dir(project_id) / Path(project.song.path or "song")
+            verdict = song_measurement_verdict(
+                store,
+                project_id,
+                project.song.analysis if project.song else SongAnalysis(),
+                source_song,
+            )
+            if not verdict.current:
+                # The export's own sentence, whole. A preview is the export's promise, so the
+                # two may not refuse one state in two wordings — and refusing is the only
+                # outcome with a symptom: an undriven render succeeds and looks like a still
+                # look, at rc 0, with nothing in the response saying the music was dropped.
+                raise HTTPException(
+                    status_code=422,
+                    detail=BINDING_WITHOUT_ENVELOPE_REFUSAL.format(
+                        shot=label, reason=verdict.reason
+                    ),
+                )
+            envelope = verdict.envelope
         # The composer's geometry is the **preview's**, not the export's, and that is what makes
         # this the same look rather than the same numbers. `StageContext` describes the delivery
         # grid a treatment is composed for — `chroma_split` stores a fraction and turns it into
@@ -10593,6 +11040,16 @@ def create_app(
                 # gets a new clip rather than a cached picture of the old ramp.
                 clip_offset=0.0,
                 shot_seconds=shot.duration,
+                # A preview is the whole Shot from its own first frame, so the clip *is* the
+                # Shot: `shot_start` is the Shot's start in the song and `clip_seconds` is the
+                # frames this render will actually write over the grid rate — the same number
+                # `frames` above is, and never `shot.duration`, so the compiled script cannot
+                # carry a command past the last frame ffmpeg is asked for. The export resolves
+                # the same pair from the clip window it is cutting, which is a different pair
+                # for the second half of a split Shot and the identical one for every other.
+                envelope=envelope,
+                shot_start=shot.start,
+                clip_seconds=frames / ASSEMBLY_FPS,
             )
         except EffectRefusal as refusal:
             raise HTTPException(
@@ -10612,10 +11069,32 @@ def create_app(
             offset=offset,
             stack=stack,
             luts=looks,
-            # Epic 10 and Epic 11 fill these two. They are hashed now, empty, so that filling
-            # them later changes the fingerprint of the Shots that acquire one rather than of
-            # every Shot in every project at once. See `effects.preview_fingerprint`.
-            bindings=(),
+            # Epic 10 fills the fifth slot; Epic 11 still owns the seventh. `bindings` is the
+            # **stored** binding spec of every card, in stack order, and it is `()` for every
+            # Shot that carries none — which is what keeps a Shot with no binding naming the
+            # clip it already named and its cached preview served (R-20).
+            #
+            # It is hashed as well as the chain rather than instead of it, and neither is
+            # redundant. The chain carries the compiled script's *name*, whose digest is taken
+            # over the script's own text, so it moves when the envelope, the Shot's place in the
+            # song or the resting value moves. This slot moves when the Director's own numbers
+            # move — including for the one case the chain cannot see, a change that compiles to
+            # the identical text.
+            # `()` and not `((), (), ())` for an unbound stack, which is not a nicety: the two
+            # canonicalise as `[]` and `[[],[]]`, so hashing the per-card shape unconditionally
+            # would move the name of every Shot in every project that carries any effect at all
+            # and re-render the lot for a picture that did not change.
+            bindings=(
+                tuple(
+                    tuple(dict(binding) for binding in spec.get("bindings") or ())
+                    for spec in stack
+                )
+                if envelope is not None
+                else ()
+            ),
+            envelope=envelope,
+            shot_start=shot.start,
+            clip_seconds=frames / ASSEMBLY_FPS,
             transition=None,
             song_fingerprint=(
                 project.song.analysis.song_fingerprint
@@ -10630,7 +11109,11 @@ def create_app(
             # picture this route did not render.
             reference_width=delivery[0],
         )
-        previews_root = store.media_dir(project_id) / "previews"
+        # Resolved for the reason the export's `workdir` is: a bound Shot's render runs with this
+        # as ffmpeg's working directory, and the scratch clip's own path is written relative to
+        # wherever this process is standing. See the export's note. `relative` below is a URL
+        # fragment and is untouched by this.
+        previews_root = (store.media_dir(project_id) / "previews").resolve()
         relative = f"previews/{fingerprint}.mp4"
         clip = previews_root / f"{fingerprint}.mp4"
 
@@ -10693,6 +11176,15 @@ def create_app(
         # is neither a cache entry nor a collision with the render that replaced it. The cache is
         # only ever entered by the rename at the end.
         scratch = previews_root / f".{record.token}.mp4"
+        # The compiled drive scripts, into the cache folder this render is about to write its
+        # clip into, and read from there as bare relative names with ffmpeg's working directory
+        # set to it (R-30, `run_tool`'s `cwd`). Content-addressed like the clip beside them:
+        # the name carries a digest of the script's own text, so writing one that is already
+        # there rewrites identical bytes, and two Shots that compile the same drive share a file.
+        # Nothing here is a cache entry — the clip is named by the fingerprint and only the clip
+        # is served — and emptying the folder costs a re-render exactly as it did before.
+        for script in stages.scripts:
+            (previews_root / script.filename).write_text(script.text, encoding="utf-8")
         try:
             rc, _out, err = await run_tool(
                 trim_args(
@@ -10707,6 +11199,9 @@ def create_app(
                     treatment_stages=stages.treatment,
                 ),
                 on_start=record.attach,
+                # Only when there is a script to read: an unbound Shot's preview spawns ffmpeg
+                # in this process's own directory, exactly as it did before this epic.
+                cwd=previews_root if stages.scripts else None,
             )
             if record.superseded:
                 # The gate. Whatever ffmpeg managed to write is deleted rather than published,
@@ -10892,6 +11387,27 @@ def create_app(
         # Only a Shot with a stack appears in `stacks`, and `ExportSubject.looks` is the callable
         # rather than the listing, so a project with no effects at all reads the looks folder
         # exactly never.
+        # The envelope, behind a one-shot memo for `discovered_looks`' reason and at a larger
+        # cost: the verdict hashes the whole master and reads a ~405 KB sidecar, and it is asked
+        # twice — once by the plan check that refuses a binding with no measurement, once by the
+        # composition that compiles the scripts. An export whose Shots carry no binding never
+        # calls it at all. `song` is the manifest's, re-read above; `song_path` is the resolved
+        # and containment-checked file the duration was probed from a few lines earlier, so this
+        # judges the audio that will actually play.
+        measured: list[SongMeasurement] = []
+
+        def song_measurement() -> SongMeasurement:
+            if not measured:
+                measured.append(
+                    song_measurement_verdict(
+                        store,
+                        project_id,
+                        project.song.analysis if project.song else SongAnalysis(),
+                        song_path,
+                    )
+                )
+            return measured[0]
+
         subject = ExportSubject(
             clips=tuple(clips),
             song_seconds=song_seconds,
@@ -10901,6 +11417,7 @@ def create_app(
                 if shot.effects
             },
             looks=discovered_looks,
+            measurement=song_measurement,
         )
         refusals = export_plan_refusals(subject)
         if refusals:
@@ -10959,7 +11476,18 @@ def create_app(
         fresh.jobs.append(job)
         store.save(fresh)
         app.state.live_assemblies.add(job.id)
-        workdir = exports_root / f".work-{job.id}"
+        # Resolved, because a bound Shot's trim runs with this directory as ffmpeg's **working
+        # directory** — that is how `sendcmd=f=` reaches a bare relative script name (R-30) — and
+        # every other path in that argv is written relative to wherever this process happens to
+        # be standing. A data root configured as a relative path (`MVP_DATA_ROOT=data`, and every
+        # harness that passes one) then had ffmpeg looking for its own output inside `.work-…`
+        # and failing with `No such file or directory` on a file this application had just chosen
+        # the name of. Measured 2026-08-27 on the drive harness, and it is the one thing a `cwd`
+        # can break that has nothing to do with the script.
+        #
+        # `resolve` is the identity for the absolute root every real installation has, so the
+        # argv and `clips.txt` are unchanged wherever this was already correct.
+        workdir = (exports_root / f".work-{job.id}").resolve()
         workdir.mkdir(parents=True, exist_ok=True)
 
         def settle(patch) -> RenderJob | None:
@@ -11028,6 +11556,19 @@ def create_app(
                 # inside is two clips here, and story 9.7 composed them apart on purpose so the
                 # second carries on where the first stopped rather than replaying it.
                 composed = effect_stages.get(index, EffectStages())
+                # This clip's compiled drive scripts, written beside `clips.txt` and the
+                # intermediates in the export's own `workdir`, which is then ffmpeg's working
+                # directory for exactly this call. `sendcmd=f=` reads a **bare relative** name
+                # (R-30, `run_tool`'s `cwd`), and the name carries a digest of the script's own
+                # text — so a Shot that becomes two clips writes two files rather than one clip
+                # silently driving the other, and two clips that really do compile the same
+                # script share one, which is right rather than lucky.
+                #
+                # `cwd` is passed **only** when there is a script to read. An export whose Shots
+                # carry no binding — every export in every project until one is bound — spawns
+                # ffmpeg exactly as it did before, argv and working directory alike.
+                for script in composed.scripts:
+                    (workdir / script.filename).write_text(script.text, encoding="utf-8")
                 rc, _out, err = await run_tool(
                     with_progress(
                         trim_args(
@@ -11049,6 +11590,7 @@ def create_app(
                     on_progress=lambda microseconds, at=trimmed_seconds: report(
                         progress.trim(at, microseconds)
                     ),
+                    cwd=workdir if composed.scripts else None,
                 )
                 if rc != 0 or not dest.is_file():
                     raise failed(f"trim ({clip.label})", err)

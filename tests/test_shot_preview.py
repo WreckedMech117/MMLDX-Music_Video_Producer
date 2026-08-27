@@ -13,6 +13,8 @@ cache leaves the export unaffected.
 
 import asyncio
 import dataclasses
+import math
+import struct
 import subprocess
 import sys
 import threading
@@ -25,9 +27,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from music_video_producer.app import (
+    BINDING_WITHOUT_ENVELOPE_REFUSAL,
     PREVIEW_ABANDONED_DETAIL,
     PREVIEW_NO_TAKE_REFUSAL,
     PREVIEW_SUPERSEDED_REFUSAL,
+    SONG_ENVELOPE_NOT_TAKEN,
+    SONG_ENVELOPE_SONG_CHANGED,
     create_app,
 )
 from music_video_producer.assembly import (
@@ -39,7 +44,8 @@ from music_video_producer.assembly import (
 )
 from music_video_producer.comfy import ComfyError
 from music_video_producer.config import Settings
-from music_video_producer.effects import EFFECT_CATALOGUE
+from music_video_producer.effects import EFFECT_CATALOGUE, preview_fingerprint
+from music_video_producer.models import SongAnalysis
 from music_video_producer.store import ProjectStore
 from music_video_producer.timeline import over_render_frames, over_render_lead
 
@@ -1419,3 +1425,297 @@ def test_the_preview_preset_is_ultrafast_crf_28_and_is_not_offered_at_the_export
     project_id, _shots_dir = project_with_two_approved_takes(client, tmp_path)
     refused = client.post(f"/api/projects/{project_id}/assemble", json={"preset": "preview"})
     assert refused.status_code == 422, refused.text
+# ------------------------------------------------------------------------------------------
+# Epic 10: the preview is the export's promise, and a bound Shot's preview has to keep it.
+#
+# The failure this block exists against is silent on every screen. A `sendcmd` aimed at a target
+# not in the graph is discarded at rc 0 with no warning and byte-identical frames, so a preview
+# that rendered the undriven picture would look exactly like one that worked, would be published
+# under the bound Shot's own fingerprint, and would then be served from the cache for ever --
+# which is Story 9.7's defect wearing this epic's clothes. Every claim here is a comparison of
+# frame checksums against the undriven render of the same chain.
+# ------------------------------------------------------------------------------------------
+
+
+def beaty_wav_bytes(seconds: float = 8.0, rate: int = 22050) -> bytes:
+    """A song with transients in it. `wav_bytes` above is digital silence, which drives nothing:
+    `punch` measures level above its own running average, so a silent track and a track pinned at
+    full scale both compile a script that writes the resting value at every tick and produce a
+    picture identical to the undriven one -- a test that could not fail."""
+    content = BytesIO()
+    with wave.open(content, "wb") as target:
+        target.setnchannels(1)
+        target.setsampwidth(2)
+        target.setframerate(rate)
+        frames = bytearray()
+        for index in range(int(seconds * rate)):
+            moment = index / rate
+            decay = math.exp(-(moment % 0.5) * 25.0)
+            value = int(28000 * decay * math.sin(2 * math.pi * 60.0 * moment))
+            frames += struct.pack("<h", max(-32767, min(32767, value)))
+        target.writeframes(bytes(frames))
+    return content.getvalue()
+
+
+def frame_checksums(path: Path) -> list[str]:
+    """One md5 per decoded video frame, ffmpeg's own `framemd5`, mapped to the picture stream
+    alone. A preview carries no audio, but the map is written anyway so this reads the same way
+    its sibling in `test_assembly_route` does."""
+    output = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", path.as_posix(), "-map", "0:v:0", "-f", "framemd5", "-"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    return [
+        line.split(",")[-1].strip()
+        for line in output.splitlines()
+        if line and not line.startswith("#")
+    ]
+
+
+def a_measured_project_with_a_graded_shot(client, tmp_path: Path):
+    """The preview fixture, with a measurable song and Exposure resting at a non-identity 0.2.
+
+    0.2 rather than 0 for the reason the export's sibling fixture gives: at the identity the card
+    composes no stage unless it is bound, so the comparison would be "no `eq`" against "a driven
+    `eq`" and a difference in the frames would prove only that an `eq` ran. At 0.2 both chains
+    carry the identical `eq=brightness=0.2` and the only difference is the `sendcmd`.
+    """
+    project_id = client.post("/api/projects", json={"name": "Drive"}).json()["id"]
+    upload = client.post(
+        f"/api/projects/{project_id}/songs/upload",
+        data={"title": "Drive Song", "duration": "0"},
+        files={"file": ("song.wav", beaty_wav_bytes(8.0), "audio/wav")},
+    )
+    assert upload.status_code == 200, upload.text
+
+    shots_dir = tmp_path / "comfy" / "output" / "music-video-producer" / project_id / "shots"
+    picture_seconds = over_render_frames(4.0) / ASSEMBLY_FPS
+    synthesize_take(shots_dir / "shot_a-h3_00001-audio.mp4", picture_seconds, "128x72", "red")
+    prefix = f"music-video-producer/{project_id}/shots"
+    saved = client.put(f"/api/projects/{project_id}/shots", json={"shots": [{
+        "id": "shot_a", "start": 0, "duration": 4.0, "prompt": "Red room", "status": "complete",
+        "latest_output": f"{prefix}/shot_a-h3_00001-audio.mp4",
+    }]})
+    assert saved.status_code == 200, saved.text
+    assert client.post(f"/api/projects/{project_id}/shots/shot_a/approve").status_code == 200
+    assert client.post(f"/api/projects/{project_id}/song/analyze").status_code == 200
+    graded = client.put(
+        f"/api/projects/{project_id}/shots/shot_a/effects",
+        json={"effects": [{"effect": "exposure", "parameters": {"amount": 0.2}}]},
+    )
+    assert graded.status_code == 200, graded.text
+    return project_id
+
+
+def bind_exposure(client, project_id: str, **settings):
+    binding = {"parameter": "amount", "drive": "punch", "depth": 0.8, "band_centre": 0.0,
+               "band_width": 0.3, "band_softness": 0.35, "floor": 0.0}
+    binding.update(settings)
+    return client.put(
+        f"/api/projects/{project_id}/shots/shot_a/effects/0/bindings",
+        json={"effect": "exposure", "bindings": [binding]},
+    )
+
+
+def test_a_bound_shots_preview_shows_the_driven_picture_under_a_new_name(tmp_path: Path):
+    """The slice's second acceptance criterion: the fingerprint moves, and the clip it names is
+    a different picture from the undriven render of the same chain.
+
+    Both halves matter and neither implies the other. A moved fingerprint with an undriven
+    picture is the silent failure; an unmoved fingerprint with a driven picture would serve the
+    old clip for ever, because nothing in this application evicts `previews/`.
+    """
+    client, _store, comfy, _app = make_client(tmp_path)
+    project_id = a_measured_project_with_a_graded_shot(client, tmp_path)
+    media = tmp_path / "projects" / project_id / "media"
+
+    undriven = client.post(f"/api/projects/{project_id}/shots/shot_a/preview")
+    assert undriven.status_code == 200, undriven.text
+    before = frame_checksums(media / undriven.json()["preview"])
+
+    assert bind_exposure(client, project_id).status_code == 200
+    driven = client.post(f"/api/projects/{project_id}/shots/shot_a/preview")
+    assert driven.status_code == 200, driven.text
+    assert driven.json()["rendered"] is True, "the cache answered a Shot whose look had changed"
+    assert driven.json()["fingerprint"] != undriven.json()["fingerprint"]
+    after = frame_checksums(media / driven.json()["preview"])
+
+    assert len(before) == len(after) == 96, (len(before), len(after))
+    moved = [index for index, (a, b) in enumerate(zip(before, after)) if a != b]
+    assert moved, (
+        "the preview's frames are byte-identical with the binding on, which is exactly what a "
+        "mistargeted sendcmd looks like: rc 0, no warning, and nothing driven"
+    )
+    # Not every frame: `punch` measures a transient against a running average that starts cold,
+    # so the opening of the clip sits at the resting value and matches the undriven render frame
+    # for frame. A drive that moved all 96 would be a constant offset wearing a binding's clothes.
+    assert before[0] == after[0]
+    assert len(moved) < 96, len(moved)
+
+    # The script it was driven by is beside the clip, named by its own content, and is what the
+    # chain asked for -- bare, relative, and holding nothing a filtergraph splits on.
+    scripts = sorted(path.name for path in (media / "previews").glob("*.cmds"))
+    assert len(scripts) == 1, scripts
+    assert scripts[0].startswith("exposure-amount-b0-") and scripts[0].endswith(".cmds")
+    assert not (set(scripts[0]) & set(":/\\,;=&'")), scripts[0]
+    text = (media / "previews" / scripts[0]).read_text(encoding="utf-8")
+    assert text.startswith("0 eq@b0 brightness 0.2;"), text[:80]
+    assert all(line.endswith(";") for line in text.splitlines()), text[:200]
+
+    assert comfy.prompts == []
+
+
+def test_an_unbound_shots_preview_is_named_and_cached_exactly_as_it_was(tmp_path: Path):
+    """R-20's other half, and the one this slice could most easily have broken silently.
+
+    Nothing about a Shot with no binding may move: not the composed chain, not the fingerprint,
+    not the process ffmpeg is spawned in. The clip rendered before the feature existed is served
+    from the cache after it, because the name is the whole of the staleness mechanism and a name
+    that moved would have re-rendered every Shot in every project on this machine for a picture
+    that did not change.
+    """
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id = a_measured_project_with_a_graded_shot(client, tmp_path)
+
+    first = client.post(f"/api/projects/{project_id}/shots/shot_a/preview")
+    assert first.status_code == 200, first.text
+    assert first.json()["rendered"] is True
+
+    spawned: list[object] = []
+    real_exec = asyncio.create_subprocess_exec
+
+    async def watched(*args, **kwargs):
+        spawned.append(kwargs.get("cwd"))
+        return await real_exec(*args, **kwargs)
+
+    asyncio.create_subprocess_exec = watched
+    try:
+        again = client.post(f"/api/projects/{project_id}/shots/shot_a/preview")
+    finally:
+        asyncio.create_subprocess_exec = real_exec
+
+    assert again.status_code == 200, again.text
+    assert again.json()["fingerprint"] == first.json()["fingerprint"]
+    assert again.json()["rendered"] is False, "an unbound Shot's cached clip was not served"
+    # And the name is the one `preview_fingerprint` gives for the **empty** fifth slot, computed
+    # here independently of the route. Self-consistency across two requests cannot see this: a
+    # route that hashed the per-card binding shape unconditionally would send `[[]]` where `[]`
+    # belongs, agree with itself perfectly, and rename every already-cached clip in every project
+    # on this machine. `bindings=()` and no envelope is what a Shot with no binding must get.
+    stored = store.get(project_id)
+    assert preview_fingerprint(
+        take=stored.shots[0].approved_output,
+        window_start=0.0,
+        window_duration=4.0,
+        offset=stored.shots[0].latest_take_lead + stored.shots[0].trim_nudge,
+        stack=[spec.model_dump() for spec in stored.shots[0].effects],
+        bindings=(),
+        song_fingerprint=stored.song.analysis.song_fingerprint,
+        transition=None,
+        width=first.json()["width"],
+        height=first.json()["height"],
+        reference_width=first.json()["width"] * 2,
+    ) == first.json()["fingerprint"]
+    # The cache hit spawns the probes and no render, and none of them is handed a directory.
+    assert all(cwd is None for cwd in spawned), spawned
+    # And no script exists anywhere: `EffectStages.scripts` is empty for every stack that carries
+    # no binding, which is every stack in every project until one is bound.
+    assert not list((tmp_path / "projects" / project_id / "media").rglob("*.cmds"))
+
+
+def test_a_preview_whose_envelope_stopped_describing_the_song_refuses_in_the_exports_words(
+    tmp_path: Path,
+):
+    """Story 10.4's state, at the route that is supposed to predict the export.
+
+    The preview refuses, in the export's own sentence, rather than rendering the undriven picture
+    -- because the undriven picture is indistinguishable from a working one and would be
+    published under the bound Shot's name. And the cached clip from *before* the song went stale
+    is not served either: the refusal is raised before the cache is consulted, for the reason a
+    deleted `.cube` is.
+    """
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id = a_measured_project_with_a_graded_shot(client, tmp_path)
+    assert bind_exposure(client, project_id).status_code == 200
+    live = client.post(f"/api/projects/{project_id}/shots/shot_a/preview")
+    assert live.status_code == 200, live.text
+    cached = tmp_path / "projects" / project_id / "media" / live.json()["preview"]
+    assert cached.is_file()
+    stored = [spec.model_dump() for spec in store.get(project_id).shots[0].effects]
+
+    project = store.get(project_id)
+    project.song.analysis.song_fingerprint = "12-notthesongthatisonthedisk"
+    store.save(project)
+
+    refused = client.post(f"/api/projects/{project_id}/shots/shot_a/preview")
+
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["detail"] == BINDING_WITHOUT_ENVELOPE_REFUSAL.format(
+        shot="SHOT 01 (shot_a)", reason=SONG_ENVELOPE_SONG_CHANGED
+    )
+    # The clip is still on disk -- a stale entry is inert, never deleted -- and was not served.
+    assert cached.is_file()
+    # The binding is retained, and re-measuring makes it live again with its stored values.
+    assert [spec.model_dump() for spec in store.get(project_id).shots[0].effects] == stored
+    assert client.post(f"/api/projects/{project_id}/song/analyze").status_code == 200
+    revived = client.post(f"/api/projects/{project_id}/shots/shot_a/preview")
+    assert revived.status_code == 200, revived.text
+    assert revived.json()["fingerprint"] == live.json()["fingerprint"]
+
+
+def test_a_binding_on_a_project_that_was_never_analyzed_refuses_by_its_own_reason(
+    tmp_path: Path,
+):
+    """The other absence, and it is a different sentence with a different remedy: never measured
+    rather than measured-and-stale. `song_measurement_verdict` is the one function that tells
+    them apart and the refusal carries whichever it reached, whole."""
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id = a_measured_project_with_a_graded_shot(client, tmp_path)
+    assert bind_exposure(client, project_id).status_code == 200
+
+    project = store.get(project_id)
+    project.song.analysis = SongAnalysis()
+    store.save(project)
+
+    refused = client.post(f"/api/projects/{project_id}/shots/shot_a/preview")
+
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["detail"] == BINDING_WITHOUT_ENVELOPE_REFUSAL.format(
+        shot="SHOT 01 (shot_a)", reason=SONG_ENVELOPE_NOT_TAKEN
+    )
+def test_a_shot_later_in_the_song_previews_its_own_stretch_of_the_measurement(tmp_path: Path):
+    """The preview's half of the arithmetic the export's sibling test proves.
+
+    A preview is the whole Shot from its own first frame, so the filter graph's clock starts at
+    zero -- but the drive's clock is the song's. Move the Shot four seconds along a song whose
+    beats are half a second apart and the identical binding compiles a **different script**,
+    because it is listening to a different stretch of one measurement. Handed the song's start
+    whatever the Shot's, both would compile one script and the moved Shot would flash on the
+    opening's beats.
+    """
+    client, _store, _comfy, _app = make_client(tmp_path)
+    project_id = a_measured_project_with_a_graded_shot(client, tmp_path)
+    assert bind_exposure(client, project_id).status_code == 200
+    previews = tmp_path / "projects" / project_id / "media" / "previews"
+
+    assert client.post(f"/api/projects/{project_id}/shots/shot_a/preview").status_code == 200
+    at_the_start = {path.name: path.read_text(encoding="utf-8") for path in previews.glob("*.cmds")}
+    assert len(at_the_start) == 1, sorted(at_the_start)
+
+    # The whole shot list back through `PUT /shots`, which is how the browser moves a clip -- and
+    # which must not disturb the binding on the way past (`_adopt_shot_effects`).
+    project = client.get(f"/api/projects/{project_id}").json()
+    project["shots"][0]["start"] = 4.0
+    moved = client.put(f"/api/projects/{project_id}/shots", json={"shots": project["shots"]})
+    assert moved.status_code == 200, moved.text
+    assert client.post(f"/api/projects/{project_id}/shots/shot_a/approve").status_code == 200
+    assert client.post(f"/api/projects/{project_id}/shots/shot_a/preview").status_code == 200
+
+    later = {path.name: path.read_text(encoding="utf-8") for path in previews.glob("*.cmds")}
+    assert len(later) == 2, (
+        "the moved Shot compiled the identical script, so it is being driven by the opening of "
+        "the song rather than by the four seconds it actually occupies"
+    )
+    # Both are clip-local and both address the same labelled stage: only the values differ.
+    for text in later.values():
+        assert text.startswith("0 eq@b0 brightness "), text[:60]

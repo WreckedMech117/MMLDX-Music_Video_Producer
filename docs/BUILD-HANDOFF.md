@@ -102,6 +102,14 @@ and then left in a commit subject is a number nobody will find.**
   geometry a fact about the whole project, and without the memo every preview on a twenty-shot
   project paid **538 ms** re-probing takes. This is the number that justifies the preview route
   taking no busy check — see AD-24.
+- **A bound Shot's preview cache hit is 20.5 ms, not 2.1 ms — and only a bound Shot pays it.**
+  Measured 2026-08-27 on a 3-minute master (7.9 MB) with a 326 KB envelope sidecar: **2.08 ms
+  unbound, 20.46 ms bound** on a cache hit, and 74 ms for a bound first render. The cost is the
+  SHA-256 of the song plus the sidecar read that `preview_fingerprint` now needs, because it
+  composes the chain itself and cannot name a bound Shot without the envelope. Both render paths
+  gate on `stack_is_driven` — an *enabled* card carrying a binding — so a project with no bindings
+  reads no sidecar and pays nothing. Still two orders of magnitude inside FX-NFR-6's one-second
+  budget, and recorded here rather than left in a commit subject, which is Epic 8's retro item R1.
 - **Effects cost the export nothing measurable.** Wall-clock for a no-effects export, the effects
   build against a `git worktree` at the previous commit with its own `PYTHONPATH`, arms alternated
   and pooled: **median 0.2556 s against 0.2545 s — +1.1 ms, +0.4 %**, p25 identical to four decimal

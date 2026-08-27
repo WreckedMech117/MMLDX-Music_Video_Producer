@@ -30,8 +30,10 @@ from music_video_producer.app import (
     ASSEMBLY_ORPHANED_ERROR,
     ASSEMBLY_RENDERS_OPEN_REFUSAL,
     ASSEMBLY_SONG_FILE_REFUSAL,
+    BINDING_WITHOUT_ENVELOPE_REFUSAL,
     SHOT_EFFECT_STACK_LIMIT,
     SHOT_EFFECTS_TOO_MANY_REFUSAL,
+    SONG_ENVELOPE_SONG_CHANGED,
     create_app,
 )
 from music_video_producer.assembly import (
@@ -2225,3 +2227,379 @@ def test_the_export_job_record_does_not_revert_a_shot_edited_while_it_probed(tmp
     assert [job.status for job in stored.jobs] == ["complete"]
     assert stored.jobs[0].output_files == ["exports/assembly_00001.mp4"]
     assert comfy.prompts == []
+# ------------------------------------------------------------------------------------------
+# Epic 10: a Parameter Binding reaches the export.
+#
+# The load-bearing claim in this block is one a grep can never make. A `sendcmd` aimed at a target
+# that is not in the graph is discarded at rc 0, with no warning even at `-v warning`, and the
+# frames come back byte-identical -- so a compiled script sitting on disk beside the intermediates
+# proves nothing whatever about whether the picture moved. Every claim here that a binding drove
+# an export is a comparison of **frame checksums** against the undriven render of the same chain,
+# and never the existence of the script.
+# ------------------------------------------------------------------------------------------
+
+
+def beaty_wav_bytes(seconds: float = 8.0, rate: int = 22050) -> bytes:
+    """A song with transients in it: a 60 Hz burst decaying every half second.
+
+    `punch` measures level *above its own running average*, so a track that is loud everywhere and
+    one that is silent everywhere both drive nothing -- and the digital silence every other
+    fixture in this file uses would compile a script that writes the resting value 120 times and
+    produce a picture identical to the undriven one. That would be a test that could not fail.
+    """
+    content = BytesIO()
+    with wave.open(content, "wb") as target:
+        target.setnchannels(1)
+        target.setsampwidth(2)
+        target.setframerate(rate)
+        frames = bytearray()
+        for index in range(int(seconds * rate)):
+            moment = index / rate
+            decay = math.exp(-(moment % 0.5) * 25.0)
+            value = int(28000 * decay * math.sin(2 * math.pi * 60.0 * moment))
+            frames += struct.pack("<h", max(-32767, min(32767, value)))
+        target.writeframes(bytes(frames))
+    return content.getvalue()
+
+
+def frame_checksums(path: Path) -> list[str]:
+    """One md5 per decoded frame of a file, ffmpeg's own `framemd5`.
+
+    Read per frame rather than over the file because of R-20: multi-threaded libx264 is not
+    bit-exact, so two runs of one identical chain can differ as whole files. Frame by frame, a
+    difference is localised to the frames the drive was active over instead of being smeared
+    across a container, and the frames the drive was *not* active over are available as the
+    control.
+    """
+    output = subprocess.run(
+        # `-map 0:v:0`, which is not optional: an export carries a song, and `framemd5` over a
+        # file with two streams interleaves the audio packets' hashes with the pictures'. Read
+        # without it, "the frames that moved" is a list of positions in a mixture and a video
+        # frame's index in that list depends on how the audio packed -- which is how a first
+        # draft of this test read a bound Shot's drive as reaching into its unbound neighbour.
+        ["ffmpeg", "-v", "error", "-i", path.as_posix(), "-map", "0:v:0", "-f", "framemd5", "-"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    return [
+        line.split(",")[-1].strip()
+        for line in output.splitlines()
+        if line and not line.startswith("#")
+    ]
+
+
+def bind_exposure(client, project_id: str, shot_id: str = "shot_a", index: int = 0, **settings):
+    """One binding written the only way one can be: through its own route."""
+    binding = {"parameter": "amount", "drive": "punch", "depth": 0.8, "band_centre": 0.0,
+               "band_width": 0.3, "band_softness": 0.35, "floor": 0.0}
+    binding.update(settings)
+    return client.put(
+        f"/api/projects/{project_id}/shots/{shot_id}/effects/{index}/bindings",
+        json={"effect": "exposure", "bindings": [binding]},
+    )
+
+
+def a_project_ready_to_be_bound(client, store, tmp_path: Path):
+    """An 8 s project, measured, whose first Shot carries Exposure at a resting 0.2.
+
+    The resting value is deliberately **not** the identity. At 0 the card composes no stage at all
+    unless it is bound, so the undriven comparison would be "no `eq` in the chain" against "an
+    `eq` driven by the music", and a difference in the frames would prove only that an `eq` ran.
+    At 0.2 both chains carry the identical `eq=brightness=0.2` stage and the only difference
+    between them is the `sendcmd` -- which is what "the undriven render of the same chain" has to
+    mean for the comparison to say anything at all.
+    """
+    project_id, shots_dir = project_with_two_approved_takes(
+        client, store, tmp_path, song_bytes=beaty_wav_bytes(8.0)
+    )
+    analysed = client.post(f"/api/projects/{project_id}/song/analyze")
+    assert analysed.status_code == 200, analysed.text
+    graded = client.put(
+        f"/api/projects/{project_id}/shots/shot_a/effects",
+        json={"effects": [{"effect": "exposure", "parameters": {"amount": 0.2}}]},
+    )
+    assert graded.status_code == 200, graded.text
+    return project_id, shots_dir
+
+
+def test_a_binding_written_through_its_own_route_drives_the_exported_frames(tmp_path: Path):
+    """The slice's first acceptance criterion, proved on the pictures and not on the script.
+
+    Two exports of one project, in one run, from one identical chain -- once with the binding on
+    and once with it off. The bound Shot's frames differ; its unbound neighbour, which shares the
+    export, the encoder and the preset, does not move at all.
+    """
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = a_project_ready_to_be_bound(client, store, tmp_path)
+    media = tmp_path / "projects" / project_id / "media"
+
+    undriven = client.post(f"/api/projects/{project_id}/assemble", json={"preset": "draft"})
+    assert undriven.status_code == 200, undriven.text
+    before = frame_checksums(media / undriven.json()["export"])
+
+    assert bind_exposure(client, project_id).status_code == 200
+    driven = client.post(f"/api/projects/{project_id}/assemble", json={"preset": "draft"})
+    assert driven.status_code == 200, driven.text
+    after = frame_checksums(media / driven.json()["export"])
+
+    # 8 s at 24 fps on the cumulative grid: 96 video frames each for shot_a and shot_b.
+    assert len(before) == len(after) == 192, (len(before), len(after))
+    moved = [index for index, (a, b) in enumerate(zip(before, after)) if a != b]
+    assert moved, (
+        "the export's frames are byte-identical with the binding on, which is exactly what a "
+        "mistargeted sendcmd looks like: rc 0, no warning, and nothing driven"
+    )
+    # shot_a is the first 96 frames of the export and shot_b is the rest. Only the bound Shot
+    # moved -- so what changed is this Shot's chain and not the encoder having a different day.
+    assert max(moved) < 96, moved[-5:]
+    # And it did not move from its own first frame. `punch` measures a transient against a running
+    # average that starts cold, so the opening frames sit at the resting value and are identical
+    # to the undriven render; a drive that moved *every* frame would be a constant offset wearing
+    # a binding's clothes.
+    assert before[0] == after[0]
+
+    assert comfy.prompts == []
+
+
+def test_the_compiled_script_reaches_ffmpeg_as_a_bare_relative_name_in_its_own_directory(
+    tmp_path: Path, monkeypatch
+):
+    """R-30's remedy at the export, and `run_tool`'s new `cwd` with it.
+
+    The script goes into the export's own `workdir`, beside `clips.txt` and the intermediates, and
+    the chain names it with no path at all -- so nothing the filtergraph splits on can appear in
+    it and no absolute path can reach the composed chain, which is `preview_fingerprint`'s fourth
+    input. The trim that reads it is spawned with that directory as its working directory; every
+    other invocation in the same export is spawned with none.
+    """
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = a_project_ready_to_be_bound(client, store, tmp_path)
+    assert bind_exposure(client, project_id).status_code == 200
+
+    spawned: list[dict] = []
+    real_exec = asyncio.create_subprocess_exec
+
+    async def watched(*args, **kwargs):
+        cwd = kwargs.get("cwd")
+        spawned.append({
+            "args": [str(part) for part in args],
+            "cwd": cwd,
+            # Read now: the route deletes `workdir` in its own `finally`, and the moment the
+            # trim runs is the only moment this claim is about.
+            "beside": sorted(p.name for p in Path(cwd).glob("*.cmds")) if cwd else [],
+        })
+        return await real_exec(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", watched)
+    response = client.post(f"/api/projects/{project_id}/assemble", json={"preset": "draft"})
+    assert response.status_code == 200, response.text
+
+    driven = [call for call in spawned if any("sendcmd=f=" in part for part in call["args"])]
+    assert len(driven) == 1, [call["args"] for call in spawned]
+    chain = next(part for part in driven[0]["args"] if "sendcmd=f=" in part)
+    name = chain.split("sendcmd=f=", 1)[1].split(",")[0]
+    assert name.startswith("exposure-amount-b0-") and name.endswith(".cmds"), name
+    # Bare and relative: no drive letter, no separator, nothing a filtergraph splits on.
+    assert not (set(name) & set(":/\\,;=&'")), name
+    # And the file of that exact name was sitting in the directory ffmpeg was standing in.
+    assert driven[0]["cwd"] is not None
+    assert driven[0]["beside"] == [name], driven[0]["beside"]
+    assert Path(driven[0]["cwd"]).name.startswith(".work-"), driven[0]["cwd"]
+    # Every other process in this export -- the probes, the unbound trim, the concat, the
+    # verification -- is spawned with no working directory at all.
+    assert [call["cwd"] for call in spawned if call is not driven[0]].count(None) == len(
+        spawned
+    ) - 1
+
+
+def test_an_export_records_the_bindings_that_drove_it(tmp_path: Path):
+    """FX-25's second reserved slot, filled by the epic that reserved it.
+
+    `effects` alone cannot tell a look that surged on the kick from one that sat still: both
+    record the same resting numbers. What is stored is the **agreed** binding, every setting the
+    Director never touched filled in from the catalogue, for the reason `exported_look` stores
+    resolved values -- the manifest's own copy is sparse, and a record taken from it would stop
+    being readable the day a default moved.
+    """
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = a_project_ready_to_be_bound(client, store, tmp_path)
+    assert bind_exposure(client, project_id).status_code == 200
+
+    response = client.post(f"/api/projects/{project_id}/assemble", json={"preset": "draft"})
+    assert response.status_code == 200, response.text
+    look = response.json()["job"]["look"]
+
+    assert look["effects"] == ['shot_a=exposure:{"amount":0.2}']
+    assert look["bindings"] == [
+        (
+            'shot_a=exposure.amount:{"band_centre":0,"band_softness":0.35,"band_width":0.3,'
+            '"depth":0.8,"drive":"punch","floor":0,"hold":0.8,"sustain":1.5}'
+        )
+    ]
+    assert look["transitions"] == []
+
+
+def test_an_export_whose_envelope_stopped_describing_the_song_refuses_by_name(tmp_path: Path):
+    """Story 10.4's export criterion, which is the half of that story this slice ships.
+
+    `SongAnalysis` derives validity at read time from the song's own bytes, so a song replaced by
+    a route that never thought about bindings leaves every binding pointing at a measurement of a
+    track this project no longer has -- with nothing stored saying so. The state is reached here
+    the way a hand-edited manifest reaches it, which is the same state and is reachable without a
+    second song file.
+
+    It refuses rather than rendering undriven, and that is the whole point: an undriven export
+    succeeds, at rc 0, and says nothing. The binding is untouched by the refusal, which is the
+    other half of the story -- re-analyze and it is live again with its stored values.
+    """
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = a_project_ready_to_be_bound(client, store, tmp_path)
+    assert bind_exposure(client, project_id).status_code == 200
+    stored = [
+        spec.model_dump() for spec in store.get(project_id).shots[0].effects
+    ]
+
+    project = store.get(project_id)
+    project.song.analysis.song_fingerprint = "12-notthesongthatisonthedisk"
+    store.save(project)
+
+    refused = client.post(f"/api/projects/{project_id}/assemble", json={"preset": "draft"})
+
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["detail"] == BINDING_WITHOUT_ENVELOPE_REFUSAL.format(
+        shot="SHOT 01 (shot_a)", reason=SONG_ENVELOPE_SONG_CHANGED
+    )
+    # Retained and reported unresolvable, never dropped and never silently zeroed (FX-15).
+    assert [spec.model_dump() for spec in store.get(project_id).shots[0].effects] == stored
+    # And nothing was written: no job record for an export that never started.
+    assert store.get(project_id).jobs == []
+
+    assert client.post(f"/api/projects/{project_id}/song/analyze").status_code == 200
+    assert client.post(
+        f"/api/projects/{project_id}/assemble", json={"preset": "draft"}
+    ).status_code == 200
+
+
+def test_an_export_with_no_binding_spawns_exactly_the_process_it_always_spawned(
+    tmp_path: Path, monkeypatch
+):
+    """R-20 and this slice's seventh constraint, asserted on the argv and never on the mp4 --
+    which is the whole of what that ruling says a determinism claim may be about.
+
+    The Shot here carries a real Effect Stack and no binding. No `sendcmd` stage appears in any
+    command line, no `.cmds` file is written anywhere under the export's workdir, and no
+    invocation is handed a working directory -- so the process this export spawns is the process
+    it spawned before this epic existed, environment and command line alike.
+    """
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = a_project_ready_to_be_bound(client, store, tmp_path)
+
+    spawned: list[dict] = []
+    real_exec = asyncio.create_subprocess_exec
+
+    async def watched(*args, **kwargs):
+        spawned.append({"args": [str(part) for part in args], "cwd": kwargs.get("cwd")})
+        return await real_exec(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", watched)
+    response = client.post(f"/api/projects/{project_id}/assemble", json={"preset": "draft"})
+    assert response.status_code == 200, response.text
+
+    assert spawned, "no ffmpeg process was spawned"
+    assert [call["cwd"] for call in spawned] == [None] * len(spawned)
+    for call in spawned:
+        assert not any("sendcmd" in part for part in call["args"]), call["args"]
+    assert not list((tmp_path / "projects" / project_id / "media").rglob("*.cmds"))
+def test_two_shots_with_one_binding_are_driven_by_their_own_stretches_of_the_song(
+    tmp_path: Path, monkeypatch
+):
+    """The one piece of arithmetic this epic adds, and the one the artefacts do not address.
+
+    The drive's clock is the **song's** and the filter graph's is the **clip's**: `trim_args`
+    prepends `setpts=PTS-STARTPTS`, so ffmpeg's `t` is zero at the first frame of every clip. A
+    binding therefore cannot simply be handed the song's own times -- `build_effect_stages` is
+    given the Shot's start and the clip's offset inside it, adds them, and measures every compiled
+    time back from there.
+
+    Two Shots carrying the character-for-character identical binding, four seconds apart in one
+    song, are what makes that visible. They compile **two different scripts**, because they are
+    listening to two different stretches of one measurement -- and because a script's filename
+    carries a digest of its own text, two different scripts are two different files. Handed the
+    song's start for both, they would compile one script, share one file, and the second Shot
+    would flash on the first Shot's beats.
+    """
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = a_project_ready_to_be_bound(client, store, tmp_path)
+    assert client.put(
+        f"/api/projects/{project_id}/shots/shot_b/effects",
+        json={"effects": [{"effect": "exposure", "parameters": {"amount": 0.2}}]},
+    ).status_code == 200
+    assert bind_exposure(client, project_id, "shot_a").status_code == 200
+    assert bind_exposure(client, project_id, "shot_b").status_code == 200
+
+    scripts: list[dict[str, str]] = []
+    real_exec = asyncio.create_subprocess_exec
+
+    async def watched(*args, **kwargs):
+        cwd = kwargs.get("cwd")
+        if cwd is not None:
+            # Read at the moment the trim runs: the route deletes `workdir` in its own `finally`.
+            scripts.append({
+                path.name: path.read_text(encoding="utf-8")
+                for path in Path(cwd).glob("*.cmds")
+            })
+        return await real_exec(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", watched)
+    response = client.post(f"/api/projects/{project_id}/assemble", json={"preset": "draft"})
+    assert response.status_code == 200, response.text
+
+    assert len(scripts) == 2, "both bound Shots should have been trimmed with a working directory"
+    first, second = scripts
+    # The second trim sees both files, because the first one wrote its own into the shared
+    # workdir and nothing cleans up between clips.
+    assert len(second) == 2, sorted(second)
+    assert len(set(second.values())) == 2, (
+        "the two Shots compiled the identical script, so the later one is being driven by the "
+        "opening of the song rather than by its own four seconds of it"
+    )
+    # Both start at clip-local zero and both address their own labelled stage: the times are the
+    # clip's, and only the values differ.
+    for text in second.values():
+        assert text.startswith("0 eq@b0 brightness "), text[:60]
+        assert next(iter(first.values())).splitlines()[0].split()[1] == "eq@b0"
+def test_a_disabled_bound_card_neither_drives_an_export_nor_refuses_one(tmp_path: Path):
+    """A card the Director switched off composes no stage, so nothing addressed it and nothing
+    was driven -- the rule the look record already applies, applied to the question of whether an
+    export needs a measurement at all.
+
+    Without it a Shot whose bound card was switched off would refuse its own export over an
+    envelope that could not have reached the picture, and would pay for reading one on every
+    export that did succeed.
+    """
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = a_project_ready_to_be_bound(client, store, tmp_path)
+    assert bind_exposure(client, project_id).status_code == 200
+    switched_off = client.put(
+        f"/api/projects/{project_id}/shots/shot_a/effects",
+        json={"effects": [{
+            "effect": "exposure", "enabled": False, "parameters": {"amount": 0.2},
+            "bindings": [{"parameter": "amount", "drive": "punch", "depth": 0.8,
+                          "band_centre": 0.0, "band_width": 0.3, "band_softness": 0.35,
+                          "floor": 0.0}],
+        }]},
+    )
+    assert switched_off.status_code == 200, switched_off.text
+
+    project = store.get(project_id)
+    project.song.analysis.song_fingerprint = "12-notthesongthatisonthedisk"
+    store.save(project)
+
+    response = client.post(f"/api/projects/{project_id}/assemble", json={"preset": "draft"})
+
+    assert response.status_code == 200, response.text
+    # And the record says the same thing the picture does: nothing composed, nothing driving.
+    assert response.json()["job"]["look"] == {
+        "effects": [], "bindings": [], "transitions": []
+    }
+    # The binding is still there, waiting for the card to be switched back on.
+    assert store.get(project_id).shots[0].effects[0].bindings != []

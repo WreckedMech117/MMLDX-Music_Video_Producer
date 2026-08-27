@@ -8973,7 +8973,7 @@ def graded_project(tmp_path: Path) -> tuple[object, str, dict]:
     assert graded.status_code == 200, graded.text
     project = client.get(f"/api/projects/{project_id}").json()
     assert project["shots"][0]["effects"] == [
-        {"effect": "punch_in", "enabled": True, "parameters": {"zoom": 1.2}}
+        {"effect": "punch_in", "enabled": True, "parameters": {"zoom": 1.2}, "bindings": []}
     ]
     return client, project_id, project
 
@@ -9025,7 +9025,9 @@ def test_a_split_saved_the_way_the_browser_saves_it_keeps_the_look_on_both_halve
     from music_video_producer.store import ProjectStore
 
     client, project_id, project = graded_project(tmp_path)
-    look = [{"effect": "punch_in", "enabled": True, "parameters": {"zoom": 1.2}}]
+    look = [
+        {"effect": "punch_in", "enabled": True, "parameters": {"zoom": 1.2}, "bindings": []}
+    ]
 
     # 1. The split, composed by app.js and landed on the real route.
     body = browser_shot_save(project, "#split-shot", "shot_one")
@@ -19894,6 +19896,11 @@ def effects_shot(**overrides) -> str:
     return json.dumps(shot)
 
 
+#: One Parameter Binding as the wire carries it -- Exposure's amount driven by the lowest band.
+#: `effects._BINDING_SETTINGS` owns the shape; this is a value in it, not a second declaration.
+BOUND_AMOUNT = {"parameter": "amount", "band_centre": 0, "band_width": 1, "band_softness": 0, "drive": "punch", "trigger_floor": 0.0, "depth": 0.5}
+
+
 def effects_project(shots: str, project_id: str = "p1", sections: str = "",
                     placed: str = "") -> str:
     """One Project as the workspace holds it.
@@ -20261,6 +20268,70 @@ def test_disabling_an_effect_keeps_the_card_with_its_parameters_and_writes_enabl
     assert 'id="effect-param-0-strength"' in disabled["effects"]
     assert 'value="12"' in disabled["effects"]
     assert "Grain: Disabled" in disabled["effects"]
+
+
+def test_an_ordinary_stack_write_carries_a_binding_it_did_not_touch():
+    """The client half of the server's *carry, never mint* rule, and the half that fails silently.
+
+    `carried_bindings_refusal` stops a body **inventing** a binding, and nothing on the server can
+    stop one **dropping** it: losing a binding is indistinguishable from removing the bound card,
+    because an `EffectSpec` has no id (R-26). So a client that rebuilt the stack from three keys
+    would destroy the Director's work on the next slider release and be answered 200.
+
+    Reachable the moment the band panel ships and not before, which is exactly why the guard lands
+    with the field rather than with the panel: AD-16's rule exists because afterwards never
+    arrived. Driven through the real toggle rather than by calling `effectStackWrite`, so it is the
+    *gesture* that is asserted to be safe.
+    """
+    bound = json.loads(effects_shot(effects=[
+        {"effect": "exposure", "enabled": True, "parameters": {"amount": 0.2},
+         "bindings": [BOUND_AMOUNT]},
+    ]))
+    reply = {"id": "p1", "jobs": [], "song": None, "assets": [], "messages": [], "sections": [],
+             "shots": [bound]}
+    written = drawn_effects_panel(
+        json.dumps(bound),
+        responses={"/api/projects/p1/shots/shot_a/effects": {"body": reply}},
+        extra="""
+          requests.length = 0;
+          at('#effect-toggle-0').checked = false;
+          await fire('#effect-toggle-0:change', {});
+          await flush();
+        """,
+    )
+
+    body = json.loads(written["requests"][0]["body"])
+    # The gesture landed -- and it did not cost the binding.
+    assert body["effects"][0]["enabled"] is False
+    assert body["effects"][0]["bindings"] == [BOUND_AMOUNT]
+
+
+def test_a_card_with_no_binding_is_written_exactly_as_it_was_before_bindings_existed():
+    """The other direction, because carrying sparsely is what keeps every older body byte-identical.
+
+    A fourth key present-and-empty on every card would change every request this application has
+    ever sent and would make `effectStackChanged` answer differently for two stacks that mean the
+    same thing.
+    """
+    plain = json.loads(effects_shot(effects=[
+        {"effect": "grain", "enabled": True, "parameters": {"strength": 12.0}},
+    ]))
+    reply = {"id": "p1", "jobs": [], "song": None, "assets": [], "messages": [], "sections": [],
+             "shots": [plain]}
+    written = drawn_effects_panel(
+        json.dumps(plain),
+        responses={"/api/projects/p1/shots/shot_a/effects": {"body": reply}},
+        extra="""
+          requests.length = 0;
+          at('#effect-toggle-0').checked = false;
+          await fire('#effect-toggle-0:change', {});
+          await flush();
+        """,
+    )
+
+    assert json.loads(written["requests"][0]["body"]) == {"effects": [
+        {"effect": "grain", "enabled": False, "parameters": {"strength": 12.0}},
+    ]}
 
 
 def test_a_slider_writes_on_release_and_paints_without_writing_while_it_is_dragged():
@@ -22396,8 +22467,8 @@ def test_the_copy_route_applies_to_every_unlocked_target_and_names_the_locked_on
     }]
     # Written exactly as the source holds it -- sparsely, so a corrected default still reaches it.
     assert client.get(f"/api/projects/{project_id}/shots/b/effects").json()["effects"] == [
-        {"effect": "grain", "enabled": True, "parameters": {"strength": 12}},
-        {"effect": "punch_in", "enabled": True, "parameters": {}},
+        {"effect": "grain", "enabled": True, "parameters": {"strength": 12}, "bindings": []},
+        {"effect": "punch_in", "enabled": True, "parameters": {}, "bindings": []},
     ]
     assert client.get(f"/api/projects/{project_id}/shots/c/effects").json()["effects"] == []
     # And the whole Project comes back, so a client redraws from what was stored.
@@ -22420,7 +22491,7 @@ def test_the_copy_route_replaces_rather_than_merges_and_clears_from_an_empty_sta
     assert replaced.status_code == 200, replaced.text
     # Replaced whole: neither of the target's own two cards survives.
     assert client.get(f"/api/projects/{project_id}/shots/b/effects").json()["effects"] == [
-        {"effect": "grain", "enabled": True, "parameters": {"strength": 8}}
+        {"effect": "grain", "enabled": True, "parameters": {"strength": 8}, "bindings": []}
     ]
 
     client.put(f"/api/projects/{project_id}/shots/a/effects", json={"effects": []})
@@ -22590,7 +22661,7 @@ def test_a_locked_source_is_copied_from(tmp_path: Path):
     assert response.status_code == 200, response.text
     assert response.json()["applied"] == ["SHOT 02 (b)"]
     assert client.get(f"/api/projects/{project_id}/shots/a/effects").json()["effects"] == [
-        {"effect": "grain", "enabled": True, "parameters": {"strength": 5}}
+        {"effect": "grain", "enabled": True, "parameters": {"strength": 5}, "bindings": []}
     ]
 
 

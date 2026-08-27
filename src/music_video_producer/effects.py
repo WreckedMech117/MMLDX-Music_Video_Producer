@@ -3687,6 +3687,43 @@ def exported_look(
     return tuple(f"{effect.effect_id}:{_canonical(effect.values)}" for effect in ordered)
 
 
+def exported_bindings(
+    stack: Iterable[Mapping[str, Any]], *, luts: Sequence[LutEntry] = ()
+) -> tuple[str, ...]:
+    """One stack as the record of what drove an export: `"<effect>.<parameter>:{settings}"`, in
+    chain order, for every Parameter Binding it carries.
+
+    `exported_look`'s sibling and the other half of FX-25's provenance — that one records what was
+    *done* to the takes, this one records what was **moving** while it was done. An export whose
+    Bloom surged on the kick and one whose Bloom sat still are two different pictures from one
+    identical `effects` list, and the record has to be able to tell them apart.
+
+    The values are the **agreed** ones, every setting the Director never touched filled in from
+    `_BINDING_SETTINGS`, for `exported_look`'s reason: the stored form is sparse by design, so a
+    record taken from it would go stale the moment a default was corrected and would be unreadable
+    without the catalogue of the day it was written.
+
+    Disabled entries are omitted, exactly as they are there: a card switched off composes no stage,
+    so nothing addressed it and nothing was driven. Ordered by `FAMILY_ORDER` then by the
+    Director's order within a family, which is the chain's order and therefore the order the
+    `sendcmd` scripts sat in.
+    """
+    resolved = validate_stack(stack, luts=luts)
+    return tuple(
+        f"{effect.effect_id}.{binding.parameter}:"
+        + _canonical(
+            {
+                field: getattr(binding, field)
+                for field in ("drive", "depth", *(name for name, *_ in _BINDING_SETTINGS))
+            }
+        )
+        for family in FAMILY_ORDER
+        for effect in resolved
+        if effect.enabled and effect.family == family
+        for binding in effect.bindings
+    )
+
+
 #: The eight inputs of the preview fingerprint, in the order they are hashed in. A tuple rather
 #: than eight literals inside the function so that the order is a thing a test can read, and so
 #: that adding a ninth is visibly a change to AD-28 rather than a line in a payload.
@@ -3715,6 +3752,9 @@ def preview_fingerprint(
     stack: Iterable[Mapping[str, Any]] = (),
     luts: Sequence[LutEntry] = (),
     bindings: Iterable[Any] = (),
+    envelope: Mapping[str, Any] | None = None,
+    shot_start: float = 0.0,
+    clip_seconds: float = 0.0,
     song_fingerprint: str = "",
     transition: Any = None,
     width: int,
@@ -3736,6 +3776,31 @@ def preview_fingerprint(
     later then changes the fingerprint only of the Shots that acquire one. Leaving them out and
     adding them later would reshape the payload for every Shot at once and invalidate every
     cached preview in every project on the day that epic merges — for looks that did not change.
+
+    **`envelope` and `shot_start` are what a bound stack needs, and a stack with no binding
+    ignores both.** They are not two more fingerprint inputs: they reach the chain, and the chain
+    already is one. A bound stage composes a `sendcmd=f=<name>.cmds` whose name carries a digest
+    of the compiled script's own text (`_drive_script_name`), so a re-measured envelope, a moved
+    Shot or a changed depth all move the fourth slot on their own — the preview cannot serve a
+    clip cached from before the binding, and cannot serve one driven by a measurement of a song
+    that has since been replaced. Passing them is therefore not optional for a bound Shot: with no
+    envelope `build_effect_stages` refuses by name here rather than naming a picture ffmpeg would
+    render undriven, which is the one failure `sendcmd`'s silence makes undetectable afterwards.
+
+    A preview is the whole Shot from its own first frame, so `clip_offset` is zero and the span a
+    ramp is measured against is `window_duration` — both read off inputs this already hashes
+    rather than taken on trust. `shot_start` is the Shot's own start **in the song**, because the
+    drive's clock is the song's and the filter graph's is the clip's.
+
+    `clip_seconds` is the one number that is genuinely the caller's and cannot be derived here: it
+    is the frames ffmpeg is asked to write over the assembly rate, and the grid that decides that
+    lives in `timeline`, which this module may not import. `0` — the default — falls back to
+    `window_duration`, which is what a caller with no binding gets and what a caller with no
+    opinion means; the preview passes its own `frames / ASSEMBLY_FPS`, which is the same number
+    the export's plan hands `build_effect_stages` for an unsplit Shot, so the two compile the
+    identical script and the preview goes on being the export's chain at half the geometry. It is
+    not a ninth fingerprint input for the reason `reference_width` is not: what it changes is the
+    chain, and the chain already is one.
 
     `song_fingerprint` is the **stored** content fingerprint of the song the envelope was
     measured from, not a fresh read of the file: it is here for the bindings that will be driven
@@ -3805,6 +3870,9 @@ def preview_fingerprint(
         clip_offset=0.0,
         shot_seconds=window_duration,
         reference_width=reference_width,
+        envelope=envelope,
+        shot_start=shot_start,
+        clip_seconds=clip_seconds or window_duration,
     )
     fields = (
         _canonical(take),

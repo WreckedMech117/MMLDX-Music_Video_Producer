@@ -40,6 +40,7 @@ import pytest
 
 from music_video_producer.assembly import trim_args
 from music_video_producer.effects import (
+    BINDING_NO_ENVELOPE_REFUSAL,
     BRANCH_FRAME_GUARD,
     BRANCH_LEG_FORMAT,
     DEFAULT_LUT_SIZE,
@@ -67,6 +68,7 @@ from music_video_producer.effects import (
     build_effect_stages,
     cube_text,
     discover_luts,
+    exported_bindings,
     exported_look,
     identity_transform,
     lut_directory,
@@ -2895,3 +2897,225 @@ def test_a_pixelated_frame_carries_the_same_blocks_across_at_both_delivery_sizes
     assert counted[export[0]] == 16
     assert counted[preview[0]] == 8
     assert export[0] / counted[export[0]] == preview[0] / counted[preview[0]] == 40
+# ------------------------------------------------------------------------------------------
+# Slice E2: the fingerprint learns the envelope, and the record learns what was driving.
+# ------------------------------------------------------------------------------------------
+
+#: Three preview fingerprints computed by `effects.py` **as it stood at `ad67a14`**, the commit
+#: before this slice. Taken by importing that revision's file directly -- which is possible only
+#: because it imports stdlib and nothing else, and is the sharpest available demonstration of why
+#: that house rule is worth keeping.
+#:
+#: They are here for one claim and it is the claim this slice could most easily have broken
+#: silently: **a Shot with no binding names the clip it already named.** Nothing evicts
+#: `previews/`, so a payload that moved would have re-rendered every Shot in every project on this
+#: machine, once, for pictures that did not change -- and every one of them would still have
+#: looked right. `envelope`, `shot_start` and `clip_seconds` are new arguments to this function
+#: and the fifth slot now has a real value to carry; none of that may reach an unbound stack.
+FINGERPRINTS_BEFORE_BINDINGS = {
+    "grain": "7ebe3bd59abb0c43f994cf09f5a52686859422f2a882e6b210d430540b8389ae",
+    "bloom": "f2546cac152b4220f6c3e5f29b9176b03d534218a573277f27aec2bcf64c46e0",
+    "empty": "6f1076ab2e60ad7a4d5d9c7eed289cbadc5f7773d29fcc04abfcbf67b70cea94",
+}
+
+
+def _unbound_fingerprint(stack, **changed):
+    inputs = {
+        "take": "shots/shot_a-h3_00001-audio.mp4",
+        "window_start": 4.0,
+        "window_duration": 3.0,
+        "offset": 0.25,
+        "stack": stack,
+        "bindings": (),
+        "song_fingerprint": "4096-abcdef",
+        "transition": None,
+        "width": 528,
+        "height": 304,
+    }
+    inputs.update(changed)
+    return preview_fingerprint(**inputs)
+
+
+def test_a_shot_with_no_binding_names_the_clip_it_named_before_this_slice():
+    """R-20 and constraint 7, pinned against the previous commit's own arithmetic.
+
+    Asserted three ways, because the failure has three doors: an empty stack, a stack whose one
+    card is linear, and a stack whose one card composes a branch. And asserted **again** with the
+    three new arguments supplied, since a caller that has an envelope in its hand still must not
+    move the name of a Shot that is not listening to it.
+    """
+    envelope = {"analysis_rate": 30.0, "band_count": 2, "bands": [[0.9] * 90, [0.2] * 90]}
+    for name, stack in (
+        ("empty", []),
+        ("grain", [{"effect": "grain", "enabled": True, "parameters": {"strength": 30.0}}]),
+        ("bloom", [{"effect": "bloom", "enabled": True, "parameters": {"intensity": 0.4}}]),
+    ):
+        assert _unbound_fingerprint(stack) == FINGERPRINTS_BEFORE_BINDINGS[name], name
+        assert _unbound_fingerprint(
+            stack, envelope=envelope, shot_start=4.0, clip_seconds=3.0
+        ) == FINGERPRINTS_BEFORE_BINDINGS[name], name
+
+
+def test_a_bound_shots_fingerprint_moves_with_the_measurement_that_drives_it():
+    """The fifth slot and the fourth, and neither is redundant.
+
+    The chain carries the compiled script's *name*, whose digest is taken over the script's own
+    text -- so a re-measured envelope and a moved Shot both change the name of the clip even
+    though the Director changed nothing. The `bindings` slot carries the Director's own numbers,
+    which is the one thing the chain cannot see when two states compile to identical text.
+
+    A `sendcmd` that resolves to nothing is silent, so the only defence against serving a clip
+    from before a binding is that the name is different. This is that defence.
+    """
+    # A band with a **transient** in it, because `punch` measures level above its own running
+    # average: a flat envelope at 0.9 and a flat one at 0.4 drive the identical nothing, compile
+    # the identical script, and would make every assertion below pass for the wrong reason.
+    def bumped(at: int):
+        bass = [0.1] * 90
+        for tick in range(at, at + 4):
+            bass[tick] = 0.95
+        return {"analysis_rate": 30.0, "band_count": 2, "bands": [bass, [0.2] * 90]}
+
+    envelope = bumped(20)
+    remeasured = bumped(40)
+    stack = [{
+        "effect": "bloom",
+        "enabled": True,
+        "parameters": {"intensity": 0.4},
+        "bindings": [{"parameter": "intensity", "drive": "punch", "depth": 0.5}],
+    }]
+    bound = {
+        "stack": stack,
+        "bindings": (({"parameter": "intensity", "drive": "punch", "depth": 0.5},),),
+        "envelope": envelope,
+        "shot_start": 0.0,
+        "clip_seconds": 3.0,
+    }
+
+    baseline = _unbound_fingerprint(**bound)
+    assert baseline != FINGERPRINTS_BEFORE_BINDINGS["bloom"], (
+        "a bound Shot named the same clip as the unbound one, so the cache would serve the "
+        "undriven picture for ever"
+    )
+    assert _unbound_fingerprint(**bound) == baseline
+
+    # The envelope moved: same binding, same Shot, a song measured again.
+    assert _unbound_fingerprint(**{**bound, "envelope": remeasured}) != baseline
+    # The Shot moved along the song, so it is driven by a different stretch of one measurement.
+    assert _unbound_fingerprint(**{**bound, "shot_start": 0.5}) != baseline
+    # The Director's own numbers moved.
+    deeper = [{**stack[0],
+               "bindings": [{"parameter": "intensity", "drive": "punch", "depth": 0.9}]}]
+    assert _unbound_fingerprint(**{
+        **bound,
+        "stack": deeper,
+        "bindings": (({"parameter": "intensity", "drive": "punch", "depth": 0.9},),),
+    }) != baseline
+
+
+def test_a_bound_stack_with_no_envelope_refuses_rather_than_naming_an_undriven_picture():
+    """`build_effect_stages` refuses by name, and `preview_fingerprint` refuses with it.
+
+    The alternative is the whole reason this epic is dangerous: composing the stage without its
+    `sendcmd`, naming the clip after the bound state, and rendering the undriven picture into it
+    at rc 0 with nothing to see. FX-15 read the only way it can be read here -- a binding is never
+    silently dropped.
+    """
+    stack = [{
+        "effect": "bloom",
+        "enabled": True,
+        "parameters": {"intensity": 0.4},
+        "bindings": [{"parameter": "intensity", "drive": "punch", "depth": 0.5}],
+    }]
+    with pytest.raises(EffectRefusal) as refusal:
+        _unbound_fingerprint(stack)
+    assert str(refusal.value) == BINDING_NO_ENVELOPE_REFUSAL.format(
+        effect="bloom", parameter="intensity"
+    )
+
+
+def test_the_export_record_names_every_binding_that_drove_it_with_its_settings_filled_in():
+    """`exported_bindings`, `exported_look`'s sibling: what was *moving* while the look was
+    applied. Two identical `effects` lists with different drives are two different pictures, and
+    the record has to be able to tell them apart.
+
+    Resolved rather than stored: the manifest's copy is sparse by design, so a record taken from
+    it would stop meaning anything the day a default moved. Ordered by `FAMILY_ORDER` then by the
+    Director's order within a family, which is the order the scripts sat in. A disabled card
+    composed no stage, so nothing addressed it and it is not listed.
+    """
+    stack = [
+        {"effect": "exposure", "parameters": {"amount": 0.2},
+         "bindings": [{"parameter": "amount", "drive": "sustain", "depth": 0.5, "floor": 0.3}]},
+        {"effect": "soft_focus", "parameters": {"sigma": 4},
+         "bindings": [{"parameter": "sigma", "drive": "punch", "depth": 2}]},
+        {"effect": "contrast", "parameters": {},
+         "bindings": [{"parameter": "amount", "drive": "punch", "depth": 1}],
+         "enabled": False},
+    ]
+
+    assert exported_bindings(stack) == (
+        # Texture before Grade, which is `FAMILY_ORDER` and therefore the chain's own order --
+        # never the order these were written in.
+        (
+            'soft_focus.sigma:{"band_centre":0.25,"band_softness":0.35,"band_width":0.3,'
+            '"depth":2,"drive":"punch","floor":0,"hold":0.8,"sustain":1.5}'
+        ),
+        (
+            'exposure.amount:{"band_centre":0.25,"band_softness":0.35,"band_width":0.3,'
+            '"depth":0.5,"drive":"sustain","floor":0.3,"hold":0.8,"sustain":1.5}'
+        ),
+    )
+    # A stack with no binding records nothing, which is what every export before this epic was.
+    assert exported_bindings([{"effect": "grain", "parameters": {"strength": 10}}]) == ()
+def test_the_sendcmd_stage_sits_ahead_of_every_filter_it_drives():
+    """Placement, which is a property of the picture and not of tidiness.
+
+    `sendcmd` issues its commands while handling a frame and then passes **that** frame on, so a
+    filter upstream of it does not see a new value until the frame after -- the whole clip
+    delivered one tick late, on every driven parameter, with no symptom anyone could name. So the
+    stage goes at the head of the chain, ahead of the labelled filter it addresses.
+
+    The one thing that stays ahead of even this is `BRANCH_FRAME_GUARD`: it is the stage that must
+    see a frame still carrying the decoder's own duration, and `sendcmd` changes no timestamp.
+    """
+    envelope = {"analysis_rate": 30.0, "band_count": 2,
+                "bands": [[0.1] * 60, [0.2] * 60]}
+    # A Geometry card beside the bound one, and it is what makes this assertion able to fail at
+    # all: no Geometry *parameter* is drivable (R-29), so a bound stack composes nothing into the
+    # geometry group on its own and "at the head" and "at the tail" are the same one-element
+    # tuple. An unbound Punch In is what puts something there for the driver to sit ahead of.
+    linear = build_effect_stages(
+        [{"effect": "punch_in", "parameters": {"zoom": 1.2}},
+         {"effect": "exposure", "parameters": {"amount": 0.2},
+          "bindings": [{"parameter": "amount", "drive": "punch", "depth": 0.5}]}],
+        width=1920, height=1080, envelope=envelope, shot_start=0.0, clip_seconds=2.0,
+    )
+    assert len(linear.scripts) == 1
+    driver = f"sendcmd=f={linear.scripts[0].filename}"
+    assert linear.geometry[0] == driver, linear.geometry
+    assert len(linear.geometry) == 2 and linear.geometry[1].startswith("crop="), linear.geometry
+    # `b1`, not `b0`: the label counts the effect's position in the **composed** order, and
+    # the unbound Punch In takes slot zero.
+    assert linear.treatment == ("eq@b1=brightness=0.2",), linear.treatment
+
+    branched = build_effect_stages(
+        [{"effect": "bloom", "parameters": {"intensity": 0.4},
+          "bindings": [{"parameter": "intensity", "drive": "punch", "depth": 0.5}]}],
+        width=1920, height=1080, envelope=envelope, shot_start=0.0, clip_seconds=2.0,
+    )
+    assert branched.branched
+    # The branch frame guard stays ahead of even the driver: it is the stage that must see a
+    # frame still carrying the decoder's own duration, and `sendcmd` changes no timestamp.
+    assert branched.geometry == (
+        BRANCH_FRAME_GUARD, f"sendcmd=f={branched.scripts[0].filename}"
+    ), branched.geometry
+
+    # And every target the compiler emits really is an `@label` in the chain composed by the same
+    # call -- the one thing standing between a typo and a silently undriven export.
+    for stages in (linear, branched):
+        for script in stages.scripts:
+            assert any(
+                f"{script.target}=" in stage or f"{script.target}@" in stage
+                for stage in (*stages.geometry, *stages.treatment)
+            ), (script.target, stages)

@@ -599,16 +599,28 @@ class EffectSpec(BaseModel):
     keys — `effects.EFFECT_SPEC_KEYS` names them, and its refusal prints them to a client that
     misspelled one.
 
-    **`EFFECT_SPEC_KEYS` names a fourth key this model does not yet declare: `bindings`.** Epic
-    10's compiler reads a Parameter Binding off a stack entry, keyed by parameter name, and the
-    validator agrees one — but the field is deliberately not here yet, and nothing in this
-    application writes one. It is the *write path* that is missing rather than the shape: a
-    binding is server-owned and written only by its own route (AD-16), so the field arrives with
-    that route and with its `_adopt_*` guard on the generic writes in the same commit. Adding it
-    here first would open exactly the hole this repository has now found more times than any
-    other — a whole-project or whole-shots `PUT` from a client that predates the field, quietly
-    clearing a Director's work. A stack entry read off disk therefore carries no binding today,
-    which is why the compiler is unreachable from any route in this build.
+    **`bindings` is `EFFECT_SPEC_KEYS`' fourth key, and it arrived here on 2026-08-27 with the
+    route that mints one and the guards that keep every other write off it.** It was deliberately
+    withheld until then — the shape was ready and the *write path* was not, and a field whose
+    guards land "afterwards" is the hole this repository has found fourteen times in one route.
+    What arrived with it, in the same commit AD-16 asks for:
+
+    * `PUT .../shots/{id}/effects/{index}/bindings` — the one route that mints, alters or clears a
+      binding, and the only one.
+    * `app.carried_bindings_refusal` — **carry, never mint**, applied at the two other doors a
+      stack can arrive through. `PUT .../effects` may carry a binding this Shot already stores,
+      and `_adopt_shot_effects` may carry onto a *new* Shot a binding the project already stores
+      somewhere — which is exactly what Split and Duplicate do, and why `SHOT_PLAN_CONTENT_FIELDS`
+      says the two halves of one shot are one shot's look. Anything else is refused by name.
+    * An **existing** Shot's stack is still adopted whole from the store by `_adopt_shot_effects`,
+      in both directions, so a binding riding inside it was already out of a generic write's reach
+      before this field existed. That is the half that needed nothing new.
+
+    A binding is stored the way `parameters` is stored and for the same reason: **as the Director
+    wrote it**, sparse, `dict[str, Any]`, with the catalogue filling every default at the moment
+    it composes. `effects.BINDING_SPEC_KEYS` names the nine keys and `effects._BINDING_SETTINGS`
+    owns their bounds; a `ParameterBindingSpec` model here would be a second copy of both, and a
+    corrected default could not reach a manifest that had frozen the old one.
 
     **Nothing here validates the effect or its parameters, and that is the design.** `effect` is a
     free string and `parameters` an open mapping *on the model*, because the catalogue — which
@@ -628,6 +640,10 @@ class EffectSpec(BaseModel):
     effect: str
     enabled: bool = True
     parameters: dict[str, Any] = Field(default_factory=dict)
+    #: The Parameter Bindings this card carries, keyed inside each entry by the parameter's own
+    #: name (R-26). Defaulted empty, so every manifest written before this existed loads
+    #: unchanged and composes exactly the chain it always composed.
+    bindings: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class Shot(BaseModel):
