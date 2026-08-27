@@ -594,10 +594,21 @@ class EffectSpec(BaseModel):
     """One entry of a Shot's Effect Stack: which effect, whether it is on, and its parameters.
 
     **The same shape `effects.validate_stack` already accepts**, deliberately, so a stack entry
-    has one definition rather than two. `model_dump()` on this produces exactly the mapping that
-    validator reads, which is what lets the manifest, the wire and the chain builder all speak the
-    same three keys — `effects.EFFECT_SPEC_KEYS` names them, and its refusal prints them to a
-    client that misspelled one.
+    has one definition rather than two. `model_dump()` on this produces a mapping that validator
+    reads, which is what lets the manifest, the wire and the chain builder all speak the same
+    keys — `effects.EFFECT_SPEC_KEYS` names them, and its refusal prints them to a client that
+    misspelled one.
+
+    **`EFFECT_SPEC_KEYS` names a fourth key this model does not yet declare: `bindings`.** Epic
+    10's compiler reads a Parameter Binding off a stack entry, keyed by parameter name, and the
+    validator agrees one — but the field is deliberately not here yet, and nothing in this
+    application writes one. It is the *write path* that is missing rather than the shape: a
+    binding is server-owned and written only by its own route (AD-16), so the field arrives with
+    that route and with its `_adopt_*` guard on the generic writes in the same commit. Adding it
+    here first would open exactly the hole this repository has now found more times than any
+    other — a whole-project or whole-shots `PUT` from a client that predates the field, quietly
+    clearing a Director's work. A stack entry read off disk therefore carries no binding today,
+    which is why the compiler is unreachable from any route in this build.
 
     **Nothing here validates the effect or its parameters, and that is the design.** `effect` is a
     free string and `parameters` an open mapping *on the model*, because the catalogue — which

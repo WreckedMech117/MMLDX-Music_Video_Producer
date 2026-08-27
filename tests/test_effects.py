@@ -852,14 +852,24 @@ def test_a_misspelled_top_level_key_is_refused_rather_than_ignored():
     with pytest.raises(EffectRefusal) as typo:
         stages([{"effect": "grain", "paramters": {"strength": 40}}])
     assert str(typo.value) == (
-        "grain has no key called 'paramters'. It takes effect, enabled, parameters. "
+        "grain has no key called 'paramters'. It takes effect, enabled, parameters, bindings. "
         "Nothing was composed."
     )
     with pytest.raises(EffectRefusal) as flag:
         stages([{"effect": "grain", "enabledd": False}])
     assert "grain has no key called 'enabledd'" in str(flag.value)
-    # The three that are declared are, of course, all accepted together.
-    assert stages([{"effect": "grain", "enabled": True, "parameters": {"strength": 4}}])
+    # The four that are declared are, of course, all accepted together. `bindings` joined them
+    # for Epic 10 and is empty here, which is what every stack in every project holds today.
+    assert stages(
+        [
+            {
+                "effect": "grain",
+                "enabled": True,
+                "parameters": {"strength": 4},
+                "bindings": [],
+            }
+        ]
+    )
 
 
 def test_a_refusal_prints_the_number_it_was_given_and_not_a_filter_rounding():

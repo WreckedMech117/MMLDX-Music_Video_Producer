@@ -175,6 +175,77 @@ sub-frame continuity error and not a count, dimension or timestamp defect — se
 Neither number is discoverable here — `effects.py` imports the standard
 library and nothing else, and `assembly.py` does not import this module back — so both arrive
 through the caller, from the `ClipWindow` the export is already iterating.
+
+---
+
+**The music drives a parameter through a generated `sendcmd` script** (AD-22, Epic 10), and the
+whole of that lives here too: the drive model, the compiler, and the instance labels that make a
+filter addressable. `band_series` → `drive_series` → `sendcmd_script`, three pure functions, and
+`build_effect_stages` is what runs them because the script's target must be the label the chain
+was composed with — one call, or nothing checks that they agree.
+
+**Why the compiler comes before any control, and why its test is a pinned string.** Measured
+2026-08-27 against this project's ffmpeg 7.0: a `sendcmd` command aimed at a target that does not
+exist is **silently ignored** — rc 0, no warning even at `-v warning`, output byte-identical to
+the same chain undriven. So is a command to a filter that takes no runtime options. There is no
+render-time evidence, on any screen, for any parameter, ever. So the target string is asserted to
+appear as an `@label` in the chain the same call composed, and the script text is compared
+character for character, which is how this repository has always asserted an ffmpeg argv.
+
+**A filter is addressed as `class@instance`, and only a bound one is labelled.** Measured the
+same day: `eq@b0` and `eq` both reach a filter written `eq@b0=…`, and the bare instance name `b0`
+reaches nothing. The class alone would be wrong anyway — a stack holding an Exposure, a Contrast
+and a Saturation composes three `eq` filters and a command to `eq` drives all three. Labelling
+runs through `StageContext.named`, which returns the bare name when nothing is bound, so a
+project with effects and no bindings composes the chain it always composed — and the chain is the
+fourth input to `preview_fingerprint`, so labelling everything would re-render every Shot on this
+machine for a picture that did not change.
+
+**Drivability is a property of a `(parameter, filter option)` pair, never of an effect**, and it
+is declared per parameter as a `ParameterDrive`. Three things make a parameter undrivable and all
+three are measured rather than reasoned:
+
+* *The filter takes no runtime commands.* `noise`, `vignette`, `unsharp`, `edgedetect` and
+  `shufflepixels` expose no AVOption carrying ffmpeg's `T` flag. Note that this is not the same
+  as "Grain, Vignette, Sharpen, Edge Treatment and Pixel Shuffle cannot be driven": the last two
+  compose as a *branch*, and their Director-facing dial is written into the `blend` join, which
+  is runtime-settable. `edge_treatment.strength` and `pixel_shuffle.amount` are drivable today.
+* *Driving it would resize the frame.* `crop` and `scale` both carry the `T` flag on `w` and `h`,
+  and a `sendcmd` that changes **both** aborts the whole process —
+  `Assertion best_input >= 0 failed at fftools/ffmpeg_filter.c:1923`, rc 3, no output file — at
+  any pair of timestamps, with or without `-frames:v`. Changing one dimension alone survives; a
+  zoom is never one dimension alone. **A table built from the `T` flag alone would have shipped a
+  punch-in that crashed every export it appeared in**, which is why the flag is not the test.
+* *The value reaches the filter inside an expression.* `posterize`'s `lutyuv=y=trunc(val/8)*8`,
+  `scanlines`' `drawgrid=h=max(2\,trunc(ih/200))`. `sendcmd` can carry an expression; rewriting
+  one is a second mechanism, and FX-NFR-3 allows exactly one.
+
+**A `.cube`'s `file` has no timeline flag at all**, so a binding drives a grade's parameters and
+can never swap the look.
+
+**The script's times are clip-local and the drive's state is the song's.** A Shot with another
+nested inside it composes twice, and `trim_args` restarts the graph clock at zero for each clip —
+so a tick at song second `T` is written at `T - (shot_start + clip_offset)`. But the drive itself
+carries state, and state computed from a clip's own first tick starts cold, so the band and the
+drive are computed over the **whole song** and then sliced. The second clip therefore picks the
+drive up exactly where the first left it, and its first line is character for character the
+whole-Shot script's line at the seam.
+
+**On the path `sendcmd=f=` takes, re-measured 2026-08-27 — and AD-22's stated cause did not
+reproduce.** AD-22 and `docs/BUILD-HANDOFF.md` both say an absolute Windows path fails because
+the drive-letter colon parses as a filter option separator. It does not: `sendcmd=f=C:/x/y.cmds`
+works, drives the render, and produces frames identical to the cwd-relative form, including from
+a directory whose name holds a space. What actually fails is a path holding a character the
+*filtergraph* splits on — a comma (`No such filter: 'comma/t1.cmds'`), an `=` or an `&`
+(`No option name near 'y & 100%/t1.cmds'`, which is the family of message AD-22 quotes) — or a
+path written with backslashes, which are eaten as escapes. The single-quoted colon-escaped form
+`lut_file_argument` already writes survives all of it, for `sendcmd` exactly as for `lut3d`.
+**This module still writes a bare relative name**, and AD-22's remedy stands even though its
+reason does not: a name this module generates holds nothing but `[a-z0-9_.-]`, so it needs no
+escaping and no measurement, and it keeps the composed chain independent of where the files land
+— which is what `preview_fingerprint` wants of it. The cwd contract is the caller's, and a
+missing script is **loud** (`Cannot read file 'x.cmds'`, `Error initializing filters`), so it is
+the one part of this feature that cannot be silently forgotten.
 """
 
 from __future__ import annotations
@@ -190,11 +261,17 @@ from pathlib import Path
 from typing import Any
 
 __all__ = [
+    "BINDING_SPEC_KEYS",
     "BRANCH_FRAME_GUARD",
     "BRANCH_LEG_FORMAT",
     "DEBAND_FLOOR",
     "DEFAULT_LUTS",
     "DEFAULT_LUT_SIZE",
+    "DRIVE_MODES",
+    "DRIVE_PUNCH",
+    "DRIVE_REFERENCE_RATE",
+    "DRIVE_SCRIPT_SUFFIX",
+    "DRIVE_SUSTAIN",
     "EFFECT_CATALOGUE",
     "EFFECT_SPEC_KEYS",
     "FAMILY_GEOMETRY",
@@ -212,23 +289,30 @@ __all__ = [
     "LUT_SUFFIX",
     "MAX_LUMA_CODE",
     "MIN_LUMA_CODE",
+    "NOT_A_NUMBER",
     "PREVIEW_FINGERPRINT_INPUTS",
     "PRE_PAD_FAMILIES",
     "PRE_SCALE_FAMILIES",
     "SEAM_SEED_PER_SECOND",
     "SHARPEN_MATRIX",
     "ChoiceParameter",
+    "DriveScript",
     "EffectDefinition",
     "EffectRefusal",
     "EffectStages",
     "LutEntry",
     "LutParameter",
     "NumberParameter",
+    "ParameterBinding",
+    "ParameterDrive",
     "ResolvedEffect",
     "StageContext",
+    "band_series",
+    "binding_drive",
     "build_effect_stages",
     "cube_text",
     "discover_luts",
+    "drive_series",
     "exported_look",
     "fingerprint_size",
     "identity_transform",
@@ -236,6 +320,7 @@ __all__ = [
     "lut_file_argument",
     "lut_id_for_name",
     "preview_fingerprint",
+    "sendcmd_script",
     "song_fingerprint",
     "song_fingerprints_match",
     "validate_stack",
@@ -421,6 +506,66 @@ EFFECT_LUT_PATH_UNUSABLE_REFUSAL = (
 EFFECT_NO_SPAN_REFUSAL = (
     "{effect!r} ramps over its Shot's own length, and no length was given to compose it "
     "against. Nothing was composed."
+)
+
+# --- Bindings (Epic 10). One sentence shape, four reasons, each a measured fact. ---
+
+BINDING_NOT_A_LIST_REFUSAL = (
+    "{effect}'s bindings must be given as a list, and {value!r} is not. Nothing was composed."
+)
+BINDING_NOT_A_SPEC_REFUSAL = (
+    "A binding must be named with its settings, and entry {index} of {effect}'s bindings is "
+    "{value!r} instead. Nothing was composed."
+)
+BINDING_UNKNOWN_KEY_REFUSAL = (
+    "A binding on {effect} has no key called {key!r}. It takes {declared}. "
+    "Nothing was composed."
+)
+BINDING_UNNAMED_REFUSAL = (
+    "A binding on {effect} names no parameter. Every binding names the parameter it drives. "
+    "Nothing was composed."
+)
+BINDING_UNKNOWN_PARAMETER_REFUSAL = (
+    "{effect} has no parameter called {parameter!r} to bind. It takes {declared}. "
+    "Nothing was composed."
+)
+BINDING_DUPLICATE_REFUSAL = (
+    "{effect}'s {parameter} carries two bindings, and a parameter may carry at most one. "
+    "Nothing was composed."
+)
+#: Why the music cannot reach a parameter. The reason clause is one of the four below, each of
+#: which is a fact about ffmpeg measured on this machine rather than an opinion about the look.
+BINDING_UNDRIVABLE_REFUSAL = (
+    "{effect}'s {parameter} cannot be driven by the music: {reason}. Nothing was composed."
+)
+#: `noise`, `vignette`, `unsharp`, `edgedetect` and `shufflepixels` expose no AVOption carrying
+#: ffmpeg's runtime `T` flag — checked filter by filter against this project's ffmpeg 7.0 on
+#: 2026-08-27. A command aimed at one of them is accepted, ignored, and reported nowhere.
+DRIVE_NO_COMMANDS = "ffmpeg's {filter} filter takes no runtime commands"
+#: Measured 2026-08-27: a `sendcmd` that changes **both** of a filter's output dimensions aborts
+#: the whole process — `Assertion best_input >= 0 failed at fftools/ffmpeg_filter.c:1923`, rc 3,
+#: no output file — on `crop` and on `scale` alike, at any pair of timestamps, with or without
+#: `-frames:v`. Driving one dimension alone survives; a zoom is never one dimension alone. The
+#: `T` flag is therefore *not* the whole test, and a table built from the flag alone would have
+#: shipped a punch-in that crashed every export it appeared in.
+DRIVE_RESIZES = "driving it would resize the frame partway through the clip, which ffmpeg aborts on"
+#: The value reaches the filter woven into an expression — `lutyuv=y=trunc(val/8)*8`,
+#: `drawgrid=h=max(2\,trunc(ih/200))` — rather than as an option of its own. `sendcmd` can carry
+#: an expression, so this is a boundary this application draws rather than one ffmpeg draws: a
+#: command that rewrites an expression is a second mechanism, and FX-NFR-3 allows exactly one.
+DRIVE_EXPRESSION = (
+    "it reaches ffmpeg's {filter} filter inside an expression rather than as a value of its own"
+)
+#: A band produces a number. A look and a word are not numbers, and `lut3d`'s `file` carries no
+#: runtime flag at all, so a binding can drive a grade's parameters and can never swap the LUT.
+DRIVE_NOT_A_NUMBER = "it is not a number"
+BINDING_NO_ENVELOPE_REFUSAL = (
+    "{effect}'s {parameter} is bound to the music, and this song has not been analysed. "
+    "Analyse the song, or remove the binding. Nothing was composed."
+)
+BINDING_NO_CLIP_REFUSAL = (
+    "{effect}'s {parameter} is bound to the music, and no clip length was given to compile the "
+    "drive against. Nothing was composed."
 )
 
 
@@ -824,16 +969,77 @@ def lut_file_argument(path: Path, *, lut_id: str = "") -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class ParameterDrive:
+    """Where one parameter's value lands inside ffmpeg at runtime — or why nothing can put it
+    there. The whole of what makes "can the music drive this?" answerable in the compiler rather
+    than at render time, which is the point of the question: **a `sendcmd` aimed at a target that
+    does not exist is silently ignored** — measured 2026-08-27 on this project's ffmpeg 7.0, rc 0,
+    no warning even at `-v warning`, frames byte-identical to the undriven chain. So is a command
+    to a filter that takes no runtime options. There is no render-time evidence to discover.
+
+    `filter_name` is the ffmpeg filter class the value reaches, and it is named even when the
+    parameter cannot be driven, because the refusal a Director reads says *which* filter takes no
+    runtime commands. `options` are that filter's own option names, in the order they are
+    written; there is more than one whenever the composer spends a single dial on several — a
+    Temperature is `rm` up and `bm` down together, a Lift is the same shift on all three shadow
+    channels.
+
+    `compute` is **the composer's own arithmetic, factored out** and returning the option values
+    already formatted through `_number`. That makes this a second copy of something the composer
+    also knows, which this module normally refuses; it is tolerable here for exactly one reason,
+    which is that the copy is *checkable*. A test composes the stage at a value and asserts every
+    `option=value` this produces appears in the composed text, so the two cannot drift silently.
+    Without the copy there is no way to say what a command's argument should be.
+
+    An empty `reason` means drivable. A non-empty one is the clause
+    `BINDING_UNDRIVABLE_REFUSAL` prints, already formatted with `filter_name` where it names one.
+    """
+
+    filter_name: str
+    options: tuple[str, ...] = ()
+    compute: Callable[[float, StageContext], tuple[str, ...]] | None = None
+    reason: str = ""
+
+    @property
+    def drivable(self) -> bool:
+        return not self.reason
+
+
+def _undrivable(filter_name: str, reason: str) -> ParameterDrive:
+    """One parameter the music cannot reach, and the sentence saying why, formatted once here so
+    a refusal never has to know which of the four reasons carries a filter name."""
+    return ParameterDrive(
+        filter_name=filter_name, reason=reason.format(filter=filter_name)
+    )
+
+
+#: A parameter that is a word or a look rather than a number. It has no filter option to reach,
+#: so it names no filter either — a band produces a number, and that is the whole of it.
+NOT_A_NUMBER = ParameterDrive(filter_name="", reason=DRIVE_NOT_A_NUMBER)
+
+
+@dataclass(frozen=True, slots=True)
 class NumberParameter:
     """A bounded number. `integer` means the filter takes a count of pixels or a seed, not a
     fraction, and a value that is not whole is refused rather than rounded — rounding would make
-    two different specs produce the same chain, which a fingerprint would then disagree about."""
+    two different specs produce the same chain, which a fingerprint would then disagree about.
+
+    `drive` is where this number lands inside ffmpeg at runtime, or why it cannot be reached, and
+    it deliberately has **no default**. A catalogue entry that gained a number nobody classified
+    would not construct, so the application does not start — the same gate the song fields use,
+    applied here because an unclassified parameter would otherwise be silently unbindable, which
+    is the exact shape of failure this whole slice exists to make impossible.
+
+    A `ChoiceParameter` and a `LutParameter` declare nothing of the sort: a band produces a
+    number, so neither is bindable at all, and the binding validator says so by name.
+    """
 
     name: str
     label: str
     default: float
     minimum: float
     maximum: float
+    drive: ParameterDrive
     integer: bool = False
 
 
@@ -925,6 +1131,21 @@ class StageContext:
     It counts the *composed* order rather than the stored one, so a stack copied or hand-edited
     out of family order still composes to the same text (AD-31). No composer may read it for
     anything else; it is a name, not a number about the picture.
+
+    **`driven` says this effect carries a binding, and it is the only thing that overrides an
+    identity value** (ruled 2026-08-27). Every composer here but `mirror` and `lut_look` returns
+    no stage at all at its identity — that is this module's oldest promise and the reason a
+    Temperature card left at 0 costs no picture. A parameter bound while sitting at rest would
+    then have no filter instance for a command to address, and the binding would be silently
+    inert; so a bound effect composes its stage anyway, at its resting value, and the music moves
+    it from there. It is per *effect* rather than per parameter because a Bloom whose radius is
+    bound needs the whole branch composed, `blend` and `gblur` together, whatever its intensity
+    says. An effect carrying **no** binding never sees this, which is what keeps a Shot with no
+    bindings composing exactly the chain it composes today.
+
+    **`labels` names the filters a command will address**, keyed by ffmpeg filter class — see
+    `named`. Empty for every effect that carries no binding, which is every effect in every
+    project until one is bound.
     """
 
     width: int
@@ -934,6 +1155,28 @@ class StageContext:
     shot_seconds: float = 0.0
     slot: int = 0
     reference_width: int = 0
+    driven: bool = False
+    labels: Mapping[str, str] = field(default_factory=dict)
+
+    def named(self, filter_name: str) -> str:
+        """One filter's name, with the instance label a binding needs — and without it otherwise.
+
+        `sendcmd` addresses a filter by `class@instance`, and the instance form is what makes the
+        address unambiguous: a stack holding an Exposure, a Contrast and a Saturation composes
+        three `eq` filters, and a command aimed at the class drives all three. Measured
+        2026-08-27 on this project's ffmpeg 7.0: `eq@b0` and `eq` both reach a filter written
+        `eq@b0=…`, and the bare instance name `b0` reaches **nothing** — rc 0, no warning, output
+        byte-identical to the undriven chain. So the target this module emits always carries the
+        class and the `@`.
+
+        **Only a stage that carries a binding is labelled**, which is why this returns the bare
+        name whenever nothing asked for one. Labelling everything would move the composed chain
+        for every project holding an effect, and the chain is the fourth input to
+        `preview_fingerprint` — so it would cost a re-render of every Shot on this machine for a
+        picture that did not change.
+        """
+        instance = self.labels.get(filter_name, "")
+        return f"{filter_name}@{instance}" if instance else filter_name
 
     @property
     def pixel_scale(self) -> float:
@@ -1345,9 +1588,9 @@ def _compose_soft_focus(values: Mapping[str, Any], context: StageContext) -> tup
     Measured through the real chain: `sigma=8` spread a step edge over 1.458 % of the frame at
     1920 and 2.917 % at 960 before this, and 1.458 % at both after.
     """
-    if float(values["sigma"]) == 0.0:
+    if float(values["sigma"]) == 0.0 and not context.driven:
         return ()
-    return (f"gblur=sigma={_number(_at_reference(values['sigma'], context))}",)
+    return (f"{context.named('gblur')}=sigma={_number(_at_reference(values['sigma'], context))}",)
 
 
 def _compose_sharpen(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
@@ -1381,10 +1624,15 @@ def _compose_banding_suppression(
     own floor, which is measurably nothing — `inf` PSNR through the real chain — so at the floor
     there is no stage at all, and the default costs not even a filter pass.
     """
-    if float(values["threshold"]) <= DEBAND_FLOOR:
+    if float(values["threshold"]) <= DEBAND_FLOOR and not context.driven:
         return ()
     threshold = _number(values["threshold"])
-    return (f"deband=1thr={threshold}:2thr={threshold}:3thr={threshold}:4thr={threshold}",)
+    return (
+        (
+            f"{context.named('deband')}"
+            f"=1thr={threshold}:2thr={threshold}:3thr={threshold}:4thr={threshold}"
+        ),
+    )
 
 
 def _compose_bloom(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
@@ -1415,20 +1663,20 @@ def _compose_bloom(values: Mapping[str, Any], context: StageContext) -> tuple[st
     guard cannot move.
     """
     intensity = float(values["intensity"])
-    if intensity == 0.0:
+    if intensity == 0.0 and not context.driven:
         return ()
     threshold = _number(
         round(MIN_LUMA_CODE + float(values["threshold"]) * (MAX_LUMA_CODE - MIN_LUMA_CODE))
     )
     leg = (
         rf"lutyuv=y=if(gt(val\,{threshold})\,val\,0):u=0:v=0,"
-        f"gblur=sigma={_number(_at_reference(values['radius'], context))}"
+        f"{context.named('gblur')}=sigma={_number(_at_reference(values['radius'], context))}"
     )
     return (
         _branch_stage(
             context,
             leg=leg,
-            join=f"blend=all_mode=screen:all_opacity={_number(intensity)}",
+            join=f"{context.named('blend')}=all_mode=screen:all_opacity={_number(intensity)}",
         ),
     )
 
@@ -1446,23 +1694,23 @@ def _compose_lut_look(values: Mapping[str, Any], context: StageContext) -> tuple
 
 def _compose_exposure(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
     """Brightness zero is the identity, and an `eq` pass is not free: no stage."""
-    if float(values["amount"]) == 0.0:
+    if float(values["amount"]) == 0.0 and not context.driven:
         return ()
-    return (f"eq=brightness={_number(values['amount'])}",)
+    return (f"{context.named('eq')}=brightness={_number(values['amount'])}",)
 
 
 def _compose_contrast(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
     """Contrast 1 is the identity, and an `eq` pass is not free: no stage."""
-    if float(values["amount"]) == 1.0:
+    if float(values["amount"]) == 1.0 and not context.driven:
         return ()
-    return (f"eq=contrast={_number(values['amount'])}",)
+    return (f"{context.named('eq')}=contrast={_number(values['amount'])}",)
 
 
 def _compose_saturation(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
     """Saturation 1 is the identity, and an `eq` pass is not free: no stage."""
-    if float(values["amount"]) == 1.0:
+    if float(values["amount"]) == 1.0 and not context.driven:
         return ()
-    return (f"eq=saturation={_number(values['amount'])}",)
+    return (f"{context.named('eq')}=saturation={_number(values['amount'])}",)
 
 
 def _compose_temperature(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
@@ -1475,17 +1723,19 @@ def _compose_temperature(values: Mapping[str, Any], context: StageContext) -> tu
     1056x608 `testsrc2`. A Temperature card added and left at 0 cost the picture exactly that.
     """
     amount = float(values["amount"])
-    if amount == 0.0:
+    if amount == 0.0 and not context.driven:
         return ()
-    return (f"colorbalance=rm={_number(amount)}:bm={_number(-amount)}",)
+    return (
+        f"{context.named('colorbalance')}=rm={_number(amount)}:bm={_number(-amount)}",
+    )
 
 
 def _compose_tint(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
     """The axis perpendicular to temperature: green against magenta — and the same 47.10 dB at
     zero, for the same reason. No stage."""
-    if float(values["amount"]) == 0.0:
+    if float(values["amount"]) == 0.0 and not context.driven:
         return ()
-    return (f"colorbalance=gm={_number(values['amount'])}",)
+    return (f"{context.named('colorbalance')}=gm={_number(values['amount'])}",)
 
 
 def _compose_lift_gamma_gain(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
@@ -1501,13 +1751,17 @@ def _compose_lift_gamma_gain(values: Mapping[str, Any], context: StageContext) -
         float(values["lift"]) == 0.0
         and float(values["gain"]) == 0.0
         and float(values["gamma"]) == 1.0
+        and not context.driven
     ):
         return ()
     lift = _number(values["lift"])
     gain = _number(values["gain"])
     return (
-        f"colorbalance=rs={lift}:gs={lift}:bs={lift}:rh={gain}:gh={gain}:bh={gain}",
-        f"eq=gamma={_number(values['gamma'])}",
+        (
+            f"{context.named('colorbalance')}"
+            f"=rs={lift}:gs={lift}:bs={lift}:rh={gain}:gh={gain}:bh={gain}"
+        ),
+        f"{context.named('eq')}=gamma={_number(values['gamma'])}",
     )
 
 
@@ -1519,9 +1773,9 @@ def _compose_monochrome(values: Mapping[str, Any], context: StageContext) -> tup
     An amount of 0 is an identity *value* even though it is not the default, so it composes to
     nothing like every other identity here: `hue=s=1` reproduces its input and charges for it.
     """
-    if float(values["amount"]) == 0.0:
+    if float(values["amount"]) == 0.0 and not context.driven:
         return ()
-    return (f"hue=s={_number(1.0 - float(values['amount']))}",)
+    return (f"{context.named('hue')}=s={_number(1.0 - float(values['amount']))}",)
 
 
 # --- Stylize. ---
@@ -1540,9 +1794,9 @@ def _compose_chroma_split(values: Mapping[str, Any], context: StageContext) -> t
     shift of none, and composes to nothing rather than to `chromashift=cbh=0:crh=0`.
     """
     pixels = round(float(values["shift"]) * context.width)
-    if pixels == 0:
+    if pixels == 0 and not context.driven:
         return ()
-    return (f"chromashift=cbh={pixels}:crh={-pixels}",)
+    return (f"{context.named('chromashift')}=cbh={pixels}:crh={-pixels}",)
 
 
 def _compose_posterize(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
@@ -1593,9 +1847,9 @@ def _compose_pixelate(values: Mapping[str, Any], context: StageContext) -> tuple
     pixel is exactly the no-op this module refuses to emit.
     """
     size = _pixels_at_reference(values["size"], context, floor=1)
-    if size <= 1:
+    if size <= 1 and not context.driven:
         return ()
-    return (f"pixelize=w={size}:h={size}:mode=avg",)
+    return (f"{context.named('pixelize')}=w={size}:h={size}:mode=avg",)
 
 
 def _compose_edge_treatment(values: Mapping[str, Any], context: StageContext) -> tuple[str, ...]:
@@ -1621,7 +1875,7 @@ def _compose_edge_treatment(values: Mapping[str, Any], context: StageContext) ->
     *untouched* copy rather than about the edges.
     """
     strength = float(values["strength"])
-    if strength == 0.0:
+    if strength == 0.0 and not context.driven:
         return ()
     leg = (
         f"edgedetect=low={_number(values['low'])}:high={_number(values['high'])}:mode=colormix"
@@ -1630,7 +1884,7 @@ def _compose_edge_treatment(values: Mapping[str, Any], context: StageContext) ->
         _branch_stage(
             context,
             leg=leg,
-            join=f"blend=all_mode=normal:all_opacity={_number(strength)}",
+            join=f"{context.named('blend')}=all_mode=normal:all_opacity={_number(strength)}",
             leg_on_top=True,
             pin_format=True,
         ),
@@ -1679,13 +1933,13 @@ def _compose_scanlines(values: Mapping[str, Any], context: StageContext) -> tupl
     Strength zero is a grid drawn in nothing at all: the default, and no stage.
     """
     strength = float(values["strength"])
-    if strength == 0.0:
+    if strength == 0.0 and not context.driven:
         return ()
     spacing = rf"max(2\,trunc(ih/{int(values['lines'])}))"
     thickness = rf"max(1\,trunc(ih/{int(values['lines'])}/2))"
     return (
         (
-            f"drawgrid=x=-{thickness}:y=0:w=iw*2:h={spacing}:t={thickness}"
+            f"{context.named('drawgrid')}=x=-{thickness}:y=0:w=iw*2:h={spacing}:t={thickness}"
             f":c=black@{_number(strength)}"
         ),
     )
@@ -1721,7 +1975,7 @@ def _compose_pixel_shuffle(values: Mapping[str, Any], context: StageContext) -> 
     is a branch at all and it is not scaled, so the frame guard cannot move.
     """
     amount = float(values["amount"])
-    if amount == 0.0:
+    if amount == 0.0 and not context.driven:
         return ()
     block = _pixels_at_reference(values["block"], context, floor=1)
     leg = (
@@ -1732,11 +1986,76 @@ def _compose_pixel_shuffle(values: Mapping[str, Any], context: StageContext) -> 
         _branch_stage(
             context,
             leg=leg,
-            join=f"blend=all_mode=normal:all_opacity={_number(amount)}",
+            join=f"{context.named('blend')}=all_mode=normal:all_opacity={_number(amount)}",
             leg_on_top=True,
             pin_format=True,
         ),
     )
+
+
+# ------------------------------------------------------------------------------------------
+# What a driven parameter is worth as a filter option.
+#
+# Each of these is one composer's own arithmetic, factored out so a `sendcmd` argument and the
+# filter text agree by construction rather than by two people remembering the same thing. They
+# return **formatted** values, through the same `_number` the composers write with, so a driven
+# value and a composed one that mean the same number are the same characters — which is the rule
+# `preview_fingerprint` already rests on.
+#
+# `test_sendcmd.py` composes every drivable effect and asserts each `option=value` these produce
+# is present in the composed stage. That test is the only thing keeping this from being a second
+# truth, and it is why the copy is acceptable at all.
+# ------------------------------------------------------------------------------------------
+
+
+def _drive_plain(value: float, context: StageContext) -> tuple[str, ...]:
+    """The value, as the filter takes it. Fifteen of the twenty drivable options."""
+    return (_number(value),)
+
+
+def _drive_opposed(value: float, context: StageContext) -> tuple[str, ...]:
+    """Temperature's two halves: red up and blue down by the same amount."""
+    return (_number(value), _number(-value))
+
+
+def _drive_tripled(value: float, context: StageContext) -> tuple[str, ...]:
+    """One shift applied to all three channels — Lift's shadows, Gain's highlights."""
+    text = _number(value)
+    return (text, text, text)
+
+
+def _drive_quadrupled(value: float, context: StageContext) -> tuple[str, ...]:
+    """`deband`'s one threshold across its four planes."""
+    text = _number(value)
+    return (text, text, text, text)
+
+
+def _drive_monochrome(value: float, context: StageContext) -> tuple[str, ...]:
+    """`hue`'s saturation is what is *left*, so the dial is subtracted rather than sent."""
+    return (_number(1.0 - float(value)),)
+
+
+def _drive_at_reference(value: float, context: StageContext) -> tuple[str, ...]:
+    """A count of pixels, worth what it is worth on the grid being composed for."""
+    return (_number(_at_reference(value, context)),)
+
+
+def _drive_chroma_split(value: float, context: StageContext) -> tuple[str, ...]:
+    """A fraction of the frame's width, as whole pixels, opposed on the two chroma planes."""
+    pixels = round(float(value) * context.width)
+    return (str(pixels), str(-pixels))
+
+
+def _drive_pixelate(value: float, context: StageContext) -> tuple[str, ...]:
+    """A block, square, in whole pixels on this grid."""
+    size = _pixels_at_reference(value, context, floor=1)
+    return (str(size), str(size))
+
+
+def _drive_scanline_colour(value: float, context: StageContext) -> tuple[str, ...]:
+    """The one drivable option in this catalogue that is not a number: `drawgrid` takes its
+    strength as the alpha of a colour, and the colour is what a command has to carry."""
+    return (f"black@{_number(value)}",)
 
 
 #: The catalogue itself. Insertion order is the order a picker would list them in; it has no
@@ -1754,7 +2073,10 @@ _CATALOGUE: tuple[EffectDefinition, ...] = (
         family=FAMILY_GEOMETRY,
         label="Punch In",
         parameters=(
-            NumberParameter("zoom", "Zoom", default=1.0, minimum=1.0, maximum=2.0),
+            NumberParameter(
+                "zoom", "Zoom", default=1.0, minimum=1.0, maximum=2.0,
+                drive=_undrivable("crop", DRIVE_RESIZES),
+            ),
         ),
         compose=_compose_punch_in,
     ),
@@ -1763,7 +2085,10 @@ _CATALOGUE: tuple[EffectDefinition, ...] = (
         family=FAMILY_GEOMETRY,
         label="Slow Zoom",
         parameters=(
-            NumberParameter("zoom", "Zoom", default=1.0, minimum=1.0, maximum=2.0),
+            NumberParameter(
+                "zoom", "Zoom", default=1.0, minimum=1.0, maximum=2.0,
+                drive=_undrivable("scale", DRIVE_RESIZES),
+            ),
             ChoiceParameter("direction", "Direction", default="in", choices=("in", "out")),
         ),
         compose=_compose_slow_zoom,
@@ -1773,8 +2098,14 @@ _CATALOGUE: tuple[EffectDefinition, ...] = (
         family=FAMILY_GEOMETRY,
         label="Handheld Shake",
         parameters=(
-            NumberParameter("amplitude", "Amplitude", default=0.0, minimum=0.0, maximum=0.05),
-            NumberParameter("frequency", "Frequency", default=2.0, minimum=0.1, maximum=10.0),
+            NumberParameter(
+                "amplitude", "Amplitude", default=0.0, minimum=0.0, maximum=0.05,
+                drive=_undrivable("crop", DRIVE_RESIZES),
+            ),
+            NumberParameter(
+                "frequency", "Frequency", default=2.0, minimum=0.1, maximum=10.0,
+                drive=_undrivable("crop", DRIVE_EXPRESSION),
+            ),
         ),
         compose=_compose_handheld_shake,
     ),
@@ -1783,7 +2114,10 @@ _CATALOGUE: tuple[EffectDefinition, ...] = (
         family=FAMILY_GEOMETRY,
         label="Dutch Tilt",
         parameters=(
-            NumberParameter("angle", "Angle", default=0.0, minimum=-15.0, maximum=15.0),
+            NumberParameter(
+                "angle", "Angle", default=0.0, minimum=-15.0, maximum=15.0,
+                drive=_undrivable("crop", DRIVE_RESIZES),
+            ),
         ),
         compose=_compose_dutch_tilt,
     ),
@@ -1806,9 +2140,13 @@ _CATALOGUE: tuple[EffectDefinition, ...] = (
         family=FAMILY_TEXTURE,
         label="Grain",
         parameters=(
-            NumberParameter("strength", "Strength", default=0.0, minimum=0.0, maximum=60.0),
             NumberParameter(
-                "seed", "Seed", default=0.0, minimum=0.0, maximum=65535.0, integer=True
+                "strength", "Strength", default=0.0, minimum=0.0, maximum=60.0,
+                drive=_undrivable("noise", DRIVE_NO_COMMANDS),
+            ),
+            NumberParameter(
+                "seed", "Seed", default=0.0, minimum=0.0, maximum=65535.0, integer=True,
+                drive=_undrivable("noise", DRIVE_NO_COMMANDS),
             ),
         ),
         compose=_compose_grain,
@@ -1818,7 +2156,10 @@ _CATALOGUE: tuple[EffectDefinition, ...] = (
         family=FAMILY_TEXTURE,
         label="Vignette",
         parameters=(
-            NumberParameter("angle", "Falloff", default=0.0, minimum=0.0, maximum=1.2),
+            NumberParameter(
+                "angle", "Falloff", default=0.0, minimum=0.0, maximum=1.2,
+                drive=_undrivable("vignette", DRIVE_NO_COMMANDS),
+            ),
         ),
         compose=_compose_vignette,
     ),
@@ -1827,7 +2168,10 @@ _CATALOGUE: tuple[EffectDefinition, ...] = (
         family=FAMILY_TEXTURE,
         label="Soft Focus",
         parameters=(
-            NumberParameter("sigma", "Diffusion", default=0.0, minimum=0.0, maximum=8.0),
+            NumberParameter(
+                "sigma", "Diffusion", default=0.0, minimum=0.0, maximum=8.0,
+                drive=ParameterDrive("gblur", ("sigma",), _drive_at_reference),
+            ),
         ),
         compose=_compose_soft_focus,
     ),
@@ -1836,7 +2180,10 @@ _CATALOGUE: tuple[EffectDefinition, ...] = (
         family=FAMILY_TEXTURE,
         label="Sharpen",
         parameters=(
-            NumberParameter("amount", "Amount", default=0.0, minimum=-2.0, maximum=2.0),
+            NumberParameter(
+                "amount", "Amount", default=0.0, minimum=-2.0, maximum=2.0,
+                drive=_undrivable("unsharp", DRIVE_NO_COMMANDS),
+            ),
         ),
         compose=_compose_sharpen,
     ),
@@ -1846,7 +2193,11 @@ _CATALOGUE: tuple[EffectDefinition, ...] = (
         label="Banding Suppression",
         parameters=(
             NumberParameter(
-                "threshold", "Threshold", default=DEBAND_FLOOR, minimum=DEBAND_FLOOR, maximum=0.05
+                "threshold", "Threshold",
+                default=DEBAND_FLOOR, minimum=DEBAND_FLOOR, maximum=0.05,
+                drive=ParameterDrive(
+                    "deband", ("1thr", "2thr", "3thr", "4thr"), _drive_quadrupled
+                ),
             ),
         ),
         compose=_compose_banding_suppression,
@@ -1856,9 +2207,18 @@ _CATALOGUE: tuple[EffectDefinition, ...] = (
         family=FAMILY_TEXTURE,
         label="Bloom",
         parameters=(
-            NumberParameter("intensity", "Intensity", default=0.0, minimum=0.0, maximum=1.0),
-            NumberParameter("threshold", "Threshold", default=0.7, minimum=0.0, maximum=1.0),
-            NumberParameter("radius", "Radius", default=8.0, minimum=0.5, maximum=40.0),
+            NumberParameter(
+                "intensity", "Intensity", default=0.0, minimum=0.0, maximum=1.0,
+                drive=ParameterDrive("blend", ("all_opacity",), _drive_plain),
+            ),
+            NumberParameter(
+                "threshold", "Threshold", default=0.7, minimum=0.0, maximum=1.0,
+                drive=_undrivable("lutyuv", DRIVE_EXPRESSION),
+            ),
+            NumberParameter(
+                "radius", "Radius", default=8.0, minimum=0.5, maximum=40.0,
+                drive=ParameterDrive("gblur", ("sigma",), _drive_at_reference),
+            ),
         ),
         compose=_compose_bloom,
     ),
@@ -1882,7 +2242,10 @@ _CATALOGUE: tuple[EffectDefinition, ...] = (
         family=FAMILY_GRADE,
         label="Exposure",
         parameters=(
-            NumberParameter("amount", "Amount", default=0.0, minimum=-1.0, maximum=1.0),
+            NumberParameter(
+                "amount", "Amount", default=0.0, minimum=-1.0, maximum=1.0,
+                drive=ParameterDrive("eq", ("brightness",), _drive_plain),
+            ),
         ),
         compose=_compose_exposure,
     ),
@@ -1891,7 +2254,10 @@ _CATALOGUE: tuple[EffectDefinition, ...] = (
         family=FAMILY_GRADE,
         label="Contrast",
         parameters=(
-            NumberParameter("amount", "Amount", default=1.0, minimum=0.0, maximum=3.0),
+            NumberParameter(
+                "amount", "Amount", default=1.0, minimum=0.0, maximum=3.0,
+                drive=ParameterDrive("eq", ("contrast",), _drive_plain),
+            ),
         ),
         compose=_compose_contrast,
     ),
@@ -1900,7 +2266,10 @@ _CATALOGUE: tuple[EffectDefinition, ...] = (
         family=FAMILY_GRADE,
         label="Saturation",
         parameters=(
-            NumberParameter("amount", "Amount", default=1.0, minimum=0.0, maximum=3.0),
+            NumberParameter(
+                "amount", "Amount", default=1.0, minimum=0.0, maximum=3.0,
+                drive=ParameterDrive("eq", ("saturation",), _drive_plain),
+            ),
         ),
         compose=_compose_saturation,
     ),
@@ -1909,7 +2278,10 @@ _CATALOGUE: tuple[EffectDefinition, ...] = (
         family=FAMILY_GRADE,
         label="Temperature",
         parameters=(
-            NumberParameter("amount", "Amount", default=0.0, minimum=-1.0, maximum=1.0),
+            NumberParameter(
+                "amount", "Amount", default=0.0, minimum=-1.0, maximum=1.0,
+                drive=ParameterDrive("colorbalance", ("rm", "bm"), _drive_opposed),
+            ),
         ),
         compose=_compose_temperature,
     ),
@@ -1918,7 +2290,10 @@ _CATALOGUE: tuple[EffectDefinition, ...] = (
         family=FAMILY_GRADE,
         label="Tint",
         parameters=(
-            NumberParameter("amount", "Amount", default=0.0, minimum=-1.0, maximum=1.0),
+            NumberParameter(
+                "amount", "Amount", default=0.0, minimum=-1.0, maximum=1.0,
+                drive=ParameterDrive("colorbalance", ("gm",), _drive_plain),
+            ),
         ),
         compose=_compose_tint,
     ),
@@ -1927,9 +2302,18 @@ _CATALOGUE: tuple[EffectDefinition, ...] = (
         family=FAMILY_GRADE,
         label="Lift / Gamma / Gain",
         parameters=(
-            NumberParameter("lift", "Lift", default=0.0, minimum=-1.0, maximum=1.0),
-            NumberParameter("gamma", "Gamma", default=1.0, minimum=0.1, maximum=3.0),
-            NumberParameter("gain", "Gain", default=0.0, minimum=-1.0, maximum=1.0),
+            NumberParameter(
+                "lift", "Lift", default=0.0, minimum=-1.0, maximum=1.0,
+                drive=ParameterDrive("colorbalance", ("rs", "gs", "bs"), _drive_tripled),
+            ),
+            NumberParameter(
+                "gamma", "Gamma", default=1.0, minimum=0.1, maximum=3.0,
+                drive=ParameterDrive("eq", ("gamma",), _drive_plain),
+            ),
+            NumberParameter(
+                "gain", "Gain", default=0.0, minimum=-1.0, maximum=1.0,
+                drive=ParameterDrive("colorbalance", ("rh", "gh", "bh"), _drive_tripled),
+            ),
         ),
         compose=_compose_lift_gamma_gain,
     ),
@@ -1938,7 +2322,10 @@ _CATALOGUE: tuple[EffectDefinition, ...] = (
         family=FAMILY_GRADE,
         label="Monochrome",
         parameters=(
-            NumberParameter("amount", "Amount", default=1.0, minimum=0.0, maximum=1.0),
+            NumberParameter(
+                "amount", "Amount", default=1.0, minimum=0.0, maximum=1.0,
+                drive=ParameterDrive("hue", ("s",), _drive_monochrome),
+            ),
         ),
         compose=_compose_monochrome,
     ),
@@ -1947,7 +2334,10 @@ _CATALOGUE: tuple[EffectDefinition, ...] = (
         family=FAMILY_STYLIZE,
         label="Chroma Split",
         parameters=(
-            NumberParameter("shift", "Shift", default=0.0, minimum=-0.02, maximum=0.02),
+            NumberParameter(
+                "shift", "Shift", default=0.0, minimum=-0.02, maximum=0.02,
+                drive=ParameterDrive("chromashift", ("cbh", "crh"), _drive_chroma_split),
+            ),
         ),
         compose=_compose_chroma_split,
     ),
@@ -1957,7 +2347,8 @@ _CATALOGUE: tuple[EffectDefinition, ...] = (
         label="Posterize",
         parameters=(
             NumberParameter(
-                "levels", "Levels", default=256.0, minimum=2.0, maximum=256.0, integer=True
+                "levels", "Levels", default=256.0, minimum=2.0, maximum=256.0, integer=True,
+                drive=_undrivable("lutyuv", DRIVE_EXPRESSION),
             ),
         ),
         compose=_compose_posterize,
@@ -1968,7 +2359,8 @@ _CATALOGUE: tuple[EffectDefinition, ...] = (
         label="Pixelate",
         parameters=(
             NumberParameter(
-                "size", "Block Size", default=1.0, minimum=1.0, maximum=64.0, integer=True
+                "size", "Block Size", default=1.0, minimum=1.0, maximum=64.0, integer=True,
+                drive=ParameterDrive("pixelize", ("w", "h"), _drive_pixelate),
             ),
         ),
         compose=_compose_pixelate,
@@ -1978,9 +2370,18 @@ _CATALOGUE: tuple[EffectDefinition, ...] = (
         family=FAMILY_STYLIZE,
         label="Edge Treatment",
         parameters=(
-            NumberParameter("strength", "Strength", default=0.0, minimum=0.0, maximum=1.0),
-            NumberParameter("low", "Low Threshold", default=0.08, minimum=0.0, maximum=1.0),
-            NumberParameter("high", "High Threshold", default=0.2, minimum=0.0, maximum=1.0),
+            NumberParameter(
+                "strength", "Strength", default=0.0, minimum=0.0, maximum=1.0,
+                drive=ParameterDrive("blend", ("all_opacity",), _drive_plain),
+            ),
+            NumberParameter(
+                "low", "Low Threshold", default=0.08, minimum=0.0, maximum=1.0,
+                drive=_undrivable("edgedetect", DRIVE_NO_COMMANDS),
+            ),
+            NumberParameter(
+                "high", "High Threshold", default=0.2, minimum=0.0, maximum=1.0,
+                drive=_undrivable("edgedetect", DRIVE_NO_COMMANDS),
+            ),
         ),
         compose=_compose_edge_treatment,
     ),
@@ -1989,9 +2390,13 @@ _CATALOGUE: tuple[EffectDefinition, ...] = (
         family=FAMILY_STYLIZE,
         label="Scanlines",
         parameters=(
-            NumberParameter("strength", "Strength", default=0.0, minimum=0.0, maximum=1.0),
             NumberParameter(
-                "lines", "Lines", default=200.0, minimum=20.0, maximum=600.0, integer=True
+                "strength", "Strength", default=0.0, minimum=0.0, maximum=1.0,
+                drive=ParameterDrive("drawgrid", ("c",), _drive_scanline_colour),
+            ),
+            NumberParameter(
+                "lines", "Lines", default=200.0, minimum=20.0, maximum=600.0, integer=True,
+                drive=_undrivable("drawgrid", DRIVE_EXPRESSION),
             ),
         ),
         compose=_compose_scanlines,
@@ -2001,12 +2406,17 @@ _CATALOGUE: tuple[EffectDefinition, ...] = (
         family=FAMILY_STYLIZE,
         label="Pixel Shuffle",
         parameters=(
-            NumberParameter("amount", "Amount", default=0.0, minimum=0.0, maximum=1.0),
             NumberParameter(
-                "block", "Block Size", default=8.0, minimum=2.0, maximum=64.0, integer=True
+                "amount", "Amount", default=0.0, minimum=0.0, maximum=1.0,
+                drive=ParameterDrive("blend", ("all_opacity",), _drive_plain),
             ),
             NumberParameter(
-                "seed", "Seed", default=0.0, minimum=0.0, maximum=65535.0, integer=True
+                "block", "Block Size", default=8.0, minimum=2.0, maximum=64.0, integer=True,
+                drive=_undrivable("shufflepixels", DRIVE_NO_COMMANDS),
+            ),
+            NumberParameter(
+                "seed", "Seed", default=0.0, minimum=0.0, maximum=65535.0, integer=True,
+                drive=_undrivable("shufflepixels", DRIVE_NO_COMMANDS),
             ),
         ),
         compose=_compose_pixel_shuffle,
@@ -2040,18 +2450,79 @@ del _definition
 #: Every key an effect spec may carry, and the whole of the shape slice C accepts as JSON. It is
 #: a tuple rather than a check written into the validator because the refusal prints it: a client
 #: that misspelled one is told what the three are, in this order.
-EFFECT_SPEC_KEYS: tuple[str, ...] = ("effect", "enabled", "parameters")
+EFFECT_SPEC_KEYS: tuple[str, ...] = ("effect", "enabled", "parameters", "bindings")
+
+#: Every key one Parameter Binding may carry, and the shape the compiler reads. A tuple for the
+#: same reason `EFFECT_SPEC_KEYS` is one: the refusal prints it.
+#:
+#: **A binding lives on the effect, keyed by parameter name** (ruled 2026-08-27). An `EffectSpec`
+#: has no id and its entries are positional, and a stack may hold two Blooms — so `(effect,
+#: parameter)` is ambiguous, and `(index, parameter)` stops meaning anything the moment Story
+#: 9.4's reorder moves a card. The parameter's own name inside its own effect is the only key
+#: that survives both.
+#:
+#: `parameter`, `drive` and `depth` carry no default and are refused when missing. The other six
+#: do, because they are settings with a sensible rest; those three are the *decisions*. Nothing
+#: infers a drive mode (FX-14), a binding that names no parameter drives nothing, and a depth of
+#: zero is a binding that silently does nothing — which is the failure this module refuses
+#: everywhere else and will not accept here.
+BINDING_SPEC_KEYS: tuple[str, ...] = (
+    "parameter",
+    "drive",
+    "depth",
+    "band_centre",
+    "band_width",
+    "band_softness",
+    "floor",
+    "hold",
+    "sustain",
+)
+
+#: The two drives, and there is no third. `punch` measures level above its own running average,
+#: which is what lets it flash on a hit through a master that keeps raw level pinned near the
+#: top; `sustain` is a section gate that engages after its band holds and survives dips.
+DRIVE_PUNCH = "punch"
+DRIVE_SUSTAIN = "sustain"
+DRIVE_MODES: tuple[str, ...] = (DRIVE_PUNCH, DRIVE_SUSTAIN)
+
+
+@dataclass(frozen=True, slots=True)
+class ParameterBinding:
+    """One agreed Parameter Binding: which parameter, which band, which drive, how far.
+
+    `effect_id` is not stored on the wire — it is the effect the binding was found on, filled in
+    here so the compiler and every refusal can name the offender without being handed the stack
+    again.
+
+    `depth` is signed: a binding may pull a parameter down as readily as up. It is bounded by the
+    parameter's own span, and the compiled value is clamped into the parameter's own range at
+    every tick, so FX-14's *"a binding cannot drive a parameter outside its own declared range"*
+    is true by arithmetic rather than by the bound alone.
+    """
+
+    effect_id: str
+    parameter: str
+    drive: str
+    depth: float
+    band_centre: float = 0.25
+    band_width: float = 0.3
+    band_softness: float = 0.35
+    floor: float = 0.0
+    hold: float = 0.8
+    sustain: float = 1.5
 
 
 @dataclass(frozen=True, slots=True)
 class ResolvedEffect:
-    """One agreed effect: its id, its family, every declared parameter filled in, and whether
-    the Director has it switched on. Nothing outside the catalogue survives into `values`."""
+    """One agreed effect: its id, its family, every declared parameter filled in, whether
+    the Director has it switched on, and any Parameter Bindings it carries. Nothing outside the
+    catalogue survives into `values`."""
 
     effect_id: str
     family: str
     values: Mapping[str, Any]
     enabled: bool = True
+    bindings: tuple[ParameterBinding, ...] = ()
 
 
 def _validate_number(effect_id: str, parameter: NumberParameter, value: Any) -> float | int:
@@ -2165,6 +2636,143 @@ def _validate_lut(
     return value
 
 
+#: The six settings of a binding that are *settings* rather than decisions, with the bounds each
+#: is refused outside. `(name, default, minimum, maximum)`. `depth` is not here because its
+#: bound is not a constant — it is the span of whatever parameter the binding drives.
+#:
+#: The band is centre, width and softness across the spectrum (FX-13). The width's floor of 0.02
+#: is the port's own: a band narrower than that weights nothing and the drive is a flat line
+#: dressed as a signal. `hold` and `sustain` are read only by the `sustain` drive and are stored
+#: on every binding anyway, so switching drive back and forth does not lose them.
+_BINDING_SETTINGS: tuple[tuple[str, float, float, float], ...] = (
+    ("band_centre", 0.25, 0.0, 1.0),
+    ("band_width", 0.3, 0.02, 1.0),
+    ("band_softness", 0.35, 0.0, 1.0),
+    ("floor", 0.0, 0.0, 1.0),
+    ("hold", 0.8, 0.0, 10.0),
+    ("sustain", 1.5, 0.0, 20.0),
+)
+
+
+def _binding_number(
+    effect_id: str, parameter: str, setting: str, value: Any, low: float, high: float
+) -> float:
+    """One of a binding's numbers, refused in the catalogue's own words.
+
+    `_validate_number` is reused rather than reimplemented — it is the only thing in this module
+    that knows a `bool` is not a number, that a 401-digit integer is not a *finite* one, and that
+    a refusal prints `repr` rather than the filter formatter. The synthetic parameter it is
+    handed is named for the binding it belongs to, so the sentence a Director reads is
+    *"bloom's radius's depth is 3, above its maximum of 1"* rather than something about an effect
+    parameter that does not exist.
+    """
+    return float(
+        _validate_number(
+            effect_id,
+            NumberParameter(
+                name=f"{parameter}'s {setting}",
+                label=setting,
+                default=0.0,
+                minimum=low,
+                maximum=high,
+                drive=NOT_A_NUMBER,
+            ),
+            value,
+        )
+    )
+
+
+def _validate_bindings(
+    effect_id: str, definition: EffectDefinition, given: Any
+) -> tuple[ParameterBinding, ...]:
+    """A stack entry's bindings, agreed against the catalogue — or a refusal naming the offender.
+
+    **This is where "can the music drive this?" is answered**, and it is answered *here* rather
+    than at render time because there is nothing to discover at render time: a `sendcmd` aimed at
+    a filter that takes no runtime commands is accepted, ignored and reported nowhere. Measured
+    2026-08-27 on this project's ffmpeg 7.0 — rc 0, silent at `-v warning`, frames byte-identical
+    to the undriven chain. A binding that could not work would look exactly like one that did.
+    """
+    if given is None:
+        given = ()
+    if isinstance(given, (str, bytes)) or not isinstance(given, Sequence):
+        raise EffectRefusal(
+            BINDING_NOT_A_LIST_REFUSAL.format(effect=effect_id, value=given)
+        )
+    declared = {parameter.name: parameter for parameter in definition.parameters}
+    bindings: list[ParameterBinding] = []
+    seen: set[str] = set()
+    for index, spec in enumerate(given):
+        if not isinstance(spec, Mapping):
+            raise EffectRefusal(
+                BINDING_NOT_A_SPEC_REFUSAL.format(effect=effect_id, index=index, value=spec)
+            )
+        unknown = sorted(set(spec) - set(BINDING_SPEC_KEYS), key=repr)
+        if unknown:
+            raise EffectRefusal(
+                BINDING_UNKNOWN_KEY_REFUSAL.format(
+                    effect=effect_id,
+                    key=unknown[0],
+                    declared=", ".join(BINDING_SPEC_KEYS),
+                )
+            )
+        name = spec.get("parameter")
+        if not isinstance(name, str) or not name:
+            raise EffectRefusal(BINDING_UNNAMED_REFUSAL.format(effect=effect_id))
+        parameter = declared.get(name)
+        if parameter is None:
+            raise EffectRefusal(
+                BINDING_UNKNOWN_PARAMETER_REFUSAL.format(
+                    effect=effect_id,
+                    parameter=name,
+                    declared=", ".join(sorted(declared)) or "no parameters",
+                )
+            )
+        if name in seen:
+            raise EffectRefusal(
+                BINDING_DUPLICATE_REFUSAL.format(effect=effect_id, parameter=name)
+            )
+        seen.add(name)
+        # A word and a look are not numbers, so a band cannot reach either — and `lut3d`'s
+        # `file` carries no runtime flag at all, which is why a binding can drive a grade's
+        # parameters and can never swap the LUT.
+        drive = parameter.drive if isinstance(parameter, NumberParameter) else NOT_A_NUMBER
+        if not drive.drivable:
+            raise EffectRefusal(
+                BINDING_UNDRIVABLE_REFUSAL.format(
+                    effect=effect_id, parameter=name, reason=drive.reason
+                )
+            )
+        span = float(parameter.maximum) - float(parameter.minimum)
+        settings = {
+            setting: _binding_number(
+                effect_id, name, setting, spec.get(setting, default), low, high
+            )
+            for setting, default, low, high in _BINDING_SETTINGS
+        }
+        bindings.append(
+            ParameterBinding(
+                effect_id=effect_id,
+                parameter=name,
+                drive=_validate_choice(
+                    effect_id,
+                    ChoiceParameter(
+                        name=f"{name}'s drive",
+                        label="Drive",
+                        default=DRIVE_PUNCH,
+                        choices=DRIVE_MODES,
+                    ),
+                    spec.get("drive"),
+                ),
+                depth=_binding_number(
+                    effect_id, name, "depth", spec.get("depth"), -span, span
+                ),
+                **settings,
+            )
+        )
+    return tuple(bindings)
+
+
 def validate_stack(
     stack: Iterable[Mapping[str, Any]], *, luts: Sequence[LutEntry] = ()
 ) -> tuple[ResolvedEffect, ...]:
@@ -2264,9 +2872,406 @@ def validate_stack(
                 family=definition.family,
                 values=values,
                 enabled=enabled,
+                bindings=_validate_bindings(effect_id, definition, spec.get("bindings")),
             )
         )
     return tuple(resolved)
+
+
+# ------------------------------------------------------------------------------------------
+# The reactive drive, and the `sendcmd` script it compiles to (AD-22, FX-12, FX-14).
+#
+# Three pure functions, in the order a binding passes through them: the band, the drive, the
+# script. Each is a function of its arguments and of nothing else — no clock, no filesystem, no
+# catalogue lookup that is not keyed by what it was handed — so all three are asserted by
+# comparing text and numbers rather than by running anything.
+#
+# **The drive model is ported, not invented.** `punch` measures level *above its own running
+# average* rather than absolute level, and that is the whole reason the mode exists: a mastered
+# track keeps raw band level pinned near the top, so raw level cannot flash on a hit and a
+# binding built on it looks broken rather than musical. `sustain` is the other shape entirely —
+# a section gate that engages only after its band has held, and survives dips — for "change when
+# the chorus lands" rather than "move on every kick".
+#
+# **Every constant below is per *reference* tick, not per envelope tick.** The port's attack and
+# release were written against a 60 Hz surface; an envelope is 30 Hz today and the rate is a
+# recorded field precisely because it may not be tomorrow (`SongAnalysis`, `audio.py`). So the
+# coefficients are scaled by `DRIVE_REFERENCE_RATE / analysis_rate` and the same song analysed at
+# two rates drives the same picture, which is the only reason the recorded rate is worth reading.
+# ------------------------------------------------------------------------------------------
+
+#: The tick rate the ported coefficients below were written against. Not the rate anything is
+#: analysed at — `audio.DEFAULT_ANALYSIS_RATE` is 30 — and deliberately not read from there:
+#: this number is a property of the attack and release constants, and changing the analysis rate
+#: must not silently change how a binding feels.
+DRIVE_REFERENCE_RATE = 60.0
+
+#: How fast the running average the transient is measured against follows the band, per
+#: reference tick. Slow: it is the thing a hit has to stand out from.
+DRIVE_AVERAGE_COEFFICIENT = 0.03
+
+#: The dead band above the running average, below which a rise is not a hit. Absolute, because
+#: the band level it is subtracted from is normalised to 0..1 by the envelope itself.
+DRIVE_TRANSIENT_MARGIN = 0.015
+
+#: What one unit of transient is worth as drive, before the clamp at 1.
+DRIVE_TRANSIENT_GAIN = 12.0
+
+#: What is left of the transient envelope one reference tick later. Fast attack, slow release —
+#: the release is this, the attack is instantaneous by the `max` it is written with.
+DRIVE_RELEASE_PER_TICK = 0.88
+
+#: How long the `sustain` gate takes to reach full, and to fall back to nothing, in seconds.
+#: Release is slower than attack for the same reason a fader is: a section that has arrived
+#: should not flicker out on one quiet bar.
+DRIVE_SUSTAIN_ATTACK_SECONDS = 0.35
+DRIVE_SUSTAIN_RELEASE_SECONDS = 0.7
+
+#: The band edge's falloff, in spectrum position, at softness 0 and at softness 1. A Gaussian
+#: skirt: at the edge itself the weight is 1, and it reaches 1/e one `soft` further out.
+DRIVE_SOFTNESS_FLOOR = 0.02
+DRIVE_SOFTNESS_SPAN = 0.25
+
+#: What a compiled script is written as, and the extension the file carries. `.cmds` rather than
+#: `.txt` because a directory of export intermediates should say what its files are.
+DRIVE_SCRIPT_SUFFIX = ".cmds"
+
+#: How many hex characters of the script's own digest go in its filename. Enough that two clips
+#: of one Shot — which compile different scripts from the same binding — cannot collide in a
+#: directory they share, and short enough to read. The digest is of the text, so two clips that
+#: really do compile the same script share one file, which is correct rather than lucky.
+DRIVE_SCRIPT_DIGEST_CHARACTERS = 8
+
+
+def _band_weight(position: float, centre: float, width: float, softness: float) -> float:
+    """How much one band counts toward a binding's level: 1 inside the region, a Gaussian skirt
+    outside it. Ported from the drive engine the PRD's addendum names, `bandWeight`."""
+    half = width / 2.0
+    distance = abs(position - centre)
+    if distance <= half:
+        return 1.0
+    soft = DRIVE_SOFTNESS_FLOOR + softness * DRIVE_SOFTNESS_SPAN
+    reach = (distance - half) / soft
+    return math.exp(-reach * reach)
+
+
+def _envelope_bands(envelope: Mapping[str, Any] | None) -> tuple[float, list[Sequence[float]]]:
+    """The two things a drive needs off a Song Envelope: the rate it was taken at, and its
+    per-band rows — or `(0.0, [])` if what was handed over is not an envelope.
+
+    **Read off the envelope, never from today's constants** (`SongAnalysis`'s own docstring says
+    why): an envelope on disk was taken at whatever the rate and band count were on the day it
+    was written, and a consumer that assumed today's would misread it without complaining. So the
+    band count is `len(bands)` rather than `audio.DEFAULT_BAND_COUNT`, and it is cross-checked
+    against the recorded `band_count` — a file whose two disagree is not an envelope this will
+    read.
+
+    Absence is reported as `(0.0, [])` rather than raised, because *"is there an analysis"* and
+    *"this binding cannot be composed"* are two different questions with two different callers.
+    """
+    if not isinstance(envelope, Mapping):
+        return (0.0, [])
+    rate = envelope.get("analysis_rate", 0)
+    bands = envelope.get("bands")
+    declared = envelope.get("band_count", 0)
+    if not isinstance(rate, (int, float)) or isinstance(rate, bool) or rate <= 0:
+        return (0.0, [])
+    if not isinstance(bands, Sequence) or isinstance(bands, (str, bytes)) or not bands:
+        return (0.0, [])
+    if not all(isinstance(row, Sequence) and not isinstance(row, (str, bytes)) for row in bands):
+        return (0.0, [])
+    if isinstance(declared, int) and not isinstance(declared, bool) and declared != len(bands):
+        return (0.0, [])
+    if len({len(row) for row in bands}) != 1 or not bands[0]:
+        return (0.0, [])
+    return (float(rate), list(bands))
+
+
+def band_series(
+    envelope: Mapping[str, Any] | None,
+    *,
+    centre: float,
+    width: float,
+    softness: float,
+) -> tuple[float, ...]:
+    """One band selection reduced to a level per analysis tick, over the **whole song**.
+
+    Whole song, never the clip, and that is the load-bearing half of it. The drive below carries
+    state — a running average, an envelope, a gate — and state computed from a clip's own first
+    tick starts cold. A Shot that becomes two clips would then show the drive restarting at the
+    seam, on a frame the Director never asked to be a cut, which is exactly the defect
+    `shot_seconds` exists to keep out of `slow_zoom`. Computed over the song and *sliced* per
+    clip, the second clip picks the drive up precisely where the first one left it.
+
+    Band positions are `k / (bands - 1)`, bass at 0 and treble at 1, which is the port's own
+    spacing. A one-band envelope has no spacing at all and sits at 0.
+    """
+    rate, bands = _envelope_bands(envelope)
+    if rate <= 0:
+        return ()
+    count = len(bands)
+    weights = [
+        _band_weight(
+            0.0 if count == 1 else index / (count - 1), centre, width, softness
+        )
+        for index in range(count)
+    ]
+    total = sum(weights)
+    if total <= 0:
+        return tuple(0.0 for _ in bands[0])
+    return tuple(
+        sum(float(row[tick]) * weight for row, weight in zip(bands, weights, strict=True))
+        / total
+        for tick in range(len(bands[0]))
+    )
+
+
+def drive_series(
+    levels: Sequence[float],
+    *,
+    drive: str,
+    floor: float,
+    hold: float,
+    sustain: float,
+    analysis_rate: float,
+) -> tuple[float, ...]:
+    """A band's level per tick turned into a drive per tick, in 0..1.
+
+    **The Trigger Floor is one number with one meaning: below it the drive is nothing** (FX-14).
+    The port remapped its own floor slider onto a fixed 0.55..0.97 window, which was a fact about
+    that interface's dial rather than about the signal, and is not reproduced — the Director's
+    floor is the level, and it is both the gate and the bottom of the sustained term's range.
+
+    `punch` is the transient path: level above its own running average, past a small dead band,
+    with instantaneous attack and a slow release; taken together with a term that rides how far
+    the band sits above the floor, so a passage that is simply loud drives *something* while a
+    hit drives more. `sustain` ignores transients entirely and answers a section.
+    """
+    if analysis_rate <= 0 or not levels:
+        return ()
+    scale = DRIVE_REFERENCE_RATE / analysis_rate
+    step = 1.0 / analysis_rate
+    if drive == DRIVE_SUSTAIN:
+        return _sustain_series(levels, floor=floor, hold=hold, sustain=sustain, step=step)
+    return _punch_series(levels, floor=floor, scale=scale)
+
+
+def _punch_series(levels: Sequence[float], *, floor: float, scale: float) -> tuple[float, ...]:
+    """Transients, and **only** transients.
+
+    The port this is taken from combined the transient envelope with a term that rides how far
+    the band sits above a floor, and that term is deliberately not here. FX-14 states the
+    property this mode exists for — *"on a heavily limited master it still flashes on hits rather
+    than sitting pinned high"* — and a term proportional to absolute level is exactly what makes
+    it sit pinned high. The port got away with it because its own floor slider was remapped onto
+    a fixed 0.55..0.97 window, so the level term was off for most of the dial; that remap was a
+    fact about that interface and not about the signal, and reproducing it here would have made
+    the Trigger Floor mean two different things at once. It means one: below it, nothing.
+
+    Absolute level is what `sustain` is for, and having both modes answer level would leave the
+    Director choosing between two shades of the same thing.
+    """
+    follow = min(1.0, DRIVE_AVERAGE_COEFFICIENT * scale)
+    release = DRIVE_RELEASE_PER_TICK**scale
+    slow = float(levels[0])
+    envelope = 0.0
+    out: list[float] = []
+    for raw in levels:
+        raw = float(raw)
+        slow += (raw - slow) * follow
+        transient = max(0.0, raw - slow - DRIVE_TRANSIENT_MARGIN)
+        envelope = max(min(1.0, transient * DRIVE_TRANSIENT_GAIN), envelope * release)
+        out.append(0.0 if raw < floor else envelope)
+    return tuple(out)
+
+
+def _sustain_series(
+    levels: Sequence[float], *, floor: float, hold: float, sustain: float, step: float
+) -> tuple[float, ...]:
+    above = 0.0
+    remaining = 0.0
+    engaged = False
+    level = 0.0
+    out: list[float] = []
+    for raw in levels:
+        raw = float(raw)
+        if raw >= floor:
+            above += step
+            remaining = sustain
+            if above >= hold:
+                engaged = True
+        else:
+            above = 0.0
+            if engaged:
+                remaining -= step
+                if remaining <= 0.0:
+                    engaged = False
+        target = 1.0 if engaged else 0.0
+        seconds = (
+            DRIVE_SUSTAIN_ATTACK_SECONDS if target > level else DRIVE_SUSTAIN_RELEASE_SECONDS
+        )
+        speed = step / seconds
+        level = min(1.0, max(0.0, level + max(-speed, min(speed, target - level))))
+        out.append(level)
+    return tuple(out)
+
+
+def binding_drive(
+    envelope: Mapping[str, Any] | None, binding: ParameterBinding
+) -> tuple[float, ...]:
+    """One binding's drive per analysis tick over the whole song. The band and the drive, joined.
+
+    This is the signal Story 10.3's readout draws, and it is *this* function rather than a
+    likeness of it, because FX-22 asks that the readout be the signal the export will use and not
+    an illustration of one.
+    """
+    rate, _ = _envelope_bands(envelope)
+    return drive_series(
+        band_series(
+            envelope,
+            centre=binding.band_centre,
+            width=binding.band_width,
+            softness=binding.band_softness,
+        ),
+        drive=binding.drive,
+        floor=binding.floor,
+        hold=binding.hold,
+        sustain=binding.sustain,
+        analysis_rate=rate,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class DriveScript:
+    """One compiled `sendcmd` file: what to call it, what it addresses, and its text.
+
+    `target` is the `class@instance` string every line names, and it is carried here so a test
+    can assert it appears as an `@label` in the chain composed by the *same call*. Nothing else
+    can catch a typo in it: a `sendcmd` aimed at a target that does not exist is accepted,
+    ignored, and reported nowhere.
+
+    `filename` is **bare and relative**, which is AD-22's remedy — the process's working
+    directory is set to the file's own, and the name goes into `sendcmd=f=` unescaped. See
+    `_drive_script_name` for what that name is made of, and the module docstring for what
+    measurement did and did not survive re-checking on 2026-08-27.
+    """
+
+    filename: str
+    target: str
+    text: str
+
+
+def _drive_script_name(binding: ParameterBinding, slot: int, text: str) -> str:
+    """What one compiled script is called: the effect, the parameter, the chain slot, a digest.
+
+    The digest is of the **text**, and it is there for a case nothing else covers: a Shot that
+    becomes two clips compiles two different scripts from one binding, and the export writes its
+    intermediates for both into one directory. Named by effect and parameter alone they would be
+    one file, and whichever clip was written second would drive both. Named by content they are
+    two files — and two clips that genuinely compile the same script share one, which is right.
+
+    Every character is `[a-z0-9_.-]`: a catalogue id, a parameter name, `b` and a number, and
+    hex. So the name needs no escaping, holds no comma, no colon and no backslash, and is exactly
+    what `sendcmd=f=` takes.
+    """
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return (
+        f"{binding.effect_id}-{binding.parameter}-b{slot}"
+        f"-{digest[:DRIVE_SCRIPT_DIGEST_CHARACTERS]}{DRIVE_SCRIPT_SUFFIX}"
+    )
+
+
+def sendcmd_script(
+    envelope: Mapping[str, Any] | None,
+    binding: ParameterBinding,
+    *,
+    target: str,
+    resting: float,
+    context: StageContext,
+    song_start: float,
+    clip_seconds: float,
+) -> str:
+    """A Song Envelope, a binding and the seconds a clip occupies, as the text of a `sendcmd`
+    script. The compiler, and the whole of what AD-22 asks for.
+
+    One `START TARGET COMMAND ARG;` line per analysis tick per option, in `sendcmd`'s own
+    grammar, with the flags omitted so each interval fires on `enter` — its default, and what an
+    instantaneous interval wants.
+
+    **The times are clip-local, and that is the constraint most easily got wrong.**
+    `assembly.trim_args` prepends `setpts=PTS-STARTPTS` to every clip cut at an offset, so the
+    filter graph's clock is zero at the first frame of *each* clip — and a Shot with another
+    nested inside it is two clips. The envelope's clock is the song's. So the drive is computed
+    over the whole song (`band_series` says why the state has to be), and then sliced: a tick at
+    song second `T` is written at `T - song_start`, where `song_start` is the song second this
+    clip's first frame lands on. `_compose_grain` faces the same seam and answers it the same
+    way, by carrying the clip's place in its Shot into what it writes.
+
+    The first line is always at time zero, carrying the tick that covers `song_start` — the clip
+    starts driven rather than sitting at its resting value until the first tick inside it.
+
+    The value at each tick is `resting + depth * drive`, clamped into the parameter's own
+    declared range, so FX-14's *"a binding cannot drive a parameter outside its own declared
+    range"* holds by arithmetic and not only by the bound on depth. It is then formatted by the
+    parameter's own `ParameterDrive.compute` — the composer's arithmetic — so the value a command
+    carries and the value the chain was composed with are the same characters at the same number.
+
+    Refuses, in the catalogue's own words, when there is no envelope to read or no clip to
+    compile against. Neither is reachable from a stack that carries no binding.
+    """
+    rate, _ = _envelope_bands(envelope)
+    if rate <= 0:
+        raise EffectRefusal(
+            BINDING_NO_ENVELOPE_REFUSAL.format(
+                effect=binding.effect_id, parameter=binding.parameter
+            )
+        )
+    if clip_seconds <= 0:
+        raise EffectRefusal(
+            BINDING_NO_CLIP_REFUSAL.format(
+                effect=binding.effect_id, parameter=binding.parameter
+            )
+        )
+    drive = binding_drive(envelope, binding)
+    parameter = _bound_parameter(binding)
+    compute = parameter.drive.compute or _drive_plain
+    low = float(parameter.minimum)
+    high = float(parameter.maximum)
+    first = max(0, math.floor(song_start * rate))
+    last = math.ceil((song_start + clip_seconds) * rate)
+    lines: list[str] = []
+    for tick in range(first, last):
+        moment = tick / rate
+        if moment >= song_start + clip_seconds:
+            break
+        # The drive is the song's, so a clip sitting past the last analysed tick holds the last
+        # measured value rather than falling to nothing — an envelope is `ceil`ed to whole
+        # analysis frames and a Shot may legitimately end after the last one.
+        level = drive[min(tick, len(drive) - 1)] if drive else 0.0
+        value = min(high, max(low, resting + binding.depth * level))
+        at = _number(max(0.0, moment - song_start))
+        for option, argument in zip(
+            parameter.drive.options, compute(value, context), strict=True
+        ):
+            lines.append(f"{at} {target} {option} {argument};")
+    return "\n".join(lines) + "\n"
+
+
+def _bound_parameter(binding: ParameterBinding) -> NumberParameter:
+    """The catalogue's declaration of the parameter a binding drives.
+
+    Looked up rather than carried on the binding, because the catalogue is the only thing
+    entitled to say what a parameter's bounds and arithmetic are (AD-27), and a copy on the
+    binding would be a second truth that a corrected bound could not reach. `validate_stack` has
+    already refused every binding whose parameter is not a drivable number, so the two `assert`s
+    this would otherwise need are the validator's job and not this function's.
+    """
+    parameter = next(
+        declared
+        for declared in EFFECT_CATALOGUE[binding.effect_id].parameters
+        if declared.name == binding.parameter
+    )
+    return parameter  # type: ignore[return-value]
 
 
 # ------------------------------------------------------------------------------------------
@@ -2310,6 +3315,12 @@ class EffectStages:
 
     geometry: tuple[str, ...] = ()
     treatment: tuple[str, ...] = ()
+    #: One compiled `sendcmd` script per Parameter Binding, in chain order. Empty for every stack
+    #: that carries no binding, which is every stack in every project until one is bound. They
+    #: are **not** stages: the caller writes each one to disk beside the render's other inputs
+    #: and runs ffmpeg with its working directory set there, and the `sendcmd=f=` stages that
+    #: read them are already in `geometry`.
+    scripts: tuple[DriveScript, ...] = ()
 
     def __bool__(self) -> bool:
         return bool(self.geometry or self.treatment)
@@ -2352,6 +3363,9 @@ def build_effect_stages(
     clip_offset: float = 0.0,
     shot_seconds: float = 0.0,
     reference_width: int = 0,
+    envelope: Mapping[str, Any] | None = None,
+    shot_start: float = 0.0,
+    clip_seconds: float = 0.0,
 ) -> EffectStages:
     """A stack, the export's geometry and the clip's place in its Shot in; the stages out.
 
@@ -2388,6 +3402,20 @@ def build_effect_stages(
     decided once, over the finished groups, and it goes at the head of the geometry group —
     which is the head of the whole chain, the last point at which a frame still carries the
     duration the decoder gave it. A chain with no branch in it never sees it.
+
+    **`envelope`, `shot_start` and `clip_seconds` are what a Parameter Binding needs**, and they
+    are ignored entirely by a stack that carries none — which is every stack in every project
+    until one is bound. A bound stack gets three things it would not otherwise: its stage
+    composes even at its resting value, the filter the music addresses carries an instance label,
+    and a `sendcmd=f=` stage goes at the head of the chain reading a script this call compiled.
+    They come back on `EffectStages.scripts`; nothing here writes a file.
+
+    `shot_start` is the Shot's own start in the song, and `song_start = shot_start +
+    clip_offset` is where **this clip's** first frame lands — the one piece of arithmetic
+    bindings add, and the one the artefacts do not address. See `sendcmd_script`.
+
+    A binding with no envelope to resolve against is refused by name rather than composed inert,
+    which is FX-15 read the only way it can be read here: a binding is never silently dropped.
     """
     resolved = validate_stack(stack, luts=luts)
     entries = {entry.lut_id: entry for entry in luts}
@@ -2411,8 +3439,16 @@ def build_effect_stages(
                 )
             lut_arguments[lut_id] = lut_file_argument(entry.path, lut_id=lut_id)
 
+    # Where this clip's first frame lands in the song, which is the only new arithmetic bindings
+    # need and the one thing the artefacts do not address. `clip_offset` is already the seconds
+    # from the Shot's first frame to this clip's — `_compose_grain` reads the same number to keep
+    # two clips of one Shot off the same noise — so the song second is the Shot's start plus it,
+    # and every compiled time is measured back from here. A Shot that was never split adds zero
+    # and compiles the script it always would.
+    song_start = shot_start + clip_offset
     geometry: list[str] = []
     treatment: list[str] = []
+    scripts: list[DriveScript] = []
     slot = 0
     for family in FAMILY_ORDER:
         target = geometry if family in PRE_SCALE_FAMILIES else treatment
@@ -2423,6 +3459,11 @@ def build_effect_stages(
             # its position in *this* order, which is what a branch's link labels are named from.
             # Counted over the composed order rather than the stored one, so a stack that was
             # copied or hand-edited out of family order composes to the same text (AD-31).
+            #
+            # A bound effect is the one case that also carries labels and `driven`. Both are
+            # empty and False for every effect that carries no binding, so the text below is the
+            # text this module has always composed — which is what keeps a Shot with no bindings
+            # byte-identical, argv and cached previews alike.
             context = StageContext(
                 width=width,
                 height=height,
@@ -2431,14 +3472,70 @@ def build_effect_stages(
                 shot_seconds=shot_seconds,
                 slot=slot,
                 reference_width=reference_width,
+                driven=bool(effect.bindings),
+                labels={
+                    _bound_parameter(binding).drive.filter_name: f"b{slot}"
+                    for binding in effect.bindings
+                },
             )
+            for binding in effect.bindings:
+                scripts.append(
+                    _compile_binding(
+                        binding,
+                        context=context,
+                        envelope=envelope,
+                        resting=float(effect.values[binding.parameter]),
+                        song_start=song_start,
+                        clip_seconds=clip_seconds,
+                    )
+                )
             slot += 1
             target.extend(EFFECT_CATALOGUE[effect.effect_id].compose(effect.values, context))
-    stages = EffectStages(geometry=tuple(geometry), treatment=tuple(treatment))
+    # `sendcmd` sits at the head of the chain, ahead of every filter it drives: it issues its
+    # commands while handling a frame and then passes that frame on, so a filter *upstream* of it
+    # would not see a new value until the frame after. The branch frame guard stays ahead of even
+    # this — it is the stage that must see a frame still carrying the decoder's own duration, and
+    # `sendcmd` changes no timestamp.
+    geometry = [f"sendcmd=f={script.filename}" for script in scripts] + geometry
+    stages = EffectStages(
+        geometry=tuple(geometry), treatment=tuple(treatment), scripts=tuple(scripts)
+    )
     if not stages.branched:
         return stages
     return EffectStages(
-        geometry=(BRANCH_FRAME_GUARD, *stages.geometry), treatment=stages.treatment
+        geometry=(BRANCH_FRAME_GUARD, *stages.geometry),
+        treatment=stages.treatment,
+        scripts=stages.scripts,
+    )
+
+
+def _compile_binding(
+    binding: ParameterBinding,
+    *,
+    context: StageContext,
+    envelope: Mapping[str, Any] | None,
+    resting: float,
+    song_start: float,
+    clip_seconds: float,
+) -> DriveScript:
+    """One binding, as the file that will drive it and the target every line of it addresses.
+
+    The target is built from the same `labels` mapping the composer will read one line later, so
+    the address in the script and the `@label` in the chain are two readings of one value rather
+    than two strings that have to agree.
+    """
+    target = context.named(_bound_parameter(binding).drive.filter_name)
+    text = sendcmd_script(
+        envelope,
+        binding,
+        target=target,
+        resting=resting,
+        context=context,
+        song_start=song_start,
+        clip_seconds=clip_seconds,
+    )
+    return DriveScript(
+        filename=_drive_script_name(binding, context.slot, text), target=target, text=text
     )
 
 
@@ -2567,19 +3664,25 @@ def exported_look(
     # The look's file argument is never read: `lut_look` composes a stage at every value it has,
     # so the placeholder cannot change the answer, and a record must not touch the disk to say
     # what an export recorded.
-    context = StageContext(
-        width=width,
-        height=height,
-        lut_arguments={entry.lut_id: "" for entry in luts},
-        shot_seconds=LOOK_PROBE_SECONDS,
-    )
+    def probe(effect: ResolvedEffect) -> StageContext:
+        # `driven` is carried through for the same reason the record exists: a bound parameter
+        # composes its stage even at its identity value, so the export really did run that
+        # filter, and a record that dropped it would describe a picture the export did not make.
+        return StageContext(
+            width=width,
+            height=height,
+            lut_arguments={entry.lut_id: "" for entry in luts},
+            shot_seconds=LOOK_PROBE_SECONDS,
+            driven=bool(effect.bindings),
+        )
+
     ordered = [
         effect
         for family in FAMILY_ORDER
         for effect in resolved
         if effect.enabled
         and effect.family == family
-        and EFFECT_CATALOGUE[effect.effect_id].compose(effect.values, context)
+        and EFFECT_CATALOGUE[effect.effect_id].compose(effect.values, probe(effect))
     ]
     return tuple(f"{effect.effect_id}:{_canonical(effect.values)}" for effect in ordered)
 

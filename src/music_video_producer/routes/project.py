@@ -262,10 +262,22 @@ def register(ctx: RouterContext) -> None:
         # differs only here must compare equal, or an ordinary save from an old client would be
         # told it is replacing the song.
         _adopt_song_vocal_type(project.song, current.song)
-        # And the envelope pointer, the seventh field to need this in this route. Same hole, same
-        # two failures, same position — ahead of the comparison, or a client that predates the
-        # field sends a default `SongAnalysis`, compares unequal, and is told an ordinary save is
-        # a song replacement. See `_adopt_song_analysis`.
+        # And the envelope pointer, the **twelfth** recorded time this exact hole has been found
+        # in this exact route. Same hole, same two failures, same position — ahead of the
+        # comparison, or a client that predates the field sends a default `SongAnalysis`,
+        # compares unequal, and is told an ordinary save is a song replacement. See
+        # `_adopt_song_analysis`.
+        #
+        # **This said "the seventh field to need this in this route" from 2026-08-24 until
+        # 2026-08-27, and it made the route's own ledger unreadable.** Seven was already taken by
+        # `character_slot` (2026-08-21), so the sequence read 3,4,5,6,7,7,8,9,10,11,12,13 — two
+        # different fields answering to one number, in the one place this repository counts a
+        # defect it keeps re-meeting. This guard landed 2026-08-24, after the eleventh
+        # (2026-08-23) and before the Effect Stack (2026-08-25), so twelfth is where it falls and
+        # the two below moved up by one. The ordinals are chronological by when the hole was
+        # *found*, which is the only ordering that makes "the Nth time" mean anything; every one
+        # was dated from `git log -S` on its own comment before this renumbering, not inferred
+        # from its position in the file.
         _adopt_song_analysis(project.song, current.song)
         if project.song != current.song:
             _require_song_replacement_confirmation(current, confirm_song_replacement)
@@ -373,7 +385,7 @@ def register(ctx: RouterContext) -> None:
         # The recorded map is server-owned here for the fifth time this exact hole has been found
         # in this exact route. See `_adopt_expansion_maps`.
         _adopt_expansion_maps(project, {shot.id: shot for shot in current.shots})
-        # The Effect Stack is server-owned here for the **twelfth** recorded time this one route
+        # The Effect Stack is server-owned here for the **thirteenth** recorded time this route
         # has been the hole for a field a narrower sibling guards, and this guard lands in the
         # same commit as the field rather than after the first save that eats one (AD-16). A body
         # carries every field of every Shot and `effects` is defaulted, so an ordinary save from
@@ -387,7 +399,7 @@ def register(ctx: RouterContext) -> None:
             project, {shot.id: shot for shot in current.shots}, looks=discovered_looks
         )
         # Every recorded fact about a job is server-owned here — the *eleventh* and now the
-        # *thirteenth* time this one route has been the hole for a field nothing else may write,
+        # *fourteenth* time this one route has been the hole for a field nothing else may write,
         # and the third time this particular helper has had to grow to close it. A body carries
         # every field of every job, and all of them are defaulted, so without this one ordinary
         # save from any existing client would blank the render costs, the sampling bundles *and*
@@ -396,7 +408,7 @@ def register(ctx: RouterContext) -> None:
         # **only** generic route a `RenderJob` can arrive on — `PUT .../shots` carries a
         # `ShotListRequest`, which has no `jobs` — and that is asserted rather than assumed by
         # `test_the_whole_project_put_is_the_only_route_a_job_record_can_arrive_on`, because the
-        # twelfth instance of this hole was a spec naming one of two routes. See
+        # thirteenth instance of this hole was a spec naming one of two routes. See
         # `_adopt_job_measurements`.
         _adopt_job_measurements(project, {job.id: job for job in current.jobs})
         # The generic write is the widest citation writer there is: a body carries every field of

@@ -149,7 +149,7 @@ The Director gives a Shot a look and sees it, then carries that look across the 
 **FRs covered:** FX-4, FX-5, FX-6, FX-7, FX-8, FX-9, FX-10, FX-11, FX-20, FX-23, FX-24, FX-25, FX-NFR-3, FX-NFR-4, FX-NFR-5, FX-NFR-6
 
 ### Epic 10: The Picture Moves With the Music
-The Director ties a parameter to a frequency band and the video answers the track — grain surging on the kick, the frame breathing with the bass — without animating anything by hand. The song becomes the automation.
+The Director ties a parameter to a frequency band and the video answers the track — ~~grain surging on the kick~~ *(amended 2026-08-27, R-25: grain is one of the parameters ffmpeg cannot drive — `noise` takes no runtime commands, and a `sendcmd` at it changes nothing at rc 0. The epic's flagship example was the one effect that provably cannot react; re-composing grain as a driven blend is a follow-up story with a measurement attached.)*, ~~the frame breathing with the bass~~ *(amended 2026-08-27, R-29: geometry cannot be driven either — a `sendcmd` moving both `crop` dimensions aborts ffmpeg at rc 3 with a truncated file, and a zoom is never one dimension alone. The headline has now lost both its examples, which is the honest reading that it was written from what the filters looked like they could do. Texture, Grade and Stylize drive; the geometry recompose is a follow-up story.)* — without animating anything by hand. The song becomes the automation.
 **FRs covered:** FX-12, FX-13, FX-14, FX-15, FX-22, FX-NFR-5
 
 ### Epic 11: Cuts That Blend
@@ -537,7 +537,7 @@ So that the video moves with the track without my animating anything.
 **Then** a band panel opens inline beneath that row, with a `--blue` left edge marking it as reactive (FX-12, UX-DR5)
 **And** `ParameterBinding` is added to the model as the only entity this story creates, defaulted so every existing manifest loads unchanged, and written only by the dedicated binding route (AD-16)
 **And** only one band panel is open at a time; opening another closes the first
-**And** no parameter is specially privileged and none is excluded by category (FX-12).
+**And** ~~no parameter is specially privileged and none is excluded by category (FX-12)~~ *(amended 2026-08-27, R-25)* **Not literally true and never could have been:** drivability is a property of the (parameter -> filter option) pair. Measured on ffmpeg 7.0, `noise`, `vignette`, `unsharp`, `shufflepixels` and `edgedetect` expose no runtime-settable option at all, and a `sendcmd` aimed at one is silently ignored at rc 0. The genuinely non-drivable parameters are `grain.strength`, `grain.seed`, `vignette.angle`, `sharpen.amount`, `edge_treatment.low`, `edge_treatment.high`, `pixel_shuffle.block`, `pixel_shuffle.seed` and `lut_look.lut` -- the last because a `.cube`'s `file` has no timeline flag. `edge_treatment.strength` and `pixel_shuffle.amount` **are** drivable, because both effects compose as a branch and their dial is written into `blend`'s `all_opacity`. What survives of this clause, and is the half worth keeping: **no parameter is excluded by *family or category*** -- Geometry, Texture, Grade and Stylize are all bindable, and exclusion is per-parameter, measured, and refused by name.
 
 **Given** a parameter being bound
 **When** the binding is configured

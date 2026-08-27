@@ -225,7 +225,7 @@ A locked Shot's Effects tab is read-only.
 The Director can bind any Effect Parameter to a Band.
 
 **Consequences (testable):**
-- Any parameter of any Effect in any Family can carry a Parameter Binding. No parameter is specially privileged and none is excluded by category.
+- Any parameter of any Effect in any Family can carry a Parameter Binding. ~~No parameter is specially privileged and none is excluded by category.~~ *(amended 2026-08-27, R-25)* **Not literally true and never could have been:** drivability is a property of the (parameter -> filter option) pair. Measured on ffmpeg 7.0, `noise`, `vignette`, `unsharp`, `shufflepixels` and `edgedetect` expose no runtime-settable option at all, and a `sendcmd` aimed at one is silently ignored at rc 0. The genuinely non-drivable parameters are `grain.strength`, `grain.seed`, `vignette.angle`, `sharpen.amount`, `edge_treatment.low`, `edge_treatment.high`, `pixel_shuffle.block`, `pixel_shuffle.seed` and `lut_look.lut` -- the last because a `.cube`'s `file` has no timeline flag. `edge_treatment.strength` and `pixel_shuffle.amount` **are** drivable, because both effects compose as a branch and their dial is written into `blend`'s `all_opacity`. What survives of this clause, and is the half worth keeping: **no parameter is excluded by *family or category*** -- Geometry, Texture, Grade and Stylize are all bindable, and exclusion is per-parameter, measured, and refused by name.
 - A parameter carries at most one binding.
 - A bound parameter's manual value becomes its resting value; the binding moves it from there by Depth.
 - Removing a binding restores the parameter to its resting value with no residue.

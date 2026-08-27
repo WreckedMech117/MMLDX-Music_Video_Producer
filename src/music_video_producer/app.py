@@ -8187,8 +8187,8 @@ def _detach_song_analysis(song: Song | None) -> None:
 def _adopt_song_analysis(incoming: Song | None, stored: Song | None) -> None:
     """Overwrite `incoming`'s analysis with the stored song's, because a client is never its author.
 
-    `_adopt_song_recovery_slots`' argument again, for the *seventh* field to meet this hole in
-    this one route, and it fails the same two ways. A client written before the field existed
+    `_adopt_song_recovery_slots`' argument again, for the **twelfth** recorded time this hole has
+    been found in this one route, and it fails the same two ways. A client written before the field existed
     omits it, so an ordinary save arrives carrying a default `SongAnalysis` and would silently
     discard the pointer to a measurement that is still on disk and still current — the envelope
     would report absent from then on, and nothing would say why. A client that *invents* one is

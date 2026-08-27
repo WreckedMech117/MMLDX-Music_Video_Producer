@@ -1,7 +1,9 @@
 # Director's rulings — Effects and Transitions, 2026-08-24
 
-Recorded by Amelia (Dev) during the build of Epic 8 and its retrospective, and continued through
-Epic 9's first slice. These are decisions, not proposals. They continue the sequence begun in
+Recorded by Amelia (Dev) during the build of Epic 8 and its retrospective, continued through
+Epic 9's first slice, and — since 2026-08-27, R-25 onward — through the rulings that settle Epic 10
+before it starts. The file keeps its 2026-08-24 name because the sequence, not the date, is what a
+reader follows. These are decisions, not proposals. They continue the sequence begun in
 `effects-director-rulings-2026-08-21.md` (R-1…R-7); a change here is a change to the PRD and the
 architecture spine.
 
@@ -360,6 +362,270 @@ plays" can mean.
 
 ---
 
+## Rulings of 2026-08-27 — Epic 10's shape, settled before it starts
+
+Made after Epic 9 closed at `0b0bb96` and before Slice E began. They continue this file's sequence
+rather than opening a new one: it is the same feature, and someone asking *what has the Director
+decided about effects* should find one answer in one place. Same rules — each names what was
+rejected, and a change here is a change to the PRD and the architecture spine.
+
+## R-25 — Grain cannot be driven, and Epic 10 ships the drivable subset
+
+A `sendcmd` can only move an ffmpeg option the filter declares as runtime-settable — the `T` flag
+in `ffmpeg -h filter=<name>`. **Measured 2026-08-27 against this project's own ffmpeg 7.0**, and the
+split is not where the epic assumed it was:
+
+| Filter | Runtime-settable options |
+|---|---|
+| `noise` (Grain) | **0 of 25** |
+| `vignette` (Vignette) | **0 of 8** |
+| `unsharp` (Sharpen) | **0 of 18** |
+| `shufflepixels` (Pixel Shuffle's leg) | **0 of 10** |
+| `edgedetect` (Edge Treatment's leg) | **0 of 4** |
+| `eq` | 8 of 9 |
+| `colorbalance` · `hue` · `gblur` · `deband` · `chromashift` · `pixelize` · `lutyuv` · `drawgrid` | every option |
+| `crop` | 6 of 8 — `w`, `h`, `x`, `y` among them |
+| `rotate` | `angle`/`a` |
+| `scale` | `w`, `h` among 36 |
+| `blend` | 15 of 19 — **including `all_opacity`** |
+
+**A `sendcmd` aimed at a filter that takes no commands does nothing and says nothing.** Frames come
+back byte-identical, rc 0, no warning even at `-v warning`; a command addressed to a target that is
+not in the graph at all is discarded the same silent way. There is no error to catch and no output
+to compare against, which is why this is a ruling and not a detail.
+
+**The ruling:** Epic 10 ships the drivable subset. A bind glyph on a parameter that cannot be driven
+stays `--dim` and **refuses by name**, saying which ffmpeg filter takes no runtime commands — the
+refusal shape this feature already uses everywhere else. A dial that binds and then does nothing is
+the "control that appears to do nothing" failure R-24 rejects by name, and here it would be
+invisible from the outside: the export succeeds, the picture is simply un-driven.
+
+**Two acceptance criteria are amended by this, and they are amended rather than quietly narrowed.**
+Story 10.1's *"no parameter is specially privileged and none is excluded by category (FX-12)"*
+(`epics-effects.md:540`, stated as FX-12 at `prd.md:228`) cannot hold: nothing about the *category*
+excludes anything, but five filters this application already composes take no commands, and that is
+a fact about ffmpeg rather than a design choice available to be made differently. Epic 10's own
+headline — *"grain surging on the kick"* (`epics-effects.md:152`) — names as its example the one
+effect that cannot do it. Both want rewording: the privilege clause to say *no category is
+privileged and the drivable set is a measured property of the filters*, and the headline to reach
+for a look that is actually drivable. **Grain surging on the kick is still the right thing to want**,
+which is why it becomes a story rather than a deletion.
+
+*Rejected:* **re-composing Grain as a driven `blend` of a `noise` leg inside this epic.** It would
+work — `blend`'s `all_opacity` is settable, which is exactly how Edge Treatment and Pixel Shuffle
+already earn their dials — and it is deliberately not done here. It changes a composer, so it
+changes the composed chain, so it changes every affected preview's name and every affected export's
+argv; and Epic 9 shipped a 26-pixel black bar down the left edge of Scanlines the last time a
+composer changed quietly (`e4aec46`). That belongs in its own story **with a measurement attached**
+— the frame cost of the branch, and the frame-guard interaction AD-17's amendment describes — and
+not inside a UI epic. *Also rejected:* letting the glyph appear and the binding store, resolving to
+nothing at export, which is the silent failure above wearing a checkbox.
+
+> **A premise of this ruling was verified and half of it did not survive, so it is recorded here
+> rather than discovered in the build.** The five filters above are correct. **The inference from
+> filter to effect is not**, for two of them: `edge_treatment` and `pixel_shuffle` do not hand the
+> Director's dial to `edgedetect` or `shufflepixels` at all. Both compose as a **branch** — the
+> treated copy crossfaded back over the untouched one — so `strength` and `amount` are written into
+> `blend=all_mode=normal:all_opacity=…`, and `all_opacity` **is** runtime-settable. Their headline
+> dials are drivable today, with no recomposition, exactly as the rejected Grain remedy would have
+> made Grain's.
+>
+> **Drivability is a property of the (parameter → filter option) pair, not of the effect and not of
+> the family**, and that is the granularity the bind glyph must be decided at. Read off the
+> composers on 2026-08-27, the parameters that **cannot** be driven are exactly:
+>
+> * `grain.strength`, `grain.seed` → `noise`
+> * `vignette.angle` → `vignette`
+> * `sharpen.amount` → `unsharp`
+> * `edge_treatment.low`, `edge_treatment.high` → `edgedetect` — but **`strength` → `blend`, drivable**
+> * `pixel_shuffle.block`, `pixel_shuffle.seed` → `shufflepixels` — but **`amount` → `blend`, drivable**
+> * `lut_look.lut` → `lut3d`'s `file=`, which has no timeline flag (spine, *How a filename reaches a
+>   filter*). `interp` is settable, and swapping interpolation mid-clip is not a look anybody asked
+>   for.
+>
+> Everything else in the catalogue lands on `crop`, `scale`, `overlay`, `rotate`, `eq`,
+> `colorbalance`, `hue`, `gblur`, `deband`, `lutyuv`, `chromashift`, `pixelize`, `drawgrid` or
+> `blend`, and is drivable. **The ruling stands as stated** — ship the drivable subset, refuse the
+> rest by name — and it excludes far less than it appeared to.
+
+## R-26 — A `ParameterBinding` lives on `EffectSpec`, keyed by parameter name
+
+Three placements were available and only one survives contact with what Epic 9 shipped.
+
+**`(effect id, parameter)` is ambiguous.** `EffectSpec` is `{effect, enabled, parameters}` and
+carries **no id** (`models.py`); stack entries are positional, and duplicates of one effect are
+legal and composable — verified 2026-08-27, two `grain` entries validate and compose to two `noise`
+stages at different strengths. There is nothing there for a binding to name.
+
+**`(stack index, parameter)` breaks under Story 9.4**, which shipped stack reordering. An index is
+correct until the Director drags a card, and then it is silently pointing at a different effect —
+the worst available failure, because the binding still resolves.
+
+**The ruling: the binding lives on its own entry, keyed by parameter name.** A binding then travels
+with the card it belongs to, so it survives reorder, copy, split and duplicate **for free**:
+`effects` is already in `SHOT_PLAN_CONTENT_FIELDS` (`models.py`), which is the one classification
+Split, Duplicate and copy-a-look all read. It is also what makes copy-a-stack (FX-6) carry its
+bindings correctly with no new code, which is the property **AD-26** was written to make meaningful
+— the whole-song band average is identical in every Shot's panel, so the band the Director chose
+against the reference is the same band on the target.
+
+**And it stays clear of the import-time classification gate.** A new field on `Shot` is not a schema
+decision in this codebase, it is a startup failure: `_withheld_fields` (`app.py`) proves
+`visible | withheld` is exactly the model's declared surface and raises `RuntimeError` **at import**
+for anything unclassified, so the application refuses to start until somebody decides whether the
+Director's prompt should carry it. A binding inside `EffectSpec` adds no `Shot` field at all, and it
+inherits `_adopt_shot_effects` — the twelfth of that route's thirteen recorded guard holes — rather
+than needing a fourteenth adopt helper of its own.
+
+*Rejected:* a `bindings` list on `Shot` parallel to `effects`, which is two structures describing one
+card, plus that fourteenth `_adopt_*`; and adding an `id` to `EffectSpec` so `(effect id, parameter)`
+would work, which changes the three-key shape `effects.validate_stack`, the wire and every stored
+manifest already share, for a key needed only because the binding was put somewhere else.
+
+## R-27 — The Drive readout draws the compiled `sendcmd` values themselves
+
+Story 10.3's acceptance criterion is that *"the signal drawn is the same one the export will use,
+not an illustration of one"* (`epics-effects.md:600`; FX-22, FX-NFR-3). Serving the **compiled
+values** is the strongest available form of that guarantee: it reuses the pure compiler rather than
+deriving the same curve a second way, and it makes the Drive readout a **test artifact** — what the
+canvas draws is the text that will be handed to ffmpeg — instead of a second renderer that can drift
+from the first. FX-NFR-3's *one engine describes an effect*, applied to the drive signal.
+
+**The per-frame `bands` array stays on disk.** It is about 98 % of a 469 KB sidecar, against
+manifests of 110–190 KB, and AD-20 exists because of that ratio. Compiling on the server and serving
+the result sends the readout exactly what it draws and nothing else.
+
+**`SERVED_ENVELOPE_KEYS`' standing rule holds:** *a consumer is necessary and not sufficient*
+(`app.py`). A key does not join that tuple because something on the page would read it; it joins
+because nothing else can answer the question. The Drive readout has a compiler that can.
+
+*Rejected:* shipping the raw band series to the browser and drawing the drive model in JavaScript —
+the second-implementation shape R-15 already refused for snapping, and worse here, because it is a
+second *renderer*: the picture and the export could disagree while every automated gate passed.
+
+## R-28 — A bound parameter composes its stage even at the identity value
+
+Every composer that has an identity value returns `()` at it — `punch_in` at zoom 1.0, `grain` at
+strength 0, `vignette` at angle 0, `exposure` at amount 0. That is deliberate, and it is what makes
+an empty stack cost nothing. **It also means binding a parameter that currently sits at rest would
+produce no filter instance for `sendcmd` to address**, and a command aimed at a filter that is not
+in the graph is discarded silently at rc 0 (R-25). The binding would be **inert, and inert with no
+symptom**: the export succeeds and the picture never moves.
+
+**The ruling: a parameter carrying a binding composes its stage, at the identity value or not.** The
+Director asked for the picture to move; the resting value is where it moves *from*, not a statement
+that there is nothing to do.
+
+**It costs the empty-stack argv guarantee nothing.** R-20's guarantee is about a Shot with no
+effects, and this rule fires only on a Shot that carries a binding — a Shot with none composes
+exactly what it composes today, character for character.
+
+> **Verified 2026-08-27 before recording, and the wording is narrowed by one clause.** *Every*
+> composer does not return `()` at its identity: **23 of the 25 do**, and the two that do not have
+> no identity to return at. `mirror` takes a choice of axis and its own docstring says *"a mirror
+> that mirrors nothing is not a look anybody asked for"*; `lut_look` always names a file. Neither
+> declares a number, so neither is bindable in the first place and neither is touched by this
+> ruling. Every composer that declares a drivable number does return `()` at rest, which is the
+> clause the ruling actually rests on.
+
+---
+
+## R-29 — Geometry cannot be driven either, and the recompose is a follow-up story
+
+**Driving both dimensions of `crop` or `scale` aborts ffmpeg.** Measured 2026-08-27 on ffmpeg 7.0
+and reproduced independently: a `sendcmd` moving `w` *and* `h` gives
+`Assertion best_input >= 0 failed at fftools/ffmpeg_filter.c:1923`, **rc 3 and a 48-byte truncated
+file**, at any pair of timestamps, with or without `-frames:v`. Moving one dimension alone is fine.
+**A zoom is never one dimension alone.**
+
+So `punch_in.zoom`, `slow_zoom.zoom`, `handheld_shake.amplitude` and `dutch_tilt.angle` are
+undrivable as composed today, and the whole Geometry family is out of Epic 10's drivable subset
+alongside grain (R-25).
+
+**The consequence worth stating plainly: ffmpeg's `T` flag is not the test for drivability.** Both
+`crop` and `scale` carry `T` on `w` and `h`. A drive table built from the flag — which is exactly
+what R-25's first draft was built from — would have shipped a punch-in that **crashed every export
+it appeared in**, and crashed it with a written output file rather than a clean failure. Drivability
+is a property of `(parameter -> filter option)` **verified by running it**, not by reading a flag.
+
+**The ruling: Epic 10 drives Texture, Grade and Stylize.** A Geometry parameter's bind glyph stays
+dim and **refuses by name**, saying that ffmpeg aborts when both `crop` dimensions move. Story
+10.1's AC and the epic's headline are amended a second time — the headline has now lost *both* its
+examples, *grain surging on the kick* and *the frame breathing with the bass*, and the honest
+reading is that the epic was written from what the filters looked like they could do rather than
+from what they do.
+
+**The way back is a composer change, not a compiler one, and it is a follow-up story with a
+measurement attached** — the same shape as R-25's grain recompose, and for the same reason: a
+composer change landing mid-UI-epic is how Epic 9 shipped a 26-pixel black bar. A bound geometry
+stage would compose its companion `crop` sized for the binding's **whole reach** rather than its
+resting value, so only one dimension moves at render time. `dutch_tilt.angle` already drives
+`rotate`'s `a` cleanly on its own and is the cheapest first case.
+
+---
+
+## R-30 — The script stays cwd-relative, and AD-22's stated cause was false
+
+AD-22 said `sendcmd=f=` cannot take an absolute Windows path because **the drive-letter colon
+parses as a filter option separator**, failing with `No option name near 'frame'`. Re-measured
+2026-08-27 on ffmpeg 7.0, and reproduced independently: **that is not true.**
+`sendcmd=f=C:/dir/name.cmds` — forward slashes, plain, unquoted — renders correctly, drive-letter
+colon and all, and keeps working when the directory name holds a space. What actually breaks it is
+a character the **filtergraph** splits on: a comma gives `No such filter: 'comma/t1.cmds'`, and a
+path holding `=` or `&` gives `No option name near '...'`. That last message is the one AD-22
+quoted, so the original measurement was almost certainly taken on such a path and the cause
+misattributed to the drive letter.
+
+**And the two remedies were never different.** `lut3d`'s single-quoted colon-escaped form
+`'C\:/dir/name.cmds'` survives a directory named `hard, dir; [x] =y & 100%` for `sendcmd` too.
+The spine's amendment of 2026-08-26 — which corrected a blanket rule into two per-filter rules —
+was right that the blanket rule was wrong and wrong about why they differ.
+
+**The ruling: the script stays a bare relative filename with the process cwd set to its directory,
+and `run_tool` gains a `cwd` in the next slice.** Not because the alternative fails, but because a
+generated script name is `[a-z0-9_.-]` only and needs no escaping, and because **an absolute path
+inside the composed chain is an absolute path inside the preview cache key** — the chain became
+`preview_fingerprint`'s fourth input on 2026-08-26, so a project that moved on disk would
+invalidate every preview it owns. AD-22's stated cause is struck in the spine and in
+`docs/BUILD-HANDOFF.md`.
+
+**The lesson, which is the reason this is a ruling and not a footnote: a remedy can be correct
+while the reason given for it is false, and the false reason is what the next reader generalises
+from.** Two of Epic 10's first three days were spent on measurements that contradicted recorded
+causes — this one, and the `T` flag in R-29.
+
+---
+
+## Delegated decisions
+
+Not the Director's calls. Recorded here because they were made *for* the Director on 2026-08-27,
+under rulings R-25 to R-28, and a later reader has no way to tell a delegated decision from a ruling
+except by being told which it was.
+
+- **Label only the stages that carry a binding.** An `@label` is part of the composed filter text,
+  and the composed chain has been the fourth of `preview_fingerprint`'s eight inputs since
+  2026-08-26 (AD-28's amendment) — so labelling every stage would rename every cached preview in
+  every project on the day Epic 10 merges, for looks that did not change, and would move the
+  export's argv on Shots that carry no binding at all. Labelling only bound stages keeps an unbound
+  Shot **byte-identical in argv and valid in cache**, which is R-20's guarantee still holding after
+  this epic.
+  **The test this obliges is not optional:** every `sendcmd` target string must appear as an
+  `@label` in the composed chain **produced by the same call**, asserted by string comparison the
+  way every generated render input in this project already is. A mistargeted command is ignored in
+  silence, so that assertion is the only thing standing between a typo and an export that is quietly
+  un-driven.
+- **Ship on 8 bands, and leave the band count unjudged.** The spine's *Deferred* has said since
+  2026-08-24 that 30 Hz and 8 bands are an assumption Epic 8 shipped on and that nothing has judged
+  them; Epic 10 gives the band selector its first consumer and still does not judge them. What Epic
+  10 must not do is **bake either in**: the spectrum strip reads the band count off the measurement
+  it is drawing — `band_count` on the envelope, or equivalently the length of `band_average` on the
+  served subset — never a literal 8. Both the count and the rate are recorded fields on every
+  envelope rather than constants (AD-20, `models.SongAnalysis`, `audio.py`), so re-judging them
+  later stays a **re-measurement rather than a migration**, which is the property that made shipping
+  on an unjudged assumption acceptable in the first place.
+
+---
+
 ## Process rulings
 
 Recorded because they governed how the work was done, not what was built.
@@ -386,5 +652,12 @@ Recorded because they governed how the work was done, not what was built.
   unresolved. Epic 8 ships exactly those values, recorded as fields rather than constants so
   tuning them is not a migration, but nothing has judged them.
 - **The envelope's size** was estimated three times and measured once: ~750 KB in the spine,
-  1.13 MB in a synthetic probe, and **405 KB** measured through the shipped extractor (0.51 MB on
-  a real 3-minute master). The spine and `docs/ROADMAP.md` still carry the oldest figure.
+  1.13 MB in a synthetic probe, and **405 KB** measured through the shipped extractor (469 KB on a
+  real 202-second master). ~~The spine and `docs/ROADMAP.md` still carry the oldest figure.~~
+  **Corrected 2026-08-27:** they no longer do. Epic 8's action item 18 reached AD-20, `ROADMAP.md`
+  and `docs/project-context.md`; `docs/BUILD-HANDOFF.md` was the instance it missed and was corrected
+  on 2026-08-26. All four now carry 405 KB and name the two wrong figures as wrong. *(This bullet said ~~0.51 MB on a real
+  3-minute master~~. Every other artifact — AD-20, `BUILD-HANDOFF.md`, `ROADMAP.md` — carries
+  **469 KB on a real 202-second master**, and nothing found on 2026-08-27 supports 0.51 MB or the
+  3-minute framing. Restated in the figure the rest of the record agrees on; if 0.51 MB was a
+  separate reading it has no surviving source.)*

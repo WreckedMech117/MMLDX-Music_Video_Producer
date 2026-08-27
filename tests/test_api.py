@@ -21149,7 +21149,7 @@ def _routes_whose_body_can_carry_a_job(app) -> dict[str, str]:
 
 
 def test_every_route_a_job_record_can_arrive_on_is_enumerated(tmp_path: Path):
-    """The twelfth instance of the `replace_project` guard hole was a spec that named one of the
+    """The thirteenth instance of the `replace_project` guard hole was a spec that named one of the
     two routes a `Shot` can arrive on, and the implementer had to find the other. So the routes a
     **job** can arrive on are enumerated here rather than assumed, from the routing table itself.
 
@@ -22312,7 +22312,10 @@ def test_a_manifest_without_the_analysis_field_loads_and_round_trips(tmp_path: P
 
 
 def test_the_analysis_pointer_is_server_owned_on_the_generic_project_put(tmp_path: Path):
-    """The seventh field to meet this route's recurring guard hole, guarded the same way.
+    """The twelfth time this route's recurring guard hole has been found, guarded the same way.
+
+    Numbered *seventh* until 2026-08-27, which `character_slot` had already held since
+    2026-08-21; dated from `git log -S`, this guard landed 2026-08-24 and falls twelfth.
 
     Both directions, because both are real. A client written before the field existed *omits* it,
     so an ordinary save arrives carrying a default record and would discard the pointer to a
@@ -23778,7 +23781,7 @@ def test_an_unwritable_stack_is_refused_by_the_chains_own_sentence_and_stores_no
         (
             [{"effect": "grain", "paramters": {}}],
             EFFECT_UNKNOWN_KEY_REFUSAL.format(
-                effect="grain", key="paramters", declared="effect, enabled, parameters"
+                effect="grain", key="paramters", declared="effect, enabled, parameters, bindings"
             ),
         ),
         (
@@ -23913,7 +23916,7 @@ def test_a_smuggled_stack_is_counted_as_well_as_validated(tmp_path: Path):
 def test_the_generic_writes_can_neither_clear_nor_forge_an_effect_stack(tmp_path: Path):
     """**The guard.** `_adopt_shot_effects`, on both whole-shot write paths, both directions.
 
-    The recorded hole in this codebase, met for the twelfth time by `replace_project`'s own
+    The recorded hole in this codebase, met for the thirteenth time by `replace_project`'s own
     count — and this test lands in the same commit as the field rather than after the save
     that eats one, which is AD-16 and BUILD-ORDER's explicit instruction.
 
