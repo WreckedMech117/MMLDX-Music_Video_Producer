@@ -102,7 +102,7 @@ Three things carry the risk, none of them the render itself: superseding an in-f
 |---|---|
 | Delivers | FX-12, FX-13, FX-14, FX-15, FX-22 |
 | Depends on | A (envelope), C (parameter rows to bind), D (a preview to judge against) |
-| Files | `effects.py` (sendcmd — to be written; AD-25's 2026-08-27 amendment records that none exists yet), `models.py` (`ParameterBinding` on `EffectSpec`, ruling R-26), ~~`app.py`~~ **`routes/shots.py`** for the binding routes and **`routes/song.py`** for anything read off the envelope — but **`app.py`** for the preview and the drive readout if it composes a chain, because `render_shot_preview` is pinned there; band panel + spectrum + drive canvases |
+| Files | `effects.py` (sendcmd — ~~to be written; AD-25's 2026-08-27 amendment records that none exists yet~~ **shipped `ad67a14`; corrected 2026-08-28**), `models.py` (`ParameterBinding` on `EffectSpec`, ruling R-26), ~~`app.py`~~ **`routes/shots.py`** for the binding routes and **`routes/song.py`** for anything read off the envelope — but **`app.py`** for the preview and the drive readout if it composes a chain, because `render_shot_preview` is pinned there; band panel + spectrum + drive canvases |
 | Binds | AD-22, AD-26, AD-28 |
 | Risk | **High on two shared mechanisms, low everywhere else.** Rewritten 2026-08-27 — see below. |
 

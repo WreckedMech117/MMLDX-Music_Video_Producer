@@ -1694,8 +1694,11 @@ def test_an_export_records_the_look_it_ran_and_the_record_outlives_the_shot(
     * A Shot carrying no look contributes no entry, so an unstyled project's record is empty
       rather than a row of nothings.
 
-    And `bindings` and `transitions` are present and empty on the record this build writes, which
-    is the slot Epic 10 and Epic 11 fill without reshaping what every export has already written.
+    And `bindings` and `transitions` are empty on **this** record, because no Shot here carries
+    either. *Corrected 2026-08-28: this sentence said they are empty "on the record this build
+    writes", which stopped being true of `bindings` when Epic 10 filled it* --
+    `test_an_export_records_the_bindings_that_drove_it` asserts a real one a few hundred lines
+    below. `transitions` is Epic 11's and is empty on every record this build can write.
     """
     client, store, comfy, _app = make_client(tmp_path)
     project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
@@ -2603,3 +2606,180 @@ def test_a_disabled_bound_card_neither_drives_an_export_nor_refuses_one(tmp_path
     }
     # The binding is still there, waiting for the card to be switched back on.
     assert store.get(project_id).shots[0].effects[0].bindings != []
+
+
+def a_project_whose_bound_shot_is_buried(client, store, tmp_path: Path):
+    """Two Shots on the identical window over a 4 s song, the bound one underneath.
+
+    `assembly_plan` resolves an overlap as layers, later on top — so the second Shot in the
+    manifest covers the first completely and the first contributes **no frames**. It is still in
+    `ExportSubject.clips`, which is every Shot the manifest holds, and not in `plan.clips`, which
+    is what the export will cut.
+
+    The windows are moved through the store rather than through `PUT .../shots`, which refuses a
+    save that would change an approval, and the snapshots are moved with them so
+    `assembly_refusals`' staleness check is not what answers.
+    """
+    project_id, _shots_dir = project_with_two_approved_takes(
+        client, store, tmp_path, song_bytes=beaty_wav_bytes(4.0)
+    )
+    project = store.get(project_id)
+    for shot in project.shots:
+        shot.start = 0.0
+        shot.duration = 4.0
+        shot.approved_start = 0.0
+        shot.approved_duration = 4.0
+    store.save(project)
+    assert client.post(f"/api/projects/{project_id}/song/analyze").status_code == 200
+    graded = client.put(
+        f"/api/projects/{project_id}/shots/shot_a/effects",
+        json={"effects": [{"effect": "exposure", "parameters": {"amount": 0.2}}]},
+    )
+    assert graded.status_code == 200, graded.text
+    assert bind_exposure(client, project_id).status_code == 200
+    return project_id
+
+
+def test_a_bound_shot_that_renders_no_frame_still_refuses_the_export(tmp_path: Path):
+    """A5, and it is a **ruling** rather than a repair: the answer is that the refusal stands.
+
+    A Shot buried under a later one contributes nothing to the export, so refusing over it looks
+    like refusing over nothing. Three things settle it the other way, and the second is the one
+    that could only be had by running it.
+
+    * The check cannot see the plan. `ExportSubject.plan` is `None` for every plan-stage check by
+      construction — they run *before* `assembly_plan` — so "skip the buried Shot" means moving
+      this check to the composition stage and leaving the two stack checks behind, disagreeing.
+    * **Measured in the test below: the checks that share this clip source already refuse over a
+      buried Shot**, and the oldest of them, `assembly_refusals`, has done so since before any
+      effect existed in this application. The binding check is the last member of a consistent
+      family, not the one exception.
+    * The refusal's own remedy is *analyse the song again* — one gesture that clears every bound
+      Shot in the project — and not *unbind this one*. A Director is never held by a Shot they
+      cannot see.
+
+    The mirror is the state that would be worse: an export that quietly ignores a buried Shot
+    succeeds today and refuses tomorrow, when the covering Shot is dragged aside and a binding
+    nobody touched surfaces over a song replaced weeks ago.
+
+    The fixture proves the burial rather than assuming it: the healthy export cuts **one** clip,
+    names one take, and records an empty look — the bound Shot is in none of the three.
+    """
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id = a_project_whose_bound_shot_is_buried(client, store, tmp_path)
+
+    healthy = client.post(f"/api/projects/{project_id}/assemble", json={"preset": "draft"})
+    assert healthy.status_code == 200, healthy.text
+    body = healthy.json()
+    assert body["clip_count"] == 1, "shot_a is not actually buried, so this test proves nothing"
+    assert body["job"]["inputs"] == [
+        f"shot_b=music-video-producer/{project_id}/shots/shot_b-h3_00001-audio.mp4"
+    ]
+    # And the composition stage, which iterates `plan.clips`, records nothing for the buried Shot
+    # — its look never composed and never ran.
+    assert body["job"]["look"] == {"effects": [], "bindings": [], "transitions": []}
+
+    project = store.get(project_id)
+    project.song.analysis.song_fingerprint = "12-notthesongthatisonthedisk"
+    store.save(project)
+
+    refused = client.post(f"/api/projects/{project_id}/assemble", json={"preset": "draft"})
+
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["detail"] == BINDING_WITHOUT_ENVELOPE_REFUSAL.format(
+        shot="SHOT 01 (shot_a)", reason=SONG_ENVELOPE_SONG_CHANGED
+    )
+
+
+def test_every_plan_check_answers_the_same_way_about_a_buried_shot(tmp_path: Path):
+    """The measurement A5's ruling rests on, and the guard that keeps the four in step.
+
+    Each of these faults is put on the **buried** Shot, one at a time, and each is expected to
+    refuse the export by that Shot's name. If a later change decides a buried Shot should be
+    skipped, this test says out loud that the decision is about all of them and not about one.
+    """
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id = a_project_whose_bound_shot_is_buried(client, store, tmp_path)
+    manifest = store.manifest_path(project_id)
+    label = "SHOT 01 (shot_a)"
+
+    def assembled():
+        return client.post(f"/api/projects/{project_id}/assemble", json={"preset": "draft"})
+
+    # `assembly_refusals`, which predates every effect here: no approved take.
+    project = store.get(project_id)
+    approved = project.shots[0].approved_output
+    project.shots[0].approved_output = ""
+    store.save(project)
+    unapproved = assembled()
+    assert unapproved.status_code == 422, unapproved.text
+    assert ASSEMBLY_UNAPPROVED_REFUSAL.format(shot=label) in unapproved.json()["detail"]
+
+    # `_effect_stack_refusals`: a value the catalogue will not agree to, hand-edited past the
+    # write route the way a manifest actually goes wrong.
+    project = store.get(project_id)
+    project.shots[0].approved_output = approved
+    store.save(project)
+    raw = json.loads(manifest.read_text(encoding="utf-8"))
+    sound_effects = raw["shots"][0]["effects"]
+    raw["shots"][0]["effects"] = [
+        {"effect": "exposure", "enabled": True, "parameters": {"amount": 99.0}, "bindings": []}
+    ]
+    manifest.write_text(json.dumps(raw), encoding="utf-8")
+    impossible = assembled()
+    assert impossible.status_code == 422, impossible.text
+    assert impossible.json()["detail"].startswith(f"{label}: exposure's amount is 99")
+
+    # `_oversized_stack_refusals`: past the card limit.
+    raw["shots"][0]["effects"] = [
+        {"effect": "grain", "enabled": True, "parameters": {"strength": 8}, "bindings": []}
+    ] * (SHOT_EFFECT_STACK_LIMIT + 1)
+    manifest.write_text(json.dumps(raw), encoding="utf-8")
+    oversized = assembled()
+    assert oversized.status_code == 422, oversized.text
+    assert oversized.json()["detail"] == f"{label}: " + SHOT_EFFECTS_TOO_MANY_REFUSAL.format(
+        limit=SHOT_EFFECT_STACK_LIMIT, count=SHOT_EFFECT_STACK_LIMIT + 1
+    )
+
+    # `_binding_envelope_refusals`: the last of them, and the one A5 asked about.
+    raw["shots"][0]["effects"] = sound_effects
+    manifest.write_text(json.dumps(raw), encoding="utf-8")
+    project = store.get(project_id)
+    project.song.analysis.song_fingerprint = "12-notthesongthatisonthedisk"
+    store.save(project)
+    bound = assembled()
+    assert bound.status_code == 422, bound.text
+    assert bound.json()["detail"] == BINDING_WITHOUT_ENVELOPE_REFUSAL.format(
+        shot=label, reason=SONG_ENVELOPE_SONG_CHANGED
+    )
+
+
+def test_a_sidecar_element_that_is_not_a_number_refuses_the_export_by_name(tmp_path: Path):
+    """B3 at the export, which was the third of the three routes that answered 500.
+
+    `song_measurement_verdict` reads `band_count`, `analysis_rate` and `len(bands)` and nothing
+    inside the rows, so a poisoned sidecar is *current* and the export walks straight into the
+    compiler. Before 2026-08-28 a string or a `null` came back out as `ValueError`/`TypeError`
+    past `except EffectRefusal`, and a `NaN` came back out as a **successful export** whose
+    binding had silently collapsed to its resting value.
+    """
+    from music_video_producer.effects import BINDING_NO_ENVELOPE_REFUSAL
+
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = a_project_ready_to_be_bound(client, store, tmp_path)
+    assert bind_exposure(client, project_id).status_code == 200
+    sidecar = store.song_envelope_path(project_id)
+    sound = json.loads(sidecar.read_text(encoding="utf-8"))
+    refusal = BINDING_NO_ENVELOPE_REFUSAL.format(effect="exposure", parameter="amount")
+
+    for poison in ("loud", None, True, float("nan"), float("inf")):
+        payload = json.loads(json.dumps(sound))
+        payload["bands"][0][7] = poison
+        sidecar.write_text(json.dumps(payload), encoding="utf-8")
+
+        refused = client.post(f"/api/projects/{project_id}/assemble", json={"preset": "draft"})
+
+        assert refused.status_code == 422, (repr(poison), refused.text)
+        assert refused.json()["detail"].endswith(refusal), (repr(poison), refused.text)
+        # Nothing half-started: the refusal happens before the job record is written.
+        assert store.get(project_id).jobs == [], repr(poison)

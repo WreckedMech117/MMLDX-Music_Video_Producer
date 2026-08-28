@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     app_port: int = 8765
     comfy_url: str = "http://127.0.0.1:8188"
     comfy_root: Path = DEFAULT_COMFY_ROOT
+    #: Where projects, the LUT folder and machine preferences live. **Anchored to an absolute
+    #: path by `_anchor_data_root` below**, and that is not cosmetic — see the validator.
     data_root: Path = PROJECT_ROOT / "data"
     llm_base_url: str = ""
     llm_api_key: str = ""
@@ -48,6 +50,36 @@ class Settings(BaseSettings):
     #: options. Requires the `sageattention` package inside ComfyUI's python — installed
     #: 2026-08-19 (woct0rdho 2.2.0+cu128torch2.7.1, kernel-probed on the RTX 5090).
     sage_attention: str = ""
+
+    @field_validator("data_root")
+    @classmethod
+    def _anchor_data_root(cls, value: Path) -> Path:
+        """A relative `MVP_DATA_ROOT` is anchored to this process's directory before anything
+        reads it.
+
+        **Because one path derived from this root reaches ffmpeg's argv, and ffmpeg does not
+        always run in this process's directory.** A bound Shot's render sets `cwd` to the
+        export's `workdir` or to `previews/` so a `sendcmd` script can be a bare relative
+        filename (R-30); `lut3d=file=` is the only other filesystem reference in the composed
+        chain, and it is built from `discover_luts(settings.data_root)`. Under
+        `MVP_DATA_ROOT=data` the entry's path stayed `data/luts/warm-shift.cube`, so a Shot
+        carrying **both** a binding and a Grade card composed a chain ffmpeg read from inside
+        `.work-<job>/` and could not find. Measured 2026-08-28 through real ffmpeg: rc -2,
+        `Parsed_lut3d: data/luts/warm-shift.cube: No such file or directory`, and the last line
+        of the stderr the Director is shown blames the *output* file rather than the grade.
+
+        The export's `workdir` and the preview's `previews_root` were each given a `.resolve()`
+        when the `cwd` arrived; this is the third path that needed one, and it is fixed at the
+        root rather than at the call site so `ProjectStore` and `MachinePreferences` are anchored
+        by the same rule.
+
+        **An already-absolute root is returned untouched, deliberately.** `resolve()` also
+        follows junctions and symlinks, and this value ends up inside the composed chain, which
+        is the fourth input to `effects.preview_fingerprint` — rewriting an absolute root that
+        happens to sit behind a junction would rename every cached preview on that machine for a
+        look that did not change. Relativity is the whole fault, so relativity is the whole fix.
+        """
+        return value if value.is_absolute() else value.resolve()
 
     @property
     def workflow_root(self) -> Path:

@@ -48,7 +48,7 @@ graph TD
 
 **Corrected 2026-08-27 — the route layer is a package now.** The `APP` node read ~~`app.py routes`~~.
 On 2026-08-26 (`4a1a4f6`, `e6f6b23`) the routes came out of `create_app`'s closure into
-`src/music_video_producer/routes/`, eight modules holding **60 of the 76 routes**; sixteen stay in
+`src/music_video_producer/routes/`, eight modules holding ~~**60 of the 76 routes**~~ **62 of the 78 routes** *(count corrected 2026-08-28: Epic 10 added two, both to `routes/shots.py`, and made this sentence stale in the epic that wrote it)*; sixteen stay in
 `app.py`, fifteen of them pinned by tests that monkeypatch a module-level name in
 `music_video_producer.app`'s namespace, and the sixteenth is `index`. **The layering this diagram
 asserts is unchanged** — the route modules are what reach `effects.py`, `audio.py`, `assembly.py`
@@ -202,7 +202,7 @@ Binding, read-only. Not re-derived here.
 > | Clause | Status |
 > |---|---|
 > | **filter-stage construction** | **As-built.** `build_effect_stages`, twenty-five composers, the catalogue, `validate_stack`, `preview_fingerprint`, the LUT discovery and quoting. |
-> | ~~`sendcmd` generation~~ | **Planned — Epic 10 (Slice E).** Grep the module for `sendcmd` and you get two lines of *prose*, in the module docstring and in `lut_file_argument`, both saying that `lut3d`'s quoted form is more robust than the cwd-relative remedy `sendcmd` needs. There is no generator, no script text, and no caller. |
+> | ~~`sendcmd` generation~~ | ~~**Planned — Epic 10 (Slice E).** Grep the module for `sendcmd` and you get two lines of *prose*, in the module docstring and in `lut_file_argument`, both saying that `lut3d`'s quoted form is more robust than the cwd-relative remedy `sendcmd` needs. There is no generator, no script text, and no caller.~~ **Shipped 2026-08-27 in `ad67a14`, and this row was left standing by that very commit — corrected 2026-08-28 by Epic 10's retrospective.** `effects.py` now holds `drive_samples`, `sendcmd_script`, `DriveScript` and `drive_readout`; `app.py` and `routes/shots.py` call them. The sentence above was true when written and false in the commit that published it, which is the single failure this epic repeated most: **a commit that changes what a document describes must correct that document in the same commit.** |
 > | ~~transition-segment argv~~ | **Planned — Epic 11 (Slice F).** No `xfade` anywhere in the module. The only occurrences of the word are `preview_fingerprint`'s seventh input slot, deliberately hashed empty so Epic 11 moves only the Shots that acquire a transition. |
 >
 > Both remain the right home for the work and AD-25's placement decision is unchanged — what is
@@ -242,6 +242,8 @@ Binding, read-only. Not re-derived here.
 > **Amended 2026-08-26.** The fourth slot used to hold *"the Effect Stack serialized canonically"*, and that was the defect rather than the description. A cached preview is named after what produced it, and what produces it is the composed chain — so a corrected composer or a corrected catalogue default moved the picture and left the name alone. Measured: Epic 9's own last commit (`e4aec46`) fixed `scanlines` drawing a 26-pixel black bar down the left edge, and every preview already rendered with a Scanlines card went on being served **from cache, still showing the bar**, because the stack had not changed. Nothing evicts `previews/`, so it was permanent.
 >
 > The slot now holds the chain. `bindings` and `transition` are unaffected and still hashed empty, so Epics 10 and 11 still move only the Shots that acquire one.
+>
+> **Amended 2026-08-28, by the AD's own rule.** Epic 10 filled the `bindings` slot and **changed what the song-fingerprint slot holds**: it is now populated only when the stack is *driven* (`app.py`, `if driven and project.song and project.song.analysis`), and `bindings` only when an envelope was read. This AD says in terms that *"adding an input to either — or changing what one of them holds — is a change to this AD"*, and the change shipped without one; the retrospective found it. **Why the gating is right:** an ungated song fingerprint moves the name of every effected Shot's preview whenever a song is re-analysed, and `build_effect_stages` ignores the envelope entirely for an unbound stack — so the song provably cannot reach an unbound Shot's picture, and hashing it there would spend a re-render of the whole plan on a gesture about beats. **What that costs, and it is the part to watch:** two slots now depend on a predicate rather than only on their own value, so the client's cache key must gate on the *same* predicate. It did not, for the whole epic — the Monitor went on showing a picture driven by a replaced song, permanently and silently, until `4fd9b41`. One rule, two engines (`stack_is_driven` / `stackIsDriven`), pinned by a cross-engine table.
 >
 > **The known boundary, measured rather than left to be discovered:** a LUT's *file content* is still outside the fingerprint. Rewriting a `.cube` in place leaves the cached clip served. Closing that means hashing every referenced look on every request, including cache hits, and bypassing the held listing that exists so a picker does not re-read a 44 MB folder — measured at 0.56 ms for a 33-cube and 4.24 ms for a 64-cube against a ~116 ms render. Named in `preview_fingerprint`'s docstring so the next reader inherits the measurement.
 
@@ -328,7 +330,7 @@ src/music_video_producer/
                  #       per-band envelopes + whole-song band averages. ffmpeg decode only.
   effects.py     # filter-stage construction + effect catalogue + fingerprints (SHIPPED,
                  #       Epics 8-9). sendcmd generation PLANNED (Epic 10); transition-segment
-                 #       argv PLANNED (Epic 11) — neither exists in the module today.
+                 #       argv PLANNED (Epic 11) — sendcmd shipped 2026-08-27; the argv does not exist yet.
   assembly.py    # + splices effects.py stages into trim_args; + transition intermediates
                  #   in assembly_plan and the concat list. Grid math untouched.
   models.py      # + EffectSpec, ParameterBinding, TransitionSpec, SongAnalysis
@@ -359,7 +361,7 @@ data/projects/<id>/
 | FX-1..FX-3 song analysis, beat markers, snapping | `audio.py` + sidecar (AD-20, AD-21); snapping extends existing boundary logic |
 | FX-4..FX-7 tab, stack, copy, lock refusal | `routes/shots.py` (`read_shot_effects`/`replace_shot_effects`) + `routes/unsorted.py` (catalogue) + frontend; storage AD-16 |
 | FX-8..FX-11 four families | `effects.py` catalogue + chain order AD-17 |
-| FX-12..FX-15 reactive binding | `effects.py` sendcmd AD-22 (to be written — see AD-25's 2026-08-27 amendment); binding routes in `routes/shots.py`, envelope reads in `routes/song.py`; envelope AD-20/21; spectrum AD-26; validation AD-27 |
+| FX-12..FX-15 reactive binding | `effects.py` sendcmd AD-22 (~~to be written~~ **as-built since `ad67a14`, corrected 2026-08-28**); binding routes in `routes/shots.py`, envelope reads in `routes/song.py`; envelope AD-20/21; spectrum AD-26; validation AD-27 |
 | FX-16..FX-19 transitions | `assembly.py` AD-18, AD-19 |
 | FX-20..FX-22 preview | preview cache AD-23, supersede AD-24; the route itself is pinned in `app.py` by three monkeypatched names, not in `routes/` |
 | FX-23..FX-25 export integrity | AD-16 (non-destructive), AD-27 (refusals), inherited AD-9/AD-13 |

@@ -21607,6 +21607,71 @@ def test_a_sidecar_the_reader_accepts_but_cannot_be_drawn_is_still_a_200(tmp_pat
         assert served[intact] == served_before["envelope"][intact], intact
 
 
+@pytest.mark.parametrize(
+    "trim_average, trim_edges",
+    [
+        pytest.param(True, False, id="only-the-averages"),
+        pytest.param(False, True, id="only-the-edges"),
+        pytest.param(True, True, id="both-together-which-only-the-server-can-see"),
+    ],
+)
+def test_a_sidecar_whose_served_arrays_are_short_stops_being_current(
+    tmp_path: Path, trim_average: bool, trim_edges: bool
+):
+    """The other half of the sidecar story, and the half no client can see.
+
+    The test above is about a **malformed** served key: it is dropped, the rest of the envelope
+    survives, and the route stays a 200. This is about a **short** one — well-formed numbers, just
+    fewer of them than the record says there are — which is a sidecar disagreeing with itself and
+    is invisible downstream.
+
+    Why it matters, measured 2026-08-28: the browser never receives `bands`. The spectrum strip
+    positions its bars off `band_average` while the compiler weights off `bands`, so with
+    `band_average` trimmed to five beside eight real bands, the strip painted its middle bar at
+    full weight over bands the export weighted at 8e-05 — **the Director selected one band and
+    drove another.** The client now refuses to draw when `band_edges` fails to corroborate
+    `band_average`, but corroboration is not proof: trim both together and only this verdict can
+    tell. `audio.py` writes all three from one `band_count` in one breath, so any disagreement is a
+    hand edit or a half-written file.
+
+    **Parametrized over which array is short, and the reason is a mutation that survived.** The
+    first draft trimmed both at once — the state the client cannot see and the one worth catching —
+    and with only that case, disabling the `band_average` check left the `band_edges` check to pass
+    the test alone. A fixture that makes its own defect impossible is this epic's most-repeated
+    verification failure, and it was written here by the author who catalogued it. Each check now
+    has a row that only it can answer.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Short sidecar"))
+    import_measured_song(client, project.id)
+
+    sidecar = tmp_path / "projects" / project.id / "media" / "analysis" / "song-envelope.json"
+    healthy = json.loads(sidecar.read_text(encoding="utf-8"))
+    count = healthy["band_count"]
+    assert len(healthy["band_average"]) == count
+    assert len(healthy["band_edges"]) == count + 1
+
+    served_before = client.get(f"/api/projects/{project.id}/timeline/snap-targets").json()
+    assert served_before["analysed"] is True
+
+    short = 5
+    damaged = dict(healthy)
+    if trim_average:
+        damaged["band_average"] = healthy["band_average"][:short]
+    if trim_edges:
+        damaged["band_edges"] = healthy["band_edges"][:short + 1]
+    sidecar.write_text(json.dumps(damaged), encoding="utf-8")
+
+    body = client.get(f"/api/projects/{project.id}/timeline/snap-targets").json()
+    # Not an error -- absence never is on this route -- but no longer current, and nothing of the
+    # envelope is served, because a sidecar that disagrees with its own record cannot be trusted
+    # for the parts that happen to look intact.
+    assert body["analysed"] is False, body
+    assert not (body["envelope"] or {}), body["envelope"]
+    # And the half that never came from the envelope survives it, as it does for a malformed key.
+    assert body["gaps"] == served_before["gaps"]
+
+
 def test_importing_a_song_measures_it_into_a_sidecar_and_records_only_a_pointer(tmp_path: Path):
     """The first matrix row, and the shape of the whole story.
 
@@ -25144,6 +25209,68 @@ def test_a_binding_on_a_parameter_the_catalogue_cannot_drive_is_refused_by_name(
         assert response.status_code == 422, (effect, response.text)
         assert response.json()["detail"] == sentence, effect
         assert manifest.read_bytes() == untouched, f"a refused binding moved the manifest: {effect}"
+
+
+def test_a_binding_at_a_depth_of_zero_is_refused_rather_than_answering_200(tmp_path: Path):
+    """B1. `BINDING_SPEC_KEYS`' own comment has always said this module *"will not accept"* a
+    depth of zero. It accepted one: `_binding_number(..., -span, span)` takes 0 because 0 is
+    inside the interval.
+
+    Reproduced 2026-08-28 before it was fixed — the route answered **200**, the glyph read
+    *bound*, and the compiler emitted `0 blend@b0 all_opacity 0.2; 0.033333 blend@b0 all_opacity
+    0.2; …` for the whole clip. Rendered through this project's real ffmpeg against the same
+    chain with the `sendcmd` stage stripped, every frame's `framemd5` was **identical** at rc 0.
+    That is this feature's silent failure mode reached through a fully supported gesture, and the
+    only feedback was a sentence about the music.
+
+    Both signs of zero, because `-0.0 == 0.0` and a range control can hand over either.
+    """
+    from music_video_producer.effects import BINDING_DEPTH_ZERO_REFUSAL
+
+    client, _store, _comfy = make_client(tmp_path)
+    project_id = project_with_two_shots(client)
+    a_bindable_shot(client, project_id)
+    manifest = ProjectStore(tmp_path).manifest_path(project_id)
+    untouched = manifest.read_bytes()
+
+    for depth in (0, 0.0, -0.0):
+        refused = client.put(
+            bindings_url(project_id),
+            json={"effect": "bloom", "bindings": [dict(A_BINDING, depth=depth)]},
+        )
+        assert refused.status_code == 422, (depth, refused.text)
+        assert refused.json()["detail"] == BINDING_DEPTH_ZERO_REFUSAL.format(
+            effect="bloom", parameter="intensity"
+        ), depth
+        assert manifest.read_bytes() == untouched, depth
+
+    # The refusal is of zero and of nothing else: a depth is signed, and the smallest magnitude
+    # the catalogue's own step can reach still writes.
+    for depth in (-0.5, 0.01):
+        written = client.put(
+            bindings_url(project_id),
+            json={"effect": "bloom", "bindings": [dict(A_BINDING, depth=depth)]},
+        )
+        assert written.status_code == 200, (depth, written.text)
+        assert ProjectStore(tmp_path).get(project_id).shots[0].effects[0].bindings == [
+            dict(A_BINDING, depth=depth)
+        ]
+
+    # And the door a hand-edited manifest comes through says the same thing: the generic stack
+    # write validates the whole card, so a zero depth cannot be smuggled past the narrow route.
+    smuggled = write_stack(
+        client,
+        project_id,
+        [{
+            "effect": "bloom",
+            "parameters": {"intensity": 0.4},
+            "bindings": [dict(A_BINDING, depth=0)],
+        }],
+    )
+    assert smuggled.status_code == 422, smuggled.text
+    assert smuggled.json()["detail"].endswith(
+        BINDING_DEPTH_ZERO_REFUSAL.format(effect="bloom", parameter="intensity")
+    ), smuggled.text
 
 
 def test_the_binding_routes_own_gates_refuse_by_name_and_write_nothing(tmp_path: Path):

@@ -1724,12 +1724,18 @@ class ExportLook(BaseModel):
     "unknown" to cover that case would make the field unreadable for the ninety-nine cases it is
     for. `tests/test_assembly_route.py` pins the reading rather than leaving it to be assumed.
 
-    **`bindings` and `transitions` are present and empty on purpose**, exactly as
-    `effects.PREVIEW_FINGERPRINT_INPUTS` reserves the same two slots. Neither exists on any model
-    yet — bindings are Epic 10 and transitions Epic 11 — and declaring them now means the epic
-    that ships one fills a slot every already-written record already has, rather than reshaping
+    **`bindings` and `transitions` were declared before either existed**, exactly as
+    `effects.PREVIEW_FINGERPRINT_INPUTS` reserves the same two slots — so that the epic which
+    shipped one would fill a slot every already-written record already had, rather than reshaping
     what every export has been writing. A reader six months from now sees three questions asked of
     every export and can tell "no transition" from "this build could not say".
+
+    *Corrected 2026-08-28.* This paragraph said ~~"Neither exists on any model yet — bindings are
+    Epic 10 and transitions Epic 11"~~, and that was written false of `bindings` in the epic that
+    falsified it. `bindings` is filled by the assemble route from `effects.exported_bindings`, and
+    `tests/test_assembly_route.py` asserts a real, non-empty value. It reads exactly like
+    `effects` above it: one `"<shot_id>=<binding>"` line per agreed binding that drove a stage.
+    `transitions` is still empty on every record this build can write, and is Epic 11's.
 
     **What an entry records is what the export *used*, resolved, not a pointer to the Shot.** The
     Shot's stack is editable and will have moved on; each entry is `effects.exported_look`'s
@@ -1746,9 +1752,12 @@ class ExportLook(BaseModel):
 
     #: One entry per effect that composed a stage, in plan order then chain order.
     effects: list[str] = Field(default_factory=list)
-    #: Epic 10's envelope bindings. Present and empty; see the class docstring.
+    #: One entry per Parameter Binding that drove a stage, in the same order and the same
+    #: `"<shot_id>=<value>"` shape as `effects` above (FX-25). *Corrected 2026-08-28: this said
+    #: ~~"Present and empty"~~, which stopped being true when Epic 10 filled it.*
     bindings: list[str] = Field(default_factory=list)
-    #: Epic 11's transitions. Present and empty; see the class docstring.
+    #: Epic 11's transitions. Present and empty — genuinely, on every record this build writes.
+    #: See the class docstring.
     transitions: list[str] = Field(default_factory=list)
 
 

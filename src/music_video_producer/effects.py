@@ -565,6 +565,28 @@ DRIVE_EXPRESSION = (
 #: A band produces a number. A look and a word are not numbers, and `lut3d`'s `file` carries no
 #: runtime flag at all, so a binding can drive a grade's parameters and can never swap the LUT.
 DRIVE_NOT_A_NUMBER = "it is not a number"
+#: Why a binding that names everything correctly still cannot be composed: it was given a depth
+#: of zero, so it would write the parameter's own resting value at every tick.
+#:
+#: Reproduced 2026-08-28 through this project's real ffmpeg: the route answered 200, the glyph
+#: read *bound*, the compiler emitted `0 blend@b0 all_opacity 0.2; 0.033333 blend@b0 all_opacity
+#: 0.2; …` for the whole clip, and the `framemd5` of every frame was identical to the undriven
+#: chain at rc 0. That is this feature's default failure mode — a `sendcmd` that changes nothing
+#: is silent — reached through a fully supported gesture, and it is refused here rather than
+#: rendered, for `band_width`'s floor of 0.02's reason one field over: a band narrower than that
+#: weights nothing, and a depth of zero moves nothing.
+#:
+#: **Exactly zero, and no epsilon.** A depth small enough that `_number`'s six decimal places
+#: round every compiled value back onto the resting one is inert too, and where that boundary
+#: sits is a function of the parameter's own magnitude and has not been measured. Inventing a
+#: floor for it would be a bound with no measurement behind it, which is the mistake this
+#: project keeps finding in its own prescriptions; zero is the case the module's own contract
+#: names and the case a slider can reach on its way past.
+BINDING_DEPTH_ZERO_REFUSAL = (
+    "{effect}'s {parameter} is bound at a depth of 0, so the music would write its resting "
+    "value at every tick and the picture would never move. Give the depth a size — it may be "
+    "negative — or remove the binding. Nothing was composed."
+)
 BINDING_NO_ENVELOPE_REFUSAL = (
     "{effect}'s {parameter} is bound to the music, and this song has not been analysed. "
     "Analyse the song, or remove the binding. Nothing was composed."
@@ -2472,6 +2494,13 @@ EFFECT_SPEC_KEYS: tuple[str, ...] = ("effect", "enabled", "parameters", "binding
 #: infers a drive mode (FX-14), a binding that names no parameter drives nothing, and a depth of
 #: zero is a binding that silently does nothing — which is the failure this module refuses
 #: everywhere else and will not accept here.
+#:
+#: **That last clause was a statement about behaviour and was false until 2026-08-28**, which is
+#: why it is now a pointer to the guard that makes it true: `_validate_bindings` refuses a zero
+#: depth by name (`BINDING_DEPTH_ZERO_REFUSAL`). `_binding_number(..., -span, span)` accepted 0
+#: because 0 is inside the interval, so the route answered 200 and the compiled script wrote the
+#: resting value at every tick — reproduced against real ffmpeg with frames byte-identical to
+#: the undriven chain. A rule stated in prose is not a guard, including inside source.
 BINDING_SPEC_KEYS: tuple[str, ...] = (
     "parameter",
     "drive",
@@ -2770,23 +2799,35 @@ def _validate_bindings(
             )
             for setting, default, low, high in BINDING_SETTINGS
         }
+        # Settings, then the drive, then the depth. The order is the order the sentences used to
+        # come out in when these three were arguments to the constructor below, and it is kept
+        # deliberately: a body wrong in two ways is answered about the same one it was answered
+        # about yesterday.
+        drive = _validate_choice(
+            effect_id,
+            ChoiceParameter(
+                name=f"{name}'s drive",
+                label="Drive",
+                default=DRIVE_PUNCH,
+                choices=DRIVE_MODES,
+            ),
+            spec.get("drive"),
+        )
+        depth = _binding_number(effect_id, name, "depth", spec.get("depth"), -span, span)
+        # The one bound in this function that is not an interval, because the value it excludes
+        # is in the *middle* of one. See `BINDING_DEPTH_ZERO_REFUSAL`: a zero depth composes a
+        # `sendcmd` that writes the parameter's resting value at every tick, which ffmpeg
+        # performs perfectly and silently, so there is no render-time evidence to find later.
+        if depth == 0.0:
+            raise EffectRefusal(
+                BINDING_DEPTH_ZERO_REFUSAL.format(effect=effect_id, parameter=name)
+            )
         bindings.append(
             ParameterBinding(
                 effect_id=effect_id,
                 parameter=name,
-                drive=_validate_choice(
-                    effect_id,
-                    ChoiceParameter(
-                        name=f"{name}'s drive",
-                        label="Drive",
-                        default=DRIVE_PUNCH,
-                        choices=DRIVE_MODES,
-                    ),
-                    spec.get("drive"),
-                ),
-                depth=_binding_number(
-                    effect_id, name, "depth", spec.get("depth"), -span, span
-                ),
+                drive=drive,
+                depth=depth,
                 **settings,
             )
         )
@@ -2975,6 +3016,36 @@ def _band_weight(position: float, centre: float, width: float, softness: float) 
     return math.exp(-reach * reach)
 
 
+def _is_a_measured_number(value: Any) -> bool:
+    """Whether one element of a sidecar's `bands` is a number a drive may be weighted from.
+
+    `_validate_number` asks this of every number a *client* sends; this is the same question one
+    level down, of every number a **file on disk** carries. The three shapes it excludes are each
+    reachable and each was a real fault:
+
+    * a `bool` — `True` is an `int` in Python and would have weighted as 1.0, the loudest reading
+      the band can take, out of a JSON `true`;
+    * a string or a `null` — `float()` raises `ValueError`/`TypeError`, which is not an
+      `EffectRefusal`, so it left `GET .../drive`, the preview and the export as a **500**;
+    * a `NaN` or an infinity — `json.loads` accepts the bare `NaN` literal, and one of them
+      poisons the weighted mean for *every* band at that tick and then poisons `_punch_series`'
+      running average for the whole rest of the song, so every binding in the project collapses
+      to its resting value at rc 0 with `silenced: false`. An un-dimmed flat line and an export
+      that ran and changed nothing — this feature's worst failure, from one character in a file.
+
+    `math.isfinite` is asked inside a `try` because it converts an `int` to a `double` first, and
+    a 401-digit integer — which JSON permits and Python holds exactly — raises `OverflowError`
+    there rather than answering. That is `_validate_number`'s own recorded case, in the one place
+    it can arrive without a route having seen it.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 def _envelope_bands(envelope: Mapping[str, Any] | None) -> tuple[float, list[Sequence[float]]]:
     """The two things a drive needs off a Song Envelope: the rate it was taken at, and its
     per-band rows — or `(0.0, [])` if what was handed over is not an envelope.
@@ -2988,6 +3059,15 @@ def _envelope_bands(envelope: Mapping[str, Any] | None) -> tuple[float, list[Seq
 
     Absence is reported as `(0.0, [])` rather than raised, because *"is there an analysis"* and
     *"this binding cannot be composed"* are two different questions with two different callers.
+
+    **`(0.0, [])` means "there is no measurement here this can read", which is wider than "no
+    file".** A sidecar of the right shape holding a string, a `null` or a `NaN` is answered the
+    same way a ragged one already was, and every caller's behaviour follows from that one answer:
+    the export and the preview refuse in `BINDING_NO_ENVELOPE_REFUSAL`'s words, whose remedy —
+    analyse the song again — is the right one for an unreadable measurement as much as for a
+    missing one, and `GET .../drive` answers with the empty list it answers every other absence
+    with. Before 2026-08-28 those three routes answered **500** instead, because the `float()` in
+    `band_series` was unguarded.
     """
     if not isinstance(envelope, Mapping):
         return (0.0, [])
@@ -3003,6 +3083,17 @@ def _envelope_bands(envelope: Mapping[str, Any] | None) -> tuple[float, list[Seq
     if isinstance(declared, int) and not isinstance(declared, bool) and declared != len(bands):
         return (0.0, [])
     if len({len(row) for row in bands}) != 1 or not bands[0]:
+        return (0.0, [])
+    # The elements themselves, and not only the shape. Every check above this line asks about
+    # the *arrangement* of the measurement — the rate, the row count against the recorded
+    # `band_count`, the rows being equal and non-empty — and every one of them passes for an
+    # array of the right shape holding a string, a `null` or a `NaN`. `_is_a_measured_number`
+    # says why each of those three mattered.
+    #
+    # Measured 2026-08-28: 5.5 ms over a real 8-band, 202-second envelope (8 x 6,060), against
+    # 36 ms for the weighted walk this protects and a verdict that already hashes the whole
+    # master. It is the cheapest thing on this path by an order of magnitude.
+    if not all(_is_a_measured_number(value) for row in bands for value in row):
         return (0.0, [])
     return (float(rate), list(bands))
 
@@ -3961,11 +4052,20 @@ def preview_fingerprint(
     nothing else. A stored flag would be a second truth that outlives what it describes, which
     is the rule AD-21 and AD-23 both exist to keep.
 
-    **The two empty slots are load-bearing.** `bindings` (Epic 10) and `transition` (Epic 11) do
-    not exist on any model yet, and both are hashed *now*, as their empty values. Adding them
-    later then changes the fingerprint only of the Shots that acquire one. Leaving them out and
-    adding them later would reshape the payload for every Shot at once and invalidate every
-    cached preview in every project on the day that epic merges — for looks that did not change.
+    **The two reserved slots are load-bearing, and one of them is no longer empty.**
+
+    *Corrected 2026-08-28.* This paragraph said `bindings` (Epic 10) and `transition` (Epic 11)
+    ~~"do not exist on any model yet"~~. That has been false of `bindings` since `5773978`:
+    `models.EffectSpec.bindings` is a stored field, this function takes the slot's value as an
+    argument, and the preview route fills it with every card's stored binding spec. `transition`
+    is still genuinely absent and is Epic 11's, so the second half stands as written.
+
+    Both were hashed from the beginning as their empty values, and reserving them is what made
+    Epic 10's arrival cheap: the fifth slot moved the name of the Shots that acquired a binding
+    and of no others, so an unbound Shot's cached previews stayed valid (R-20). Leaving them out
+    and adding them later would have reshaped the payload for every Shot at once and invalidated
+    every cached preview in every project on the day that epic merged — for looks that did not
+    change. That is still the whole reason the seventh slot is here now.
 
     **`envelope` and `shot_start` are what a bound stack needs, and a stack with no binding
     ignores both.** They are not two more fingerprint inputs: they reach the chain, and the chain

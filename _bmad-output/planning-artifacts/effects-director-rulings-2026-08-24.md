@@ -649,6 +649,77 @@ has a non-canvas equivalent**, and the equivalent has to be reachable wherever t
 
 ---
 
+## R-33 — `EffectSpec` gets a stable id, and bindings are adopted rather than refused
+
+Epic 10's retrospective reproduced three defects and an investigation established they are not
+three bugs. **A1** (a deleted `.cube` empties the binding census for the whole project and refuses
+every Split and Duplicate of every bound Shot, and on the narrow route makes deleting the binding
+the only accepted write), **A3** (a generic write relocates a binding between two cards of one
+effect, changing the rendered picture at 200) and **A4** (one held binding multiplies onto
+arbitrarily many new Shot ids in a single write) are three consequences of one contract's shape:
+**"carry, never mint"**, which compares a multiset of validated `ParameterBinding`s because an
+`EffectSpec` has no identity to compare instead.
+
+**The ruling: give `EffectSpec` a stable id and adopt a card's bindings from the stored card,
+retiring `binding_census` and `carried_bindings_refusal`.**
+
+**The reasoning, because it is the part worth keeping.** Epic 10's stated obstacle was that *an
+`EffectSpec` has no id, so adopting means matching stack entries positionally, and positional
+matching is what R-26 rejected.* That is a reason not to **match** positionally. It was never a
+reason not to **have** an id. R-26 rejected `(effect, parameter)` and `(index, parameter)` as
+*addressing* schemes precisely **because** there was no id, and nobody then asked whether there
+should be one. R-26 decided **where a binding is stored** — keyed by parameter name on its own card
+— and that stands untouched; this changes the **addressing**, which is the question R-26 was never
+asked.
+
+**AD-16 already prescribed this.** Its Rule reads: *"adopts them from the stored Shot, via the
+established `_adopt_*` idiom… a body that omits them, or invents them, does not change them."* Epic
+10 substituted a refusal mechanism, argued it at length in `models.EffectSpec`'s docstring, and it
+produced three holes the idiom would not have. The substitution is the finding, not the argument.
+
+**A3 has no fix inside the old contract, and that decided it.** The census key can only be content
+or position. Content-keyed refuses the slider drag the route exists for — *measured: that same drag
+changes a bound card's resting value at 200 today*. Ordinal-keyed is `(index, parameter)` in a thin
+disguise. Patching would have dissolved A1 and A4 and left A3 permanently open.
+
+**What was measured before ruling, so nobody re-derives it:**
+
+- **Zero effect cards and zero bindings exist in stored data** — 5 projects, 91 shots, no `effects`
+  key on any stored shot. The migration cost is **zero**, and it will not stay zero.
+- Both shapes were prototyped end to end in a scratch copy. The id plus adoption costs **14 test
+  edits, every one mechanical** — ten wire-shape equality literals, two asserting a key list, two
+  asserting the refusal that stops existing.
+- **No fingerprint moves and no cached preview is invalidated**: `preview_fingerprint` hashes the
+  composed chain plus the stored `bindings`, and `effects` reaches neither the ComfyUI payload nor
+  `expansion_input`.
+- All four adversarial writes come back correct with adoption in place, in a running application.
+
+**AD-21 is not in play.** It forbids a stored *verdict* that can outlive its condition — "a second
+truth that can disagree with the first". An id has no condition and nothing to disagree with. Six
+models in `models.py` already carry `new_id(...)`, including `SongSection`, a repeated element
+nested inside another model — exactly `EffectSpec`'s shape. `EffectSpec` is the only repeated nested
+element in this schema without one.
+
+**Two costs, accepted rather than discovered:**
+
+1. **A wire-contract change.** Any non-browser client writing a bound Shot's stack must echo card
+   ids or be refused by name. Losing a binding is otherwise indistinguishable from removing its
+   card, which is where this whole thread began.
+2. **New machinery: card ids clone.** Split, Duplicate and copy-a-stack all copy a card, so two
+   Shots can hold one card id until something re-mints on collision. This is the piece no
+   measurement covers yet and the piece most likely to be got wrong — it is to be designed against
+   the shipped panel, not inherited from the prototype's sketch.
+
+**How the Director could have ruled otherwise, recorded because it was close.** The feature has no
+users — zero stacks exist anywhere. A1 alone refuses real work and is six lines and 0.03 ms. A3's
+picture consequence is already reachable through an intended slider drag and needs two cards of one
+effect to exist at all; A4's end state is what `POST .../effects/copy` produces on purpose, with an
+announcement. Patching A1 and writing the other two down would have been defensible. It was not
+chosen because A3 would then never close, and because the id is free today in a way it stops being
+the moment a Director saves a stack.
+
+---
+
 ## Delegated decisions
 
 Not the Director's calls. Recorded here because they were made *for* the Director on 2026-08-27,

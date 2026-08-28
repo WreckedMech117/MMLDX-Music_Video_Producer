@@ -13,6 +13,7 @@ cache leaves the export unaffected.
 
 import asyncio
 import dataclasses
+import json
 import math
 import struct
 import subprocess
@@ -2013,3 +2014,63 @@ def test_the_drive_route_404s_for_a_shot_that_is_not_there(tmp_path: Path):
     project_id = a_measured_project_with_a_graded_shot(client, tmp_path)
 
     assert client.get(f"/api/projects/{project_id}/shots/nobody/drive").status_code == 404
+
+
+def test_a_sidecar_element_that_is_not_a_number_is_refused_rather_than_raised(tmp_path: Path):
+    """B3. `effects._envelope_bands` validated the envelope's *shape* and nothing about the
+    numbers in it, and `band_series`' `float()` was unguarded.
+
+    Reproduced 2026-08-28 at `4fd9b41`. A string or a `null` in `bands` raises `ValueError` /
+    `TypeError`, which is not an `EffectRefusal`, and these routes catch nothing else — so
+    `GET .../drive`, the preview and the export each answered **500**.
+
+    **`NaN` was worse and is the reason this test asserts the drive is absent rather than merely
+    non-crashing.** `json.loads` accepts the bare literal, one of them poisons the weighted mean
+    for every band at that tick, and `_punch_series`' running average is poisoned for the whole
+    rest of the song from there — so every binding in the project collapsed to its resting value
+    at rc 0 with `silenced: false`. An un-dimmed flat line and an export that ran and changed
+    nothing: no exception to catch, and no evidence in the picture that anything went wrong.
+
+    Every poison is written straight into the sidecar rather than through `write_song_envelope`,
+    which refuses a non-finite float with `allow_nan=False` — the file on disk is hand-editable
+    and that is the door this closes.
+    """
+    from music_video_producer.effects import BINDING_NO_ENVELOPE_REFUSAL
+
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id = a_measured_project_with_a_graded_shot(client, tmp_path)
+    assert bind_exposure(client, project_id).status_code == 200
+    drive_url = f"/api/projects/{project_id}/shots/shot_a/drive"
+
+    healthy = client.get(drive_url).json()["bindings"]
+    assert healthy and len({value for value in healthy[0]["values"]}) > 2, (
+        "the fixture must drive a real signal, or every assertion below passes for the wrong "
+        "reason"
+    )
+
+    sidecar = store.song_envelope_path(project_id)
+    sound = json.loads(sidecar.read_text(encoding="utf-8"))
+    refusal = BINDING_NO_ENVELOPE_REFUSAL.format(effect="exposure", parameter="amount")
+
+    for poison in ("loud", None, True, float("nan"), float("inf"), 10**401):
+        payload = json.loads(json.dumps(sound))
+        payload["bands"][0][7] = poison
+        # `allow_nan=True` is `json.dump`'s own default and writes the bare `NaN` token, which is
+        # exactly what a hand-edited or foreign-written sidecar can hold and what `json.loads`
+        # reads back without complaint.
+        sidecar.write_text(json.dumps(payload), encoding="utf-8")
+        label = repr(poison)
+
+        served = client.get(drive_url)
+        assert served.status_code == 200, (label, served.text)
+        assert served.json()["bindings"] == [], (
+            f"{label} in the sidecar drew a readout off a measurement nothing can read"
+        )
+
+        previewed = client.post(f"/api/projects/{project_id}/shots/shot_a/preview")
+        assert previewed.status_code == 422, (label, previewed.text)
+        assert previewed.json()["detail"].endswith(refusal), (label, previewed.text)
+
+    # And a sound sidecar put back is driven again: the refusal is of the poison, not of the song.
+    sidecar.write_text(json.dumps(sound), encoding="utf-8")
+    assert client.get(drive_url).json()["bindings"] == healthy

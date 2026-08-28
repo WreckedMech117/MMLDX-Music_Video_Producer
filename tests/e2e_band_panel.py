@@ -51,6 +51,18 @@ And, added by slice E4 as steps 7b and 7c:
    zero as well and its handle has no ground left -- it is withdrawn and the panel names the box
    that still sets it.
 
+And, added 2026-08-28 with two reproduced defects from the Epic 10 retrospective:
+
+7d. **An edge dragged off the end of the strip holds its partner still.** Pointer tracking is
+   bound to `window`, so leaving a 183px canvas mid-drag is an ordinary gesture -- and the width
+   and the centre were clamped to their bounds separately, so the anchored edge jumped 0.90 to
+   0.50. Driven with a real pointer, on both handles, past both ends (B4).
+7e. **A measurement that disagrees with itself about its band count is not drawn.** The strip
+   positioned its bars off the served `band_average` while the compiler weights the sidecar's
+   `bands`, so a hand-edited sidecar -- `analysed: true` and five served against eight measured --
+   painted one band at full weight while the export weighted a different one at 8e-5. The sidecar
+   is trimmed here by hand, and put back before the steps that follow (B2).
+
 The panel's height and its distance below the rail's fold are recorded in both the unbound and
 the bound states, because the strip is 36px added to a panel that was already 503.6px in a 626px
 rail with 212px of it below the fold.
@@ -1174,6 +1186,151 @@ def main() -> None:
             }
             shot(driver, "07c-widened-from-the-minimum")
             strip_shot(driver, "07c-strip-canvas-widened")
+
+            # --- 7d. An edge dragged off the end of the strip holds its partner still --------
+            #
+            # `effectBandStripDrag`'s own comment says *"the opposite edge is what an edge drag
+            # holds still"*, and past the end of the strip it did not: the width was clamped to
+            # its bound and the centre to **its** bound separately, so once the centre clamp bit,
+            # the anchor had been derived from the unclamped width and was never re-derived.
+            # Pointer tracking is bound to `window`, so leaving a 183px canvas mid-drag is an
+            # ordinary gesture -- which is exactly why this is driven with a real pointer here
+            # rather than only as arithmetic in the contract tests.
+            #
+            # Both handles, because the mirror is worse than the reported case: a low edge dragged
+            # off the *bottom* of the spectrum moved its anchored high edge outward, which reads
+            # as the band growing in the direction nobody dragged.
+            edge_cases = []
+            for name, centre, reach_to in (("high", "0.95", "right"), ("low", "0.05", "left")):
+                for setting, value in (("band_width", "0.1"), ("band_centre", centre)):
+                    type_into(driver, f"effect-band-0-amount-{setting}", value)
+                    driver.find_element(By.ID, "shot-tab-effects").click()
+                    settle(driver, "#shot-inspector", quiet_ms=500)
+                    open_effects(driver)
+                wait_for_stack(
+                    server.base_url, project_id,
+                    lambda entries, want=float(centre): (
+                        entries[0]["bindings"][0].get("band_centre") == want
+                        and entries[0]["bindings"][0].get("band_width") == 0.1),
+                    f"the {name}-edge starting band did not reach the manifest",
+                )
+                reach(driver, "effect-band-0-amount-band_centre")
+                placed = look(driver)
+                geometry = strip_geometry(driver, envelope, settings, band_values(placed))
+                held = stack(server.base_url, project_id)[0]["bindings"][0]
+                anchor = (held["band_centre"] + held["band_width"] / 2 if name == "low"
+                          else held["band_centre"] - held["band_width"] / 2)
+                handle = next(item for item in geometry["handles"] if item["name"] == name)
+                # How far off the canvas the pointer can actually be taken, measured rather than
+                # guessed: Selenium refuses a move outside the viewport, and the rail this canvas
+                # lives in is against the right edge of a 1600px window.
+                room = driver.execute_script("return window.innerWidth;")
+                target = (min(geometry["width"] + 220.0, room - geometry["left"] - 4.0)
+                          if reach_to == "right" else -150.0)
+                assert (target > geometry["width"] + 8 if reach_to == "right"
+                        else target < -8), ("the pointer never left the strip", target, room)
+                canvas = driver.find_element(By.CSS_SELECTOR, ".effect-band-strip")
+                pointer = StripPointer(driver, canvas, geometry)
+                pointer.press(handle["x"])
+                pointer.drag_to(target)
+                pointer.release()
+                landed = wait_for_stack(
+                    server.base_url, project_id,
+                    lambda entries: entries[0]["bindings"][0].get("band_width", 0) > 0.1,
+                    f"the {name} edge did not widen the band at all",
+                )[0]["bindings"][0]
+                settle(driver, "#shot-inspector", quiet_ms=500)
+                moved = (landed["band_centre"] + landed["band_width"] / 2 if name == "low"
+                         else landed["band_centre"] - landed["band_width"] / 2)
+                # 0.005 is the half step the quantisation is allowed to move any number by, and
+                # is the tolerance the numeric box beside the canvas already has. The defect
+                # measured 0.40 at these numbers and worsened the further the pointer went.
+                assert abs(moved - anchor) <= 0.005 + 1e-9, (
+                    f"a {name}-edge drag past the end of the strip moved the edge it holds still",
+                    {"anchor": anchor, "after": moved, "from": held, "to": landed,
+                     "pointer": target})
+                edge_cases.append({
+                    "handle": name, "pressed_at": handle["x"], "released_at": target,
+                    "anchor": anchor, "anchor_after": round(moved, 6),
+                    "from": held, "to": landed,
+                })
+                shot(driver, f"07d-{name}-edge-past-the-end")
+                strip_shot(driver, f"07d-strip-canvas-{name}-past-the-end")
+            result["edge_past_the_end"] = edge_cases
+
+            # --- 7e. A measurement that disagrees with itself is not drawn ------------------
+            #
+            # The strip positions bar `k` at `k / (len(band_average) - 1)` off the served array;
+            # the compiler weights band `k` at `k / (len(bands) - 1)` off the sidecar's own. Those
+            # agree only while the sidecar is self-consistent -- and `served_measurement` carries
+            # a short array **short** on purpose, while `song_measurement_verdict` checks
+            # `band_count`, `analysis_rate` and `len(bands)` and neither of the arrays it serves.
+            # So this state is `analysed: true` with a picture that would select one band while
+            # the export drives another, and the whole of the old hint was the Hz tooltip going
+            # quiet. Written here by hand, because a sidecar is a file a Director can edit and
+            # nothing else in this application produces it.
+            spectrum_path = sidecar(
+                server, project_id, manifest(server, project_id)["song"]["analysis"]["path"])
+            whole = json.loads(spectrum_path.read_text(encoding="utf-8"))
+            assert len(whole["band_average"]) == len(whole["bands"]), (
+                "the measurement was already inconsistent", len(whole["band_average"]))
+            trimmed = dict(whole)
+            trimmed["band_average"] = whole["band_average"][:5]
+            spectrum_path.write_text(json.dumps(trimmed), encoding="utf-8")
+            ragged = targets(server, project_id)
+            assert ragged["analysed"] is True, (
+                "the route no longer serves this state, so this step is not the defect", ragged)
+            assert len(ragged["envelope"]["band_average"]) == 5, ragged["envelope"]
+            assert len(ragged["envelope"]["band_edges"]) == len(whole["bands"]) + 1, (
+                ragged["envelope"])
+            driver.refresh()
+            select_project(driver, wait, project_id)
+            driver.find_element(By.CSS_SELECTOR, '[data-panel="timeline"]').click()
+            select_clip(driver, wait, SHOT)
+            open_effects(driver)
+            driver.find_element(By.ID, BIND).click()
+            settle(driver, "#shot-inspector", quiet_ms=350)
+            uncounted = look(driver)
+            # The sentence read off the module the page itself imports, so it is asserted whole
+            # and verbatim rather than paraphrased into this file (house rules).
+            said = driver.execute_async_script(
+                "const done = arguments[0];"
+                "import('/assets/api.js').then((api) => done(api.EFFECT_BAND_STRIP_UNCOUNTED))"
+                ".catch((error) => done(String(error)));")
+            assert uncounted["strip"] is None, (
+                "a spectrum whose arrays disagree was drawn anyway", uncounted["strip"])
+            assert uncounted["undrawn"] and uncounted["undrawn"]["text"] == said, (
+                uncounted["undrawn"], said)
+            assert uncounted["undrawn"]["colour"] == uncounted["palette"]["muted"], (
+                "an absence took an accent", uncounted["undrawn"])
+            # Only the picture is withheld: the three boxes still set the band, and the binding is
+            # still live rather than being drawn as a fault.
+            assert glyph(uncounted, BIND)["state"] == "bound", uncounted["glyphs"]
+            assert uncounted["refusedRows"] == 0, uncounted
+            for control in ("band_centre", "band_width", "band_softness", "floor", "depth"):
+                assert any(item["id"].endswith(control) for item in uncounted["inputs"]), control
+            result["uncounted_spectrum"] = {
+                "served": {"band_average": len(ragged["envelope"]["band_average"]),
+                           "band_edges": len(ragged["envelope"]["band_edges"]),
+                           "bands": len(whole["bands"]), "analysed": ragged["analysed"]},
+                "sentence": uncounted["undrawn"]["text"],
+                "colour": uncounted["undrawn"]["colour"],
+                "strip": uncounted["strip"],
+                "panelBelowFold": uncounted["panelBelowFold"],
+            }
+            shot(driver, "07e-spectrum-that-disagrees-with-itself")
+            # And the measurement put back, so the steps after this one see the song they expect.
+            spectrum_path.write_text(json.dumps(whole), encoding="utf-8")
+            driver.refresh()
+            select_project(driver, wait, project_id)
+            driver.find_element(By.CSS_SELECTOR, '[data-panel="timeline"]').click()
+            select_clip(driver, wait, SHOT)
+            open_effects(driver)
+            driver.find_element(By.ID, BIND).click()
+            settle(driver, "#shot-inspector", quiet_ms=350)
+            restored = look(driver)
+            assert restored["strip"] and restored["painted"], (
+                "the strip did not come back with the measurement", restored["strip"])
 
             # --- 8. A locked Shot: readable, and every writing control disabled --------------
             #

@@ -39,6 +39,7 @@ import numpy as np
 import pytest
 
 from music_video_producer.assembly import trim_args
+from music_video_producer.config import Settings
 from music_video_producer.effects import (
     BINDING_NO_ENVELOPE_REFUSAL,
     BRANCH_FRAME_GUARD,
@@ -1200,6 +1201,57 @@ def test_the_drive_letter_colon_never_reaches_ffmpegs_option_parser():
     with pytest.raises(EffectRefusal) as refusal:
         lut_file_argument(Path("F:/Director's looks/warm.cube"), lut_id="warm")
     assert "contains an apostrophe" in str(refusal.value)
+
+
+def test_a_relative_data_root_is_anchored_before_a_look_reaches_the_chain(tmp_path, monkeypatch):
+    r"""A2, and it is the one relative path the `cwd` fix left in the argv.
+
+    A bound Shot's render runs with ffmpeg's working directory set to the export's `workdir` or
+    to `previews/`, so a `sendcmd` script can be a bare relative filename (R-30). `lut3d=file=`
+    is the only other filesystem reference the composed chain holds, and it is built from
+    `discover_luts(settings.data_root)` — which under `MVP_DATA_ROOT=data` handed back
+    `data/luts/warm-shift.cube`. Reproduced 2026-08-28 through this project's real ffmpeg: a
+    Shot carrying **both** a binding and a Grade card gave rc -2 and
+    `[Parsed_lut3d_6 @ ...] data/luts/warm-shift.cube: No such file or directory`, and the last
+    line of the stderr the Director is shown blames the output file rather than the grade.
+
+    `Settings` anchors it now (`config._anchor_data_root`), and the assertion is written where
+    the fault was visible: the text of the chain. Anything relative in there but the script name
+    is a file ffmpeg will look for in the wrong directory.
+    """
+    monkeypatch.chdir(tmp_path)
+    settings = Settings(data_root="data")
+    assert settings.data_root.is_absolute(), settings.data_root
+    assert settings.data_root == (tmp_path / "data").resolve()
+
+    looks = discover_luts(settings.data_root)
+    warm = next(entry for entry in looks if entry.lut_id == "warm-shift")
+    assert warm.path.is_absolute(), warm.path
+
+    envelope = {"analysis_rate": 30.0, "band_count": 2, "bands": [[0.1] * 60, [0.2] * 60]}
+    composed = build_effect_stages(
+        [
+            {"effect": "lut_look", "parameters": {"lut": "warm-shift"}},
+            {
+                "effect": "bloom",
+                "parameters": {"intensity": 0.2},
+                "bindings": [{"parameter": "intensity", "drive": "punch", "depth": 0.5}],
+            },
+        ],
+        width=EXPORT_WIDTH,
+        height=EXPORT_HEIGHT,
+        luts=looks,
+        envelope=envelope,
+        shot_start=0.0,
+        clip_seconds=2.0,
+        shot_seconds=2.0,
+    )
+    text = ",".join([*composed.geometry, *composed.treatment])
+    assert f"lut3d=file={lut_file_argument(warm.path)}:interp=tetrahedral" in text, text
+    assert "file='data/luts" not in text, text
+    # The script is the one deliberately relative reference, and it is the only one.
+    assert len(composed.scripts) == 1
+    assert f"sendcmd=f={composed.scripts[0].filename}" in text, text
 
 
 # ------------------------------------------------------------------------------------------

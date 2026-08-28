@@ -6898,6 +6898,30 @@ SONG_ENVELOPE_RECORD_DISAGREES = (
 SERVED_ENVELOPE_KEYS = ("beats", "onsets", "band_average", "band_edges")
 
 
+def _served_length(value: Any) -> int | None:
+    """How many numbers this value would put on the wire, or ``None`` if it would be dropped.
+
+    `song_measurement_verdict` asks this so it can tell two states apart that look alike from the
+    outside. A *short* array is a sidecar that disagrees with its own record and nothing downstream
+    can see it -- the spectrum strip positions its bars off `band_average` while the compiler
+    weights off `bands`, so a Director selects one band and drives another. A *malformed* array is
+    already handled by `served_measurement` dropping that one key, which leaves the beats and the
+    gaps intact and lets the client refuse the strip on its own.
+
+    Mirrors `served_measurement`'s own rule deliberately -- a list of finite, non-bool numbers, all
+    or nothing -- rather than restating it loosely, because two spellings of "would this reach the
+    wire" is the shape of defect this application keeps paying for.
+    """
+    if not isinstance(value, list):
+        return None
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            return None
+        if not math.isfinite(item):
+            return None
+    return len(value)
+
+
 def served_measurement(envelope: dict[str, Any] | None) -> dict[str, Any] | None:
     """`SERVED_ENVELOPE_KEYS` off a read envelope, or `None` when there is no measurement.
 
@@ -8008,6 +8032,20 @@ class ExportSubject:
     """
 
     #: One per Shot, in no particular order; every check that reports per clip sorts for itself.
+    #:
+    #: **Every Shot the manifest holds, including one the plan will bury.** `assembly_plan`
+    #: resolves an overlap as layers — later on top — so a Shot another one completely covers
+    #: contributes no frames and does not appear in `plan.clips` at all. It still appears here,
+    #: and that is the plan stage's whole question: *can this project export*, asked of the
+    #: manifest, before a plan exists to ask anything of. The field above says so — `plan` is
+    #: `None` for every plan-stage check — so a check registered in `EXPORT_PLAN_CHECKS` could
+    #: not consult the resolved clips if it wanted to.
+    #:
+    #: Measured 2026-08-28 on a buried Shot, because a rule nobody has run is a guess: **all
+    #: four** plan-stage checks refuse over one — no approved take, a take missing from disk, a
+    #: stack the catalogue refuses, a stack past the card limit, and the binding check beside
+    #: them. `assembly_refusals` has behaved that way since long before any effect existed. See
+    #: `_binding_envelope_refusals` for the ruling that keeps the fifth consistent with the four.
     clips: tuple[ClipWindow, ...]
     #: ffprobe's reading of the song that will play, never the stored field.
     song_seconds: float
@@ -8307,6 +8345,30 @@ def _binding_envelope_refusals(subject: ExportSubject) -> list[str]:
 
     Said once per Shot, like both of its siblings: a Shot another nests inside is two clips here
     and one missing analysis, and a Director told the same sentence twice is worse off.
+
+    **A Shot that renders no frame is still refused over, decided 2026-08-28 and recorded because
+    it was a judgement rather than an oversight.** A Shot completely covered by a later one is in
+    `subject.clips` and not in `plan.clips`, so this refuses an export the buried Shot could not
+    have changed. Three things settle it. The first is that this check *cannot* see the plan —
+    `ExportSubject.plan` is `None` at the plan stage, by construction — so "skip it" would mean
+    moving this to the composition stage, where the two remaining plan checks about a stack would
+    still disagree with it. The second is measured: with a Shot buried, an unapproved take, a
+    take missing from disk, a stack the catalogue refuses and an oversized stack **each already
+    refuse the export by that Shot's name**, and the oldest of those is `assembly_refusals`,
+    which predates every effect in this application. Skipping here would make one of five checks
+    answer a different question about the same Shot. The third is the sentence itself: its remedy
+    is *analyse the song again*, one gesture that clears every bound Shot in the project at once,
+    not *unbind this one* — so a Director is never held by a Shot they cannot see.
+
+    The mirror is what would be worse. An export that ignores a buried Shot succeeds today and
+    refuses tomorrow, when the Director drags the covering Shot aside and unburies a binding they
+    never touched, for a song they replaced weeks ago.
+
+    `_compose_effect_chains` iterates `plan.clips` instead, and that is not the same rule read
+    two ways: it does not judge, it *builds* — one composed chain per plan index, and a record of
+    the look that actually ran. A Shot contributing no frames must contribute no chain and no
+    provenance entry, which is the same principle as `ExportLook`'s "only the effects that
+    actually composed a stage are listed".
     """
     bound = _bound_shot_ids(subject)
     if not bound:
@@ -8819,6 +8881,30 @@ def song_measurement_verdict(
         envelope.get("band_count") != analysis.band_count
         or envelope.get("analysis_rate") != analysis.analysis_rate
         or len(envelope.get("bands") or ()) != analysis.band_count
+        # The two arrays this application actually *serves*, added 2026-08-28. The comment above
+        # names the hazard exactly -- a consumer reads `band_count` off the record and then indexes
+        # the file -- and `band_average` and `band_edges` were the two consumers it did not check.
+        # The browser never sees `bands`, so the spectrum strip positions its bars off
+        # `band_average` while the compiler weights off `bands`: with the two disagreeing, the
+        # strip painted its middle bar at full weight over bands the export weighted at 8e-05, and
+        # a Director selected one band and drove another. The client now refuses to draw when
+        # `band_edges` fails to corroborate `band_average`, but corroboration is not proof -- a
+        # sidecar trimmed in both still lies, and only this check can see that. `audio.py` writes
+        # all three from one `band_count` in one breath, so any disagreement is a hand edit or a
+        # half-written file, and the remedy is the one this verdict already offers: re-analyse.
+        #
+        # **Only when the array is drawable, which is the whole subtlety.** A *malformed*
+        # `band_average` -- nested lists, a string, a null inside it -- is already handled, and
+        # better: `served_measurement` drops that one key, the rest of the envelope survives, and
+        # the client's own corroboration then refuses to draw a strip. Refusing the whole
+        # measurement there would take the beats and the gaps down with a key nobody asked for,
+        # which is what `test_a_sidecar_the_reader_accepts_but_cannot_be_drawn_is_still_a_200`
+        # exists to prevent -- and what the first draft of this check did. So the length is
+        # compared only for a value that would actually reach the wire; anything else is left to
+        # the drop. The state this catches is the one no client can see: both arrays present,
+        # well-formed, agreeing with each other, and disagreeing with the record.
+        or _served_length(envelope.get("band_average")) not in (None, analysis.band_count)
+        or _served_length(envelope.get("band_edges")) not in (None, analysis.band_count + 1)
     ):
         return SongMeasurement(False, SONG_ENVELOPE_RECORD_DISAGREES)
     return SongMeasurement(True, "", envelope)

@@ -605,7 +605,34 @@ So that I can tell whether it is firing on the hits or flickering on noise.
 
 **Given** a screen reader
 **When** the readout is encountered
-**Then** the canvas is `aria-hidden` and the facts it conveys — where the drive peaks, and whether it fires at all — are also stated in text on the band panel (UX-DR7, UX-DR15).
+**Then** the canvas is `aria-hidden` and the facts it conveys — where the drive peaks, and whether it fires at all — are also stated in text ~~on the band panel~~ **in a caption inside the readout's own `<figure>`** (UX-DR7, UX-DR15) *(amended 2026-08-28, R-32. The band panel is closed most of the time, so a screen reader meeting the canvas with no panel open would get nothing — which is the case this criterion exists to serve. R-32 ruled this on 2026-08-27 and amended UX-DR7; **this line was missed**, and the retrospective found it. As-built: `api.js`'s `EFFECT_BAND_READOUT_NOTE` points at the readout without restating its numbers, because repeating them is the doubled-sentence defect Story 10.2's browser QA found.)*
+
+### Shipped in Epic 10 and described by no criterion *(recorded 2026-08-28)*
+
+Found by the retrospective. Each is a real decision that reached the product recorded only in a
+docstring, which is how a later epic re-derives it wrongly or a reviewer reads it as an accident.
+
+- **The binding route addresses a card by index *and* by the effect name the client believes sits
+  there**, refusing with four distinct sentences (`SHOT_BINDINGS_UNNAMED_CARD_REFUSAL`,
+  `…CARD_MOVED…`, `…NO_SUCH_CARD…`, `…ABSENT…`). R-26 rejected `(index, parameter)` as the
+  *storage* key and said nothing about the *route's* addressing; this is the mitigation, and it is
+  a design decision of real consequence — an `EffectSpec` has no id and two Blooms are still two
+  Blooms.
+- **"Carry, never mint"** — `binding_census` plus `carried_bindings_refusal` refuse any generic
+  write that introduces a binding the project does not already hold, scoped per-Shot on the narrow
+  route and per-project on the plan write, which is what lets Split and Duplicate carry a binding
+  onto a new Shot. AD-16 asks for an `_adopt_*` guard; this is a refusal mechanism instead. The
+  retrospective found three defects that are consequences of that shape, so the substitution is
+  worth stating rather than leaving in a docstring.
+- **A preview refuses a bound Shot on a stale envelope**, before the cache is consulted. Story
+  10.4's AC covers the **export** only; the preview half is promised to the Director in prose by
+  `EFFECT_BAND_UNRESOLVABLE_NOTE` and described in no criterion.
+- **The readout draws one binding and names the others.** With a panel open it draws that
+  parameter's; with none, the first in composed-chain order. No criterion says how one is chosen —
+  only R-32's requirement that the caption say which.
+- **The softness handle can be withdrawn.** Story 10.2's AC says *"a handle sets softness"*
+  unconditionally; below a five-pixel target the handle is withdrawn and named, because at the
+  minimum band width on a 183px canvas there is not three pixels of ground for it.
 
 ### Story 10.4: Bindings Survive a Song Change
 
@@ -617,7 +644,7 @@ So that re-analyzing brings my work back instead of my having to rebuild it.
 
 **Given** a Project with no Song Envelope
 **When** the Director clicks a bind glyph
-**Then** the glyph is present but inert, and clicking it opens a one-line refusal naming the reason with an action — `No song analysis yet — bands need it. [Analyze song]` (FX-15, UX-DR12)
+**Then** the glyph is present and ~~inert~~ **answering**, and acting on it opens the reason with an action (FX-15, UX-DR12) *(amended 2026-08-28. Two clauses were wrong and the criterion contradicted itself — a control cannot be **inert** and also open something. As-built the glyph is a real button on every row that opens the panel, and the panel names **which** absence it is: the sentence is composed from the server's own `analysis_absence_reason` — never-taken, song-changed and sidecar-unreadable are different remedies and a Director can act on the difference — plus `EFFECT_BAND_NEEDS_MEASUREMENT` and the `[Analyze song]` action. The literal string this line quotes appears **nowhere** in the shipped code; the composed form is strictly better and was authorised by slice E3's spec. What survives unchanged is the clause below, which was always the point.)*
 **And** the glyph is never hidden, because a hidden control teaches nothing about what the product can do.
 
 **Given** a Project whose Song has been replaced, invalidating the envelope

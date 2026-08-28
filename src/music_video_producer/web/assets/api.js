@@ -6732,21 +6732,19 @@ export const EFFECT_BAND_LEGEND = "{label} · band";
 export const EFFECT_BAND_READOUT_NOTE =
   "The envelope this binding produces is drawn under the Monitor while this panel is open.";
 
-//: Every setting the panel draws, in the order it draws them.
+//: What each served band setting is called on the panel.
 //:
-//: **All six, `hold` and `sustain` included.** They were left out of the first pass and that was
-//: an acceptance criterion unmet rather than a slice boundary: story 10.1 says `sustain` *"engages
-//: only after its band holds above a level for a hold time, and survives dips for a sustain
-//: time"*, and a Director who could not reach either had a drive with two numbers they could not
-//: choose. Restored 2026-08-27.
+//: **There is no list of which settings are drawn** -- `effectBandPanel` draws every one the
+//: server offers, in the order it offers them. There was such a list, six names long, and it was
+//: a hardcoded client filter over a served catalogue: a seventh entry added to
+//: `effects.BINDING_SETTINGS` would have been served, validated, stored and silently never drawn,
+//: which is this application's catalogue convention exactly inverted. Removed 2026-08-28.
 //:
-//: The order here is the *shared* settings' order. A setting only one drive reads is grouped after
-//: depth by `effectBandPanel`, off the served `drive` field rather than off a position in this
-//: list -- so a third such setting would group itself.
-export const EFFECT_BAND_DRAWN_SETTINGS = [
-  "band_centre", "band_width", "band_softness", "floor", "hold", "sustain",
-];
-
+//: What remains is naming, which genuinely is this file's: a served `name` is a wire identifier
+//: and `Centre` is a word for a Director. A setting with no entry here would draw under its own
+//: key, and `test_the_band_panel_draws_every_setting_the_server_offers` fails on it -- so the
+//: server growing a setting is a failing test that says *name this*, never a control that
+//: quietly does not exist.
 export const EFFECT_BAND_SETTING_LABELS = {
   band_centre: "Centre",
   band_width: "Width",
@@ -6920,6 +6918,17 @@ export function effectBandMeasurement(project = null, report = null) {
   // reason. `SERVED_ENVELOPE_KEYS` puts them on this body precisely so the band selector needs no
   // second request -- and reading them here rather than inside the strip's own plan is what makes
   // the panel's absences and its drawing describe one measurement instead of two.
+  //
+  // **They are carried as read and judged by `effectBandSpectrumAgrees`**, which is the strongest
+  // check available on this side of the wire and not a complete one. What would close it whole is
+  // one length check on the server: `song_measurement_verdict` already refuses a sidecar whose
+  // `band_count`, `analysis_rate` or `len(bands)` disagree with the record, in that branch's own
+  // words *"a consumer reads `band_count` off the record and then indexes `bands` in the file"* --
+  // and `band_average` and `band_edges` are exactly such consumers and are exactly the two it does
+  // not check. Adding `len(band_average) != band_count` and `len(band_edges) != band_count + 1`
+  // there would make the disagreement a refused measurement with a sentence the panel already
+  // draws, instead of a picture this file has to decline to paint. It is one file this browser
+  // does not own; recorded here so it is asked for rather than assumed.
   const spectrum = {
     bands: bandNumbers(report?.envelope?.band_average),
     edges: bandNumbers(report?.envelope?.band_edges),
@@ -7052,6 +7061,23 @@ export const EFFECT_STRIP_BAR_GAP = 2;
 export const EFFECT_BAND_STRIP_UNDRAWN =
   "This song's measurement carries no spectrum to draw, so the band is these numbers.";
 
+//: And what it says when the measurement carries a spectrum it **cannot say the shape of**: a
+//: `band_average` and a `band_edges` that disagree about how many bands were measured.
+//:
+//: A separate sentence from the one above, because it is a separate absence with a separate
+//: remedy -- one song was never measured across the spectrum, the other was measured and its
+//: sidecar has since been edited into disagreeing with itself. Re-analysing fixes the second and
+//: is already offered by the panel's own absences; nothing fixes the first but measuring.
+//:
+//: It says *disagrees with itself* rather than naming the two arrays, because the arrays are the
+//: sidecar's business and the Director's remedy is the same whichever of them is wrong. What it
+//: does not do is claim the band is unusable: the three numbers still set it, the export still
+//: hears it, and only the picture is withheld -- which `effectBandSpectrumAgrees` explains at
+//: length and this sentence has to fit in a 260px rail.
+export const EFFECT_BAND_STRIP_UNCOUNTED =
+  "This song's measurement disagrees with itself about how many bands it holds, so the strip "
+  + "cannot say which band is where and the band is these numbers.";
+
 //: And what it says when the softness handle has nowhere to sit: a band pushed against the end of
 //: the spectrum, or one whose edges are so hard that the falloff has no room outside them, leaves
 //: that handle no ground to be pressed on. The gesture is withdrawn and the box that still sets
@@ -7156,16 +7182,49 @@ function bandHertz(value) {
   return `${k < 10 ? Number(k.toFixed(1)) : Math.round(k)} kHz`;
 }
 
+// Whether a served measurement can say **how many bands there are** -- which is the one question
+// the picture and the compiler have to answer the same way.
+//
+// The compiler weights band `k` at `k / (len(bands) - 1)` off the sidecar's own `bands`
+// (`effects.band_series`). The strip positions bar `k` at `k / (len(band_average) - 1)`. Those
+// two agree only while the sidecar is self-consistent, and `served_measurement` deliberately
+// carries a short array **short** rather than padding it -- so a hand-edited sidecar can present
+// a `band_average` of one length beside a `bands` of another, and `song_measurement_verdict`
+// checks `band_count`, `analysis_rate` and `len(bands)` and never the two arrays that are served.
+// Reproduced: `band_average` trimmed to five against eight `bands` answers `analysed: true`, and
+// the strip paints its mid bar at full weight while the export weights the two nearest bands at
+// about 8e-5 apiece. **The Director selects over what the picture shows and drives something
+// else** -- the sixth instance of this repository's oldest defect, after `shotLabel`, the H3
+// partition, the preview fingerprint, the section membership rule and `previewInputKey`.
+//
+// `bands` is not on the wire and neither is `band_count`, so this browser cannot read the
+// compiler's count directly. What it has is `band_edges`, which `audio.py` writes from the same
+// `band_count` in the same breath -- one more edge than there are bands. So the two served arrays
+// **corroborate each other's count**, and a pair that does not agree is a measurement this cannot
+// say where a band is on. It is not drawn at all, which is the spec's own acceptance criterion
+// (*"with `band_edges` that do not match `band_average`, then the drawing is short or absent
+// rather than invented"*) said about the whole picture rather than only about its tooltip.
+//
+// **This is a corroboration and not a proof, and the difference belongs on the server.** A
+// sidecar hand-edited to trim `band_average` *and* `band_edges` together still lies, and no
+// client check can see it. The fix that closes it whole is one length check in
+// `song_measurement_verdict` -- see the note on `effectBandMeasurement`.
+export function effectBandSpectrumAgrees(bands, edges) {
+  const count = (bands || []).length;
+  return count > 0 && (edges || []).length === count + 1;
+}
+
 // The frequencies this band covers, or `""` where the measurement cannot say.
 //
-// **`band_edges` is read only where it matches `band_average`.** `audio.py` writes one more edge
+// **`band_edges` is read only where it matches `band_average`**, which is
+// `effectBandSpectrumAgrees` and not a second opinion about it. `audio.py` writes one more edge
 // than there are bands; a sidecar whose two disagree is a file this cannot describe, and
 // inventing an edge for it would print a frequency nobody measured. The bands whose own positions
 // fall inside the region are the ones it covers; a region narrow enough to fall between two of
 // them takes the nearer one.
 function bandHertzSpan(bands, edges, centre, width) {
   const count = bands.length;
-  if (!count || edges.length !== count + 1) return "";
+  if (!effectBandSpectrumAgrees(bands, edges)) return "";
   const at = (index) => (count > 1 ? index / (count - 1) : 0);
   const half = Number(width) / 2;
   const inside = [];
@@ -7211,7 +7270,14 @@ export function effectBandStripPlan({
     shown: false, count: level.length, bars: [], curve: [], handles: [], targets: [],
     note: "", hz: "",
   };
+  // **Nothing is drawn on a measurement that cannot say how many bands it has.** A bar's position
+  // *is* the band the export weights, so a count the two served arrays do not corroborate is a
+  // picture that would put the Director's band somewhere the compiler does not hear it -- and a
+  // strip that is absent costs them the picture, while a strip that is wrong costs them the take.
+  // Applied here as well as at the panel that feeds it, because this is where the position is
+  // computed and a caller that had not asked the question is exactly how the answer drifts.
   if (!level.length || !axis || !(tall > 0)) return absent;
+  if (!effectBandSpectrumAgrees(level, frequencies)) return absent;
   const bounds = {
     centre: bandBounds(settings, "band_centre"),
     width: bandBounds(settings, "band_width"),
@@ -7353,10 +7419,39 @@ export function effectBandStripDrag(plan, hit, x, settings = []) {
     return { band_centre: bandQuantised(position, bounds.centre) };
   }
   if (hit.target === "low" || hit.target === "high") {
-    const fixed = hit.target === "low" ? centre + span / 2 : centre - span / 2;
-    const wanted = hit.target === "low" ? fixed - position : position - fixed;
-    const width = bandQuantised(wanted, bounds.width);
-    const moved = hit.target === "low" ? fixed - width / 2 : fixed + width / 2;
+    // Which way this edge widens the band, so the two cases are one piece of arithmetic and the
+    // anchor is derived once rather than written out twice and kept in step by hand.
+    const sign = hit.target === "low" ? -1 : 1;
+    const fixed = centre - sign * (span / 2);
+    const wanted = sign * (position - fixed);
+    // **Every width this drag may resolve to, from both served bounds at once -- and this is the
+    // whole of the fix.** The width's own bound is not the only one that binds: a width whose
+    // resulting centre would leave the *centre's* bound is equally impossible, and clamping the
+    // two separately meant the centre clamp bit after the anchor had already been derived from
+    // the unclamped one. The edge this gesture holds still then moved. Reproduced at the real
+    // 183px geometry with eight bands, from `band_centre` 0.95 and `band_width` 0.10: a press on
+    // the `high` handle dragged to x = 400 answered `{band_width: 1, band_centre: 1}`, so the
+    // anchored low edge jumped 0.90 to 0.50 and the band covered the mids; at x = 200, seventeen
+    // pixels past the canvas, it still slipped to 0.86, and it worsened the further the pointer
+    // went. Pointer tracking is bound to `window`, so leaving a 183px strip mid-drag is an
+    // ordinary gesture and not an exotic one.
+    //
+    // Folded into the width *before* it is resolved, the centre clamp has nothing left to bite
+    // on: the drag saturates against the end of the spectrum with its anchor exactly where the
+    // press left it, which is what a clamp is supposed to look like. What remains is the half
+    // step the quantisation below is allowed to move any number by -- 0.005, the same tolerance
+    // the numeric box beside the canvas has -- and never more.
+    const limit = (value) => Number(Number(value).toFixed(6));
+    const highest = limit(Math.min(
+      bounds.width.maximum,
+      2 * sign * ((sign > 0 ? bounds.centre.maximum : bounds.centre.minimum) - fixed),
+    ));
+    const lowest = limit(Math.min(highest, Math.max(
+      bounds.width.minimum,
+      2 * sign * ((sign > 0 ? bounds.centre.minimum : bounds.centre.maximum) - fixed),
+    )));
+    const width = bandClamp(bandQuantised(wanted, bounds.width), lowest, highest);
+    const moved = fixed + sign * (width / 2);
     return { band_width: width, band_centre: bandQuantised(moved, bounds.centre) };
   }
   // Softness, and the clamp is geometry as well as bound: the handle sits `soft` outside the
@@ -7407,7 +7502,20 @@ export function effectBandValues(settings, binding = null, draft = null) {
 export function effectBandReady(values) {
   const needs = [];
   if (!values?.drive) needs.push(EFFECT_BAND_NEEDS_DRIVE);
-  if (bandNumber(values?.depth) === null) needs.push(EFFECT_BAND_NEEDS_DEPTH);
+  // **Zero is not a depth, and the route refuses it by name** (`BINDING_DEPTH_ZERO_REFUSAL`,
+  // 2026-08-28). A binding at depth 0 compiles a full script that writes the resting value at
+  // every tick and renders frames byte-identical to the undriven chain at rc 0 -- this feature's
+  // own silent failure mode, reached through a supported gesture. R-28 makes a bound parameter
+  // compose its stage *at* the identity value precisely so a binding is never inert; a zero depth
+  // put the inertness back one level up.
+  //
+  // This line is the client's half. Everything else in this file already agreed with the server:
+  // `bandNumber` exists so an emptied box never becomes 0, and both its comment and
+  // `effectBandChange`'s carry the same sentence. Only this `=== null` disagreed, which is why a
+  // 200 was reachable at all. Not-ready is the right answer mid-drag on a range that spans zero:
+  // the panel says what is still needed and nothing is written.
+  const depth = bandNumber(values?.depth);
+  if (depth === null || depth === 0) needs.push(EFFECT_BAND_NEEDS_DEPTH);
   return { ready: needs.length === 0, needs };
 }
 
@@ -7588,17 +7696,27 @@ export function effectBandPanel(parameter, spec, {
       disabled: Boolean(locked) || idle,
     };
   };
-  const drawn = EFFECT_BAND_DRAWN_SETTINGS
-    .map((key) => (settings || []).find((setting) => String(setting?.name ?? "") === key))
-    .filter(Boolean)
+  // **Every setting the server offers, in the order it offers them.** This was a hardcoded list
+  // of six names filtering a *served* catalogue, which is the catalogue convention inverted: a
+  // seventh entry added to `effects.BINDING_SETTINGS` would be served, validated, stored and
+  // silently never drawn, and the only thing that would have said so was a constant nobody had
+  // to update. Derived, a new setting appears the day the server offers it, with its served
+  // bounds and its served `drive`; `EFFECT_BAND_SETTING_LABELS` carries the test that makes it
+  // appear *named* rather than under its own wire key.
+  //
+  // `depth` is not among them and is not missing: it is not a `BINDING_SETTINGS` entry at all --
+  // its bound is the *parameter's* own span rather than a catalogue number -- so it is built
+  // below and slotted between the shared settings and the gated ones.
+  const drawn = (settings || [])
+    .filter((setting) => String(setting?.name ?? ""))
     .map((setting) => control(
       String(setting.name), Number(setting.minimum), Number(setting.maximum),
       EFFECT_BAND_SETTING_HELP[String(setting.name)] || "",
       String(setting.drive || ""),
     ));
   // Grouped by whether one drive owns them, off the served field rather than off a position in
-  // `EFFECT_BAND_DRAWN_SETTINGS`: the band and its floor first, then depth, then the gate's own
-  // timings at the foot where a Director reads them last and only when they matter.
+  // the served list: the band and its floor first, then depth, then the gate's own timings at the
+  // foot where a Director reads them last and only when they matter.
   const shared = drawn.filter((entry) => !entry.drive);
   const gated = drawn.filter((entry) => entry.drive);
   const depth = {
@@ -7608,6 +7726,10 @@ export function effectBandPanel(parameter, spec, {
     // entitled to propose, and a prefilled one would be a value the Director never chose.
     value: bandNumber(values.depth),
   };
+  // Whether the served spectrum can say where a band is, asked once and answered for the whole
+  // panel -- the drawing, the sentence that stands in for it, and the arrays handed to the canvas
+  // all come off this one call rather than each asking for themselves.
+  const counted = effectBandSpectrumAgrees(measurement?.bands, measurement?.edges);
   return {
     shown: true,
     state,
@@ -7643,13 +7765,22 @@ export function effectBandPanel(parameter, spec, {
     // measurement carries no spectrum" underneath is a second sentence about one absence, which
     // is the thing this panel refuses everywhere else. Caught by looking, 2026-08-27: the strip's
     // first pass printed both, one under the other, on the same screen.
+    //
+    // **And a spectrum whose own two arrays disagree about how many bands there are is not
+    // drawn either**, with its own sentence saying so. A bar's position is the band the export
+    // weights, so a count this browser cannot corroborate would be a picture selecting one band
+    // while the compiler drives another -- `effectBandSpectrumAgrees` carries the measurement
+    // and the reproduction. The three numeric boxes are untouched by it: they are the band's
+    // accessible equivalent and they still set it, which is why only the picture is withheld.
     strip: {
-      shown: (measurement?.bands || []).length > 0,
-      note: (measurement?.bands || []).length || state === "unresolvable"
+      shown: counted,
+      note: counted || state === "unresolvable"
         ? ""
-        : EFFECT_BAND_STRIP_UNDRAWN,
-      bands: measurement?.bands || [],
-      edges: measurement?.edges || [],
+        : ((measurement?.bands || []).length
+          ? EFFECT_BAND_STRIP_UNCOUNTED
+          : EFFECT_BAND_STRIP_UNDRAWN),
+      bands: counted ? (measurement?.bands || []) : [],
+      edges: counted ? (measurement?.edges || []) : [],
       // Drawn on a locked Shot and not operable on one -- the stack is readable and every writing
       // control is off, which is FX-7 as this panel already applies it to its boxes and its
       // drives. A canvas has no `disabled`, so the gesture is simply never bound.
