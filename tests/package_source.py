@@ -62,13 +62,14 @@ def module_name(path: Path) -> str:
     return path.relative_to(PACKAGE).as_posix()
 
 
-def module_code(path: Path) -> str:
-    """One module's source with its comments and docstrings blanked out.
+def _prose_spans(text: str) -> list[tuple[int, int, int, int]]:
+    """Where this module's prose is: every `#` comment, and every module/class/function docstring.
 
-    Blanked, not deleted: every surviving character keeps its line and column, so a count made
-    here and a line number read off the file still describe the same place.
+    A span is `(start_row, start_col, end_row, end_col)`, rows 1-based, exactly as the tokenizer
+    and the parse tree report them. `module_code` blanks these out; `module_prose` keeps only
+    these, so the two are complements over the same character grid and a line number read off
+    either still means what it says in the file.
     """
-    text = path.read_text(encoding="utf-8")
     spans: list[tuple[int, int, int, int]] = []
     tree = ast.parse(text)
     for node in ast.walk(tree):
@@ -83,17 +84,50 @@ def module_code(path: Path) -> str:
     for token in tokenize.generate_tokens(io.StringIO(text).readline):
         if token.type == tokenize.COMMENT:
             spans.append((token.start[0], token.start[1], token.end[0], token.end[1]))
+    return spans
 
-    grid = [list(line) for line in text.splitlines(keepends=True)]
+
+def _blank(text: str, spans: list[tuple[int, int, int, int]], *, keep: bool) -> str:
+    """`text` with `spans` blanked out (`keep=False`) or with everything *else* blanked
+    (`keep=True`). Either way every surviving character keeps its line and column."""
+    lines = text.splitlines(keepends=True)
+    if keep:
+        grid = [[" " if character != "\n" else "\n" for character in line] for line in lines]
+    else:
+        grid = [list(line) for line in lines]
     for start_row, start_col, end_row, end_col in spans:
         for row in range(start_row, end_row + 1):
+            source_line = lines[row - 1]
             line = grid[row - 1]
             first_col = start_col if row == start_row else 0
-            last_col = end_col if row == end_row else len(line)
+            last_col = end_col if row == end_row else len(source_line)
             for index in range(first_col, min(last_col, len(line))):
-                if line[index] != "\n":
-                    line[index] = " "
+                if source_line[index] != "\n":
+                    line[index] = source_line[index] if keep else " "
     return "".join("".join(line) for line in grid)
+
+
+def module_code(path: Path) -> str:
+    """One module's source with its comments and docstrings blanked out.
+
+    Blanked, not deleted: every surviving character keeps its line and column, so a count made
+    here and a line number read off the file still describe the same place.
+    """
+    text = path.read_text(encoding="utf-8")
+    return _blank(text, _prose_spans(text), keep=False)
+
+
+def module_prose(path: Path) -> str:
+    """One module's comments and docstrings, with its *code* blanked out — `module_code`'s inverse.
+
+    The two together are the whole file and they do not overlap, which is the property the
+    stale-claim scan needs: a sentence found here is prose, and a token found in `module_code`
+    is code. "This thing does not exist yet" written in prose about a name that is now in code
+    is exactly the shape Epic 10 shipped four times, and it is only separable because these two
+    reads are complements rather than two greps over the same text.
+    """
+    text = path.read_text(encoding="utf-8")
+    return _blank(text, _prose_spans(text), keep=True)
 
 
 @lru_cache(maxsize=1)

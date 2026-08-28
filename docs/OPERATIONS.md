@@ -255,14 +255,23 @@ Both the repo adapter (`patch_ltx25_dimension_boundary`) and the Director's save
 
 ### Self-hosting browser QA (no server to start)
 
-> **None of these run under `uv run pytest -q`.** `pyproject.toml` sets `testpaths = ["tests"]` and
-> pytest's default `python_files = test_*.py`, so every `tests/e2e_*.py` file is **outside the
-> suite**: a green run says nothing about any of them. This is not theoretical. `e2e_effects_tab.py`
-> broke on Epic 10's first slice — a stack-equality predicate met a wire that had gained
-> `bindings: []` — and **four consecutive slices reported green gates over it** before an audit ran
-> the harnesses. Two more, `e2e_seed_and_asset_tabs.py` and `e2e_shot_controls.py`, are failing
-> today and predate Epic 10 entirely (see `deferred-work.md`). **Run the harnesses that touch what
-> you changed, and say which you ran.**
+> **None of these run under `uv run pytest -q`, and that is still true of every assertion in
+> them.** `pyproject.toml` sets `testpaths = ["tests"]` and pytest's default
+> `python_files = test_*.py`, so no `tests/e2e_*.py` file is collected as a test. This is not
+> theoretical. `e2e_effects_tab.py` broke on Epic 10's first slice — a stack-equality predicate met
+> a wire that had gained `bindings: []` — and **four consecutive slices reported green gates over
+> it** before an audit ran the harnesses. Two more, `e2e_seed_and_asset_tabs.py` and
+> `e2e_shot_controls.py`, are failing today and predate Epic 10 entirely (see `deferred-work.md`).
+> **Run the harnesses that touch what you changed, and say which you ran.**
+>
+> *Amended 2026-08-28, and the sentence being amended is the one that said a green run "says
+> nothing about any of them".* Since `tests/test_e2e_harnesses.py`, a green run now says four
+> things about all twenty-three, none of which needs a browser: **each one parses, each one
+> imports** (with `selenium` stubbed, so a name a sibling harness stopped exporting fails the
+> suite), **each one appears in the list below with the port it really starts on**, and **the
+> collisions marked below are exactly the collisions there are**. It says nothing whatever about
+> whether any of them *passes* — the two failing today are green under it — so the instruction in
+> bold above is unchanged. See that module's own docstring for the full list of what it lets past.
 
 ```bash
 uv run --with selenium python tests/e2e_shot_controls.py         # default port 8767
