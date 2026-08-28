@@ -95,6 +95,7 @@ from .effects import (
     LutParameter,
     NumberParameter,
     ParameterBinding,
+    agreed_bindings,
     build_effect_stages,
     discover_luts,
     exported_bindings,
@@ -2296,19 +2297,31 @@ def _adopt_shot_effects(
 
     **A Parameter Binding lives inside `EffectSpec`, and it needed no matching helper of its own**
     — which was worth checking rather than assuming, because a binding is nested one level deeper
-    than anything the `_adopt_*` family has guarded before, and `EffectSpec` carries no id for a
-    positional write to key against. Both branches above already answer it:
+    than anything the `_adopt_*` family has guarded before. Both branches above answer it:
 
     * An **existing** Shot's whole stack is taken off the store and the body is discarded, in both
       directions. A binding riding inside that stack was therefore server-owned by this guard from
       the moment the field existed. There is nothing to match, because nothing is merged.
     * A **new** Shot's stack is validated and kept, for `SHOT_PLAN_CONTENT_FIELDS`' reason, and a
-      binding is part of the look that argument is about. What the binding adds is one further
-      question the stack alone did not raise — *where did this come from?* — because a stack may
-      legitimately be invented by a client and a binding may not (AD-16). That is
-      `carried_bindings_refusal`, below: carried from the stored project, or refused by name.
+      binding is part of the look that argument is about. Its bindings are then **adopted from the
+      stored card each one names** — `adopted_effect_stack`, with the project's cards as the source,
+      because the whole point of a Split is that this id did not exist a moment ago and the stack
+      came off a sibling. Every card is minted a new id on the way in, so the two Shots do not both
+      claim the card the copy was taken from. A card naming no card the project holds is answered
+      by `_copied_bindings` rather than by its id, because this is the door a replayed Undo or Redo
+      arrives at and the card such a replay names may be one the replay itself deleted.
 
-    So the nested field costs one extra call on one branch, not a fourteenth adopt helper.
+    **That replaced a refusal on 2026-08-28 (R-33).** The binding used to be guarded here by
+    `carried_bindings_refusal`, a multiset of validated bindings held across every stored Shot,
+    and it failed three ways this cannot: one deleted `.cube` anywhere in the project emptied that
+    multiset and refused every Split and Duplicate of every bound Shot (A1); the count was checked
+    once per arriving Shot rather than across the write, so one held binding multiplied onto
+    arbitrarily many new ids (A4); and a body that carried *fewer* bindings than were held was
+    accepted, so a Split that dropped one landed silently. Adoption answers all three by not
+    reading the body at all — and it costs no folder read, which is what lets it run on every
+    ordinary save rather than only on a stack that carries a binding.
+
+    So the nested field costs one call on one branch, not a fourteenth adopt helper.
     """
     for shot in project.shots:
         was = stored.get(shot.id)
@@ -2348,43 +2361,34 @@ def _adopt_shot_effects(
                     shot=shot_label(project, shot), detail=refusal
                 ),
             ) from refusal
-        # Carry, never mint — the other half of the sentence above, for the field inside the
-        # field. A new Shot's stack is kept because Split and Duplicate produce one, and a
-        # binding is part of the look those two copy: `SHOT_PLAN_CONTENT_FIELDS` says the two
-        # halves of one shot are one shot's look, and a half that lost its binding would move
-        # differently from its own other half. So a binding the **project** already holds may
-        # ride onto the new id, and one it does not is refused by name with nothing saved. That
-        # keeps the door open to exactly the write a Director really makes and shut to a client
-        # inventing filter automation on a shot id nobody has seen before.
+        # Adopted from the card each entry names, for the field inside the field. A new Shot's
+        # stack is kept because Split and Duplicate produce one, and a binding is part of the look
+        # those two copy: `SHOT_PLAN_CONTENT_FIELDS` says the two halves of one shot are one
+        # shot's look, and a half that lost its binding would move differently from its own other
+        # half. So the bindings this Shot ends up with are the stored card's, whatever the body
+        # says about them — invented, altered, relocated or dropped.
         #
-        # Held across every stored Shot rather than one, because the whole point of a Split is
-        # that the new id did not exist a moment ago and the stack came off a sibling.
+        # `elsewhere` and never `own`: this branch is only reached for a Shot the store does not
+        # hold, so every card here was copied off a sibling and every one is minted a new id. That
+        # is the cloned-id resolution, at the door the clone arrives through.
         #
-        # Asked only of a stack that actually carries one, because answering it means validating
-        # every stored Shot's stack in the project: a Split of an ungraded or unbound look — which
-        # is every Split until a Director binds something — costs nothing at all.
-        uncarried = (
-            carried_bindings_refusal(
-                stack,
-                held=[
-                    spec.model_dump()
-                    for was_shot in stored.values()
-                    for spec in was_shot.effects
-                ],
-                source=BINDING_CARRIER_PROJECT,
-                luts=luts,
-            )
-            if any(spec.get("bindings") for spec in stack)
-            else ""
+        # No `luts` and no validation of the stored side, which is what makes it free enough to
+        # run on every ordinary save — and it is also A1's dissolution: the old check validated
+        # every stored Shot's stack, so one deleted `.cube` anywhere in the project refused every
+        # Split of every bound Shot.
+        adoption = adopted_effect_stack(
+            stack,
+            elsewhere=[spec for was_shot in stored.values() for spec in was_shot.effects],
+            source=BINDING_CARRIER_PROJECT,
         )
-        if uncarried:
+        if adoption.refusal:
             raise HTTPException(
                 status_code=422,
                 detail=SHOT_BINDINGS_UNCARRIED_REFUSAL.format(
-                    shot=shot_label(project, shot), detail=uncarried
+                    shot=shot_label(project, shot), detail=adoption.refusal
                 ),
             )
-        shot.effects = stored_effect_stack(stack)
+        shot.effects = adoption.stack
 
 
 #: Everything about a job that this application **recorded** rather than a client supplied. Named
@@ -7079,14 +7083,19 @@ class ShotBindingsRequest(BaseModel):
     before it can be learned twice: `{"bindigns": [...]}` would otherwise bind to `[]`, clear the
     Director's binding and answer 200. `[]` is how a binding comes off, and it stays explicit.
 
-    **`effect` is the card's identity, checked against the stored entry at `index`.** An
-    `EffectSpec` has no id and stack entries are positional (R-26), so an index alone is the one
-    thing R-26 rejected — correct until the Director drags a card, and then silently addressing a
-    different effect while still resolving. Naming the effect the client saw at that position
-    turns that silence into a refusal: the write either lands on the card the Director was looking
-    at or it lands on nothing. It is not an id and does not pretend to be one — two Blooms are
-    still two Blooms — but a binding can no longer cross a *family* boundary unnoticed, which is
-    the whole of what a stack reorder can do to an index.
+    **`effect` is what the client saw at `index`, checked against the stored entry there.** An
+    index alone is the one thing R-26 rejected — correct until the Director drags a card, and then
+    silently addressing a different effect while still resolving. Naming the effect the client drew
+    at that position turns that silence into a refusal: the write either lands on the card the
+    Director was looking at or it lands on nothing. It is not an id and does not pretend to be one
+    — two Blooms are still two Blooms — but a binding can no longer cross a *family* boundary
+    unnoticed, which is the whole of what a stack reorder can do to an index.
+
+    **A card has carried an `id` since R-33, and this field is deliberately still `effect`.** The
+    id is what the *generic* doors adopt a card's bindings by; re-addressing this route on it would
+    change the wire, the panel and the route for no defect anybody has reproduced, and the
+    2026-08-28 ruling did not ask for it. A card id here is the obvious next slice and is not this
+    one.
     """
 
     effect: str | None = None
@@ -7642,14 +7651,23 @@ def stored_effect_stack(specs: Sequence[Mapping[str, Any]]) -> list[EffectSpec]:
     the stored model never shares a mutable object with the request that carried it.
 
     **`bindings` is stored exactly as `parameters` is, and this function is deliberately not where
-    a binding is judged.** It writes whatever the agreed spec carried, which is what makes it
-    usable by all three of its callers; *whether* a spec was entitled to carry a binding at all is
-    `carried_bindings_refusal`'s question, and every caller that is not the binding route asks it
-    first. Putting the judgement here instead would make the one route that mints a binding unable
-    to use the one function that stores a stack.
+    a binding is judged.** It writes whatever the spec it is handed carries, which is what makes it
+    usable by both of its callers; *which* bindings a card is entitled to carry is
+    `adopted_effect_stack`'s question, and this is called with that answer already substituted in.
+    Putting the judgement here instead would make the one function that stores a stack unusable by
+    the one route that mints a binding.
+
+    **`id` is the same bargain one field up** (R-33). This is the *store* point, so a spec that
+    names no id is minted one here and a spec that names one is trusted — and it is trusted
+    because `adopted_effect_stack` is the only thing that puts one in front of this function: a
+    client's own id reaches a manifest never, because a body's id is only ever compared for
+    equality against an id the store already holds, and anything else is dropped in favour of a
+    fresh mint. Calling this with a raw request body would store a forged card id, which is why
+    both callers adopt first and why this says so rather than assuming the next one will look.
     """
     return [
         EffectSpec(
+            id=spec["id"] if isinstance(spec.get("id"), str) and spec.get("id") else new_id("fx"),
             effect=spec["effect"],
             enabled=bool(spec.get("enabled", True)),
             parameters=dict(spec.get("parameters") or {}),
@@ -7659,89 +7677,330 @@ def stored_effect_stack(specs: Sequence[Mapping[str, Any]]) -> list[EffectSpec]:
     ]
 
 
-#: Who a write was entitled to have copied a binding from, filled into the sentence below. Two
-#: constants rather than two sentences, because there is one rule and it is stated once.
+#: Who a write's bindings were adopted from, filled into the sentence below. Two constants rather
+#: than two sentences, because there is one rule and it is stated once.
 BINDING_CARRIER_SHOT = "this shot"
 BINDING_CARRIER_PROJECT = "this project"
 
 
-#: Why a stack write that arrived carrying a Parameter Binding was refused: nothing it could have
-#: copied that binding *from* holds it, so the write was minting one.
+#: Why a stack write was refused: the bindings a card arrived with are not the bindings the store
+#: holds on the card of that id, so the write was minting, altering or dropping one.
 #:
 #: **This is AD-16 and story 10.1's "written only by the dedicated binding route", made a property
-#: of every other door rather than a promise about one.** The rule it states is *carry, never
-#: mint*, and both halves are load-bearing:
+#: of every other door rather than a promise about one** — but it is a *diagnostic* now rather than
+#: the guard. `adopted_effect_stack` has already replaced the card's bindings with the stored
+#: card's before this sentence is composed, so nothing a body says about a binding can reach a
+#: manifest whether it is refused or not. What the refusal buys is the thing every `_adopt_*`
+#: sibling gives up: a client that has lost a binding is *told*, by name, instead of being answered
+#: 200 for a write that quietly changed the picture. Epic 10 refused by name on purpose and that
+#: much was right; the id is what makes the comparison unambiguous enough to keep it.
 #:
-#: * **Carry**, because a stack travels. `PUT .../effects` is how the panel reorders cards, and
-#:   `PUT .../shots` is how Split and Duplicate persist a copied stack; a binding that could not
-#:   ride along either would be destroyed by an ordinary gesture, which is this repository's most
-#:   frequently rediscovered defect wearing a new field's clothes. R-26 put the binding on the
-#:   card precisely so it would survive reorder, copy, split and duplicate for free.
-#: * **Never mint**, because an `EffectSpec` has no id and its entries are positional, so no route
-#:   but the binding route can be told *which* card a new binding belongs to without the
-#:   `(index, parameter)` ambiguity R-26 rejected. A generic write that could invent one would be
-#:   writing reactive filter configuration through a route that never asked the Director anything.
+#: **Its predecessor was `carried_bindings_refusal`, and it was the guard**: a multiset of
+#: validated bindings, subtracted, on the reasoning that an `EffectSpec` had no id to compare
+#: instead. Two cards of one effect are indistinguishable to a multiset, so a generic write could
+#: move a binding from a Bloom resting at 0.1 to one resting at 0.9 and change the rendered picture
+#: at 200 (A3). Adopting by id makes that write express nothing at all rather than express a
+#: relocation this sentence has to catch — which is R-33's whole reason for choosing the id over
+#: patching the census.
 #:
 #: Compared as `effects.ParameterBinding` — the **validated** binding, every default filled in by
 #: the catalogue — and never as stored JSON. The stored form is sparse on purpose
 #: (`stored_effect_stack`), so `{"parameter": "amount", "drive": "punch", "depth": 0.4}` and the
 #: same binding written out with all nine keys are one binding, and comparing text would call them
 #: two and refuse a client that had merely round-tripped what it read.
-BINDING_UNCARRIED_REFUSAL = (
-    "{effect}'s {parameter} arrives carrying a Parameter Binding that {source} does not already "
-    "hold, so nothing was saved. A binding is made, changed and taken off through the Shot's own "
-    "bindings route and through nothing else; every other write may carry a binding it was handed "
-    "and may never invent one."
+BINDING_NOT_AS_HELD_REFUSAL = (
+    "This write does not carry {effect}'s {parameter} as {source} holds it, so nothing was saved. "
+    "A Parameter Binding is made, changed and taken off through the Shot's own bindings route and "
+    "through nothing else; every other write echoes back the bindings it read, on the card id it "
+    "read them from."
 )
 
 
-def binding_census(
-    stack: Sequence[Mapping[str, Any]], *, luts: Sequence[LutEntry] = ()
-) -> Counter[ParameterBinding]:
-    """Every Parameter Binding one stack holds, agreed against the catalogue, as a multiset.
+#: Why a bound Shot's stack write was refused for naming no card ids: the one write whose intent
+#: genuinely cannot be recovered.
+#:
+#: A card is adopted by its id, so *removing* a card and *forgetting to send it* are different
+#: writes — which is the whole point of the id, and it is what a client that has never heard of
+#: one takes away again. Such a client sends a stack of cards that name nothing, every card reads
+#: as new, and every binding on the Shot goes with the cards it could not name. That is
+#: indistinguishable from a Director clearing the stack, and it is the defect this whole thread
+#: began with: losing a binding looks exactly like removing its card unless something says
+#: otherwise.
+#:
+#: **It fires only on a Shot that actually holds a binding**, so every client written before ids
+#: existed goes on writing unbound stacks exactly as it always did. The remedy is in the sentence
+#: because the client that hits this cannot work out from the outside what it failed to send.
+#:
+#: The residue, stated rather than papered over: a body that names *some* ids and drops others is
+#: read at its word, because a card whose id is absent is a card this write does not have. A client
+#: that echoed one id and invented a second card in the same write, on a Shot whose binding sat on
+#: the card it forgot, is the one shape left that loses a binding at 200 — and it is the shape that
+#: is also a legitimate "take that card off and add this one", which is why it is not refused.
+SHOT_EFFECTS_WITHOUT_CARD_IDS_REFUSAL = (
+    "This shot holds a Parameter Binding and this stack names no card ids at all, so nothing was "
+    "saved. Every effect card carries an id, and a write echoes back the ids it read: without them "
+    "a card this write left out cannot be told from a card whose binding it would have destroyed. "
+    "Send the stack back as it was read, ids and all."
+)
 
-    A multiset and not a set: two Blooms may legitimately carry the identical binding, and a set
-    would let a write turn one of them into two.
 
-    A stack the catalogue will not agree to holds **nothing** here rather than raising. That is
-    the conservative direction and it is deliberate: this function's answer is used as *what a
-    write was entitled to carry*, so a stored stack that has stopped composing — a hand-edited
-    manifest, a look deleted from the folder — entitles a write to carry nothing, and the refusal
-    a caller then reports is the catalogue's own, raised where the caller validates the body. It
-    is never used to decide that something is *allowed*.
+@dataclass(frozen=True, slots=True)
+class AdoptedStack:
+    """What a generic stack write actually stores, and what it silently changed on the way.
+
+    Two answers from one walk rather than two functions over one list, because the second is a
+    statement *about* the first: a refusal composed by a second pass could disagree with what the
+    first pass stored, and disagreeing answers to one question is the defect this repository has
+    now paid for six times.
+
+    `refusal` is `""` when the body said nothing about a binding that the store did not already
+    say. It is a *detail* sentence, never wrapped: `replace_shot_effects` raises it whole and
+    `_adopt_shot_effects` puts `SHOT_BINDINGS_UNCARRIED_REFUSAL`'s Shot name in front of it.
     """
-    try:
-        resolved = validate_stack(stack, luts=luts)
-    except EffectRefusal:
-        return Counter()
-    return Counter(binding for effect in resolved for binding in effect.bindings)
+
+    stack: list[EffectSpec]
+    refusal: str
 
 
-def carried_bindings_refusal(
-    incoming: Sequence[Mapping[str, Any]],
-    *,
-    held: Sequence[Mapping[str, Any]],
-    source: str,
-    luts: Sequence[LutEntry] = (),
+def _card_id(spec: Mapping[str, Any]) -> str:
+    """The card id a body named, or `""` for a body that named none.
+
+    **A non-string is `""` and never raises.** `EFFECT_SPEC_KEYS` declares `id` so that a client
+    round-tripping the stack it read is not refused for an undeclared key, and the validator says
+    nothing about the *value* — it does not need to, because the value is never stored and is only
+    ever looked up. But a lookup is a `dict` lookup, and `{"id": {"a": 1}}` is a body a client can
+    genuinely send: unguarded, that is `TypeError: unhashable type` — a 500 out of the one function
+    whose whole job is to keep a body's claims away from the manifest.
+    """
+    given = spec.get("id")
+    return given if isinstance(given, str) else ""
+
+
+def _card_bindings_refusal(
+    spec: Mapping[str, Any], adopted: Sequence[Mapping[str, Any]], *, source: str
 ) -> str:
-    """`""` when every binding in `incoming` was already in `held`; the refusal naming the first
-    one that was not, otherwise. See `BINDING_UNCARRIED_REFUSAL` for the rule and why.
+    """`""` when a card arrived carrying exactly the bindings that were adopted onto it; the
+    sentence naming the first parameter they differ on, otherwise.
 
-    Multiset subtraction, so a write that duplicates a binding it was handed is minting one and is
-    caught: `Counter` drops non-positive counts, which is exactly "carried at most as many times
-    as it was held".
+    The offender is chosen **by parameter name** and not by the order it arrived in, so one card
+    refuses with one sentence however its bindings were ordered — a refusal that moved when a list
+    was reordered would be a refusal a test could not assert.
 
-    The offender is chosen by name rather than by the order it arrived in, so one stack refuses
-    with one sentence however its entries were ordered — a refusal that moved when a card was
-    dragged would be a refusal a test could not assert.
+    Both sides go through `effects.agreed_bindings`, which is a fact about the *catalogue* and not
+    about the looks folder, so a card whose `.cube` has been deleted is compared exactly as it was
+    yesterday (A1). A card the catalogue cannot agree to at all — an effect this build no longer
+    ships, a hand-edited stored binding — returns `""` rather than refusing: the write it would
+    refuse has already had the stored bindings adopted onto it, so silence here loses nothing, and
+    a refusal a Director cannot act on is worse than the `_adopt_*` family's ordinary silence.
     """
-    minted = binding_census(incoming, luts=luts) - binding_census(held, luts=luts)
-    if not minted:
+    given = spec.get("bindings") or ()
+    if not given and not adopted:
         return ""
-    first = min(minted, key=lambda binding: (binding.effect_id, binding.parameter))
-    return BINDING_UNCARRIED_REFUSAL.format(
-        effect=first.effect_id, parameter=first.parameter, source=source
+    effect_id = spec.get("effect")
+    if not isinstance(effect_id, str):
+        return ""
+    try:
+        arrived = {binding.parameter: binding for binding in agreed_bindings(effect_id, given)}
+        held = {binding.parameter: binding for binding in agreed_bindings(effect_id, adopted)}
+    except EffectRefusal:
+        return ""
+    differing = sorted(
+        name for name in set(arrived) | set(held) if arrived.get(name) != held.get(name)
     )
+    if not differing:
+        return ""
+    return BINDING_NOT_AS_HELD_REFUSAL.format(
+        effect=effect_id, parameter=differing[0], source=source
+    )
+
+
+def _held_bindings(cards: Sequence[EffectSpec]) -> dict[ParameterBinding, dict[str, Any]]:
+    """Every Parameter Binding a set of stored cards holds, agreed, mapped to the JSON it is
+    stored as.
+
+    **The agreed binding is the key and the stored spelling is the value**, which is what lets the
+    fallback below be an *adoption* rather than a body read: a body may say which held binding it
+    means, and the bytes that reach the manifest come off the card that already holds it. A
+    manifest full of frozen defaults is what `stored_effect_stack` argues against, and a client
+    that spelled all nine keys out would otherwise write one.
+
+    Keyed on the agreed binding for `_card_bindings_refusal`'s reason: the stored form is sparse,
+    so comparing text would call two spellings of one binding two bindings.
+
+    A card the catalogue cannot agree to contributes nothing and raises nothing. It costs no folder
+    read on any path — `agreed_bindings` asks the catalogue about parameters and never about looks,
+    which is what keeps a deleted `.cube` out of this answer (A1).
+    """
+    held: dict[ParameterBinding, dict[str, Any]] = {}
+    for card in cards:
+        try:
+            agreed = agreed_bindings(card.effect, card.bindings)
+        except EffectRefusal:
+            continue
+        # One agreed binding per stored entry, in order: `_validate_bindings` appends exactly one
+        # for each and refuses a repeated parameter, so the two lists cannot differ in length.
+        for binding, spelled in zip(agreed, card.bindings, strict=True):
+            held.setdefault(binding, dict(spelled))
+    return held
+
+
+def _copied_bindings(
+    spec: Mapping[str, Any],
+    held: dict[ParameterBinding, dict[str, Any]],
+    *,
+    source: str,
+) -> tuple[list[dict[str, Any]], str]:
+    """What a card arriving on a Shot the store does **not** hold may keep, and the refusal when it
+    named a binding nothing in the project holds.
+
+    **This is the one place a card id is not the key, and it is the one place it cannot be.** A
+    Shot that is new to the store has no stored card to adopt from, so the body's card id is a
+    *provenance claim* — "this card was copied from that one" — and nothing guarantees the card it
+    names still exists. Measured 2026-08-28, both ways round: a **redo** of a Split replays the
+    plan as the browser last held it, naming the card the Split actually minted, which the undo in
+    between has since deleted; an **undo of a delete** replays the plan as the last save left it,
+    naming the card that Shot was *copied from*, which does still exist. Requiring the id refuses
+    the first; requiring it and correcting the browser's snapshot to match the store refuses the
+    second instead. The two replay paths want opposite answers, so accuracy is not the axis and no
+    ordering fixes it.
+
+    So this door asks AD-16's actual question — *was this binding handed to you?* — as **set
+    membership over what the project holds**. What it is not, and what the census it replaced was:
+    it is not a multiset, so nothing counts; it is not an address, so it never decides *which* card
+    anything lands on; and it never runs `validate_stack` over a stored stack, so a deleted `.cube`
+    cannot empty it (A1). A3 is untouched because `PUT .../effects` passes no `elsewhere` at all
+    and stays strict — a binding still cannot move between two cards of one effect, and that is
+    still structural rather than refused.
+
+    The bindings handed back are the **stored** spellings, so a body selects and never supplies.
+    """
+    given = spec.get("bindings") or ()
+    effect_id = spec.get("effect")
+    if not isinstance(effect_id, str):
+        return [], ""
+    try:
+        arrived = agreed_bindings(effect_id, given)
+    except EffectRefusal:
+        # Unagreeable here means unagreeable at the caller's own `validate_stack`, which has
+        # already refused this write in the catalogue's words. Nothing to add and nothing to keep.
+        return [], ""
+    absent = sorted(binding.parameter for binding in arrived if binding not in held)
+    if absent:
+        return [], BINDING_NOT_AS_HELD_REFUSAL.format(
+            effect=effect_id, parameter=absent[0], source=source
+        )
+    return [dict(held[binding]) for binding in arrived], ""
+
+
+def adopted_effect_stack(
+    specs: Sequence[Mapping[str, Any]],
+    *,
+    own: Sequence[EffectSpec] = (),
+    elsewhere: Sequence[EffectSpec] = (),
+    source: str = BINDING_CARRIER_SHOT,
+) -> AdoptedStack:
+    """An arriving stack with **every card's bindings taken from the stored card of that id**, and
+    every id the store cannot vouch for replaced by a fresh one.
+
+    This is AD-16's Rule spelled for a field one level down — *"adopts them from the stored Shot,
+    via the established `_adopt_*` idiom… a body that omits them, or invents them, does not change
+    them"* — and R-33's ruling as a function. **The bytes of every binding that reaches a manifest
+    through here come off a card the store already holds**, so a body cannot invent one, alter one,
+    relocate one or lose one. What a body may do, at one door and one door only, is *select* which
+    held binding a card being created copies — see `_copied_bindings`, and the two measurements
+    that put it there.
+
+    **The two card sources are different questions, and that is why they are two arguments.**
+
+    * `own` is the cards **this Shot already holds**. A body naming one of these is writing that
+      card back, so it keeps its id and takes its bindings. This is `PUT .../effects` — the route
+      the panel writes on every slider drag, card toggle and Story 9.4 reorder.
+    * `elsewhere` is every card the **project** holds on some *other* Shot. A body naming one of
+      these is a new Shot built from an old one — Split and Duplicate, through
+      `_adopt_shot_effects`, which is why `SHOT_PLAN_CONTENT_FIELDS` says the two halves of one
+      shot are one shot's look. It takes that card's bindings and is minted **a new id**, because
+      the card it was copied from belongs to a Shot that still exists and still holds it.
+      A card here that names *no* card the project holds falls to `_copied_bindings`, which is the
+      one place an id is not the key and the one place it cannot be: a replayed creation — an Undo,
+      a Redo — names a card that the write it is undoing may have deleted. That door asks whether
+      the binding is one the project holds instead, and hands back the store's own copy of it.
+
+    `own` never contributes to that fallback and `PUT .../effects` passes no `elsewhere` at all, so
+    the narrow route stays strict: an id or nothing. That is what keeps A3 structural rather than
+    refused, and it is why a binding still cannot be copied onto a second card of one effect on a
+    Shot the store already holds.
+
+    That last mint is the whole of the cloned-id problem, resolved where the clone is stored rather
+    than detected afterwards. `api.newShotFromPlan` deep-copies the source Shot's stack, ids and
+    all, so a Split arrives with two Shots claiming one card id; a lookup keyed on that id would
+    then depend on which Shot was read first the moment the halves diverged. Minting at the moment
+    a card is stored onto a Shot that does not already hold it means **no two Shots ever hold one
+    card id**, so there is no collision to resolve later and no order for a later lookup to depend
+    on. `POST .../effects/copy` mints for the same reason at its own copy point, and it is the
+    third door rather than an exception to this one.
+
+    **An id may be claimed once.** A body naming one stored card twice gets one adoption: the first
+    entry takes the card and the second is a new card with a new id and no bindings. Otherwise one
+    echoed id would multiply a binding across a stack — A4's shape, one level down — and a manifest
+    would hold two cards claiming one identity.
+
+    **The count invariant is gone and is not replaced.** *"Carried at most as many times as it was
+    held"* was `carried_bindings_refusal`'s rule and it was never true of the gesture it was meant
+    to describe: a Split of a bound Shot legitimately ends with two bound cards, and
+    `POST .../effects/copy` produces that state on purpose, with an announcement. What is bounded
+    now is *authorship* rather than *arithmetic* — every binding in the result is a copy of one the
+    store already held, on a card whose identity the store minted.
+
+    **No look is read and nothing is validated here.** Adoption is a copy keyed by a string, so it
+    costs no folder read on any path — which is what lets `_adopt_shot_effects` ask it on every
+    ordinary save. The callers still run `effects.validate_stack` over the body first; that is
+    unchanged and is the catalogue's own gate (AD-27).
+    """
+    kept = {spec.id: spec for spec in own if spec.id}
+    held: dict[str, EffectSpec] = dict(kept)
+    for spec in elsewhere:
+        if spec.id:
+            held.setdefault(spec.id, spec)
+    claimed: set[str] = set()
+    # Built once, on the first card that needs it, and never at all for the common write: it is
+    # asked only by a Shot the store does not hold, carrying a binding, naming no card that does.
+    copied: dict[ParameterBinding, dict[str, Any]] | None = None
+    carried: list[dict[str, Any]] = []
+    refusal = ""
+    named = False
+    for spec in specs:
+        card_id = _card_id(spec)
+        if card_id:
+            named = True
+        stored = held.get(card_id) if card_id and card_id not in claimed else None
+        if stored is not None:
+            claimed.add(card_id)
+            adopted = [dict(binding) for binding in stored.bindings]
+            refusal = refusal or _card_bindings_refusal(spec, adopted, source=source)
+        elif elsewhere and (spec.get("bindings") or ()):
+            # A card on a Shot the store does not hold, naming no card it does hold. See
+            # `_copied_bindings`: this is the one door where an id cannot be required, because the
+            # card a replayed creation names may have been destroyed by the write it is undoing.
+            if copied is None:
+                copied = _held_bindings(elsewhere)
+            adopted, unheld = _copied_bindings(spec, copied, source=source)
+            refusal = refusal or unheld
+        else:
+            adopted = []
+            refusal = refusal or _card_bindings_refusal(spec, adopted, source=source)
+        carried.append(
+            {
+                **spec,
+                # Kept only where the store can vouch for it *on this Shot*, minted by
+                # `stored_effect_stack` everywhere else — including for a card copied off another
+                # Shot, which is the clone the paragraphs above are about.
+                "id": card_id if stored is not None and card_id in kept else "",
+                "bindings": adopted,
+            }
+        )
+    if not refusal and not named and carried and any(spec.bindings for spec in own):
+        refusal = SHOT_EFFECTS_WITHOUT_CARD_IDS_REFUSAL
+    return AdoptedStack(stack=stored_effect_stack(carried), refusal=refusal)
 
 
 #: Why one Shot's effects may not be written. Names the Shot as the timeline names it — a bare
@@ -7771,12 +8030,15 @@ SHOT_EFFECTS_UNCOMPOSABLE_REFUSAL = (
 
 
 #: Why a whole-plan write was refused for its *bindings* rather than for its stack: a Shot it is
-#: adding carries a Parameter Binding no Shot in the stored project holds, so the write is minting
-#: one through a route that never asked for it.
+#: adding names a Parameter Binding that is not the one the card it copied holds, so the body was
+#: minting or altering one through a route that never asked for it.
 #:
 #: A second wrapper rather than a reuse of the sentence above, because that one says the stack
-#: "cannot be composed" and this stack composes perfectly well — the fault is where the binding
-#: came from, not what it says. `carried_bindings_refusal` supplies the whole of `{detail}`.
+#: "cannot be composed" and this stack composes perfectly well — the fault is what the body says
+#: about a binding, not what the catalogue says about the card. `adopted_effect_stack` supplies
+#: the whole of `{detail}`, and the write it refuses had already had the stored bindings adopted
+#: onto it: the refusal is a diagnostic, and nothing a body claims here reaches a manifest either
+#: way.
 SHOT_BINDINGS_UNCARRIED_REFUSAL = "{shot} is new to this plan, so nothing was saved. {detail}"
 
 

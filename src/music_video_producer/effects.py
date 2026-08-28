@@ -311,6 +311,7 @@ __all__ = [
     "ParameterDrive",
     "ResolvedEffect",
     "StageContext",
+    "agreed_bindings",
     "band_series",
     "binding_drive",
     "build_effect_stages",
@@ -2477,17 +2478,29 @@ del _definition
 
 #: Every key an effect spec may carry, and the whole of the shape slice C accepts as JSON. It is
 #: a tuple rather than a check written into the validator because the refusal prints it: a client
-#: that misspelled one is told what the three are, in this order.
-EFFECT_SPEC_KEYS: tuple[str, ...] = ("effect", "enabled", "parameters", "bindings")
+#: that misspelled one is told the whole list, in this order.
+#:
+#: **`id` is declared here and read by nothing in this module** (R-33). It is the card's own
+#: identity, minted by the server (`models.EffectSpec`) and echoed by a client that means to keep
+#: what that card holds; the value is never composed from, never hashed and never validated
+#: here, because `app.adopted_effect_stack` decides every id that reaches a manifest and a body's
+#: own is only ever compared for equality against one the store already holds. It is in this
+#: tuple so that a client round-tripping the stack it read is not refused for an undeclared key —
+#: which is the only thing this validator has to say about it.
+EFFECT_SPEC_KEYS: tuple[str, ...] = ("id", "effect", "enabled", "parameters", "bindings")
 
 #: Every key one Parameter Binding may carry, and the shape the compiler reads. A tuple for the
 #: same reason `EFFECT_SPEC_KEYS` is one: the refusal prints it.
 #:
-#: **A binding lives on the effect, keyed by parameter name** (ruled 2026-08-27). An `EffectSpec`
-#: has no id and its entries are positional, and a stack may hold two Blooms — so `(effect,
-#: parameter)` is ambiguous, and `(index, parameter)` stops meaning anything the moment Story
-#: 9.4's reorder moves a card. The parameter's own name inside its own effect is the only key
-#: that survives both.
+#: **A binding lives on the effect, keyed by parameter name** (ruled 2026-08-27, R-26). A stack
+#: may hold two Blooms, so `(effect, parameter)` is ambiguous, and `(index, parameter)` stops
+#: meaning anything the moment Story 9.4's reorder moves a card. The parameter's own name inside
+#: its own effect is the only key that survives both.
+#:
+#: **R-33 did not change this and is often read as though it did.** The card gained an `id` on
+#: 2026-08-28, which is how a *card* is addressed — how a generic write finds the stored card whose
+#: bindings a body's card adopts. Where the binding is *stored* is still the parameter's name on
+#: the card, which is what R-26 decided and what this tuple is about.
 #:
 #: `parameter`, `drive` and `depth` carry no default and are refused when missing. The other six
 #: do, because they are settings with a sensible rest; those three are the *decisions*. Nothing
@@ -2832,6 +2845,35 @@ def _validate_bindings(
             )
         )
     return tuple(bindings)
+
+
+def agreed_bindings(effect_id: str, bindings: Any) -> tuple[ParameterBinding, ...]:
+    """One card's Parameter Bindings, agreed against the catalogue — **without its parameters, its
+    look, or the rest of its stack.**
+
+    `validate_stack` is still the only thing that decides whether a *stack* may reach a filter
+    string, and this is not a second answer to that question: it answers the narrower one
+    `app.adopted_effect_stack` has to ask — *are these two spellings of a card's bindings the same
+    bindings?* — where a stored binding is sparse by design and the same binding written out with
+    all nine keys must not be called a different one. Comparing the stored JSON would refuse a
+    client that had merely round-tripped what it read.
+
+    **It is independent of the look folder on purpose, and that is the whole of A1's dissolution.**
+    Its predecessor was `app.binding_census`, which validated the entire stack and returned an
+    empty multiset for anything the catalogue would not compose — so a `.cube` deleted from the
+    folder made a Shot's stored bindings vanish from the comparison, one dead look on an unrelated
+    Shot emptied the census for the whole project, and the only write the route would then accept
+    was the one that destroyed the binding. A `lut_look` card whose file has gone still declares
+    exactly the parameters it always declared, so this function answers the same as it did
+    yesterday and a broken grade card can be *taken off* by an ordinary write.
+
+    Raises `EffectRefusal` for an effect no catalogue entry claims, which its callers read as *this
+    card cannot be compared* rather than as *this write is refused*.
+    """
+    definition = EFFECT_CATALOGUE.get(effect_id)
+    if definition is None:
+        raise EffectRefusal(EFFECT_UNKNOWN_REFUSAL.format(effect=effect_id))
+    return _validate_bindings(effect_id, definition, bindings)
 
 
 def validate_stack(

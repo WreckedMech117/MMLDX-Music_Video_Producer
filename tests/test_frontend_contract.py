@@ -8984,8 +8984,12 @@ def graded_project(tmp_path: Path) -> tuple[object, str, dict]:
     )
     assert graded.status_code == 200, graded.text
     project = client.get(f"/api/projects/{project_id}").json()
+    card = project["shots"][0]["effects"][0]
     assert project["shots"][0]["effects"] == [
-        {"effect": "punch_in", "enabled": True, "parameters": {"zoom": 1.2}, "bindings": []}
+        # The card id is the server's own (R-33) and is read back off the answer rather than
+        # pinned; the split below is where it is asserted to mean something.
+        {"id": card["id"], "effect": "punch_in", "enabled": True,
+         "parameters": {"zoom": 1.2}, "bindings": []}
     ]
     return client, project_id, project
 
@@ -9037,9 +9041,15 @@ def test_a_split_saved_the_way_the_browser_saves_it_keeps_the_look_on_both_halve
     from music_video_producer.store import ProjectStore
 
     client, project_id, project = graded_project(tmp_path)
-    look = [
-        {"effect": "punch_in", "enabled": True, "parameters": {"zoom": 1.2}, "bindings": []}
-    ]
+
+    def look(shot) -> list[dict]:
+        # The card id is read off the Shot being asserted, because every card that lands on a new
+        # Shot is minted one (R-33) -- that is what keeps the two halves from claiming one
+        # identity, and it is asserted as such below. Everything else is the literal wire shape.
+        return [
+            {"id": shot.effects[0].id, "effect": "punch_in", "enabled": True,
+             "parameters": {"zoom": 1.2}, "bindings": []}
+        ]
 
     # 1. The split, composed by app.js and landed on the real route.
     body = browser_shot_save(project, "#split-shot", "shot_one")
@@ -9049,8 +9059,11 @@ def test_a_split_saved_the_way_the_browser_saves_it_keeps_the_look_on_both_halve
 
     halves = ProjectStore(tmp_path).get(project_id).shots
     assert [shot.duration for shot in halves] == [2.0, 2.0]
-    assert [[spec.model_dump() for spec in shot.effects] for shot in halves] == [look, look], (
-        "a half of one shot came back grading differently from its own other half"
+    assert [[spec.model_dump() for spec in shot.effects] for shot in halves] == [
+        look(shot) for shot in halves
+    ], "a half of one shot came back grading differently from its own other half"
+    assert halves[0].effects[0].id != halves[1].effects[0].id, (
+        "both halves of the split claim one card id"
     )
 
     # 2. Duplicate, from the plan as it now stands, selecting the half that was minted by the
@@ -9063,8 +9076,11 @@ def test_a_split_saved_the_way_the_browser_saves_it_keeps_the_look_on_both_halve
 
     copied = ProjectStore(tmp_path).get(project_id).shots
     assert len(copied) == 3
-    assert [[spec.model_dump() for spec in shot.effects] for shot in copied] == [look] * 3, (
-        "a duplicate came back ungraded"
+    assert [[spec.model_dump() for spec in shot.effects] for shot in copied] == [
+        look(shot) for shot in copied
+    ], "a duplicate came back ungraded"
+    assert len({shot.effects[0].id for shot in copied}) == 3, (
+        [shot.effects[0].id for shot in copied]
     )
     # And the copy is still a new Shot in every other respect: it carries the plan and no take.
     assert copied[2].id not in {copied[0].id, copied[1].id}
@@ -20365,21 +20381,20 @@ def test_disabling_an_effect_keeps_the_card_with_its_parameters_and_writes_enabl
 
 
 def test_an_ordinary_stack_write_carries_a_binding_it_did_not_touch():
-    """The client half of the server's *carry, never mint* rule, and the half that fails silently.
+    """The client half of the server's adoption rule (R-33), and the half that used to fail silently.
 
-    `carried_bindings_refusal` stops a body **inventing** a binding, and nothing on the server can
-    stop one **dropping** it: losing a binding is indistinguishable from removing the bound card,
-    because an `EffectSpec` has no id (R-26). So a client that rebuilt the stack from three keys
-    would destroy the Director's work on the next slider release and be answered 200.
+    The server adopts a card's bindings from the stored card of the same id, so a client that
+    rebuilt the stack from three keys can no longer destroy the Director's work -- it is refused by
+    name instead (R-33). **Which is why the card id is asserted here too**: it is what makes the
+    refusal a refusal rather than a 200, and a client that dropped it would have every ordinary
+    gesture on a bound Shot answered 422.
 
-    Reachable the moment the band panel ships and not before, which is exactly why the guard lands
-    with the field rather than with the panel: AD-16's rule exists because afterwards never
-    arrived. Driven through the real toggle rather than by calling `effectStackWrite`, so it is the
+    Driven through the real toggle rather than by calling `effectStackWrite`, so it is the
     *gesture* that is asserted to be safe.
     """
     bound = json.loads(effects_shot(effects=[
-        {"effect": "exposure", "enabled": True, "parameters": {"amount": 0.2},
-         "bindings": [BOUND_AMOUNT]},
+        {"id": "fx_thecardsown1", "effect": "exposure", "enabled": True,
+         "parameters": {"amount": 0.2}, "bindings": [BOUND_AMOUNT]},
     ]))
     reply = {"id": "p1", "jobs": [], "song": None, "assets": [], "messages": [], "sections": [],
              "shots": [bound]}
@@ -20395,17 +20410,20 @@ def test_an_ordinary_stack_write_carries_a_binding_it_did_not_touch():
     )
 
     body = json.loads(written["requests"][0]["body"])
-    # The gesture landed -- and it did not cost the binding.
+    # The gesture landed -- and it did not cost the binding, or the id the binding is adopted by.
     assert body["effects"][0]["enabled"] is False
     assert body["effects"][0]["bindings"] == [BOUND_AMOUNT]
+    assert body["effects"][0]["id"] == "fx_thecardsown1"
 
 
 def test_a_card_with_no_binding_is_written_exactly_as_it_was_before_bindings_existed():
     """The other direction, because carrying sparsely is what keeps every older body byte-identical.
 
-    A fourth key present-and-empty on every card would change every request this application has
-    ever sent and would make `effectStackChanged` answer differently for two stacks that mean the
-    same thing.
+    A fourth or fifth key present-and-empty on every card would change every request this
+    application has ever sent and would make `effectStackChanged` answer differently for two
+    stacks that mean the same thing. `bindings` is carried only by a card that holds one, and
+    `id` only by a card that has one -- which a card the Director has just added does not, because
+    the server mints it at the moment it is stored (R-33).
     """
     plain = json.loads(effects_shot(effects=[
         {"effect": "grain", "enabled": True, "parameters": {"strength": 12.0}},
@@ -20426,6 +20444,76 @@ def test_a_card_with_no_binding_is_written_exactly_as_it_was_before_bindings_exi
     assert json.loads(written["requests"][0]["body"]) == {"effects": [
         {"effect": "grain", "enabled": False, "parameters": {"strength": 12.0}},
     ]}
+
+
+def test_a_landed_shots_save_leaves_this_client_holding_the_servers_own_card_ids():
+    """The half of R-33 that lives in the browser, and the one a server test cannot reach.
+
+    `PUT .../shots` owns `effects`: an existing Shot's stored stack is re-adopted whatever the body
+    said, and every card arriving on a **new** Shot is minted a card id, because
+    `newShotFromPlan` deep-copies the source Shot's stack, ids and all, and two Shots must not
+    claim one identity. So after a Split the client's copy of the new half's card ids is wrong --
+    it holds the *source's* -- and the next slider drag on that half would name a card that Shot
+    does not hold, adopt no bindings onto it and be refused by name for an ordinary gesture.
+
+    `adoptedShotEffects` is the whole of the fix: the reply is the truth for this one field. Only
+    this field, because adopting the whole reply would revert a prompt typed while the write was in
+    flight, and only from the save that settled the burst.
+    """
+    adopted = run_module("""
+      import { adoptedShotEffects } from './src/music_video_producer/web/assets/api.js';
+      const held = [
+        { id: 'shot_one', prompt: 'edited while the write was in flight',
+          effects: [{ id: 'fx_source', effect: 'exposure', parameters: { amount: 0.2 },
+                      bindings: [{ parameter: 'amount', drive: 'punch', depth: 0.5 }] }] },
+        // The new half, as the browser built it: the source's card id, copied.
+        { id: 'shot_split', prompt: 'the second half',
+          effects: [{ id: 'fx_source', effect: 'exposure', parameters: { amount: 0.2 },
+                      bindings: [{ parameter: 'amount', drive: 'punch', depth: 0.5 }] }] },
+        { id: 'shot_absent', effects: [{ id: 'fx_local', effect: 'grain', parameters: {} }] },
+      ];
+      const saved = [
+        { id: 'shot_one', prompt: 'as the server had it before the edit',
+          effects: [{ id: 'fx_source', effect: 'exposure', parameters: { amount: 0.2 },
+                     bindings: [{ parameter: 'amount', drive: 'punch', depth: 0.5 }] }] },
+        { id: 'shot_split', prompt: 'the second half',
+          effects: [{ id: 'fx_minted', effect: 'exposure', parameters: { amount: 0.2 },
+                     bindings: [{ parameter: 'amount', drive: 'punch', depth: 0.5 }] }] },
+      ];
+      const after = adoptedShotEffects(held, saved);
+      console.log(JSON.stringify({
+        ids: after.map((shot) => shot.effects.map((spec) => spec.id)),
+        prompts: after.map((shot) => shot.prompt),
+        bindings: after.map((shot) => shot.effects.map((spec) => (spec.bindings || []).length)),
+        aliased: after[1].effects[0] === saved[1].effects[0],
+      }));
+    """)
+
+    # The new half now names the card the server minted, so its next write adopts the right one.
+    assert adopted["ids"] == [["fx_source"], ["fx_minted"], ["fx_local"]]
+    # Only `effects`: the prompt the Director typed while the save was in flight is still theirs,
+    # and a Shot the reply does not name is left exactly as it was.
+    assert adopted["prompts"] == [
+        "edited while the write was in flight", "the second half", None
+    ]
+    assert adopted["bindings"] == [[1], [1], [0]]
+    # Copied, never aliased -- the reply object and the project on screen are two objects, and a
+    # later slider move on one must not show up in the other.
+    assert adopted["aliased"] is False
+
+
+def test_the_shots_save_adopts_the_reply_for_the_field_that_route_owns():
+    """The call site, because a pure function nothing calls is the hole `run_module` cannot see.
+
+    Asserted on the source of `saveShotsSilently`, which no import can reach, and inside the
+    settled-burst branch: adopting from a save that has been overtaken would put a stale stack on
+    screen, which is the failure the revision check already exists against.
+    """
+    landed = without_comments(app_js_block("function saveShotsSilently(", "\n}\n"))
+
+    assert "adoptedShotEffects(state.project.shots, saved?.shots)" in landed, landed
+    settled = landed.split("if (revision === shotSaveRevision) {", 1)[1]
+    assert "adoptedShotEffects" in settled, "the adoption is outside the settled-burst branch"
 
 
 def test_a_slider_writes_on_release_and_paints_without_writing_while_it_is_dragged():
@@ -22559,6 +22647,20 @@ def copy_client(tmp_path: Path):
     return TestClient(app)
 
 
+def stack_without_ids(client, project_id: str, shot_id: str) -> list[dict]:
+    """One Shot's stack as the route serves it, minus the card ids the server minted.
+
+    A card id is `new_id("fx")`'s and is different on every run (R-33), so the rows below assert
+    the rest of the wire shape against a literal and the ids where they mean something: that a
+    copy gives every target its own (`test_a_copied_stack_...` in `test_api.py`), and that both
+    halves of a Split do not claim one.
+    """
+    served = client.get(f"/api/projects/{project_id}/shots/{shot_id}/effects").json()["effects"]
+    for spec in served:
+        assert isinstance(spec.pop("id"), str), spec
+    return served
+
+
 def copy_fixture(client, *, locked_third: bool = True) -> str:
     project_id = client.post("/api/projects", json={"name": "Copy"}).json()["id"]
     shots = [
@@ -22598,11 +22700,11 @@ def test_the_copy_route_applies_to_every_unlocked_target_and_names_the_locked_on
         "detail": SHOT_EFFECTS_LOCKED_REFUSAL.format(shot="SHOT 03 (c)"),
     }]
     # Written exactly as the source holds it -- sparsely, so a corrected default still reaches it.
-    assert client.get(f"/api/projects/{project_id}/shots/b/effects").json()["effects"] == [
+    assert stack_without_ids(client, project_id, "b") == [
         {"effect": "grain", "enabled": True, "parameters": {"strength": 12}, "bindings": []},
         {"effect": "punch_in", "enabled": True, "parameters": {}, "bindings": []},
     ]
-    assert client.get(f"/api/projects/{project_id}/shots/c/effects").json()["effects"] == []
+    assert stack_without_ids(client, project_id, "c") == []
     # And the whole Project comes back, so a client redraws from what was stored.
     assert [shot["id"] for shot in report["project"]["shots"]] == ["a", "b", "c"]
 
@@ -22622,7 +22724,7 @@ def test_the_copy_route_replaces_rather_than_merges_and_clears_from_an_empty_sta
         f"/api/projects/{project_id}/shots/a/effects/copy", json={"targets": ["b"]})
     assert replaced.status_code == 200, replaced.text
     # Replaced whole: neither of the target's own two cards survives.
-    assert client.get(f"/api/projects/{project_id}/shots/b/effects").json()["effects"] == [
+    assert stack_without_ids(client, project_id, "b") == [
         {"effect": "grain", "enabled": True, "parameters": {"strength": 8}, "bindings": []}
     ]
 
@@ -22633,7 +22735,7 @@ def test_the_copy_route_replaces_rather_than_merges_and_clears_from_an_empty_sta
     assert cleared.status_code == 200, cleared.text
     assert cleared.json()["effects"] == 0
     assert cleared.json()["applied"] == ["SHOT 02 (b)"]
-    assert client.get(f"/api/projects/{project_id}/shots/b/effects").json()["effects"] == []
+    assert stack_without_ids(client, project_id, "b") == []
 
 
 def test_the_copy_route_refuses_whole_rather_than_half_applying(tmp_path: Path):
@@ -22677,7 +22779,7 @@ def test_the_copy_route_refuses_whole_rather_than_half_applying(tmp_path: Path):
         shot="SHOT 01 (a)")
     assert stranger.status_code == 404, stranger.text
     # Not one of them wrote anything: the shot named beside the bad id is untouched.
-    assert client.get(f"/api/projects/{project_id}/shots/b/effects").json()["effects"] == []
+    assert stack_without_ids(client, project_id, "b") == []
 
 
 def test_the_copy_route_counts_the_stack_it_is_about_to_multiply(tmp_path: Path):
@@ -22792,7 +22894,7 @@ def test_a_locked_source_is_copied_from(tmp_path: Path):
 
     assert response.status_code == 200, response.text
     assert response.json()["applied"] == ["SHOT 02 (b)"]
-    assert client.get(f"/api/projects/{project_id}/shots/a/effects").json()["effects"] == [
+    assert stack_without_ids(client, project_id, "a") == [
         {"effect": "grain", "enabled": True, "parameters": {"strength": 5}, "bindings": []}
     ]
 
@@ -22996,6 +23098,17 @@ def test_the_monitor_decides_the_preview_clip_without_asking_the_server_for_a_st
       const respelled = {{ ...graded, effects: [{{ effect: 'monochrome', parameters: {{}} }}] }};
       // A second Shot whose take, window and look are the same. One picture, one key.
       const twin = {{ ...graded, id: 'twin' }};
+      // The same look on a card that has been stored, so it carries a card id (R-33). An id names
+      // a card and not a picture: two Shots given one look by `POST .../effects/copy` hold
+      // different card ids and compose one chain, which the route answers with one fingerprint
+      // and one cached clip -- so a key that moved for an id would ask for a re-render of a
+      // picture that had not changed.
+      const identified = {{ ...graded, effects: [
+        {{ id: 'fx_0123456789ab', effect: 'monochrome', enabled: true, parameters: {{}} }},
+      ] }};
+      const renamed = {{ ...identified, effects: [
+        {{ ...identified.effects[0], id: 'fx_ffffffffffff' }},
+      ] }};
       console.log(JSON.stringify({{
         flag: PREVIEW_STALE_FLAG,
         staleNote: PREVIEW_STALE_NOTE,
@@ -23012,6 +23125,8 @@ def test_the_monitor_decides_the_preview_clip_without_asking_the_server_for_a_st
           moved: previewInputKey(moved) !== previewInputKey(graded),
           respelled: previewInputKey(respelled) === previewInputKey(graded),
           twin: previewInputKey(twin) === previewInputKey(graded),
+          identified: previewInputKey(identified) === previewInputKey(graded),
+          renamed: previewInputKey(renamed) === previewInputKey(identified),
           key: previewInputKey(graded),
         }},
         adoption: {{
@@ -23067,6 +23182,10 @@ def test_the_monitor_decides_the_preview_clip_without_asking_the_server_for_a_st
     assert seen["keys"]["moved"] is True
     assert seen["keys"]["respelled"] is True
     assert seen["keys"]["twin"] is True
+    # A card id is not part of the picture, so it is not part of this key: the whole of R-33's
+    # "no cached preview is invalidated", on the client side of the cache.
+    assert seen["keys"]["identified"] is True, "a card id moved the preview key"
+    assert seen["keys"]["renamed"] is True, "two ids for one look are two pictures to this client"
     # The key is this client's trigger, not a second copy of the server's name for the clip, and
     # nothing may read like one: a fingerprint is a hex digest and this is not.
     assert not re.fullmatch(r"[0-9a-f]{8,}", seen["keys"]["key"])
@@ -23865,10 +23984,12 @@ def test_the_band_panel_draws_every_setting_the_server_offers():
 def test_a_binding_survives_every_other_gesture_on_its_card():
     """The failure the server cannot catch, driven through four real gestures.
 
-    Losing a binding is indistinguishable from removing the bound card, because an `EffectSpec`
-    has no id (R-26) -- so `carried_bindings_refusal` can refuse a body that *invents* one and
-    nothing anywhere can refuse a body that drops one. One slider release would have destroyed the
-    Director's work and been answered 200.
+    The server adopts a card's bindings from the stored card of the same id (R-33), so what these
+    gestures have to carry is **two** things: the bindings, because a body that says something
+    different about one is refused; and the **card id**, because a body that names none on a bound
+    Shot is refused as well, and one that named the wrong one would be adopting some other card's
+    bindings. Before the id there was nothing on the server that could refuse either, and one
+    slider release would have destroyed the Director's work and been answered 200.
 
     Every gesture that writes a stack from this panel is performed on a Shot that carries a
     binding, and every body is read. A path added later that rebuilds an entry from its parts fails
@@ -23878,6 +23999,8 @@ def test_a_binding_survives_every_other_gesture_on_its_card():
         {"effect": "lut_look", "enabled": True, "parameters": {"lut": "kodak"}},
         {"effect": "grain", "enabled": True, "parameters": {"strength": 3.0}},
     ]))
+    for index, spec in enumerate(bound["effects"]):
+        spec["id"] = f"fx_thecard{index:04d}"
     reply = band_reply(bound)
     gestures = {
         "the slider on the bound parameter itself": """
@@ -23918,6 +24041,12 @@ def test_a_binding_survives_every_other_gesture_on_its_card():
         for entry in body["effects"]:
             if entry["effect"] != "exposure":
                 assert "bindings" not in entry, (what, entry)
+        # Every card still names itself, so every card's bindings are adopted from the card the
+        # Director was actually looking at -- including through the reorder, where the *positions*
+        # move and the identities must not.
+        assert sorted(entry["id"] for entry in body["effects"]) == [
+            f"fx_thecard{index:04d}" for index in range(len(bound["effects"]))
+        ][:len(body["effects"])], (what, body)
 
 
 def test_remove_binding_leaves_nothing_of_it_and_the_parameter_where_it_was():

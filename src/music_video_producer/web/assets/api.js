@@ -5639,7 +5639,14 @@ export function previewInputKey(shot, song = null) {
     Number(shot?.start) || 0,
     Number(shot?.duration) || 0,
     effectiveOffset(shot),
-    effectStackWrite(shotEffectStack(shot)).effects,
+    // The **card ids** come out again for the reason the Shot's id is not in here, one comment
+    // up: an id names a card, not a picture. Two Shots given one look by `POST .../effects/copy`
+    // hold different card ids (R-33) and compose the identical chain, which the server answers
+    // with one fingerprint and one cached clip -- and a card the Director has just added gains an
+    // id the moment it is stored, which would read here as a picture that had changed when only
+    // its name had. Taken off after `effectStackWrite` rather than before, so the normalisation
+    // this key rests on stays in exactly one place.
+    effectStackWrite(shotEffectStack(shot)).effects.map(({ id, ...card }) => card),
     // **The song, and only when the picture asks it something** -- `preview_fingerprint`'s sixth
     // slot, keyed here by the same rule the route gates that slot on. A bound Shot's picture is
     // a function of the measurement, so a replaced or re-analysed song is a different picture and
@@ -6553,6 +6560,29 @@ export function shotTab(tabId) {
 //: are an empty stack rather than a crash, on `shotCitations`' precedent.
 export function shotEffectStack(shot) {
   return Array.isArray(shot?.effects) ? shot.effects : [];
+}
+
+// What a landed `PUT .../shots` tells this client about its Effect Stacks: the reply's, for every
+// Shot the reply names, and the local one for anything it does not.
+//
+// **`effects` is server-owned on that route** (`_adopt_shot_effects`): an existing Shot's stored
+// stack is re-adopted whatever the body said, in both directions, and a **new** Shot's cards are
+// minted card ids this client cannot predict (R-33). So for this one field the reply is the truth
+// and the local copy is a guess -- which was always harmless and stopped being so the day a card
+// got an identity. After a Split both halves would otherwise go on claiming the *source's* card
+// ids, and the next slider drag on the new half would name a card that Shot does not hold: the
+// server would adopt no bindings onto it and refuse the write by name, for an ordinary gesture.
+//
+// Only this field, and only from the save that settled the burst. Adopting the whole reply would
+// revert a prompt the Director typed while the write was in flight; adopting a stale one would
+// revert the plan. The race that is left is the mirror of one this client already runs: a stack
+// write landing inside a shots save's round trip has `writeEffectStack` adopt the *whole* project
+// over the plan, which is the same window in the other direction.
+export function adoptedShotEffects(shots, saved) {
+  const held = new Map((saved || []).map((shot) => [shot?.id, shotEffectStack(shot)]));
+  return (shots || []).map((shot) => (
+    held.has(shot?.id) ? { ...shot, effects: structuredClone(held.get(shot.id)) } : shot
+  ));
 }
 
 // The strip itself: every tab, whether it is the active one, what it says, and the roving
@@ -9216,12 +9246,22 @@ export function effectStackWrite(stack) {
         enabled: spec?.enabled !== false,
         parameters: { ...(spec?.parameters || {}) },
       };
-      // **A Parameter Binding is carried, never re-sent as absent.** The server's rule on this
-      // route is *carry, never mint* (`carried_bindings_refusal`): a body may hold the bindings
-      // the Shot already holds and may not invent one. Dropping them is the other half of that,
-      // and it is the half a client gets wrong -- losing a binding is indistinguishable from
-      // removing the bound card, because an `EffectSpec` has no id (R-26), so nothing on the
-      // server can refuse it. One slider release would destroy the Director's work and answer 200.
+      // **The card's own id is echoed back** (R-33). The server adopts each card's Parameter
+      // Bindings from the stored card of that id, so the id is what tells "the Director took this
+      // card off" from "this client rebuilt the stack and lost what was on it": a bound Shot whose
+      // stack arrives naming no ids at all is refused by name rather than answered 200. It is
+      // never invented here -- a card the Director has just added carries none, and the server
+      // mints one at the moment it stores it.
+      //
+      // Carried **sparsely**, for the reason the bindings below are: a card with no id writes the
+      // three keys this function has always written, byte for byte.
+      if (typeof spec?.id === "string" && spec.id) written.id = spec.id;
+      // **A Parameter Binding is carried, never re-sent as absent.** The server takes a card's
+      // bindings off the stored card whatever this body says, so dropping them here cannot
+      // destroy one any more -- it is refused by name instead, which is the half a client gets
+      // wrong. Carrying them is still what keeps an ordinary slider release a 200: a body that
+      // says something *different* about a binding is a refusal, and saying nothing about one the
+      // card holds is saying something different.
       //
       // Carried **sparsely**, only when the card actually holds one, so every body this function
       // has ever written stays byte-identical and `effectStackChanged` keeps its meaning: a card

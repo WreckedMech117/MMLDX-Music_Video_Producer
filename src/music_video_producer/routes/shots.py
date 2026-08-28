@@ -87,10 +87,10 @@ from ..app import (
     _require_approval_unchanged,
     _require_in_flight_status_kept,
     _vision_media,
+    adopted_effect_stack,
     apply_expansions,
     assistant_reply,
     attempt_expansion,
-    carried_bindings_refusal,
     expand_shots,
     expansion_sweep_notices,
     expansion_write_refusal,
@@ -101,7 +101,6 @@ from ..app import (
     shot_is_approved,
     shot_render_in_flight,
     stack_is_driven,
-    stored_effect_stack,
 )
 from ..assembly import ASSEMBLY_FPS, clip_frames_on_grid
 from ..batch import PENDING_SUBMISSION_PROMPT_ID, accept_submission, prompt_is_missing, shot_label
@@ -110,7 +109,14 @@ from ..director import DirectorError, DirectorUnavailable
 from ..effects import EffectRefusal, drive_readout, validate_stack
 from ..h3_prompt import check as h3_check
 from ..h3_prompt import normalize_audio_fields
-from ..models import Project, RenderJob, VisionInspectionRecord, resolve_shot_mode, song_audio_tag
+from ..models import (
+    Project,
+    RenderJob,
+    VisionInspectionRecord,
+    new_id,
+    resolve_shot_mode,
+    song_audio_tag,
+)
 from ..reference_map import reference_map_sentence, reference_map_tag_lines
 from ..timeline import ordered_shots
 from ..workflows import (
@@ -725,13 +731,19 @@ def register(ctx: RouterContext) -> None:
         checked here rather than at the export so the refusal names the write that grew it.
 
         **It writes the stack and never a Parameter Binding.** A binding lives inside an
-        `EffectSpec` and is minted only by `replace_shot_bindings` below (AD-16), so a body may
-        *carry* a binding this Shot already holds and may never invent or alter one — which is
-        `carried_bindings_refusal`, and both halves of it matter here. Carrying is what lets this
-        route go on being what the panel writes on every slider drag, card toggle and Story 9.4
-        reorder without the Director's own gesture destroying their own work; refusing to mint is
-        what keeps reactive filter configuration out of a route that never asked for a band, a
-        drive or a depth.
+        `EffectSpec` and is minted only by `replace_shot_bindings` below (AD-16). Every card here
+        is matched to the stored card of the same id and **adopts that card's bindings**
+        (`adopted_effect_stack`), so this route can go on being what the panel writes on every
+        slider drag, card toggle and Story 9.4 reorder without the Director's own gesture
+        destroying their own work — and a body cannot invent, alter, relocate or drop a binding,
+        because nothing it says about one is read.
+
+        **The wire contract that costs, said where a reader of the route meets it (R-33).** A
+        client writing a bound Shot's stack must echo the card ids it read. The panel does, through
+        `api.effectStackWrite`; a hand-rolled client that does not is refused by name rather than
+        losing a binding to a 200, because losing one is otherwise indistinguishable from removing
+        its card. A Shot that holds no binding is untouched by any of this and writes exactly as it
+        always did, ids or no ids.
 
         **A look the catalogue does not know rescans the folder once and asks again.** A Director
         who drops `brand-new-look.cube` in and immediately grades with it was told "There is no
@@ -782,34 +794,31 @@ def register(ctx: RouterContext) -> None:
                 validate_stack(request.effects, luts=discovered_looks(rescan=True))
             except EffectRefusal as rescanned:
                 raise HTTPException(status_code=422, detail=str(rescanned)) from rescanned
-        # Carry, never mint. `stored_effect_stack` writes whatever the agreed spec carried, so
-        # without this the same body that reorders a card could also invent a Parameter Binding
-        # on it — filter automation written through a route that never asked the Director for a
-        # band, a drive or a depth, past the one place (`replace_shot_bindings`) that does.
+        # Every card's bindings come off the stored card of that id, whatever the body says about
+        # them (R-33). This is the route the effects panel writes on every slider drag, every
+        # reorder and every card toggle, and it must be able to do all three without touching a
+        # binding — in either direction. A body that invents one is writing filter automation
+        # through a route that never asked the Director for a band, a drive or a depth; a body
+        # that drops one has the Director's own gesture destroy their own work at 200; and a body
+        # that moves one between two cards of one effect changes the rendered picture at 200,
+        # which is what the multiset this replaced could not see (A3).
         #
-        # And *carry* rather than *drop*, which is the other half and the one that would have
-        # been quiet. This is the route the effects panel writes on every slider drag, every
-        # reorder and every card toggle; a rule that stripped the binding here would have the
-        # Director's own gesture destroy their own work with a 200, which is exactly the failure
-        # `_adopt_shot_effects` exists against, one level down. A binding the body carries is
-        # kept when this Shot already holds the identical binding — validated, so a client that
-        # merely round-tripped the sparse spec it read is not accused of inventing anything.
+        # `own` and never `elsewhere`: a card belonging to some other Shot is not this Shot's to
+        # write back, so a body naming one is handed a new card with a new id and no bindings.
+        # Carrying a look from Shot to Shot is `POST .../effects/copy`, which says so out loud.
         #
-        # What this cannot do, and what nothing server-side can: tell "the Director removed the
-        # bound card" from "the client forgot to send its bindings back". An `EffectSpec` has no
-        # id (R-26), so there is no key by which the two differ. Losing a binding is therefore
-        # reachable through a client that has never heard of the field — which is why the field's
-        # own panel, and the client that round-trips it, are the next slice rather than a later
-        # one.
-        uncarried = carried_bindings_refusal(
-            request.effects,
-            held=[spec.model_dump() for spec in shot.effects],
-            source=BINDING_CARRIER_SHOT,
-            luts=discovered_looks() if request.effects else (),
+        # What is left, and it is the one thing an id cannot decide: a client that names *some*
+        # ids and leaves a bound card's id out is read at its word, because a card whose id is
+        # absent is a card this write does not have — which is also exactly how a card is removed.
+        # A client naming *no* ids at all on a bound Shot is refused by name instead
+        # (`SHOT_EFFECTS_WITHOUT_CARD_IDS_REFUSAL`), because that one is not a gesture, it is a
+        # client that has never heard of the field.
+        adoption = adopted_effect_stack(
+            request.effects, own=shot.effects, source=BINDING_CARRIER_SHOT
         )
-        if uncarried:
-            raise HTTPException(status_code=422, detail=uncarried)
-        shot.effects = stored_effect_stack(request.effects)
+        if adoption.refusal:
+            raise HTTPException(status_code=422, detail=adoption.refusal)
+        shot.effects = adoption.stack
         return store.save(project)
 
     @app.put(
@@ -823,21 +832,22 @@ def register(ctx: RouterContext) -> None:
 
         AD-16 and story 10.1's acceptance criterion, as a route rather than as a promise. Every
         other path a stack can arrive by — `PUT .../effects` beside this one, `PUT .../shots` and
-        `PUT /api/projects/{id}` through `_adopt_shot_effects`, `POST .../effects/copy` — may
-        carry a binding it was handed and may never invent one, and `carried_bindings_refusal` is
-        what makes that a property instead of a convention. This is where the other side of it is:
-        a Director says which card, which parameter, which band, which drive and how far, and
-        nothing else in this application can say any of it.
+        `PUT /api/projects/{id}` through `_adopt_shot_effects`, `POST .../effects/copy` — takes a
+        card's bindings off the stored card rather than out of the body (`adopted_effect_stack`),
+        which is what makes that a property instead of a convention. This is where the other side
+        of it is: a Director says which card, which parameter, which band, which drive and how
+        far, and nothing else in this application can say any of it.
 
-        **Addressed by position plus the card's own effect id**, which is the least this can be
-        without being the thing R-26 rejected. An `EffectSpec` carries no id and a stack may hold
-        two Blooms, so `(effect, parameter)` is ambiguous; a bare index is unambiguous and
-        *silently wrong* the moment Story 9.4's reorder moves a card, which is the worse failure
-        because the binding still resolves. The client sends the position it drew and the effect
-        it drew there, and a stack edited since refuses by name
-        (`SHOT_BINDINGS_CARD_MOVED_REFUSAL`) rather than binding something else's parameter. The
-        stored binding is still keyed by parameter name alone, on the card — the index reaches
-        the card and is not kept.
+        **Addressed by position plus the card's own effect id**, which is what it has been since
+        the route existed and is deliberately left alone by R-33. A card now carries an `id` and
+        this route could be keyed on it instead — but the client sends the position it *drew* and
+        the effect it drew there, a stack edited since refuses by name
+        (`SHOT_BINDINGS_CARD_MOVED_REFUSAL`) rather than binding something else's parameter, and
+        moving the address would change the wire, the panel and this route for no defect anybody
+        has reproduced. R-33 changed how a binding is **adopted** by the generic doors; it did not
+        ask this one to be re-addressed, and doing it unasked would be a second change hiding
+        inside the first. The stored binding is still keyed by parameter name alone, on the card —
+        the index reaches the card and is not kept.
 
         The gates are `replace_shot_effects`' gates in `replace_shot_effects`' order, and for its
         reasons: the Shot first, so a request naming nothing is a 404 rather than a lecture about
@@ -1149,7 +1159,18 @@ def register(ctx: RouterContext) -> None:
             # Copied deep, never aliased: two Shots sharing one parameter mapping would have one
             # slider move both, and the manifest would not show why. `_adopt_shot_effects` copies
             # for the same reason on the same field.
-            target.effects = [spec.model_copy(deep=True) for spec in source.effects]
+            #
+            # **And minted a new card id per target** (R-33), which is the third of the three
+            # doors that clone a card — Split and Duplicate are the other two and mint at
+            # `adopted_effect_stack`. Without this, ten targets would hold the source's card ids,
+            # a later lookup keyed on a card id would depend on which Shot was read first, and
+            # the divergence arrives on the very next slider drag. The bindings ride along
+            # unchanged, which is FX-6's whole point and AD-26's: the band average is the same in
+            # every Shot's panel, so the band chosen against the reference is the band that lands.
+            target.effects = [
+                spec.model_copy(deep=True, update={"id": new_id("fx")})
+                for spec in source.effects
+            ]
             applied.append(label)
         # Saved only when something was written. A copy every one of whose targets was locked
         # changed nothing, and a manifest save for it would touch `updated_at` — which every

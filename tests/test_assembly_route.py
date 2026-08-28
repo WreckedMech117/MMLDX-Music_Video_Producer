@@ -2582,9 +2582,14 @@ def test_a_disabled_bound_card_neither_drives_an_export_nor_refuses_one(tmp_path
     client, store, _comfy, _app = make_client(tmp_path)
     project_id, _shots_dir = a_project_ready_to_be_bound(client, store, tmp_path)
     assert bind_exposure(client, project_id).status_code == 200
+    # The card's own id travels with the write, which is what the panel does and what a bound
+    # Shot's stack write has had to do since R-33: the bindings are adopted from the card of that
+    # id, and a body naming none on a bound Shot is refused rather than quietly losing one.
+    card = store.get(project_id).shots[0].effects[0].id
     switched_off = client.put(
         f"/api/projects/{project_id}/shots/shot_a/effects",
         json={"effects": [{
+            "id": card,
             "effect": "exposure", "enabled": False, "parameters": {"amount": 0.2},
             "bindings": [{"parameter": "amount", "drive": "punch", "depth": 0.8,
                           "band_centre": 0.0, "band_width": 0.3, "band_softness": 0.35,

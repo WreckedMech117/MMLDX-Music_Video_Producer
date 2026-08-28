@@ -58,7 +58,7 @@ from music_video_producer.app import (
     ASSET_NAME_TOO_LONG,
     BINDING_CARRIER_PROJECT,
     BINDING_CARRIER_SHOT,
-    BINDING_UNCARRIED_REFUSAL,
+    BINDING_NOT_AS_HELD_REFUSAL,
     CANCEL_ALL_NONE_OPEN,
     CANCEL_JOB_NOTE,
     CANCEL_JOB_SETTLED,
@@ -123,6 +123,7 @@ from music_video_producer.app import (
     SHOT_CLAIM_WITHOUT_ANY_SHOTS_NOTICE,
     SHOT_DIRECTOR_VISIBLE,
     SHOT_DIRECTOR_WITHHELD,
+    SHOT_EFFECTS_WITHOUT_CARD_IDS_REFUSAL,
     SHOT_PLAN_EMPTY_NOTICE,
     SHOT_WINDOW_NOTICE,
     SNAP_CUTS_NO_SONG,
@@ -157,6 +158,7 @@ from music_video_producer.app import (
     SongContextField,
     SongContextRequest,
     _withheld_fields,
+    adopted_effect_stack,
     analyze_project_song,
     create_app,
     document_change_notice,
@@ -23806,11 +23808,20 @@ def test_a_shots_effect_stack_is_read_back_exactly_as_it_was_written(tmp_path: P
     # `bindings` is present and empty on every card: it is `EffectSpec`'s fourth field since
     # Epic 10, defaulted, and a stack written by a client that has never heard of it reads back
     # carrying none -- which is what "exactly as it was written" means for a field nobody wrote.
+    #
+    # `id` is the fifth, and it is the one key here the *client* did not write: the server mints
+    # one per card (R-33), so it is read back off the answer rather than pinned to a literal. The
+    # shape is still exhaustive -- a sixth key would fail this -- and the ids themselves are
+    # asserted where they mean something, in the adoption tests below.
+    read = client.get(effects_url(project_id)).json()["effects"]
     expected = [
-        {"effect": "punch_in", "enabled": True, "parameters": {"zoom": 1.2}, "bindings": []},
-        {"effect": "grain", "enabled": False, "parameters": {"strength": 8}, "bindings": []},
+        {"id": read[0]["id"], "effect": "punch_in", "enabled": True,
+         "parameters": {"zoom": 1.2}, "bindings": []},
+        {"id": read[1]["id"], "effect": "grain", "enabled": False,
+         "parameters": {"strength": 8}, "bindings": []},
     ]
-    assert client.get(effects_url(project_id)).json()["effects"] == expected
+    assert read == expected
+    assert read[0]["id"].startswith("fx_") and read[0]["id"] != read[1]["id"], read
     reopened = ProjectStore(tmp_path).get(project_id)
     assert [spec.model_dump() for spec in reopened.shots[0].effects] == expected
     # A disabled card is *retained*, which is the point of the second entry: switching a
@@ -23871,7 +23882,7 @@ def test_an_unwritable_stack_is_refused_by_the_chains_own_sentence_and_stores_no
         (
             [{"effect": "grain", "paramters": {}}],
             EFFECT_UNKNOWN_KEY_REFUSAL.format(
-                effect="grain", key="paramters", declared="effect, enabled, parameters, bindings"
+                effect="grain", key="paramters", declared="id, effect, enabled, parameters, bindings"
             ),
         ),
         (
@@ -23898,9 +23909,11 @@ def test_an_unwritable_stack_is_refused_by_the_chains_own_sentence_and_stores_no
         assert response.json()["detail"] == sentence, stack
         assert manifest.read_bytes() == untouched, f"a refused write moved the manifest: {stack}"
 
-    assert [
+    survived = [
         spec.model_dump() for spec in ProjectStore(tmp_path).get(project_id).shots[0].effects
-    ] == [{"effect": "punch_in", "enabled": True, "parameters": {"zoom": 1.2}, "bindings": []}]
+    ]
+    assert survived == [{"id": survived[0]["id"], "effect": "punch_in", "enabled": True,
+                         "parameters": {"zoom": 1.2}, "bindings": []}]
 
     # A Shot this project does not hold is a 404, and it is answered before anything else —
     # a request naming nothing gets "Shot not found", never a lecture about a stack.
@@ -24047,9 +24060,13 @@ def test_the_generic_writes_can_neither_clear_nor_forge_an_effect_stack(tmp_path
         ]
 
     intact = stacks()
+    # The card ids are the server's own (R-33) and are read back off the store rather than pinned:
+    # what this row is for is the shape, and the shape is still exhaustive.
     assert intact == [
-        [{"effect": "punch_in", "enabled": True, "parameters": {"zoom": 1.2}, "bindings": []}],
-        [{"effect": "grain", "enabled": True, "parameters": {"strength": 12}, "bindings": []}],
+        [{"id": intact[0][0]["id"], "effect": "punch_in", "enabled": True,
+          "parameters": {"zoom": 1.2}, "bindings": []}],
+        [{"id": intact[1][0]["id"], "effect": "grain", "enabled": True,
+          "parameters": {"strength": 12}, "bindings": []}],
     ]
 
     # 1. The whole-project PUT, omitting the field entirely.
@@ -24084,8 +24101,12 @@ def test_the_generic_writes_can_neither_clear_nor_forge_an_effect_stack(tmp_path
     assert stacks()[:2] == intact, "a whole-project save planted a look on a stored shot"
     # The Shot that is new to the plan keeps what it arrived with — which is how a Duplicate
     # made in the browser and saved through here lands with its look on.
-    assert stacks()[2] == [
-        {"effect": "mirror", "enabled": True, "parameters": {"axis": "horizontal"}, "bindings": []}
+    landed = stacks()[2]
+    assert landed == [
+        # Minted here rather than carried: the card arrived on a Shot the store does not hold, so
+        # it is a card being stored for the first time whatever id the body put on it (R-33).
+        {"id": landed[0]["id"], "effect": "mirror", "enabled": True,
+         "parameters": {"axis": "horizontal"}, "bindings": []}
     ]
 
     # 2b. And the catalogue still answers for that new Shot, which is what makes keeping it
@@ -24398,9 +24419,11 @@ def test_a_manifest_written_before_effects_existed_round_trips_through_both_rout
         shot.pop("effects", None)
     saved = client.put(f"/api/projects/{project_id}", json=pre_c1)
     assert saved.status_code == 200, saved.text
-    assert [
+    kept = [
         spec.model_dump() for spec in ProjectStore(tmp_path).get(project_id).shots[0].effects
-    ] == [{"effect": "vignette", "enabled": True, "parameters": {"angle": 0.5}, "bindings": []}]
+    ]
+    assert kept == [{"id": kept[0]["id"], "effect": "vignette", "enabled": True,
+                     "parameters": {"angle": 0.5}, "bindings": []}]
 
 
 def test_the_effects_routes_are_discoverable_in_the_openapi_document(tmp_path: Path):
@@ -25090,12 +25113,17 @@ def test_a_second_render_does_not_erase_the_first_ones_job_record(tmp_path: Path
 # Epic 10, slice E2: the route that mints a Parameter Binding, and the rule that
 # keeps every other write off it.
 #
-# One rule, two doors: **carry, never mint**. A stack travels -- `PUT .../effects` is how the
+# One rule, two doors: **adopt, never read**. A stack travels -- `PUT .../effects` is how the
 # panel reorders a card, `PUT .../shots` is how Split and Duplicate persist a copied stack -- so a
-# binding has to be able to ride along, which is exactly why R-26 put it on the card. And an
-# `EffectSpec` has no id, so no route but this one can be told which card a *new* binding belongs
-# to without the `(index, parameter)` ambiguity R-26 rejected. Everything below drives the real
-# routes; a source grep proves a convention and never a behaviour.
+# binding has to be able to ride along, which is exactly why R-26 put it on the card. Every door
+# but this one takes a card's bindings off the stored card of the same id and never out of the
+# body, which is `app.adopted_effect_stack` and R-33.
+#
+# **It was "carry, never mint" until 2026-08-28**, comparing a multiset of validated bindings
+# because a card had no identity to compare instead -- and that shape produced three reproduced
+# defects at once (A1, A3, A4). The tests below are written against the contract that replaced it;
+# what each of the three was is recorded on the test that closes it. Everything here drives the
+# real routes; a source grep proves a convention and never a behaviour.
 # ---------------------------------------------------------------------------
 
 
@@ -25133,8 +25161,12 @@ def test_a_binding_is_written_by_its_own_route_and_read_back_as_the_director_wro
 
     assert written.status_code == 200, written.text
     reopened = ProjectStore(tmp_path).get(project_id)
-    assert [spec.model_dump() for spec in reopened.shots[0].effects] == [
+    held = [spec.model_dump() for spec in reopened.shots[0].effects]
+    assert held == [
         {
+            # Minted when the card was stored, and untouched by a binding write: this route
+            # changes one field of one entry and the card it lands on keeps its identity.
+            "id": held[0]["id"],
             "effect": "bloom",
             "enabled": True,
             "parameters": {"intensity": 0.4},
@@ -25333,18 +25365,23 @@ def test_the_binding_routes_own_gates_refuse_by_name_and_write_nothing(tmp_path:
     assert manifest.read_bytes() == untouched
 
 
-def test_the_stack_route_carries_a_binding_it_was_handed_and_cannot_invent_one(tmp_path: Path):
-    """Carry, never mint, at the door the effects panel writes on every gesture.
+def test_the_stack_route_adopts_each_cards_bindings_from_the_card_it_names(tmp_path: Path):
+    """Adopt, never read, at the door the effects panel writes on every gesture (R-33).
 
-    **Carry**, because this is the route a slider drag, a card toggle and Story 9.4's reorder all
-    land on: a rule that stripped the binding here would have the Director's own gesture destroy
-    their own work and answer 200. **Never mint**, because that is AD-16 -- a binding is written
-    by its own route and by nothing else, and a stack write that could invent one would be
-    reactive filter configuration through a route that never asked for a band, a drive or a depth.
+    This is the route a slider drag, a card toggle and Story 9.4's reorder all land on, and every
+    one of them sends the whole stack back. A rule that *stripped* the binding here would have the
+    Director's own gesture destroy their own work at 200; a rule that *read* it would let the same
+    body invent reactive filter configuration through a route that never asked for a band, a drive
+    or a depth (AD-16). So the body is not read: each card is matched to the stored card of the
+    same id and takes that card's bindings, and what the body said about them is only ever used to
+    decide whether to say so.
 
-    The comparison is of *validated* bindings, so a client that round-trips the sparse spec it
-    read is carrying rather than inventing, and one that changes a single number is inventing
-    rather than carrying.
+    **Which is why the relocation case below is the one that matters.** Its predecessor compared a
+    multiset of validated bindings, so two cards of one effect were indistinguishable to it and a
+    binding could be moved from a Bloom resting at 0.1 to one resting at 0.9 -- changing the
+    rendered picture, at 200 (A3, reproduced by Epic 10's retrospective). Here that write does not
+    express a relocation at all: the binding is on the card whose id holds it, before anything is
+    compared. The refusal is a *diagnostic* on top of that, not the guard.
     """
     client, _store, _comfy = make_client(tmp_path)
     project_id = project_with_two_shots(client)
@@ -25353,57 +25390,237 @@ def test_the_stack_route_carries_a_binding_it_was_handed_and_cannot_invent_one(t
         bindings_url(project_id), json={"effect": "bloom", "bindings": [A_BINDING]}
     ).status_code == 200
 
-    # 1. Carried: the panel reorders the stack and sends the card back with its binding on it.
+    def cards() -> list[dict]:
+        return client.get(effects_url(project_id)).json()["effects"]
+
+    bloom = cards()[0]["id"]
+
+    # 1. Carried: the panel reorders the stack and sends both cards back, ids and all.
     carried = write_stack(client, project_id, [
         {"effect": "grain", "parameters": {"strength": 6}},
-        {"effect": "bloom", "parameters": {"intensity": 0.9}, "bindings": [A_BINDING]},
+        {"id": bloom, "effect": "bloom", "parameters": {"intensity": 0.9},
+         "bindings": [A_BINDING]},
     ])
     assert carried.status_code == 200, carried.text
     stored = ProjectStore(tmp_path).get(project_id).shots[0].effects
     assert [spec.effect for spec in stored] == ["grain", "bloom"]
     assert stored[1].bindings == [A_BINDING]
     assert stored[1].parameters == {"intensity": 0.9}, "the slider still moved"
+    # The card kept its identity across the reorder, and the card that arrived without one was
+    # minted its own rather than borrowing the neighbour's.
+    assert stored[1].id == bloom and stored[0].id != bloom, [spec.id for spec in stored]
+    grain = stored[0].id
 
     # 1b. And carried whole even when the client spells every default out, because what is
     #     compared is the agreed binding and not the JSON it arrived as.
     spelled = dict(A_BINDING, band_centre=0.25, band_width=0.3, band_softness=0.35,
                    floor=0.0, hold=0.8, sustain=1.5)
     verbose = write_stack(client, project_id, [
-        {"effect": "grain", "parameters": {"strength": 6}},
-        {"effect": "bloom", "parameters": {"intensity": 0.9}, "bindings": [spelled]},
+        {"id": grain, "effect": "grain", "parameters": {"strength": 6}},
+        {"id": bloom, "effect": "bloom", "parameters": {"intensity": 0.9},
+         "bindings": [spelled]},
     ])
     assert verbose.status_code == 200, verbose.text
 
     manifest = ProjectStore(tmp_path).manifest_path(project_id)
     untouched = manifest.read_bytes()
 
-    # 2. Minted: a binding this Shot does not hold, on a card that never had one.
+    # 2. Invented: a binding this card does not hold, on a card that never had one.
     forged = write_stack(client, project_id, [
-        {"effect": "grain", "parameters": {"strength": 6},
-         "bindings": [{"parameter": "strength", "drive": "punch", "depth": 1}]},
-        {"effect": "bloom", "parameters": {"intensity": 0.9}, "bindings": [spelled]},
+        {"id": grain, "effect": "exposure", "parameters": {"amount": 0.2},
+         "bindings": [{"parameter": "amount", "drive": "punch", "depth": 0.3}]},
+        {"id": bloom, "effect": "bloom", "parameters": {"intensity": 0.9},
+         "bindings": [spelled]},
     ])
     assert forged.status_code == 422, forged.text
+    assert forged.json()["detail"] == BINDING_NOT_AS_HELD_REFUSAL.format(
+        effect="exposure", parameter="amount", source=BINDING_CARRIER_SHOT
+    )
 
-    # 3. Altered: one number of a binding this Shot *does* hold. Still minting.
+    # 3. Altered: one number of a binding this card *does* hold.
     altered = write_stack(client, project_id, [
-        {"effect": "grain", "parameters": {"strength": 6}},
-        {"effect": "bloom", "parameters": {"intensity": 0.9},
+        {"id": grain, "effect": "grain", "parameters": {"strength": 6}},
+        {"id": bloom, "effect": "bloom", "parameters": {"intensity": 0.9},
          "bindings": [dict(spelled, depth=0.6)]},
     ])
     assert altered.status_code == 422, altered.text
-    assert altered.json()["detail"] == BINDING_UNCARRIED_REFUSAL.format(
+    assert altered.json()["detail"] == BINDING_NOT_AS_HELD_REFUSAL.format(
         effect="bloom", parameter="intensity", source=BINDING_CARRIER_SHOT
     )
 
-    # 4. Duplicated: carried twice where it was held once, which is one mint.
+    # 4. Dropped: the id is echoed and the binding is not, which is what a client that rebuilt the
+    #    card from three keys sends. Nothing is lost -- the stored binding is adopted regardless --
+    #    and it is still said, because a client doing this has a defect.
+    dropped = write_stack(client, project_id, [
+        {"id": grain, "effect": "grain", "parameters": {"strength": 6}},
+        {"id": bloom, "effect": "bloom", "parameters": {"intensity": 0.9}},
+    ])
+    assert dropped.status_code == 422, dropped.text
+    assert dropped.json()["detail"] == BINDING_NOT_AS_HELD_REFUSAL.format(
+        effect="bloom", parameter="intensity", source=BINDING_CARRIER_SHOT
+    )
+
+    # 5. Duplicated: one stored card claimed twice. The first claim takes the card; the second is
+    #    a new card with a new id, which is why the binding cannot be multiplied by echoing an id.
     doubled = write_stack(client, project_id, [
-        {"effect": "bloom", "parameters": {"intensity": 0.9}, "bindings": [spelled]},
-        {"effect": "bloom", "parameters": {"intensity": 0.9}, "bindings": [spelled]},
+        {"id": bloom, "effect": "bloom", "parameters": {"intensity": 0.9},
+         "bindings": [spelled]},
+        {"id": bloom, "effect": "bloom", "parameters": {"intensity": 0.9},
+         "bindings": [spelled]},
     ])
     assert doubled.status_code == 422, doubled.text
 
     assert manifest.read_bytes() == untouched, "a refused stack write moved the manifest"
+
+
+def test_a_binding_cannot_be_relocated_between_two_cards_of_one_effect(tmp_path: Path):
+    """A3, reproduced by Epic 10's retrospective and closed **structurally** rather than refused.
+
+    Two Blooms, one resting at 0.1 and one at 0.9, and the binding on the first. The write below
+    is the one that used to land: every card composable, every binding in the stack already held
+    by this Shot, and the multiset that stood guard could not tell the two cards apart -- so the
+    Director's picture changed at 200 through a door whose own docstring said only the binding
+    route could say which card a binding belonged to.
+
+    The route refuses it now, and that is the *lesser* half. The half worth asserting is that the
+    write does not express a relocation at all: `adopted_effect_stack` puts each card's stored
+    bindings back on the card that holds them before anything is compared, so were the refusal
+    deleted tomorrow the binding would still be on the first Bloom. That is what
+    "impossible rather than refused" has to mean, and it is asserted here directly on the
+    function, because through the route the refusal hides it.
+    """
+    client, _store, _comfy = make_client(tmp_path)
+    project_id = project_with_two_shots(client)
+    assert write_stack(client, project_id, [
+        {"effect": "bloom", "parameters": {"intensity": 0.1}},
+        {"effect": "bloom", "parameters": {"intensity": 0.9}},
+    ]).status_code == 200
+    assert client.put(
+        bindings_url(project_id), json={"effect": "bloom", "bindings": [A_BINDING]}
+    ).status_code == 200
+    held = ProjectStore(tmp_path).get(project_id).shots[0].effects
+    quiet, loud = held[0].id, held[1].id
+    assert held[0].bindings == [A_BINDING] and held[1].bindings == []
+
+    manifest = ProjectStore(tmp_path).manifest_path(project_id)
+    untouched = manifest.read_bytes()
+    relocated = [
+        {"id": quiet, "effect": "bloom", "parameters": {"intensity": 0.1}},
+        {"id": loud, "effect": "bloom", "parameters": {"intensity": 0.9},
+         "bindings": [A_BINDING]},
+    ]
+
+    moved = write_stack(client, project_id, relocated)
+
+    assert moved.status_code == 422, moved.text
+    assert manifest.read_bytes() == untouched, "the relocation moved the manifest"
+
+    # And the structure, with the refusal out of the way: the same body, adopted, puts the binding
+    # back where the manifest says it is.
+    adoption = adopted_effect_stack(relocated, own=held, source=BINDING_CARRIER_SHOT)
+    assert [spec.bindings for spec in adoption.stack] == [[A_BINDING], []], (
+        "a binding followed the body rather than the card id it lives on"
+    )
+    assert [spec.id for spec in adoption.stack] == [quiet, loud]
+
+
+def test_a_bound_shots_stack_write_that_names_no_card_ids_is_refused_by_name(tmp_path: Path):
+    """The cost of the id, paid where a reader of the route meets it (R-33).
+
+    A card is adopted by its id, so a card left *out* of a write and a card whose id a client
+    forgot to send are different writes -- and to a client that has never heard of card ids they
+    are the same write. Every binding on the Shot would go with the cards that could not name
+    themselves, and losing a binding is indistinguishable from removing its card, which is the
+    defect this whole thread began with.
+
+    So it is refused by name, and only for a Shot that actually holds a binding: an unbound stack
+    is written by an id-less client exactly as it always was, which is every stack in every
+    project until a Director binds something.
+    """
+    client, _store, _comfy = make_client(tmp_path)
+    project_id = project_with_two_shots(client)
+    a_bindable_shot(client, project_id)
+
+    # Unbound: an id-less body is an ordinary write and nothing is said about ids at all.
+    assert write_stack(
+        client, project_id, [{"effect": "bloom", "parameters": {"intensity": 0.6}}]
+    ).status_code == 200
+
+    assert client.put(
+        bindings_url(project_id), json={"effect": "bloom", "bindings": [A_BINDING]}
+    ).status_code == 200
+    manifest = ProjectStore(tmp_path).manifest_path(project_id)
+    untouched = manifest.read_bytes()
+
+    naive = write_stack(client, project_id, [
+        {"effect": "bloom", "parameters": {"intensity": 0.7}},
+        {"effect": "grain", "parameters": {"strength": 6}},
+    ])
+
+    assert naive.status_code == 422, naive.text
+    assert naive.json()["detail"] == SHOT_EFFECTS_WITHOUT_CARD_IDS_REFUSAL
+    assert manifest.read_bytes() == untouched
+
+    # And clearing the stack stays reachable, which is the one id-less body that is never
+    # ambiguous: `{"effects": []}` says the Director took every card off, binding and all.
+    cleared = write_stack(client, project_id, [])
+    assert cleared.status_code == 200, cleared.text
+    assert ProjectStore(tmp_path).get(project_id).shots[0].effects == []
+
+
+def test_a_card_id_is_the_servers_and_a_body_can_neither_choose_nor_forge_one(tmp_path: Path):
+    """Every id that reaches a manifest is `new_id("fx")`'s, minted at the moment a card is stored.
+
+    A client's own id is only ever *looked up*: it either names a card this Shot already holds --
+    in which case that card keeps the identity it already had -- or it names nothing, and the card
+    is stored as the new card it is, with a new id and no bindings. So there is no body that can
+    plant a chosen id, and none that can reach a binding by guessing one.
+
+    The last row is not a nicety. `id` is declared in `EFFECT_SPEC_KEYS` so that a client
+    round-tripping the stack it read is not refused for an undeclared key, and the validator says
+    nothing about the value -- so `{"id": {}}` is a body that really arrives, and an unguarded
+    dictionary lookup on it is `TypeError: unhashable type` out of the one function whose job is
+    to keep a body's claims away from the manifest.
+    """
+    client, _store, _comfy = make_client(tmp_path)
+    project_id = project_with_two_shots(client)
+    a_bindable_shot(client, project_id)
+    assert client.put(
+        bindings_url(project_id), json={"effect": "bloom", "bindings": [A_BINDING]}
+    ).status_code == 200
+    bloom = client.get(effects_url(project_id)).json()["effects"][0]["id"]
+
+    # A chosen id on a new card is not kept, and the write is otherwise ordinary.
+    chosen = write_stack(client, project_id, [
+        {"id": bloom, "effect": "bloom", "parameters": {"intensity": 0.4},
+         "bindings": [A_BINDING]},
+        {"id": "fx_chosen_by_a_client", "effect": "grain", "parameters": {"strength": 6}},
+    ])
+    assert chosen.status_code == 200, chosen.text
+    stored = ProjectStore(tmp_path).get(project_id).shots[0].effects
+    assert stored[1].id != "fx_chosen_by_a_client", "a client chose a card id"
+    assert stored[1].id.startswith("fx_") and stored[0].id == bloom
+
+    # An invented id reaching for a binding gets a card of its own and none of it.
+    forged = write_stack(client, project_id, [
+        {"id": "fx_000000000000", "effect": "bloom", "parameters": {"intensity": 0.4},
+         "bindings": [A_BINDING]},
+    ])
+    assert forged.status_code == 422, forged.text
+    assert forged.json()["detail"] == BINDING_NOT_AS_HELD_REFUSAL.format(
+        effect="bloom", parameter="intensity", source=BINDING_CARRIER_SHOT
+    )
+
+    # An id that is not a string at all is a body, not a 500.
+    strange = write_stack(client, project_id, [
+        {"id": bloom, "effect": "bloom", "parameters": {"intensity": 0.4},
+         "bindings": [A_BINDING]},
+        {"id": {"why": "not"}, "effect": "grain", "parameters": {"strength": 6}},
+    ])
+    assert strange.status_code == 200, strange.text
+    landed = ProjectStore(tmp_path).get(project_id).shots[0].effects
+    assert [spec.effect for spec in landed] == ["bloom", "grain"]
+    assert landed[1].id.startswith("fx_") and landed[0].id == bloom, landed[1].id
 
 
 def test_the_generic_writes_can_neither_clear_alter_nor_forge_a_binding(tmp_path: Path):
@@ -25461,14 +25678,21 @@ def test_the_generic_writes_can_neither_clear_alter_nor_forge_a_binding(tmp_path
     assert stored() == intact, "a whole-project save planted a binding on a stored shot"
 
 
-def test_a_split_carries_its_binding_onto_the_new_half_and_cannot_invent_one(tmp_path: Path):
+def test_a_split_carries_its_binding_onto_the_new_half_and_mints_its_own_card_ids(tmp_path: Path):
     """`SHOT_PLAN_CONTENT_FIELDS`' argument, applied to the field inside the field.
 
     Split and Duplicate copy a stack onto a **new** id and save the whole list, which is the one
     order a Director ever produces, and the halves of one shot are one shot's look: a half that
-    lost its binding would move differently from its own other half. So a binding the project
-    already holds may ride onto a new id -- and one it does not is refused by name with nothing
-    saved, which keeps AD-16 true at the door a whole-plan write opens.
+    lost its binding would move differently from its own other half. So the new half's cards adopt
+    the bindings of the cards they name -- looked up across the project, because the whole point
+    of a Split is that this Shot id did not exist a moment ago and the stack came off a sibling.
+
+    **And every card of the new half is minted a fresh id, which is the piece no measurement
+    covered** (R-33). `api.newShotFromPlan` deep-copies the source Shot's stack, ids and all, so
+    without this both halves would claim one card id -- and the moment their bindings diverged,
+    any lookup keyed on that id would answer differently depending on which Shot it read first.
+    Minting where a card is *stored onto a Shot that does not already hold it* means no two Shots
+    ever hold one card id, so there is no collision to resolve and no order to depend on.
     """
     client, _store, _comfy = make_client(tmp_path)
     project_id = project_with_two_shots(client)
@@ -25487,12 +25711,37 @@ def test_a_split_carries_its_binding_onto_the_new_half_and_cannot_invent_one(tmp
     halves = ProjectStore(tmp_path).get(project_id).shots[:2]
     assert [shot.id for shot in halves] == ["shot_one", "shot_split"]
     assert [[spec.model_dump() for spec in shot.effects] for shot in halves] == [
-        [{"effect": "bloom", "enabled": True, "parameters": {"intensity": 0.4},
-          "bindings": [A_BINDING]}]
-    ] * 2, "a half of one shot came back driven differently from its own other half"
+        [{"id": shot.effects[0].id, "effect": "bloom", "enabled": True,
+          "parameters": {"intensity": 0.4}, "bindings": [A_BINDING]}]
+        for shot in halves
+    ], "a half of one shot came back driven differently from its own other half"
+    # The card the Director bound keeps its identity; the half that was born a moment ago is given
+    # one of its own, so nothing later has to guess which Shot a card id belongs to.
+    assert halves[0].effects[0].id != halves[1].effects[0].id, (
+        "both halves of the split claim one card id"
+    )
+    assert halves[0].effects[0].id == body["shots"][0]["effects"][0]["id"]
 
-    # But a new Shot arriving with a binding nothing in this project holds is minting one, and
-    # the whole write goes down rather than landing the plan and quietly keeping the invention.
+    # A second Split, of the *new* half, carries the binding again and mints again -- so the
+    # multiplication a Split really produces is stated rather than bounded. "Carried at most as
+    # many times as it was held" was the old rule and it was never true of this gesture: one Shot
+    # bound, split twice, is three bound cards, which is exactly what `POST .../effects/copy`
+    # produces on purpose and with an announcement.
+    body = client.get(f"/api/projects/{project_id}").json()
+    third = dict(body["shots"][1], id="shot_third", start=4, duration=1)
+    body["shots"].insert(2, third)
+    again = client.put(f"/api/projects/{project_id}/shots", json={"shots": body["shots"]})
+    assert again.status_code == 200, again.text
+    three = ProjectStore(tmp_path).get(project_id).shots[:3]
+    assert [shot.effects[0].bindings for shot in three] == [[A_BINDING]] * 3
+    assert len({shot.effects[0].id for shot in three}) == 3, (
+        [shot.effects[0].id for shot in three]
+    )
+
+    # But a new Shot arriving with a binding on a card id nothing in this project holds is
+    # inventing one, and the whole write goes down rather than landing the plan and quietly
+    # keeping the invention. The card would have been stored with no bindings either way -- the
+    # refusal is what stops a client believing otherwise.
     manifest = ProjectStore(tmp_path).manifest_path(project_id)
     untouched = manifest.read_bytes()
     body = client.get(f"/api/projects/{project_id}").json()
@@ -25505,12 +25754,253 @@ def test_a_split_carries_its_binding_onto_the_new_half_and_cannot_invent_one(tmp
 
     assert smuggled.status_code == 422, smuggled.text
     assert smuggled.json()["detail"] == SHOT_BINDINGS_UNCARRIED_REFUSAL.format(
-        shot="SHOT 04 (shot_smuggled)",
-        detail=BINDING_UNCARRIED_REFUSAL.format(
+        shot="SHOT 05 (shot_smuggled)",
+        detail=BINDING_NOT_AS_HELD_REFUSAL.format(
             effect="bloom", parameter="intensity", source=BINDING_CARRIER_PROJECT
         ),
     )
     assert manifest.read_bytes() == untouched, "a refused whole-plan write moved the manifest"
+
+
+def test_a_dead_look_on_one_shot_no_longer_refuses_every_other_shots_write(tmp_path: Path):
+    """A1, reproduced by Epic 10's retrospective and dissolved rather than patched.
+
+    Its cause was that the old guard's answer to *what was this write entitled to carry?* came
+    from `validate_stack` over the stored stacks -- and a stack the catalogue will not compose
+    entitled a write to carry **nothing**. So a `.cube` deleted from the looks folder, on a Shot
+    nobody was editing, emptied the census for the whole project: every Split and every Duplicate
+    of every bound Shot was refused, and on the narrow route the Director was told to fix the look,
+    did exactly that, and found that the only write the route would accept was the one that
+    deleted their binding.
+
+    Adoption never asks the catalogue anything. A card's bindings are copied off the card of the
+    same id, and `effects.agreed_bindings` -- which is what the diagnostic compares with -- is a
+    fact about the catalogue's parameters and not about the looks folder. So the Director can take
+    the broken card off, and the binding on the card beside it survives.
+    """
+    from music_video_producer.effects import cube_text, identity_transform, lut_directory
+
+    client, _store, _comfy = make_client(tmp_path)
+    project_id = project_with_two_shots(client)
+    # The catalogue read is what creates the folder and its default looks; the file goes in
+    # afterwards and is discovered by the write below, exactly as a Director dropping one in is.
+    assert client.get("/api/effects/catalogue").status_code == 200
+    cube = lut_directory(tmp_path) / "Doomed.cube"
+    cube.write_text(cube_text(2, identity_transform, title="Doomed"), encoding="utf-8")
+
+    assert write_stack(client, project_id, [
+        {"effect": "bloom", "parameters": {"intensity": 0.4}},
+        {"effect": "lut_look", "parameters": {"lut": "doomed"}},
+    ]).status_code == 200
+    assert client.put(
+        bindings_url(project_id), json={"effect": "bloom", "bindings": [A_BINDING]}
+    ).status_code == 200
+    held = ProjectStore(tmp_path).get(project_id).shots[0].effects
+    bloom, grade = held[0].id, held[1].id
+    assert held[0].bindings == [A_BINDING]
+
+    # Deleted, and the folder read again so the listing this application holds is the folder as it
+    # now is -- a cached listing would go on composing a look whose file has gone, which is
+    # `discovered_looks`' own design and not what this test is about.
+    cube.unlink()
+    assert client.get("/api/effects/catalogue?rescan=true").status_code == 200
+    assert write_stack(client, project_id, [
+        {"effect": "lut_look", "parameters": {"lut": "doomed"}},
+    ]).status_code == 422, "the look is still composable, so this test proves nothing"
+
+    # The Director does what the refusal asks and takes the broken grade card off. The write
+    # lands, and the binding on the card that has nothing to do with it is still there.
+    removed = write_stack(client, project_id, [
+        {"id": bloom, "effect": "bloom", "parameters": {"intensity": 0.4},
+         "bindings": [A_BINDING]},
+    ])
+    assert removed.status_code == 200, removed.text
+    after = ProjectStore(tmp_path).get(project_id).shots[0].effects
+    assert [spec.id for spec in after] == [bloom]
+    assert after[0].bindings == [A_BINDING], "removing the dead look destroyed the binding"
+    assert grade not in {spec.id for spec in after}
+
+
+def test_a_replayed_creation_carries_its_binding_whichever_card_id_it_names(tmp_path: Path):
+    """Undo and Redo, over a Split of a bound Shot -- the two writes that re-*create* a Shot.
+
+    A card id is the key everywhere a card exists, and a replay is where one may not. Both of the
+    browser's history snapshots re-send a plan verbatim, and they disagree about which card id the
+    re-created half names:
+
+    * **Redo** replays `state.project.shots` as it stood when Undo was pressed, so the half names
+      the card the Split actually minted -- and the Undo in between deleted the Shot that held it,
+      so that id is now dead.
+    * **Undo of a delete** replays the plan the last landed save left behind, which
+      `saveShotsSilently` takes from the body it *sent* rather than from the reply, so the half
+      names the card it was **copied from** -- which is alive, on the sibling.
+
+    Measured 2026-08-28, both ways round: requiring the id refuses the first, and correcting the
+    browser's snapshot to match the store refuses the second instead. The two paths want opposite
+    answers, so *accuracy* is not the axis and no ordering of the client's two snapshots fixes it.
+    What the door can ask is AD-16's own question -- was this binding handed to you? -- as set
+    membership over what the project holds (`_copied_bindings`), which is the same answer for both
+    and for a browser holding either snapshot.
+
+    Driven as the two bodies the client really sends, against the real routes, because what is at
+    stake is a sequence of writes rather than one.
+    """
+    client, _store, _comfy = make_client(tmp_path)
+    project_id = project_with_two_shots(client)
+    a_bindable_shot(client, project_id)
+    assert client.put(
+        bindings_url(project_id), json={"effect": "bloom", "bindings": [A_BINDING]}
+    ).status_code == 200
+    held = client.get(f"/api/projects/{project_id}").json()["shots"]
+
+    # The Split, exactly as `newShotFromPlan` composes it: the source Shot's stack deep-copied,
+    # card ids and all.
+    first = dict(held[0], duration=2)
+    second = dict(copy.deepcopy(held[0]), id="shot_half", start=2, duration=2)
+    split = client.put(
+        f"/api/projects/{project_id}/shots", json={"shots": [first, second, *held[1:]]}
+    )
+    assert split.status_code == 200, split.text
+    landed = split.json()["shots"]
+    minted = landed[1]["effects"][0]["id"]
+    assert minted != landed[0]["effects"][0]["id"]
+
+    # 1. Undo, then Redo -- the Redo naming the card the Split minted, which the Undo deleted.
+    undone = client.put(
+        f"/api/projects/{project_id}/shots", json={"shots": [held[0], *held[1:]]}
+    )
+    assert undone.status_code == 200, undone.text
+    assert [shot["id"] for shot in undone.json()["shots"]] == ["shot_one", "shot_two"]
+    redone = client.put(f"/api/projects/{project_id}/shots", json={"shots": landed})
+
+    assert redone.status_code == 200, redone.text
+    halves = ProjectStore(tmp_path).get(project_id).shots[:2]
+    assert [shot.effects[0].bindings for shot in halves] == [[A_BINDING]] * 2, (
+        "a redone half of a split came back unbound"
+    )
+    assert halves[0].effects[0].id != halves[1].effects[0].id
+    assert halves[1].effects[0].id != minted, "a card the store had deleted was resurrected by id"
+
+    # 2. The other snapshot: the half named the card it was **copied from**, which is alive. The
+    #    same write, and the same answer -- which is what makes this insensitive to which of the
+    #    browser's two snapshots a replay happens to be holding.
+    deleted = client.put(
+        f"/api/projects/{project_id}/shots", json={"shots": [held[0], *held[1:]]}
+    )
+    assert deleted.status_code == 200, deleted.text
+    restored = client.put(
+        f"/api/projects/{project_id}/shots", json={"shots": [first, second, *held[1:]]}
+    )
+    assert restored.status_code == 200, restored.text
+    back = ProjectStore(tmp_path).get(project_id).shots[:2]
+    assert [shot.effects[0].bindings for shot in back] == [[A_BINDING]] * 2
+    assert back[0].effects[0].id != back[1].effects[0].id
+
+    # And what the door still refuses, which is the whole of what it is for: a binding no card in
+    # this project holds, on a Shot the store has never seen. The card id it names changes nothing.
+    manifest = ProjectStore(tmp_path).manifest_path(project_id)
+    untouched = manifest.read_bytes()
+    invented = copy.deepcopy(back[1].model_dump(mode="json"))
+    invented["id"] = "shot_invented"
+    invented["start"] = 8
+    # A card id nothing holds, so this write takes the same door the two replays above took --
+    # naming a live card would put it on the strict branch instead and prove nothing about this
+    # one. The binding is one depth away from the held one, which is what the door has to see.
+    invented["effects"][0]["id"] = "fx_a_card_that_never_was"
+    invented["effects"][0]["bindings"] = [dict(A_BINDING, depth=-0.25)]
+    smuggled = client.put(
+        f"/api/projects/{project_id}/shots",
+        json={"shots": [*[shot.model_dump(mode="json") for shot in back], invented]},
+    )
+    assert smuggled.status_code == 422, smuggled.text
+    assert smuggled.json()["detail"] == SHOT_BINDINGS_UNCARRIED_REFUSAL.format(
+        shot="SHOT 03 (shot_invented)",
+        detail=BINDING_NOT_AS_HELD_REFUSAL.format(
+            effect="bloom", parameter="intensity", source=BINDING_CARRIER_PROJECT
+        ),
+    )
+    assert manifest.read_bytes() == untouched
+
+
+def test_a_copied_binding_lands_in_the_spelling_the_store_holds(tmp_path: Path):
+    """The creation door hands back the **stored** binding, never the body's own spelling.
+
+    Which is what keeps it an adoption rather than a body read: a body says *which* held binding it
+    means and the bytes come off the card that holds it. A client spelling all nine keys out would
+    otherwise write a manifest full of frozen defaults into a Shot the Director never touched --
+    the staleness `stored_effect_stack` argues against at length, arriving through the one door
+    where a body's binding is allowed to matter at all.
+    """
+    client, _store, _comfy = make_client(tmp_path)
+    project_id = project_with_two_shots(client)
+    a_bindable_shot(client, project_id)
+    assert client.put(
+        bindings_url(project_id), json={"effect": "bloom", "bindings": [A_BINDING]}
+    ).status_code == 200
+    held = client.get(f"/api/projects/{project_id}").json()["shots"]
+
+    spelled = dict(A_BINDING, band_centre=0.25, band_width=0.3, band_softness=0.35,
+                   floor=0.0, hold=0.8, sustain=1.5)
+    half = dict(copy.deepcopy(held[0]), id="shot_half", start=2, duration=2)
+    half["effects"][0]["id"] = "fx_a_card_that_is_gone"
+    half["effects"][0]["bindings"] = [spelled]
+    saved = client.put(
+        f"/api/projects/{project_id}/shots",
+        json={"shots": [dict(held[0], duration=2), half, *held[1:]]},
+    )
+
+    assert saved.status_code == 200, saved.text
+    landed = ProjectStore(tmp_path).get(project_id).shots[1]
+    assert landed.effects[0].bindings == [A_BINDING], (
+        "the body's spelling reached the manifest instead of the store's"
+    )
+    assert landed.effects[0].id != "fx_a_card_that_is_gone"
+
+
+def test_a_card_this_build_cannot_name_does_not_refuse_another_shots_split(tmp_path: Path):
+    """A1's shape, one door over, on the only stored-side read the creation door makes.
+
+    `_held_bindings` walks every card the project holds to answer *was this binding handed to
+    you?*, and a manifest is hand-editable: a card naming an effect this build no longer ships is
+    a state AD-21 says must be re-derived at the moment of composing rather than refused on
+    loading. If that walk raised, one such card anywhere in the project would take down every Split
+    of every bound Shot -- which is exactly the coupling that made a deleted `.cube` empty the
+    binding census for a whole project, arriving through a different function.
+
+    So the unreadable card contributes nothing and stops nothing. It is still refused where it
+    matters, by `build_effect_stages` at the moment it would compose.
+    """
+    client, store, _comfy = make_client(tmp_path)
+    project_id = project_with_two_shots(client)
+    a_bindable_shot(client, project_id)
+    assert client.put(
+        bindings_url(project_id), json={"effect": "bloom", "bindings": [A_BINDING]}
+    ).status_code == 200
+
+    # Written straight to the manifest, because no route accepts it -- which is the point: this is
+    # a project edited by hand, or one saved by a build that shipped an effect this one does not.
+    manifest = store.manifest_path(project_id)
+    body = json.loads(manifest.read_text(encoding="utf-8"))
+    body["shots"][1]["effects"] = [
+        {"id": "fx_fromanolderbuild", "effect": "kaleidoscope_9000",
+         "parameters": {"petals": 6}, "bindings": [{"parameter": "petals", "drive": "punch",
+                                                    "depth": 0.5}]}
+    ]
+    manifest.write_text(json.dumps(body), encoding="utf-8")
+
+    held = client.get(f"/api/projects/{project_id}").json()["shots"]
+    half = dict(copy.deepcopy(held[0]), id="shot_half", start=2, duration=2)
+    half["effects"][0]["id"] = "fx_a_card_that_is_gone"
+    split = client.put(
+        f"/api/projects/{project_id}/shots",
+        json={"shots": [dict(held[0], duration=2), half, *held[1:]]},
+    )
+
+    assert split.status_code == 200, split.text
+    landed = ProjectStore(tmp_path).get(project_id).shots
+    assert landed[1].effects[0].bindings == [A_BINDING], "the split half came back unbound"
+    # And the card nobody can name is still exactly where it was, untouched and unjudged.
+    assert landed[2].effects[0].effect == "kaleidoscope_9000"
 
 
 def test_a_copied_stack_carries_its_bindings_with_no_new_code(tmp_path: Path):
@@ -25536,9 +26026,16 @@ def test_a_copied_stack_carries_its_bindings_with_no_new_code(tmp_path: Path):
     assert copied.json()["applied"] == ["SHOT 02 (shot_two)"]
     target = ProjectStore(tmp_path).get(project_id).shots[1]
     assert [spec.model_dump() for spec in target.effects] == [
-        {"effect": "bloom", "enabled": True, "parameters": {"intensity": 0.4},
-         "bindings": [A_BINDING]}
+        {"id": target.effects[0].id, "effect": "bloom", "enabled": True,
+         "parameters": {"intensity": 0.4}, "bindings": [A_BINDING]}
     ]
     # Deep, never aliased: two Shots sharing one binding mapping would have one panel move both.
     source = ProjectStore(tmp_path).get(project_id).shots[0]
     assert source.effects[0].bindings is not target.effects[0].bindings
+    # **And a new card id on the target**, which is the third of the three doors that clone a card
+    # (R-33). Ten targets holding the source's card ids would make a lookup keyed on one depend on
+    # which Shot was read first, and the divergence arrives on the very next slider drag.
+    assert source.effects[0].id != target.effects[0].id, (
+        "a copied stack put one card id on two Shots"
+    )
+    assert target.effects[0].id.startswith("fx_")

@@ -63,6 +63,17 @@ And, added 2026-08-28 with two reproduced defects from the Epic 10 retrospective
    painted one band at full weight while the export weighted a different one at 8e-5. The sidecar
    is trimmed here by hand, and put back before the steps that follow (B2).
 
+And, added 2026-08-28 with R-33, which gave an effect card an `id` and made a Shot's stack write
+adopt each card's bindings from the stored card of that id:
+
+10. **The four gestures a card id has to survive.** A Split and a Duplicate of the bound Shot,
+   then a slider drag on the bound card of the half the Split made, then taking a *different*
+   card off the same stack -- each through the real control, with the stored binding read back
+   after each. The drag is on the new half deliberately: the browser copies the source Shot's
+   card ids into it, the server mints fresh ones, and a client still holding the old ones names a
+   card that Shot does not hold. What a stub DOM cannot see here is the *sequence* -- the reply
+   of one gesture is what the next gesture writes from.
+
 The panel's height and its distance below the rail's fold are recorded in both the unbound and
 the bound states, because the strip is 36px added to a panel that was already 503.6px in a 626px
 rail with 212px of it below the fold.
@@ -1258,17 +1269,37 @@ def main() -> None:
                 strip_shot(driver, f"07d-strip-canvas-{name}-past-the-end")
             result["edge_past_the_end"] = edge_cases
 
-            # --- 7e. A measurement that disagrees with itself is not drawn ------------------
+            # --- 7e. A measurement that disagrees with itself is refused before it is drawn --
             #
             # The strip positions bar `k` at `k / (len(band_average) - 1)` off the served array;
             # the compiler weights band `k` at `k / (len(bands) - 1)` off the sidecar's own. Those
-            # agree only while the sidecar is self-consistent -- and `served_measurement` carries
-            # a short array **short** on purpose, while `song_measurement_verdict` checks
-            # `band_count`, `analysis_rate` and `len(bands)` and neither of the arrays it serves.
-            # So this state is `analysed: true` with a picture that would select one band while
-            # the export drives another, and the whole of the old hint was the Hz tooltip going
-            # quiet. Written here by hand, because a sidecar is a file a Director can edit and
-            # nothing else in this application produces it.
+            # agree only while the sidecar is self-consistent, and a sidecar is a file a Director
+            # can edit -- so this step trims one by hand, which is the only way that state exists.
+            #
+            # **Rewritten 2026-08-28, because this step's own sentinel fired.** It used to assert
+            # that the route *served* the ragged measurement -- `analysed: true`, a five-long
+            # `band_average` against eight `bands` -- and that the client then declined to draw the
+            # strip over it. `1933c2e` closed that at the route: `song_measurement_verdict` now
+            # compares the lengths of the two arrays it actually serves against the record's
+            # `band_count`, so the measurement is withheld whole with
+            # `SONG_ENVELOPE_RECORD_DISAGREES`, and the state this step used to drive is no longer
+            # reachable by any hand edit -- every version of it fails one of the three length
+            # checks. What caught it was this step's own precondition, *"the route no longer serves
+            # this state, so this step is not the defect"*, and it fires on `1933c2e` itself: the
+            # commit that moved the behaviour did not move the harness with it.
+            #
+            # **`1933c2e` is the commit, and the pairing is the point.** That is the epic's own
+            # action item 21 -- *a commit that changes what a document describes must correct it in
+            # the same commit* -- broken by the commit immediately after it was recorded, and
+            # broken against a **harness** rather than a document, which is the hole in how the
+            # rule was phrased: this file is a record of behaviour exactly as a document is. Left
+            # standing, this step meant the browser QA gate could not be run at all.
+            #
+            # So what is driven now is the shipped answer, which is the better one -- the Director
+            # is told by name that the record and the file disagree and is offered the measurement
+            # that fixes it, instead of meeting a picture that is quietly not there. The client's
+            # own corroboration (`EFFECT_BAND_STRIP_UNCOUNTED`) stays as defence in depth and is
+            # asserted by the contract suite, which is the level it is still reachable at.
             spectrum_path = sidecar(
                 server, project_id, manifest(server, project_id)["song"]["analysis"]["path"])
             whole = json.loads(spectrum_path.read_text(encoding="utf-8"))
@@ -1278,11 +1309,10 @@ def main() -> None:
             trimmed["band_average"] = whole["band_average"][:5]
             spectrum_path.write_text(json.dumps(trimmed), encoding="utf-8")
             ragged = targets(server, project_id)
-            assert ragged["analysed"] is True, (
-                "the route no longer serves this state, so this step is not the defect", ragged)
-            assert len(ragged["envelope"]["band_average"]) == 5, ragged["envelope"]
-            assert len(ragged["envelope"]["band_edges"]) == len(whole["bands"]) + 1, (
-                ragged["envelope"])
+            assert ragged["analysed"] is False, (
+                "a sidecar that disagrees with its own record was served", ragged)
+            assert ragged["envelope"] is None, ragged["envelope"]
+            assert ragged["reason"], "the refusal said nothing at all"
             driver.refresh()
             select_project(driver, wait, project_id)
             driver.find_element(By.CSS_SELECTOR, '[data-panel="timeline"]').click()
@@ -1291,30 +1321,25 @@ def main() -> None:
             driver.find_element(By.ID, BIND).click()
             settle(driver, "#shot-inspector", quiet_ms=350)
             uncounted = look(driver)
-            # The sentence read off the module the page itself imports, so it is asserted whole
-            # and verbatim rather than paraphrased into this file (house rules).
-            said = driver.execute_async_script(
-                "const done = arguments[0];"
-                "import('/assets/api.js').then((api) => done(api.EFFECT_BAND_STRIP_UNCOUNTED))"
-                ".catch((error) => done(String(error)));")
+            # No picture, and the route's own sentence saying why -- carried whole and never
+            # paraphrased, which is the assertion step 7 makes of the absent-analysis case.
             assert uncounted["strip"] is None, (
                 "a spectrum whose arrays disagree was drawn anyway", uncounted["strip"])
-            assert uncounted["undrawn"] and uncounted["undrawn"]["text"] == said, (
-                uncounted["undrawn"], said)
-            assert uncounted["undrawn"]["colour"] == uncounted["palette"]["muted"], (
-                "an absence took an accent", uncounted["undrawn"])
-            # Only the picture is withheld: the three boxes still set the band, and the binding is
-            # still live rather than being drawn as a fault.
-            assert glyph(uncounted, BIND)["state"] == "bound", uncounted["glyphs"]
+            assert ragged["reason"] in uncounted["note"]["text"], (
+                uncounted["note"], ragged["reason"])
+            assert uncounted["analyze"] and "Analyze song" in uncounted["analyze"]["text"], (
+                "the remedy that sentence names was not offered", uncounted["analyze"])
+            # The binding itself is untouched by any of it: still stored, still drawn as a
+            # binding, and not drawn as a fault.
+            assert glyph(uncounted, BIND)["state"] == "unresolvable", uncounted["glyphs"]
+            assert glyph(uncounted, BIND)["colour"] == uncounted["palette"]["blue"], (
+                "an unresolvable binding was quietly disowned", glyph(uncounted, BIND))
             assert uncounted["refusedRows"] == 0, uncounted
-            for control in ("band_centre", "band_width", "band_softness", "floor", "depth"):
-                assert any(item["id"].endswith(control) for item in uncounted["inputs"]), control
             result["uncounted_spectrum"] = {
-                "served": {"band_average": len(ragged["envelope"]["band_average"]),
-                           "band_edges": len(ragged["envelope"]["band_edges"]),
-                           "bands": len(whole["bands"]), "analysed": ragged["analysed"]},
-                "sentence": uncounted["undrawn"]["text"],
-                "colour": uncounted["undrawn"]["colour"],
+                "served": {"analysed": ragged["analysed"], "envelope": ragged["envelope"],
+                           "band_average": 5, "bands": len(whole["bands"])},
+                "sentence": ragged["reason"],
+                "note": uncounted["note"],
                 "strip": uncounted["strip"],
                 "panelBelowFold": uncounted["panelBelowFold"],
             }
@@ -1408,8 +1433,166 @@ def main() -> None:
             result["removed"] = {"stack": gone[0], "glyph": glyph(after, BIND)["state"]}
             shot(driver, "09-removed")
 
+            # --- 10. The four gestures a card id has to survive (R-33) -----------------------
+            #
+            # A card's Parameter Bindings are adopted from the stored card of the same id, so the
+            # gestures that could lose one are the ones that move a card between Shots or rewrite
+            # the stack around it: Split and Duplicate, which clone a card onto a Shot that did
+            # not exist a moment ago; the slider, which is what this panel writes on every
+            # release; and taking a *different* card off, which rewrites the stack the bound card
+            # sits in. Every one is driven through the real control, and the stored binding is
+            # read back off the server after each.
+            #
+            # **The drag is deliberately performed on the half the Split made**, which is where
+            # this goes wrong if it goes wrong: the browser copies the source Shot's stack ids
+            # into the new half, the server mints fresh ones, and a client still holding the old
+            # ones names a card that Shot does not hold. Before `adoptedShotEffects` that write
+            # was refused by name for an ordinary gesture.
+            put_json(
+                f"{server.base_url}/api/projects/{project_id}/shots/{SHOT}/effects/0/bindings",
+                {"effect": "exposure", "bindings": [
+                    {"parameter": "amount", "drive": "punch", "depth": 0.5}]},
+            )
+            source_card = stack(server.base_url, project_id)[0]["id"]
+            assert stack(server.base_url, project_id)[0]["bindings"], "the re-bind did not land"
+            driver.refresh()
+            select_project(driver, wait, project_id)
+            driver.find_element(By.CSS_SELECTOR, '[data-panel="timeline"]').click()
+
+            def plan() -> list[dict]:
+                return get_json(f"{server.base_url}/api/projects/{project_id}")["shots"]
+
+            def wait_for_plan(count: int, what: str, timeout: float = 15.0) -> list[dict]:
+                deadline = time.time() + timeout
+                shots: list[dict] = []
+                while time.time() < deadline:
+                    shots = plan()
+                    if len(shots) == count:
+                        return shots
+                    time.sleep(0.2)
+                raise AssertionError(f"{what}; the plan holds {[s['id'] for s in shots]}")
+
+            def choose_clip(shot_id: str) -> None:
+                """`select_clip`, for a clip too narrow to be clicked in its own middle.
+
+                A Split leaves a two-second half 40px wide at this zoom and the clip draws its own
+                id label across the centre, so a click aimed at the clip's midpoint is refused by
+                the driver naming the child that would receive it. Clicking that child *is*
+                clicking the clip -- the handler is on the clip and the event bubbles, and it is
+                what a Director's pointer does. Only the automation needs telling.
+                """
+                settle(driver, "#shots-track")
+                clip = wait.until(
+                    lambda browser: browser.find_element(
+                        By.CSS_SELECTOR, f'#shots-track .shot-clip[data-shot-id="{shot_id}"]'
+                    )
+                )
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({block: 'center', behavior: 'instant'});", clip)
+                inside = clip.find_elements(By.CSS_SELECTOR, ".clip-id")
+                (inside[0] if inside else clip).click()
+                wait.until(
+                    lambda browser: "selected" in browser.find_element(
+                        By.CSS_SELECTOR, f'#shots-track .shot-clip[data-shot-id="{shot_id}"]'
+                    ).get_attribute("class")
+                )
+                settle(driver, "#shot-inspector")
+
+            def bound_card(shot_id: str) -> dict:
+                held = stack(server.base_url, server_project := project_id, shot_id)
+                assert held, (shot_id, "the Shot carries no stack at all")
+                assert held[0]["effect"] == "exposure", (shot_id, held)
+                assert held[0]["bindings"] == [
+                    {"parameter": "amount", "drive": "punch", "depth": 0.5}
+                ], (shot_id, "the binding did not survive", held)
+                assert server_project == project_id
+                return held[0]
+
+            cloned = {"source": source_card}
+
+            # 10a. Split, through `#split-shot`.
+            choose_clip(SHOT)
+            driver.find_element(By.ID, "split-shot").click()
+            shots = wait_for_plan(3, "the split did not land")
+            half = next(item["id"] for item in shots if item["id"] not in (SHOT, LOCKED))
+            cloned["split"] = bound_card(half)["id"]
+            assert bound_card(SHOT)["id"] == source_card, "the Director's own card lost its id"
+            assert cloned["split"] != source_card, "both halves of the split claim one card id"
+            shot(driver, "10-split")
+
+            # 10b. The slider on the bound card of the **new half**, dragged and released. Done
+            #      before the Duplicate below, because a duplicate is placed immediately after the
+            #      Shot it was made from -- which is where this half now sits, so the two clips
+            #      overlap on the track and neither can be pointed at afterwards.
+            choose_clip(half)
+            open_effects(driver)
+            slider = reach(driver, "effect-param-0-amount")
+            was = float(slider.get_attribute("value"))
+            ActionChains(driver).click_and_hold(slider).move_by_offset(24, 0).release().perform()
+            moved = wait_for_stack(
+                server.base_url, project_id,
+                lambda entries: entries and float(entries[0]["parameters"]["amount"]) != was,
+                "the slider drag never reached the manifest", shot_id=half,
+            )
+            assert moved[0]["bindings"] == [
+                {"parameter": "amount", "drive": "punch", "depth": 0.5}
+            ], ("the drag cost the binding", moved)
+            assert moved[0]["id"] == cloned["split"], "the drag re-minted the card"
+            errors = [
+                item.text for item in
+                driver.find_elements(By.CSS_SELECTOR, "#toast-region .toast.error")
+            ]
+            assert not errors, errors
+            dragged = float(moved[0]["parameters"]["amount"])
+            shot(driver, "10-dragged")
+
+            # 10c. Removing a *different* card off the same stack.
+            remove = driver.find_element(By.ID, "effect-remove-1")
+            visible_and_clickable(driver, remove, "the second card's remove control")
+            remove.click()
+            shortened = wait_for_stack(
+                server.base_url, project_id, lambda entries: len(entries) == 1,
+                "removing the other card did not land", shot_id=half,
+            )
+            assert shortened[0]["bindings"] == [
+                {"parameter": "amount", "drive": "punch", "depth": 0.5}
+            ], ("removing a different card cost the binding", shortened)
+            assert float(shortened[0]["parameters"]["amount"]) == dragged
+            assert shortened[0]["id"] == cloned["split"], "the removal re-minted the other card"
+            assert not driver.find_elements(By.CSS_SELECTOR, "#toast-region .toast.error")
+            shot(driver, "10-removed")
+
+            # 10d. Duplicate, through `#duplicate-shot`, of the Shot that was bound. Read back off
+            #      the server rather than pointed at again: a duplicate is placed at the end of the
+            #      Shot it copies, which is on top of the split half above.
+            choose_clip(SHOT)
+            driver.find_element(By.ID, "duplicate-shot").click()
+            shots = wait_for_plan(4, "the duplicate did not land")
+            copy = next(
+                item["id"] for item in shots if item["id"] not in (SHOT, LOCKED, half)
+            )
+            cloned["duplicate"] = bound_card(copy)["id"]
+            assert len(set(cloned.values())) == 3, ("a card id landed on two Shots", cloned)
+            assert bound_card(SHOT)["id"] == source_card
+            result["cloned_cards"] = {
+                **cloned, "dragged_to": dragged, "after_removal": shortened,
+            }
+            shot(driver, "10-duplicated")
+
             driver.save_screenshot(str(artifact_dir() / f"{NAME}-workspace.png"))
-            console_gate(driver, NAME, result)
+            # `expected` carries one entry, and it is **a defect this run reproduced** rather
+            # than a refusal the script drove on purpose -- listed so the gate goes on failing
+            # for everything else, and reported under its own key rather than filtered away.
+            #
+            # Duplicating (or splitting) a **bound** Shot selects the new Shot and redraws the
+            # inspector before `saveShotsSilently` has landed, so the Drive readout asks
+            # `GET .../shots/{new id}/drive` for a Shot the server has never heard of and gets a
+            # 404 in the console. Nothing is lost -- the readout draws once the save returns --
+            # and it is not R-33's: the gesture reaches this state because Epic 10 shipped
+            # bindings, and no harness had split or duplicated a bound Shot until step 10.
+            console_gate(driver, NAME, result, expected=[
+                "/drive - Failed to load resource: the server responded with a status of 404",
+            ])
         finally:
             driver.quit()
 

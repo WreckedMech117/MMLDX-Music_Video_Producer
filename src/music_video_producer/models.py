@@ -599,22 +599,47 @@ class EffectSpec(BaseModel):
     keys — `effects.EFFECT_SPEC_KEYS` names them, and its refusal prints them to a client that
     misspelled one.
 
-    **`bindings` is `EFFECT_SPEC_KEYS`' fourth key, and it arrived here on 2026-08-27 with the
-    route that mints one and the guards that keep every other write off it.** It was deliberately
-    withheld until then — the shape was ready and the *write path* was not, and a field whose
-    guards land "afterwards" is the hole this repository has found fourteen times in one route.
-    What arrived with it, in the same commit AD-16 asks for:
+    **`bindings` is where a Parameter Binding lives** (R-26), keyed inside each entry by the
+    parameter's own name, and it arrived here on 2026-08-27 with the one route that mints one:
+    `PUT .../shots/{id}/effects/{index}/bindings`, and no other. That half stands.
 
-    * `PUT .../shots/{id}/effects/{index}/bindings` — the one route that mints, alters or clears a
-      binding, and the only one.
-    * `app.carried_bindings_refusal` — **carry, never mint**, applied at the two other doors a
-      stack can arrive through. `PUT .../effects` may carry a binding this Shot already stores,
-      and `_adopt_shot_effects` may carry onto a *new* Shot a binding the project already stores
-      somewhere — which is exactly what Split and Duplicate do, and why `SHOT_PLAN_CONTENT_FIELDS`
-      says the two halves of one shot are one shot's look. Anything else is refused by name.
-    * An **existing** Shot's stack is still adopted whole from the store by `_adopt_shot_effects`,
-      in both directions, so a binding riding inside it was already out of a generic write's reach
-      before this field existed. That is the half that needed nothing new.
+    **`id` arrived on 2026-08-28, and it is what the other half is built on now (R-33).** Until
+    then this model carried no identity, and *"an `EffectSpec` has no id"* was the stated reason
+    every other door had to guard a binding by comparing a **multiset of validated bindings** —
+    `carry, never mint`, spelled `app.binding_census` and `app.carried_bindings_refusal`. Epic
+    10's retrospective reproduced three defects and an investigation established they were one
+    defect: two cards of one effect are indistinguishable to a content multiset, so a generic
+    write could **relocate** a binding from a Bloom resting at 0.1 to one resting at 0.9 and
+    change the rendered picture at 200 (A3); a stack the catalogue would not compose entitled a
+    write to carry **nothing**, so one deleted `.cube` on an unrelated Shot refused every Split
+    and Duplicate of every bound Shot in the project and made *destroying* the binding the only
+    accepted write (A1); and the count was checked once per arriving Shot, so one held binding
+    multiplied onto arbitrarily many new ids in a single write (A4).
+
+    R-26 rejected `(effect, parameter)` and `(index, parameter)` as **addressing** schemes
+    precisely *because* there was no id, and nobody then asked whether there should be one. That
+    is a reason not to *match positionally*; it was never a reason not to *have* an identity. So
+    a card has one, minted here and never by a client, and every other door **adopts a card's
+    bindings from the stored card of the same id** — `app.adopted_effect_stack`, the
+    `_adopt_*` idiom AD-16's Rule prescribed in the first place. A binding then cannot be
+    relocated between two cards of one effect because the two cards are no longer the same thing.
+
+    **Where a card is being *created* the id cannot be required, and that is measured rather than
+    conceded.** A Shot the store does not hold has no stored card to adopt from, so the id a body
+    puts on its card is a claim about a card that may no longer exist — an Undo deletes the card
+    its Redo then names. `app._copied_bindings` carries the two measurements and the answer that
+    door asks instead; the bytes still come off a card the store holds.
+
+    `default_factory` rather than a required argument or `""`, for `SongSection`'s reason: this is
+    a repeated element nested inside another model, and every one of them has an identity from the
+    moment it exists rather than from the moment somebody remembers to give it one. A stack
+    written before this field existed loads with fresh ids and freezes them on its next save —
+    there were **zero** stored stacks and zero stored bindings in this application's data when the
+    field was added (5 projects, 91 shots, measured), so that migration is a statement about
+    hand-made manifests rather than about anybody's work.
+
+    **AD-21 is not in play**, which was checked rather than assumed: it forbids a stored *verdict*
+    that can outlive its condition. An id has no condition and nothing to disagree with.
 
     A binding is stored the way `parameters` is stored and for the same reason: **as the Director
     wrote it**, sparse, `dict[str, Any]`, with the catalogue filling every default at the moment
@@ -637,6 +662,15 @@ class EffectSpec(BaseModel):
     composes, refusing by name with nothing half-built behind it.
     """
 
+    #: This card's own identity, minted by the server and echoed by a client that means to keep
+    #: what the card holds (R-33). It addresses **the card**, never the binding inside it: the
+    #: binding is still keyed by parameter name on this entry, which is R-26 and is untouched.
+    #:
+    #: Nothing composes from it and nothing hashes it — `effects.preview_fingerprint` hashes the
+    #: composed *chain* and the stored `bindings`, so adding this moved no preview's name and
+    #: invalidated no cached clip, and it reaches neither the ComfyUI payload nor
+    #: `timeline.expansion_input`.
+    id: str = Field(default_factory=lambda: new_id("fx"))
     effect: str
     enabled: bool = True
     parameters: dict[str, Any] = Field(default_factory=dict)

@@ -855,17 +855,19 @@ def test_a_misspelled_top_level_key_is_refused_rather_than_ignored():
     with pytest.raises(EffectRefusal) as typo:
         stages([{"effect": "grain", "paramters": {"strength": 40}}])
     assert str(typo.value) == (
-        "grain has no key called 'paramters'. It takes effect, enabled, parameters, bindings. "
+        "grain has no key called 'paramters'. It takes id, effect, enabled, parameters, bindings. "
         "Nothing was composed."
     )
     with pytest.raises(EffectRefusal) as flag:
         stages([{"effect": "grain", "enabledd": False}])
     assert "grain has no key called 'enabledd'" in str(flag.value)
-    # The four that are declared are, of course, all accepted together. `bindings` joined them
-    # for Epic 10 and is empty here, which is what every stack in every project holds today.
+    # The five that are declared are, of course, all accepted together. `bindings` joined them
+    # for Epic 10 and `id` for R-33; the id is read by nothing in this module, which is what this
+    # row asserts by composing with one present.
     assert stages(
         [
             {
+                "id": "fx_0123456789ab",
                 "effect": "grain",
                 "enabled": True,
                 "parameters": {"strength": 4},
@@ -1958,6 +1960,29 @@ def test_the_bindings_and_transition_slots_are_hashed_before_anything_fills_them
     assert a_fingerprint(bindings=[]) == a_fingerprint()
     assert a_fingerprint(bindings=[{"parameter": "grain.strength"}]) != a_fingerprint()
     assert a_fingerprint(transition={}) != a_fingerprint()
+
+
+def test_a_card_id_reaches_neither_the_chain_nor_the_fingerprint():
+    """R-33's cost, measured rather than asserted in prose: **adding `id` moved nothing.**
+
+    A card id names the card, not the picture. It is not one of the eight inputs, it is not read
+    by any composer, and `validate_stack` accepts it and ignores it -- so a Shot that gained an id
+    (which is every Shot in every project, on its next save) composes the identical filter text,
+    names the identical preview clip, and keeps every clip already cached under that name. That is
+    R-20's empty-stack guarantee and AD-23's cache, both still standing after this epic.
+
+    Asserted on the composed chain and on the name, never on an mp4 (R-20).
+    """
+    plain = [{"effect": "grain", "enabled": True, "parameters": {"strength": 30.0}}]
+    identified = [dict(spec, id="fx_0123456789ab") for spec in plain]
+
+    assert build_effect_stages(identified, width=1920, height=1080) == build_effect_stages(
+        plain, width=1920, height=1080
+    )
+    assert a_fingerprint(stack=identified) == a_fingerprint(stack=plain)
+    # And two cards of one effect that differ **only** by id are one picture, which is the
+    # statement that would be false if an id had crept into the chain or the payload.
+    assert a_fingerprint(stack=[dict(plain[0], id="fx_ffffffffffff")]) == a_fingerprint()
 
 
 def test_two_states_that_compose_to_one_chain_fingerprint_alike():
