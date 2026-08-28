@@ -1611,8 +1611,13 @@ def test_an_unbound_shots_preview_is_named_and_cached_exactly_as_it_was(tmp_path
         offset=stored.shots[0].latest_take_lead + stored.shots[0].trim_nudge,
         stack=[spec.model_dump() for spec in stored.shots[0].effects],
         bindings=(),
-        song_fingerprint=stored.song.analysis.song_fingerprint,
-        transition=None,
+        # **`""`, not the stored fingerprint, and that is the sixth slot's whole rule.** The
+        # route gates this on `stack_is_driven`, so an unbound Shot's clip is named without any
+        # reference to the song at all -- which is what lets a Director analyse or replace their
+        # track without orphaning the cached preview of every graded Shot in the plan. Passing
+        # the fingerprint here would name the clip the route named before 2026-08-27 and this
+        # assertion would fail, which is the point of computing it independently.
+        song_fingerprint="",        transition=None,
         width=first.json()["width"],
         height=first.json()["height"],
         reference_width=first.json()["width"] * 2,
@@ -1623,6 +1628,52 @@ def test_an_unbound_shots_preview_is_named_and_cached_exactly_as_it_was(tmp_path
     # no binding, which is every stack in every project until one is bound.
     assert not list((tmp_path / "projects" / project_id / "media").rglob("*.cmds"))
 
+
+def test_analysing_the_song_does_not_rename_an_unbound_shots_clip_and_does_rename_a_bound_one(
+    tmp_path: Path,
+):
+    """The sixth fingerprint slot, gated -- and the server half of a defect that had two halves.
+
+    Until 2026-08-27 the route passed `song_fingerprint` **unconditionally** while only the
+    envelope *read* was gated on `stack_is_driven`. So analysing a song renamed the Preview Clip
+    of every Shot carrying any effect at all, bound or not, and orphaned every one of their
+    cached clips -- for a reason that cannot reach an unbound Shot's picture, since
+    `build_effect_stages` ignores the envelope entirely for a stack with no binding and composes
+    no `sendcmd` stage. Analysing is a first-class gesture, so that was a re-render sweep of the
+    whole plan on a gesture about beats.
+
+    The other half was the client's: `api.previewInputKey` carried no song at all, so it never
+    re-asked for any of the clips the server had just renamed. Both sides are now gated on one
+    rule; `test_the_client_and_the_server_answer_driven_identically` is what keeps them one.
+
+    Three states in one project, because the claim is a *difference* and needs all three: the
+    same Shot unbound across a re-analysis, unbound across a replaced song, and bound.
+    """
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id = a_measured_project_with_a_graded_shot(client, tmp_path)
+
+    def named() -> str:
+        answer = client.post(f"/api/projects/{project_id}/shots/shot_a/preview")
+        assert answer.status_code == 200, answer.text
+        return answer.json()["fingerprint"]
+
+    unbound = named()
+    # Re-measured. A new analysis record over the same bytes, which is the common gesture.
+    assert client.post(f"/api/projects/{project_id}/song/analyze").status_code == 200
+    assert named() == unbound, "a re-analysis renamed an unbound Shot's clip"
+
+    # And a song genuinely replaced, which is the state the export refuses a bound Shot in. An
+    # unbound Shot's picture is untouched by it, so its clip must be untouched too.
+    stored = store.get(project_id)
+    stored.song.analysis.song_fingerprint = "12-notthesongthatisonthedisk"
+    store.save(stored)
+    assert named() == unbound, "replacing the song renamed an unbound Shot's clip"
+
+    # Bound, against a current measurement: a different picture, so a different name. This is the
+    # half that must keep moving -- it is what makes the client re-ask.
+    assert client.post(f"/api/projects/{project_id}/song/analyze").status_code == 200
+    assert bind_exposure(client, project_id).status_code == 200
+    assert named() != unbound
 
 def test_a_preview_whose_envelope_stopped_describing_the_song_refuses_in_the_exports_words(
     tmp_path: Path,

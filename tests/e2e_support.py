@@ -600,7 +600,20 @@ def resource_hits(driver, suffix: str) -> int:
 
 
 def clear_toasts(driver, timeout: float = 8.0) -> None:
-    """Wait out every toast on screen. They remove themselves after 4.2 s and are not dismissible.
+    """Wait out every toast on screen -- **the ones that go on their own**, which is not all of
+    them.
+
+    Both halves of what this used to claim were wrong, found on 2026-08-28 by a script that waited
+    eight seconds for a refusal to clear and then asserted about the page underneath it. `toast()`
+    in `app.js` reads: *"Long reports earn longer on screen, **errors stay until dismissed**, and
+    every toast dismisses on click."* So an `error` toast has **no timer at all** and never
+    self-removes, and every toast **is** dismissible -- it carries `title="Click to dismiss"` and a
+    click handler that removes it.
+
+    This function is left as a *wait* rather than made to click, because that is what its callers
+    mean by it and a shared helper that started clicking would change what four other scripts are
+    measuring. It returns quietly when the timeout passes, so a caller that needs an **error**
+    toast gone has to click it -- see `e2e_preview_song_change.dismiss_toasts` for that.
 
     Kept even though `.toast-region` no longer takes pointer events: a toast still *covers* what is
     under it, so a hit test run with one up would be measuring the wrong thing anywhere the script

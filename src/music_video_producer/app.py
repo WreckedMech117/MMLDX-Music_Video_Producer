@@ -11132,8 +11132,16 @@ def create_app(
         # a preview whose drive has stopped resolving has to refuse today, even though the clip
         # rendered yesterday is still sitting in the cache and is still a perfectly good picture
         # of a look this project can no longer render.
+        #
+        # **Evaluated once, into a name, because two things read it.** The envelope read below
+        # and the `song` slot of the fingerprint further down are one decision -- *does this
+        # picture ask the song a question* -- and asking it twice is how the two come to answer
+        # differently. `api.stackIsDriven` is this predicate's counterpart on the other side of
+        # the wire and the two are pinned to each other by
+        # `test_the_client_and_the_server_answer_driven_identically`.
         envelope: dict[str, Any] | None = None
-        if stack_is_driven(stack):
+        driven = stack_is_driven(stack)
+        if driven:
             # A song whose file has gone is a *reason*, not a 404: `song_measurement_verdict`
             # already answers `SONG_ANALYSIS_MEDIA_MISSING` for a path it cannot `stat`, and that
             # sentence sends a Director somewhere useful where "Song media was not found" would
@@ -11250,9 +11258,30 @@ def create_app(
             shot_start=shot.start,
             clip_seconds=frames / ASSEMBLY_FPS,
             transition=None,
+            # **Gated on `driven`, and that gate is the whole of this slot's meaning.** The song
+            # is part of this picture's identity exactly when the picture asks the song a
+            # question, and for an unbound Shot it never does: `build_effect_stages` ignores
+            # `envelope`, `shot_start` and `clip_seconds` entirely for a stack with no binding,
+            # composes no `sendcmd` stage, and returns the chain it composed before this epic
+            # existed. Ungated -- which is what shipped -- a re-analysis renamed the clip of
+            # **every** Shot carrying any effect at all, bound or not, and orphaned every one of
+            # their cached previews for a reason that cannot reach the picture. Analysing a song
+            # is a first-class gesture (`POST /song/analyze`, reachable from the Snap-to rows),
+            # so that was a full re-render sweep of the plan on a gesture about *beats*.
+            #
+            # It is the same rule the client keys on (`api.previewInputKey`), from the same
+            # predicate, so the two cannot disagree about whether a song change is a new
+            # picture -- which is what they did: the server renamed clips the client never
+            # re-asked for, so a bound Shot went on showing a Monitor picture driven by a song
+            # this project no longer has, at the same moment the export refused it by name.
+            #
+            # Redundant for a bound Shot and kept anyway: the fourth slot already moves, because
+            # a bound stage composes `sendcmd=f=<name>.cmds` whose name carries a digest of the
+            # compiled script's own text. A `sendcmd` that misses is silent at rc 0, so the
+            # cheap second statement of the same fact stays.
             song_fingerprint=(
                 project.song.analysis.song_fingerprint
-                if project.song and project.song.analysis
+                if driven and project.song and project.song.analysis
                 else ""
             ),
             width=width,

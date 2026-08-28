@@ -5523,7 +5523,7 @@ const previewSpareName = () => (monitorPreviewLayer === "a" ? "b" : "a");
 // safe to ask twice" is not a reason to ask twice.
 function ensureMonitorPreview(view) {
   if (!state.project || !monitorShowsTake(view)) return;
-  const wanted = shotPreviewWanted(view.shot);
+  const wanted = shotPreviewWanted(view.shot, state.project?.song);
   if (!wanted.wanted) return;
   // Already holding a clip of exactly this look, already asking for it, or already told why it
   // cannot be made. The last is what stops a deleted `.cube` from being re-asked about on every
@@ -5859,8 +5859,11 @@ function syncMonitor() {
   const onScreen = previewLayer(monitorPreviewLayer);
   const view = monitorPreviewView(settled, {
     held: monitorPreviews.get(shotId) || null,
+    // A bound Shot's preview is a picture of the measurement, so the key this compares by
+    // has to carry the song the same way the request's key does.
+    song: state.project?.song,
     failed: previewProblem?.shotId === shotId
-      && previewProblem?.key === shotPreviewWanted(settled.shot).key,
+      && previewProblem?.key === shotPreviewWanted(settled.shot, state.project?.song).key,
     // What the Director is actually looking at, and only when it belongs to *this* Shot. A clip
     // left on a layer by the previous Shot is not a picture of this one at any staleness, and
     // `paintMonitorPreview` hides it for the same reason.

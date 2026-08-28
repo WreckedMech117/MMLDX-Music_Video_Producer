@@ -23132,12 +23132,184 @@ def test_the_monitor_decides_the_preview_clip_without_asking_the_server_for_a_st
     # Both preview kinds put a picture on the screen, which is what `.showing-take` keys off.
     assert seen["shows"] == [True, True]
 
-    # And the server agrees about what a preview is a picture of: every input this client keys on
-    # is one the route's own fingerprint hashes. A change to either that the other did not follow
-    # would be a look the Monitor never re-asks for.
+    # And the server agrees about what a preview is a picture of.
+    #
+    # **This assertion used to run one way and could not fail for the defect it names.** It said
+    # *every input this client keys on is one the route's own fingerprint hashes* -- a
+    # containment that stays true however many inputs the server gains that the client has never
+    # heard of. `song_fingerprint` was exactly that for the length of Epic 10: the route hashed
+    # it unconditionally, `previewInputKey` carried no song at all, and this test passed while a
+    # bound Shot's Monitor showed a clip driven by a song the project no longer had.
+    #
+    # So it runs both ways now, and the reverse direction is the one that bites: **every
+    # parameter of `preview_fingerprint` is classified**, and the classification has to be
+    # exhaustive. A ninth input reaches this list or the test fails -- which is `_withheld_fields`
+    # and `MANIFEST_WRITE_GUARDS`' idiom, applied to the one question a cache key answers.
     signature = inspect.signature(preview_fingerprint)
-    for hashed in ("take", "window_start", "window_duration", "offset", "stack"):
-        assert hashed in signature.parameters
+
+    #: Server inputs the client keys on directly. Each is an element of `previewInputKey`.
+    keyed = ("take", "window_start", "window_duration", "offset", "stack", "song_fingerprint")
+    #: Server inputs that reach the client's key inside another element rather than on their own.
+    carried = {
+        # A binding is stored inside its own `EffectSpec`, so it rides in `effectStackWrite`'s
+        # `effects` -- which is what makes the key move when a Director changes a depth (R-26).
+        "bindings": "inside `stack`",
+        # Not fingerprint inputs at all: they reach the composed chain, and the chain is one.
+        # What the client keys on in their place is `song_fingerprint`, gated by the same rule.
+        "envelope": "reaches the chain; keyed as `song_fingerprint`",
+        "shot_start": "reaches the chain; derived from `window_start`",
+        "clip_seconds": "reaches the chain; derived from the window",
+    }
+    #: Server inputs the client deliberately does not key on, each with the reason it cannot.
+    not_keyed = {
+        # The looks folder is not on the wire. A `.cube` that has gone is refused by name at the
+        # route rather than mis-keyed here, and a look rewritten in place is a recorded open
+        # boundary (`preview_fingerprint`'s own docstring, and `deferred-work.md`).
+        "luts": "the client cannot see the looks folder",
+        # Epic 11. Hashed as its empty value on both sides until it exists.
+        "transition": "not a model field yet",
+        # The preview's geometry is the server's decision, derived from the export's. Approving a
+        # take on another Shot can move it without moving this key -- the gap `previewInputKey`'s
+        # own docstring names rather than papers over.
+        "width": "server-derived geometry (named gap)",
+        "height": "server-derived geometry (named gap)",
+        "reference_width": "server-derived geometry (named gap)",
+    }
+
+    for hashed in keyed:
+        assert hashed in signature.parameters, hashed
+    classified = set(keyed) | set(carried) | set(not_keyed)
+    assert classified == set(signature.parameters), (
+        ("`preview_fingerprint` gained or lost an input that nobody decided the client's key "
+         "should follow. Add it to `keyed`, `carried` or `not_keyed` with the reason."),
+        sorted(classified ^ set(signature.parameters)),
+    )
+
+
+#: One table of stacks, run through both engines. Every row is a shape a stored manifest can
+#: really hold -- the two the routes write, and the several a hand edit reaches -- and the last
+#: rows are where the client and the server actually disagreed before 2026-08-27.
+DRIVEN_TABLE = [
+    ("an empty stack", []),
+    ("a card with no bindings key at all", [{"effect": "grain", "parameters": {}}]),
+    ("a card with an empty bindings list", [{"effect": "grain", "bindings": []}]),
+    ("one bound card", [{"effect": "exposure", "bindings": [{"parameter": "amount"}]}]),
+    ("a bound card switched off",
+     [{"effect": "exposure", "enabled": False, "bindings": [{"parameter": "amount"}]}]),
+    ("a bound card explicitly on",
+     [{"effect": "exposure", "enabled": True, "bindings": [{"parameter": "amount"}]}]),
+    ("an unbound card beside a bound one",
+     [{"effect": "grain", "bindings": []},
+      {"effect": "exposure", "bindings": [{"parameter": "amount"}]}]),
+    ("bindings: null", [{"effect": "grain", "bindings": None}]),
+    # The rows that failed before the port was written. JavaScript calls `[]` and `{}` truthy and
+    # Python calls them falsy, so a `Boolean(spec.bindings)` client would have said *driven* for
+    # the empty object and a `.length` client would have said *not driven* for the full one --
+    # while the server, which reads truthily on purpose, said the opposite of each.
+    ("bindings holding an empty object", [{"effect": "grain", "bindings": {}}]),
+    ("bindings holding a non-empty object", [{"effect": "grain", "bindings": {"a": 1}}]),
+    ("bindings holding a non-empty string", [{"effect": "grain", "bindings": "x"}]),
+    ("bindings holding an empty string", [{"effect": "grain", "bindings": ""}]),
+    ("enabled: null beside a binding",
+     [{"effect": "exposure", "enabled": None, "bindings": [{"parameter": "amount"}]}]),
+]
+
+
+def test_the_client_and_the_server_answer_driven_identically():
+    """The one rule that decides whether the song is part of a Preview Clip identity, asked of
+    both engines over one table.
+
+    **This exists because the alternative was two predicates that agree today.** The rule cannot
+    be a shared function across a Python route and an ES module, so it is a port -- and a port is
+    only honest while something asks both sides the same question and compares the *answers*
+    rather than the source texts. That is the shape the spectrum strip falloff test already uses
+    for `effectBandWeight`, for the same reason and with the same limits.
+
+    The table is not decorative: two of its rows were a live divergence when this was written.
+    `app.stack_is_driven` reads the stored spec **truthily**, deliberately, so that a stack it
+    cannot read is never called unbound; `[]` and `{}` are falsy in Python and truthy in
+    JavaScript, so a client written with `Boolean` or with `.length` gets a different answer on a
+    hand-edited manifest than the route that refuses that Shot own export.
+    """
+    from music_video_producer.app import stack_is_driven
+
+    stacks = [stack for _label, stack in DRIVEN_TABLE]
+    served = run_module(
+        "import { stackIsDriven } from './src/music_video_producer/web/assets/api.js';\n"
+        "const TABLE = " + json.dumps(stacks) + ";\n"
+        "console.log(JSON.stringify(TABLE.map(stackIsDriven)));\n"
+    )
+
+    assert len(served) == len(DRIVEN_TABLE)
+    disagreed = [
+        (label, stack, bool(stack_is_driven(stack)), client)
+        for (label, stack), client in zip(DRIVEN_TABLE, served, strict=True)
+        if bool(stack_is_driven(stack)) != bool(client)
+    ]
+    assert not disagreed, (
+        ("the client and the server disagree about whether a stack is driven, so they disagree "
+         "about whether a song change is a new picture"),
+        disagreed,
+    )
+    # And the table really exercises the question rather than answering it one way throughout.
+    assert {bool(stack_is_driven(stack)) for _label, stack in DRIVEN_TABLE} == {True, False}
+
+
+def test_a_song_change_moves_a_bound_shots_preview_key_and_leaves_an_unbound_ones_alone():
+    """The client half of the gated sixth slot, and the reason the Monitor now re-asks.
+
+    A bound Shot picture is a function of the measurement, so a replaced or re-analysed song is a
+    different picture: the key has to move, the request has to be made, and what comes back is
+    either the driven clip of the new measurement or the route refusal in the export own words.
+    Before this element existed the key did not move, no request was made, and the Monitor went on
+    playing a clip driven by a song the project no longer had -- unflagged, at the same moment
+    `POST /assemble` refused that Shot by name.
+
+    An unbound Shot is the other half and matters just as much: its picture cannot be a function
+    of the song, so its key must **not** move, or analysing a track would re-render every graded
+    Shot in the plan for a picture that did not change.
+    """
+    bound_stack = [{"effect": "monochrome", "enabled": True, "parameters": {"amount": 1},
+                    "bindings": [{"parameter": "amount", "drive": "punch", "depth": 0.5}]}]
+    unbound_stack = [{"effect": "monochrome", "enabled": True, "parameters": {"amount": 1},
+                      "bindings": []}]
+    seen = run_module(f"""
+      import {{ previewInputKey, shotPreviewWanted, monitorPreviewView, monitorState }}
+        from './src/music_video_producer/web/assets/api.js';
+      const base = {{ id: 's1', approved_output: 'take.mp4', start: 0, duration: 4,
+                     status: 'complete', latest_output: 'take.mp4' }};
+      const boundStack = {json.dumps(bound_stack)};
+      const bound = {{ ...base, effects: boundStack }};
+      const unbound = {{ ...base, effects: {json.dumps(unbound_stack)} }};
+      const off = {{ ...base, effects: [{{ ...boundStack[0], enabled: false }}] }};
+      const a = {{ analysis: {{ song_fingerprint: 'aaa' }} }};
+      const b = {{ analysis: {{ song_fingerprint: 'bbb' }} }};
+      const view = monitorState({{ shots: [bound] }}, 1.0);
+      const held = {{ key: previewInputKey(bound, a), url: '/c/fp1.mp4', fingerprint: 'fp1' }};
+      console.log(JSON.stringify({{
+        boundMoves: previewInputKey(bound, a) !== previewInputKey(bound, b),
+        unboundHolds: previewInputKey(unbound, a) === previewInputKey(unbound, b),
+        unboundIgnoresTheSongEntirely:
+          previewInputKey(unbound, a) === previewInputKey(unbound, null),
+        disabledCardHolds: previewInputKey(off, a) === previewInputKey(off, b),
+        wantedMoves: shotPreviewWanted(bound, a).key !== shotPreviewWanted(bound, b).key,
+        // The clip in hand was rendered against the previous song, so it is stale under the new
+        // one -- which is what puts the flag on the Monitor rather than leaving it reading
+        // *current* over a picture nobody re-asked for.
+        staleUnderTheNewSong: monitorPreviewView(view, {{ held, song: b }}).stale,
+        currentUnderTheSameSong: monitorPreviewView(view, {{ held, song: a }}).stale,
+      }}));
+    """)
+
+    assert seen["boundMoves"] is True, "a song change did not move a bound Shot preview key"
+    assert seen["wantedMoves"] is True
+    assert seen["unboundHolds"] is True, "a song change threw away an unbound Shot cached clip"
+    assert seen["unboundIgnoresTheSongEntirely"] is True
+    # A card the Director switched off drives nothing, so the song cannot reach its picture --
+    # the same clause `stack_is_driven` carries, observed through the key it decides.
+    assert seen["disabledCardHolds"] is True
+    assert seen["staleUnderTheNewSong"] == "STALE"
+    assert seen["currentUnderTheSameSong"] == ""
 
 
 def test_the_monitor_plays_the_preview_and_keeps_playing_it_while_the_next_one_renders():

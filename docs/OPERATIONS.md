@@ -255,6 +255,15 @@ Both the repo adapter (`patch_ltx25_dimension_boundary`) and the Director's save
 
 ### Self-hosting browser QA (no server to start)
 
+> **None of these run under `uv run pytest -q`.** `pyproject.toml` sets `testpaths = ["tests"]` and
+> pytest's default `python_files = test_*.py`, so every `tests/e2e_*.py` file is **outside the
+> suite**: a green run says nothing about any of them. This is not theoretical. `e2e_effects_tab.py`
+> broke on Epic 10's first slice — a stack-equality predicate met a wire that had gained
+> `bindings: []` — and **four consecutive slices reported green gates over it** before an audit ran
+> the harnesses. Two more, `e2e_seed_and_asset_tabs.py` and `e2e_shot_controls.py`, are failing
+> today and predate Epic 10 entirely (see `deferred-work.md`). **Run the harnesses that touch what
+> you changed, and say which you ran.**
+
 ```bash
 uv run --with selenium python tests/e2e_shot_controls.py         # default port 8767
 uv run --with selenium python tests/e2e_song_context.py          # default port 8768  ← collides
@@ -275,9 +284,10 @@ uv run --with selenium python tests/e2e_chip_column.py           # default port 
 uv run --with selenium python tests/e2e_chip_column_narrow.py    # default port 8782
 uv run --with selenium python tests/e2e_effects_section_copy.py  # default port 8783
 uv run --with selenium python tests/e2e_band_panel.py          # default port 8779  ← collides
+uv run --with selenium python tests/e2e_preview_song_change.py   # default port 8784
 ```
 
-These nineteen **start and prove their own server** and take no base URL — `--port N` overrides. Order does not matter and they share no state; each creates a fresh temporary data root under `%TEMP%\mvp-<label>-<nonce>`, left behind as evidence.
+These twenty **start and prove their own server** and take no base URL — `--port N` overrides. Order does not matter and they share no state; each creates a fresh temporary data root under `%TEMP%\mvp-<label>-<nonce>`, left behind as evidence.
 
 **Three pairs share a default port** — 8768, 8769 and 8779, marked above. (`e2e_band_panel.py` was written for Epic 10 and left off this list through three slices, which is the omission the paragraph below already warns about; it landed on the Monitor preview's 8779.) `ManagedServer` refuses a bound port by name rather than reusing it, so the collision costs a failed start and never a run against the wrong server; it does mean those three pairs cannot run at the same time without `--port`. This list was five entries long and said "these five" while there were twelve, which is why the ports were never noticed to overlap. Two more were missing from it again on 2026-08-25 — the Effects tab's and the Monitor preview's — so **add the line when you add the script**; a gate nobody can find is a gate nobody runs.
 
@@ -288,6 +298,8 @@ These nineteen **start and prove their own server** and take no base URL — `--
 `e2e_effects_section_copy.py` gates Story 9.5's Section target on the copy control — a look copied to "named Shots **or the current Section**". It drives all five states in one project by selecting a different clip: no sections marked at all (driven first, before any are written, so it is the project's real state), a section holding the source and two others, a section holding a locked shot, a shot in no section, and a section of one. Then it replaces the 60 s song with a 24 s one under the Director's own confirmation, so the Chorus box describes seconds the track no longer has, and asserts the control goes on answering about the windows that are there. **Membership is never computed by the script.** `Project.shot_sections` is read off `GET /api/projects/{id}` and the ticked set is asserted against *that*, so a browser that started deciding for itself fails rather than agreeing by luck. Seven screenshots — the five states, the ticked set before the copy is confirmed, and the report after it — go to `test-artifacts/`. It queues nothing and never reaches `/prompt`.
 
 `e2e_band_panel.py` is Epic 10's gate: the bind glyph, the band panel, the spectrum strip and the Drive readout under the Monitor. It writes a manifest and a sidecar and nothing else — ComfyUI is pointed at a dead port and never contacted, and no render is queued. Its strongest sections are **pixel censuses of two real canvases**: a canvas that threw halfway through drawing, or one measured at zero width inside a hidden box, is a correctly-sized empty box that every structural assertion would pass over, so the painted pixels are counted and the palette tokens told apart by channel. That census is what caught the readout's rest line being painted over by its own envelope, and its layout probe is what caught the Monitor collapsing to its 120px floor on every Shot with no binding.
+
+`e2e_preview_song_change.py` gates the one question a Preview Clip's name answers — *what determines this picture?* — across a song change, and it needs **ffmpeg on PATH** for the same reason the Monitor preview's does. It exists because the server hashed `song_fingerprint` into every Shot's preview fingerprint while the client's `previewInputKey` carried no song at all: two answers to one question, which renamed the cached clip of every graded Shot on a re-analysis *and* left a bound Shot's Monitor playing a picture driven by a track the project no longer had. **The failure has no symptom of its own** — an import measures the song it writes, so nothing refuses and nothing is said; the only observable is a request that is never sent. So this script counts requests out of the browser's own resource timings, replaces the song through the Song workspace's real file input, and **never reloads the page**, because a refresh empties the Monitor's held clips and repairs the symptom without touching the cause. It drives both halves — a bound Shot re-asked for and coming back a different clip, and a graded but unbound Shot whose cached clip is left alone — then takes the measurement away entirely for the refusal path, and presses the Snap-to row's own `[Analyze song]` to bring it back. It queues nothing, contacts a dead ComfyUI port, and declares one deliberate 422.
 
 `e2e_monitor_preview.py` needs **ffmpeg on PATH**: it synthesizes its own takes and every preview it drives is an ffmpeg transcode. It is the D2 gate and most of what that slice can be checked by — it samples the Monitor every animation frame and asserts on the picture itself, so a black flash, a frozen frame or a frame belonging to the previous Shot is a failed section rather than something a human has to notice.
 

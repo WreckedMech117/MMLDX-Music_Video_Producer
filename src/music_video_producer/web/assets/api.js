@@ -5579,20 +5579,57 @@ export const PREVIEW_UNPLAYABLE =
 export const PREVIEW_WITHOUT_APPROVED_TAKE =
   "This Shot's effects are not previewed yet: a preview is the approved take through the export's chain, and nothing is approved here";
 
+// Whether this stack will ask the music for anything: an **enabled** card with a binding.
+//
+// **`app.stack_is_driven`'s counterpart, and deliberately a port rather than a second opinion.**
+// Two things on this side need the answer -- whether to ask the server for a Drive readout, and
+// whether the song is part of the Preview Clip's identity -- and until 2026-08-27 the first had
+// it inline and the second did not have it at all. That is how the client came to key a bound
+// Shot's preview on everything except the one thing that was driving it.
+//
+// **The truthiness is Python's, on purpose.** The server reads the stored spec truthily and says
+// why: a `bindings` value the catalogue will not agree to is `_effect_stack_refusals`' business,
+// and this must never answer *not driven* for a stack it could not read. JavaScript disagrees
+// with Python about exactly the values a hand-edited manifest can hold -- `[]` and `{}` are
+// truthy here and falsy there -- so the coercion is spelled out rather than left to `Boolean`.
+// Before this was written the two really did differ, on `bindings` holding a non-empty object:
+// the server called that Shot driven and refused its export, and the client called it unbound
+// and never asked. `test_the_client_and_the_server_answer_driven_identically` runs one table of
+// stacks through both engines and compares the answers, so a change to either that the other
+// does not follow fails on what they say rather than on how they are spelled.
+function pythonTruthy(value) {
+  if (value === null || value === undefined || value === false) return false;
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "object") return Object.keys(value).length > 0;
+  return Boolean(value);
+}
+
+export function stackIsDriven(stack) {
+  return (stack || []).some(
+    (spec) => pythonTruthy(spec?.bindings) && spec?.enabled !== false,
+  );
+}
+
 // What a Preview Clip would be a picture of, as a single string this client can compare.
 //
 // **Not the server's fingerprint and it must not pretend to be.** That one hashes the delivery
-// geometry and the song too, which this side cannot compute -- so this is the narrower question
-// "have the inputs *the Director just touched* changed", and it is the trigger for asking. The
-// answer comes back carrying the real fingerprint, and that comparison is what decides whether
-// a clip is actually a different picture (`previewAdoption`).
+// geometry, which this side cannot compute -- so this is the narrower question "have the inputs
+// *the Director just touched* changed", and it is the trigger for asking. The answer comes back
+// carrying the real fingerprint, and that comparison is what decides whether a clip is actually
+// a different picture (`previewAdoption`).
+//
+// *(Corrected 2026-08-28: this said the server "hashes the delivery geometry **and the song
+// too**, which this side cannot compute". The song half was wrong in the direction that costs
+// something -- the measurement's fingerprint is on the wire in `song.analysis`, this side can
+// compute it perfectly well, and the sentence was the standing reason nobody had. It is the
+// sixth element below now, under the same gate the route puts on that slot.)*
 //
 // The one gap that leaves, named rather than papered over: approving a take on *another* Shot
 // can move the export's geometry, which changes the server's fingerprint without changing this
 // key, so a Shot already previewed is not re-asked for. The clip on screen is then the right
 // look at the previous size. A Director who re-selects the Shot after such a change gets no new
 // request either; touching the stack does.
-export function previewInputKey(shot) {
+export function previewInputKey(shot, song = null) {
   // The Shot's id is deliberately **not** in here. This names a picture, and two Shots sharing a
   // take, a window and a look are a picture of the same thing -- which is exactly the case the
   // server answers with one fingerprint and one cached clip. What is held per Shot is the clip;
@@ -5603,6 +5640,21 @@ export function previewInputKey(shot) {
     Number(shot?.duration) || 0,
     effectiveOffset(shot),
     effectStackWrite(shotEffectStack(shot)).effects,
+    // **The song, and only when the picture asks it something** -- `preview_fingerprint`'s sixth
+    // slot, keyed here by the same rule the route gates that slot on. A bound Shot's picture is
+    // a function of the measurement, so a replaced or re-analysed song is a different picture and
+    // has to be re-asked for; an unbound Shot's picture cannot be, so hashing the song there
+    // would throw away a perfectly good cached clip every time a Director analysed their track.
+    //
+    // This element was missing entirely until 2026-08-27 while the route hashed the fingerprint
+    // unconditionally, which is two answers to one question -- the defect shape this repository
+    // has now paid for five times (`shotLabel`, the H3 partition, the preview fingerprint's own
+    // fourth slot, the section membership rule). The Monitor went on playing a clip driven by a
+    // song the project no longer had, un-flagged, at the same moment the export refused that
+    // Shot by name -- and no request was made, so there was nothing to refuse and nothing to say.
+    stackIsDriven(shotEffectStack(shot))
+      ? String(song?.analysis?.song_fingerprint || "")
+      : "",
   ]);
 }
 
@@ -5612,14 +5664,14 @@ export function previewInputKey(shot) {
 // "Given a Shot carrying an Effect Stack", and with no stack the preview is the take with extra
 // steps -- a transcode, a cache entry and a swapped video element to arrive back at the picture
 // the Monitor is already playing.
-export function shotPreviewWanted(shot) {
+export function shotPreviewWanted(shot, song = null) {
   if (!shotEffectStack(shot).length) return { wanted: false, key: "", note: "" };
   // The route refuses this by name (`PREVIEW_NO_TAKE_REFUSAL`), so asking would be asking for a
   // toast. The refusal is worth *saying*, once, over the picture -- it is not worth sending.
   if (!shot?.approved_output) {
     return { wanted: false, key: "", note: PREVIEW_WITHOUT_APPROVED_TAKE };
   }
-  return { wanted: true, key: previewInputKey(shot), note: "" };
+  return { wanted: true, key: previewInputKey(shot, song), note: "" };
 }
 
 // What to do with the route's answer: keep the clip that is playing, or swap to a new one.
@@ -5666,9 +5718,17 @@ export function previewAdoption(held, answer) {
 //   since it was made, and stale keeps the picture and adds the label -- it never blanks it.
 // * **A stack and no clip yet.** The take plays, unannounced. Nothing is out of date; there is
 //   simply no preview yet, and that lasts about as long as a transcode.
-export function monitorPreviewView(view, { held = null, failed = false, playing = "" } = {}) {
+export function monitorPreviewView(
+  view,
+  // `song` for the same reason `shotPreviewWanted` takes one: the key this compares against is
+  // the key the request was made under, and for a bound Shot that key carries the measurement.
+  // Left out, a song change would move the key `ensureMonitorPreview` asks by and not the one
+  // this compares by, so the clip in hand would read *current* against a look nobody re-asked
+  // for -- the same disagreement one layer up.
+  { held = null, failed = false, playing = "", song = null } = {},
+) {
   if (!monitorShowsTake(view)) return view;
-  const wanted = shotPreviewWanted(view.shot);
+  const wanted = shotPreviewWanted(view.shot, song);
   if (!wanted.wanted) return wanted.note ? { ...view, label: view.label || wanted.note } : view;
   if (!held?.url) return failed ? { ...view, label: view.label || PREVIEW_FAILED_NOTE } : view;
   const stale = held.key !== wanted.key || (Boolean(playing) && playing !== held.url);
@@ -7728,10 +7788,9 @@ function driveNumbers(value) {
 // a change to anything else is not, and must not cost a request.
 export function driveReadoutWanted(shot, song = null) {
   const stack = shotEffectStack(shot);
-  const driven = stack.some(
-    (spec) => (spec?.bindings || []).length && spec?.enabled !== false,
-  );
-  if (!driven) return { wanted: false, key: "" };
+  // `stackIsDriven`, not a second spelling of it. This was the inline copy, and it disagreed
+  // with the server on a `bindings` value that is not a list -- see that function.
+  if (!stackIsDriven(stack)) return { wanted: false, key: "" };
   return {
     wanted: true,
     key: JSON.stringify([
