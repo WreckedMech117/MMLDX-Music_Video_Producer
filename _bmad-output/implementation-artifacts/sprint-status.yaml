@@ -1,0 +1,633 @@
+# STATUS DEFINITIONS:
+# ==================
+# Epic Status:
+#   - backlog: Epic not yet started
+#   - in-progress: Epic actively being worked on
+#   - done: All stories in epic completed
+
+# Story Status:
+#   - backlog: Story only exists in epic file
+#   - ready-for-dev: Story file created, ready for development
+#   - in-progress: Developer actively working on implementation
+#   - review: Implementation complete, ready for review
+#   - done: Story completed
+
+# Retrospective Status:
+#   - optional: Can be completed but not required
+#   - done: Retrospective has been completed
+
+# Action Item Status:
+#   - open: Committed during a retrospective, not yet addressed
+#   - in-progress: Actively being worked on
+#   - done: Completed
+
+# WORKFLOW NOTES:
+# ===============
+# - Epic transitions to 'in-progress' automatically when its first story starts (via build's sprint sync)
+# - Stories can be worked in parallel if team capacity allows
+# - Developer typically creates the next story after the previous one is 'done' to incorporate learnings
+# - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
+# - Retrospective appends its action items to action_items; the status view surfaces open ones
+generated: 08-16-2026 21:31
+last_updated: 08-28-2026 15:30
+project: MusicVideoProducer
+project_key: NOKEY
+tracking_system: file-system
+story_location: _bmad-output/implementation-artifacts
+development_status:
+  epic-1: in-progress
+  1-1-generate-a-song-with-invented-lyrics: review
+  1-2-generate-a-cover-from-known-lyrics: review
+  1-3-live-song-generation-smoke-and-import-regression: review
+  epic-1-retrospective: optional
+
+  epic-2: in-progress
+  2-1-reviewable-document-replacement-with-session-recovery: review
+  2-2-story-expansion-into-fully-prompted-shots: review
+  2-3-shot-plan-readiness-gate: review
+  2-4-director-safety-notices-are-unmissable: review
+  epic-2-retrospective: optional
+
+  epic-3: in-progress
+  3-1-h3-ultra-pre-flight-audit: review
+  3-2-first-live-reference-driven-render: review
+  epic-3-retrospective: optional
+
+  epic-4: backlog
+  4-1-render-confirmation-with-gpu-coordination: backlog
+  4-2-submit-the-shot-plan-as-one-batch: backlog
+  4-3-truthful-render-state-in-the-interface: backlog
+  4-4-live-timeline-population: backlog
+  4-5-flag-in-flight-regenerate-in-place: backlog
+  4-6-responsive-under-a-full-batch: backlog
+  epic-4-retrospective: optional
+
+  epic-5: backlog
+  5-1-explicit-take-approval: backlog
+  5-2-assemble-the-video: backlog
+  5-3-honest-recovery-and-missing-media: backlog
+  epic-5-retrospective: optional
+
+  epic-6: backlog
+  6-1-derived-wizard-state: backlog
+  6-2-steps-compose-the-real-workspaces: backlog
+  6-3-first-run-journey-verified-in-a-browser: backlog
+  epic-6-retrospective: optional
+
+  epic-7: backlog
+  7-1-standalone-approved-take-enhancement-adapter-go-no-go-spike: backlog
+  7-2-finishing-as-a-route-on-approved-takes: backlog
+  epic-7-retrospective: optional
+
+  epic-8: done
+  8-1-analyze-the-song-into-an-envelope: done
+  8-2-beats-on-the-waveform: done
+  8-3-snap-shot-boundaries-to-beats: done
+  epic-8-retrospective: done
+
+  epic-9: done
+  9-1-the-effects-tab-and-a-shot-that-carries-a-grade: done
+  9-2-see-the-grade-before-exporting: done
+  9-3-texture-stylize-and-geometry-families: done
+  9-4-stack-editing-reordering-and-disabling: done
+  9-5-copy-a-look-across-the-video: done
+  9-6-honest-export-with-effects: done
+  9-7-what-the-chain-is-handed: done
+  epic-9-retrospective: done
+
+  epic-10: done
+  10-1-bind-a-parameter-to-a-band: done
+  10-2-choose-the-band-against-the-song-s-spectrum: done
+  10-3-see-what-is-driving: done
+  10-4-bindings-survive-a-song-change: done
+  epic-10-retrospective: done
+
+  epic-11: backlog
+  11-1-an-overlap-becomes-a-transition: backlog
+  11-2-the-overlap-on-the-timeline: backlog
+  11-3-the-transition-pair: backlog
+  11-4-one-sided-transitions: backlog
+  11-5-preview-a-transition: backlog
+  epic-11-retrospective: optional
+
+  epic-12: backlog
+  12-1-lock-recover-and-restore-the-brief: backlog
+  12-2-the-brief-says-what-it-is-for: backlog
+  epic-12-retrospective: optional
+
+  epic-13: backlog
+  13-1-suggest-a-video-from-the-song: backlog
+  13-2-the-long-pass-fails-safely-and-says-so: backlog
+  epic-13-retrospective: optional
+
+  epic-14: backlog
+  14-1-the-assistant-can-ask-and-can-write-the-brief: backlog
+  14-2-planning-mode: backlog
+  14-3-see-which-half-came-from-where: backlog
+  14-4-step-back-through-the-conversation-s-changes: backlog
+  epic-14-retrospective: optional
+
+  epic-15: backlog
+  15-1-a-reviewable-list-of-proposals: backlog
+  15-2-a-stale-proposal-says-so: backlog
+  15-3-generate-what-i-accepted-once: backlog
+  15-4-plan-the-cast-and-bring-your-own-character: backlog
+  epic-15-retrospective: optional
+
+  epic-16: backlog
+  16-1-proceed-to-the-next-step: backlog
+  16-2-one-analysis-moment-at-the-song-boundary: backlog
+  16-3-proceeding-to-assets-offers-to-build-them: backlog
+  epic-16-retrospective: optional
+
+  epic-17: backlog
+  17-1-turn-an-idea-into-song-fields: backlog
+  17-2-the-planner-fills-the-form-and-stops: backlog
+  epic-17-retrospective: optional
+action_items:
+  - id: "epic-8-retro-item-1-give-the-director-a-way-to-analyse-an-ex"
+    epic: 8
+    action: "Give the Director a way to analyse an existing song: POST /song/analyze
+      has no caller and 5 of 5 real projects have no envelope, so the epic does nothing
+      on any existing project"
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-8-retro-2026-08-24.md"
+  - id: "epic-8-retro-item-2-resolve-the-onset-contradiction-onsets-a"
+    epic: 8
+    action: "Resolve the onset contradiction: onsets are drawn but cannot be snapped
+      to - 279 unlandable ticks at default zoom on a real master"
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-8-retro-2026-08-24.md"
+  - id: "epic-8-retro-item-3-reconcile-drawn-beats-with-snappable-bea"
+    epic: 8
+    action: "Reconcile drawn beats with snappable beats: one zoom-out click hides
+      half the snappable beats"
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-8-retro-2026-08-24.md"
+  - id: "epic-8-retro-item-4-stop-hashing-the-master-twice-and-parsin"
+    epic: 8
+    action: "Stop hashing the master twice and parsing 0.51MB twice per project load"
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-8-retro-2026-08-24.md"
+  - id: "epic-8-retro-item-5-make-a-byte-change-under-an-unchanged-re"
+    epic: 8
+    action: "Make a byte change under an unchanged record visible to the client, and
+      make the two loaders fail together"
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-8-retro-2026-08-24.md"
+  - id: "epic-8-retro-item-6-re-read-the-playhead-during-a-drag-rathe"
+    epic: 8
+    action: "Re-read the playhead during a drag rather than freezing it at pointerdown"
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-8-retro-2026-08-24.md"
+  - id: "epic-8-retro-item-7-adopt-the-project-on-the-align-lyrics-42"
+    epic: 8
+    action: "Adopt the project on the align-lyrics 422-with-save branch so gap targets
+      are not late by one reload"
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-8-retro-2026-08-24.md"
+  - id: "epic-8-retro-item-8-make-the-undo-label-name-the-kind-actual"
+    epic: 8
+    action: "Make the Undo label name the kind actually snapped to instead of always
+      saying playhead"
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-8-retro-2026-08-24.md"
+  - id: "epic-8-retro-item-9-recalibrate-beat-marker-thinning-constan"
+    epic: 8
+    action: "Recalibrate beat-marker thinning constants against a real master - onsets
+      outnumber beats on both real songs"
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-8-retro-2026-08-24.md"
+  - id: "epic-8-retro-item-10-unify-the-three-server-side-answers-to-i"
+    epic: 8
+    action: "Unify the three server-side answers to is-this-envelope-current"
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-8-retro-2026-08-24.md"
+  - id: "epic-8-retro-item-11-correct-the-six-reasons-claims-in-three"
+    epic: 8
+    action: "Correct the six-reasons claims in three places to the measured 12 declared
+      / 9 read-reachable. The three places were never enumerated by this item and are not
+      recorded anywhere; spec-8-2-beats-on-the-waveform.md:39 still reads 'any of the six
+      reasons', found 2026-08-28."
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-8-retro-2026-08-24.md"
+  - id: "epic-8-retro-item-12-consolidate-the-three-test-audio-generat"
+    epic: 8
+    action: "Consolidate the three test-audio generators, two of which transcribe
+      one formula across languages"
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-8-retro-2026-08-24.md"
+  - id: "epic-8-retro-item-13-give-the-two-new-routes-a-response_model"
+    epic: 8
+    action: "Give the two new routes a response_model matching their siblings"
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-8-retro-2026-08-24.md"
+  - id: "epic-8-retro-item-14-move-the-beat-band-cache-key-and-marker"
+    epic: 8
+    action: "Move the beat band cache key and marker control sentences into api.js"
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-8-retro-2026-08-24.md"
+  - id: "epic-8-retro-item-15-record-the-2026-08-24-director-rulings-i"
+    epic: 8
+    action: "Record the 2026-08-24 Director rulings in a durable planning artifact
+      - five rulings exist only in gitignored specs, code comments and commit messages"
+    owner: "Director"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-8-retro-2026-08-24.md"
+  - id: "epic-8-retro-item-16-amend-ad-25-fx-nfr-4-to-record-the-numpy"
+    epic: 8
+    action: "Amend AD-25 / FX-NFR-4 to record the numpy decision and its evidence"
+    owner: "Director"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-8-retro-2026-08-24.md"
+  - id: "epic-8-retro-item-17-correct-build-order-md-slices-a-and-b-do"
+    epic: 8
+    action: "Correct BUILD-ORDER.md - slices A and B do share a file; effects.py was
+      created by story 8.1"
+    owner: "Director"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-8-retro-2026-08-24.md"
+  - id: "epic-8-retro-item-18-correct-the-envelope-size-everywhere-to"
+    epic: 8
+    action: "Correct the envelope size everywhere to the measured 405KB - three numbers
+      are in circulation and ROADMAP re-propagates the oldest. Everywhere is four places:
+      docs/project-context.md, docs/ROADMAP.md, the effects ARCHITECTURE-SPINE.md and
+      docs/BUILD-HANDOFF.md. This item reached the first three; the fourth is the one a new
+      session opens first and was closed by item 13. Enumerated 2026-08-28."
+    owner: "Director"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-8-retro-2026-08-24.md"
+  - id: "epic-8-retro-item-19-amend-fx-3-and-story-8-3-ac-to-describe"
+    epic: 8
+    action: "Amend FX-3 and story 8.3 AC to describe the targets that exist rather
+      than the lyric target that never existed"
+    owner: "Director"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-8-retro-2026-08-24.md"
+  - id: "epic-8-retro-item-20-resolve-or-re-date-spine-30hz-8-band-ass"
+    epic: 8
+    action: "Resolve or re-date SPINE 30Hz/8-band assumption which an epic has now
+      shipped on"
+    owner: "Director"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-8-retro-2026-08-24.md"
+  - id: "epic-8-retro-item-21-remove-zcr-from-the-spine-and-add-store"
+    epic: 8
+    action: "Remove ZCR from the spine and add store.py and timeline.py to the structural
+      seed"
+    owner: "Director"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-8-retro-2026-08-24.md"
+  - id: "epic-8-retro-item-22-correct-roadmap-claim-that-bpm-is-presen"
+    epic: 8
+    action: "Correct ROADMAP claim that BPM is presented as an estimate wherever it
+      appears - it appears nowhere in the UI"
+    owner: "Director"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-8-retro-2026-08-24.md"
+  - id: "epic-9-retro-item-23-apply-the-parameter-bounds-the-client-al"
+    epic: 9
+    action: "Apply the parameter bounds the client already receives: api.js ignores
+      minimum/maximum/integer that EffectParameterSpec ships, so the Effects tab draws
+      an ordinary card for a value the preview and every export refuse."
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-9-retro-2026-08-26.md"
+  - id: "epic-9-retro-item-24-make-the-preview-fingerprint-move-when-t"
+    epic: 9
+    action: "Make the preview fingerprint move when the composed chain moves. Live
+      today: previews rendered under 7db970c with a Scanlines card still show the
+      bar e4aec46 fixed, and nothing evicts previews/."
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-9-retro-2026-08-26.md"
+  - id: "epic-9-retro-item-25-give-the-five-pixel-unit-effects-soft_fo"
+    epic: 9
+    action: "Give the five pixel-unit effects (soft_focus, bloom, pixelate, pixel_shuffle,
+      sharpen) a geometry-relative parameter, or scale them for the preview; chroma_split
+      shows the pattern."
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-9-retro-2026-08-26.md"
+  - id: "epic-9-retro-item-26-add-the-stack-length-check-to-copy_shot_"
+    epic: 9
+    action: "Add the stack-length check to copy_shot_effects and correct the two docstrings
+      that assert the cap lives on 'both write doors' - it lives at three of five. The two
+      docstrings are _oversized_stack_refusals and _adopt_shot_effects, both in app.py;
+      copy_shot_effects has since moved to routes/shots.py. Enumerated 2026-08-28."
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-9-retro-2026-08-26.md"
+  - id: "epic-9-retro-item-27-move-the-alt-arrow-key-mapping-from-app"
+    epic: 9
+    action: "Move the Alt+Arrow key mapping from app.js into api.js beside shotTabAfterKey;
+      the same epic put the identical mapping on the pure side."
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-9-retro-2026-08-26.md"
+  - id: "epic-9-retro-item-28-correct-architecture-spine-md-lines-39-4"
+    epic: 9
+    action: "Correct ARCHITECTURE-SPINE.md lines 39/42/44: three import edges are
+      drawn that do not exist, and an agent will read them as permission."
+    owner: "Director"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-9-retro-2026-08-26.md"
+  - id: "epic-9-retro-item-29-amend-the-spine-s-cwd-relative-filename"
+    epic: 9
+    action: "Amend the spine's cwd-relative filename convention row (line 180) before
+      Epic 10, which is the sendcmd epic that reads it."
+    owner: "Director"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-9-retro-2026-08-26.md"
+  - id: "epic-9-retro-item-30-amend-ad-25-purity-ad-17-branch_frame_gu"
+    epic: 9
+    action: "Amend AD-25 (purity), AD-17 (BRANCH_FRAME_GUARD), AD-24 (busy-discipline
+      self-contradiction); correct models.py:759-760 and effects.py:8."
+    owner: "Director"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-9-retro-2026-08-26.md"
+  - id: "epic-9-retro-item-31-epics-effects-md-344-says-story-9-3-keep"
+    epic: 9
+    action: "epics-effects.md:344 says story 9.3 keeps 'the fifteen'; slice B shipped
+      twenty. 20+5=25."
+    owner: "Director"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-9-retro-2026-08-26.md"
+  - id: "epic-9-retro-item-32-correct-r-20-s-citation-of-tests-test_ef"
+    epic: 9
+    action: "Correct R-20's citation of tests/test_effects.py:215 - the test has never
+      been at that line."
+    owner: "Director"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-9-retro-2026-08-26.md"
+  - id: "epic-9-retro-item-33-move-fx-nfr-6-s-preview-timing-and-9-6-s"
+    epic: 9
+    action: "Move FX-NFR-6's preview timing and 9.6's export wall-clock delta from
+      commit messages into BUILD-HANDOFF.md."
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-9-retro-2026-08-26.md"
+  - id: "epic-9-retro-item-34-amend-the-four-story-acs-the-code-delibe"
+    epic: 9
+    action: "Amend the four story ACs the code deliberately diverges from: 9.1's default
+      no-op carve-out and 9.2's geometry fallback."
+    owner: "Director"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-9-retro-2026-08-26.md"
+  - id: "epic-9-retro-item-35-epic-8-item-18-incomplete-docs-build-han"
+    epic: 9
+    action: "Epic 8 item 18 incomplete: docs/BUILD-HANDOFF.md:89 still says the envelope
+      is ~750 KB, and it is the first file a session reads."
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-9-retro-2026-08-26.md"
+  - id: "epic-9-retro-item-36-epic-8-item-22-incomplete-roadmap-md-29"
+    epic: 9
+    action: "Epic 8 item 22 incomplete: ROADMAP.md:29 and :223 still assert no BPM
+      or section data exists, and :100's corrected text has itself been falsified."
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-9-retro-2026-08-26.md"
+  - id: "epic-9-retro-item-37-select-complexity-and-size-rules-in-ruff"
+    epic: 9
+    action: "Select complexity and size rules in ruff; pyproject.toml sets only line-length,
+      so nothing could ever flag create_app growing from 588 to 7882 lines."
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-9-retro-2026-08-26.md"
+  - id: "epic-9-retro-item-38-promote-the-shot-numbering-and-chip-colu"
+    epic: 9
+    action: "Promote the shot-numbering and chip-column browser harnesses from the
+      scratchpad into tests/; the delete-confirm fix's only proof is a PNG in a temp
+      folder."
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-9-retro-2026-08-26.md"
+  - id: "epic-9-retro-item-39-decide-story-9-5-s-named-shots-or-the-cu"
+    epic: 9
+    action: "DECIDE: story 9.5's 'named Shots or the current Section' - build Section
+      targeting or strike the clause. Never built, never deferred, never ruled on."
+    owner: "Director"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-9-retro-2026-08-26.md"
+  - id: "epic-9-retro-item-40-process-nothing-checks-a-record-against"
+    epic: 9
+    action: "PROCESS: nothing checks a record against the thing it describes. Every
+      process failure this retro found is that one kind - tracker, spec frontmatter,
+      architecture claims, action items, ledger, citations."
+    owner: "Director"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-9-retro-2026-08-26.md"
+  - id: "epic-9-retro-item-41-process-commit-subjects-carry-no-story-i"
+    epic: 9
+    action: "PROCESS: commit subjects carry no story id, so git_evidence.py attributed
+      0 of 13 commits. A trailer would cost nothing."
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-9-retro-2026-08-26.md"
+  - id: "epic-9-retro-item-42-process-an-action-item-phrased-everywher"
+    epic: 9
+    action: "PROCESS: an action item phrased 'everywhere' gets executed at the instances
+      its author has in hand; it should carry the enumeration or say where it stopped."
+    owner: "Director"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-9-retro-2026-08-26.md"
+  - id: "epic-10-retro-item-43-fix-census-per-stored-card-not-per-whole"
+    epic: 10
+    action: "FIX: census per stored card, not per whole stack -- one dead .cube currently
+      empties the binding census for the whole project and refuses every Split and
+      Duplicate of every bound Shot (app.py:7690, :2367)."
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-10-retro-2026-08-28.md"
+  - id: "epic-10-retro-item-44-fix-let-the-narrow-effects-put-accept-th"
+    epic: 10
+    action: "FIX: let the narrow effects PUT accept the write that removes a broken
+      grade card. Today the Director is told to fix the look, does it, and the only
+      accepted write deletes their binding."
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-10-retro-2026-08-28.md"
+  - id: "epic-10-retro-item-45-fix-resolve-settings-data_root-or-entry"
+    epic: 10
+    action: "FIX: resolve settings.data_root (or entry.path at lut_file_argument).
+      Under a relative data root a Shot carrying a binding AND a Grade card fails
+      at rc -2, and the error names the drive rather than the grade."
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-10-retro-2026-08-28.md"
+  - id: "epic-10-retro-item-46-fix-give-carried_bindings_refusal-card-i"
+    epic: 10
+    action: "FIX: give carried_bindings_refusal card identity -- a binding can currently
+      be relocated between two cards of one effect through the generic PUT, changing
+      the rendered picture at 200."
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-10-retro-2026-08-28.md"
+  - id: "epic-10-retro-item-47-fix-bound-the-carry-check-across-the-who"
+    epic: 10
+    action: "FIX: bound the carry check across the whole write rather than per new
+      Shot -- one held binding multiplies onto arbitrarily many new Shot ids in a
+      single plan write, and compounds."
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-10-retro-2026-08-28.md"
+  - id: "epic-10-retro-item-48-fix-refuse-depth-0-as-binding_spec_keys"
+    epic: 10
+    action: "FIX: refuse depth 0, as BINDING_SPEC_KEYS' own comment says this module
+      does -- or strike the comment. Not both. Today it answers 200 and drives nothing
+      at rc 0."
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-10-retro-2026-08-28.md"
+  - id: "epic-10-retro-item-49-fix-position-the-spectrum-strip-s-bars-f"
+    epic: 10
+    action: "FIX: position the spectrum strip's bars from the same array the compiler
+      weights (band_average vs bands). A short sidecar makes the Director select one
+      band and drive another."
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-10-retro-2026-08-28.md"
+  - id: "epic-10-retro-item-50-fix-validate-element-types-in-the-sideca"
+    epic: 10
+    action: "FIX: validate element types in the sidecar's bands and refuse NaN --
+      a bad element is a 500 on the drive, preview and export routes, and a NaN silently
+      flattens every binding in the project."
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-10-retro-2026-08-28.md"
+  - id: "epic-10-retro-item-51-fix-re-derive-the-anchored-edge-after-th"
+    epic: 10
+    action: "FIX: re-derive the anchored edge after the centre clamp in effectBandStripDrag
+      -- an edge drag past the strip's end moves the edge its own comment says it
+      holds still."
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-10-retro-2026-08-28.md"
+  - id: "epic-10-retro-item-52-decide-then-fix-what-_binding_envelope_r"
+    epic: 10
+    action: "DECIDE then FIX: what _binding_envelope_refusals should do about a Shot
+      that renders no frame. It iterates subject.clips while the composer iterates
+      plan.clips, so an export can be refused over a Shot contributing zero frames."
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-10-retro-2026-08-28.md"
+  - id: "epic-10-retro-item-53-test-make-the-client-half-of-the-preview"
+    epic: 10
+    action: "TEST: make the client half of the preview-key contract executable. Four
+      of previewInputKey's six inputs are asserted only in a comment; zeroing take,
+      window_start, window_duration or offset each passes 499 tests."
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-10-retro-2026-08-28.md"
+  - id: "epic-10-retro-item-54-test-give-the-export-s-clip-arithmetic-a"
+    epic: 10
+    action: "TEST: give the export's clip arithmetic a fixture with an actual split
+      -- shot_start=clip.approved_start -> clip.start survives today because every
+      bound fixture resolves to one clip."
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-10-retro-2026-08-28.md"
+  - id: "epic-10-retro-item-55-test-bring-drawdrivereadout-and-the-read"
+    epic: 10
+    action: "TEST: bring drawDriveReadout and the readout's CSS under a gate that
+      runs. Deleting the silenced ground bar, moving the rest hairline, and deleting
+      all four grid-row rules each survive the suite -- the last is the exact pre-fix
+      state of the Monitor collapse."
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-10-retro-2026-08-28.md"
+  - id: "epic-10-retro-item-56-test-vary-a-binding-fixture-s-shot_start"
+    epic: 10
+    action: "TEST: vary a binding fixture's shot_start off an analysis-tick boundary
+      -- floor->ceil and the negative-timestamp clamp are both unguarded."
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-10-retro-2026-08-28.md"
+  - id: "epic-10-retro-item-57-test-pin-the-sustain-gate-the-way-punch"
+    epic: 10
+    action: "TEST: pin the sustain gate the way punch is pinned, and exercise a Shot
+      that ends after the last analysed tick."
+    owner: "Dev"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-10-retro-2026-08-28.md"
+  - id: "epic-10-retro-item-58-spec-correct-the-four-spine-build-order"
+    epic: 10
+    action: "SPEC: correct the four spine/BUILD-ORDER statements that sendcmd generation
+      does not exist, BUILD-HANDOFF.md:27's R-8...R-28, and ARCHITECTURE-SPINE.md:52's
+      route count -- each written or left standing by the commit that falsified it."
+    owner: "Director"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-10-retro-2026-08-28.md"
+  - id: "epic-10-retro-item-59-spec-correct-the-three-claims-inside-src"
+    epic: 10
+    action: "SPEC: correct the three claims inside src/ that bindings does not exist
+      on any model (effects.py:3964, models.py:1727, models.py:1749)."
+    owner: "Director"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-10-retro-2026-08-28.md"
+  - id: "epic-10-retro-item-60-spec-amend-story-10-3-ac6-to-r-32-the-re"
+    epic: 10
+    action: "SPEC: amend Story 10.3 AC6 to R-32 (the readout's facts live in its own
+      caption, not the band panel) and Story 10.4 AC1 to the glyph and sentences that
+      actually shipped."
+    owner: "Director"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-10-retro-2026-08-28.md"
+  - id: "epic-10-retro-item-61-spec-amend-ad-28-song_fingerprint-is-now"
+    epic: 10
+    action: "SPEC: amend AD-28 -- song_fingerprint is now conditional on the stack
+      being driven, which the AD's own Rule says is a change to the AD."
+    owner: "Director"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-10-retro-2026-08-28.md"
+  - id: "epic-10-retro-item-62-spec-record-the-behaviour-no-criterion-d"
+    epic: 10
+    action: "SPEC: record the behaviour no criterion describes -- the binding route's
+      card-identity guard, carry-never-mint and its shot-vs-project scoping, the preview's
+      stale-envelope refusal, the readout's binding choice, and the withdrawable softness
+      handle."
+    owner: "Director"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-10-retro-2026-08-28.md"
+  - id: "epic-10-retro-item-63-process-a-commit-that-changes-what-a-doc"
+    epic: 10
+    action: "PROCESS: a commit that changes what a document describes must correct
+      that document in the same commit. Epic 10's false records were not drift --
+      ad67a14 wrote 'there is no generator' and 'R-8...R-28' in the commit that added
+      the generator and R-29."
+    owner: "Director"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-10-retro-2026-08-28.md"
+  - id: "epic-10-retro-item-64-process-a-gate-that-is-not-in-the-gate-i"
+    epic: 10
+    action: "PROCESS: a gate that is not in the gate is not a gate. 1,896 lines of
+      this epic's coverage sit outside pytest and hold the only checks for two defects
+      the epic already found once by looking. Either the harnesses join a gate, or
+      every slice states which it ran."
+    owner: "Director"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-10-retro-2026-08-28.md"
+  - id: "epic-10-retro-item-65-process-a-prose-statement-of-a-rule-is-n"
+    epic: 10
+    action: "PROCESS: a prose statement of a rule is not a guard, including inside
+      source. depth 0, previewInputKey's four inputs, effects.py's stdlib-only leaf
+      property and EFFECT_BAND_DRAWN_SETTINGS are each a rule written down and not
+      executed."
+    owner: "Director"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-10-retro-2026-08-28.md"

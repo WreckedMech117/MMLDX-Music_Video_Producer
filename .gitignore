@@ -24,3 +24,9 @@ _bmad-output/*
 !_bmad-output/implementation-artifacts/
 _bmad-output/implementation-artifacts/*
 !_bmad-output/implementation-artifacts/deferred-work.md
+# The standing tracker, un-ignored 2026-08-28 by Director decision. It is not a spent per-story
+# artifact: it holds what shipped, what is deferred, and 65 action items across three epics, and
+# it is the file `tests/test_sprint_tracker.py` and `tests/test_spec_frontmatter.py` exist to
+# check. Those two skipped on any checkout without it, which is Epic 10 action item 22 exactly --
+# a gate that is not in the gate. The specs beside it stay ignored.
+!_bmad-output/implementation-artifacts/sprint-status.yaml

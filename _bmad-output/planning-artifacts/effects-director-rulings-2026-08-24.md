@@ -261,8 +261,10 @@ sentence is no longer true: a client can now land a stack through `PUT .../shots
 
 **Checked before accepting it, because the docstring staked a security claim on it.** The model
 cannot reach this. `director/chat`'s `apply_shots` constructs a new Shot from three named fields —
-`Shot(start=item.start, duration=item.duration, prompt=item.prompt)` at `app.py:13885` — and
-mutates only those same three on an existing one. It never accepts a client body, and no tool
+`Shot(start=item.start, duration=item.duration, prompt=item.prompt)`, in `routes/unsorted.py`
+since the router split — and mutates only those same three on an existing one.
+*(This ruling cited that construction by line in `app.py`; the line it named no longer exists,
+so it names the function instead — corrected 2026-08-28.)* It never accepts a client body, and no tool
 schema declares `effects`. So what actually keeps filter configuration away from a model is the
 tool schema and that explicit construction, **not** the adopt guard. The guard's stated reason was
 wrong even while its conclusion was safe.
@@ -549,11 +551,21 @@ it appeared in**, and crashed it with a written output file rather than a clean 
 is a property of `(parameter -> filter option)` **verified by running it**, not by reading a flag.
 
 **The ruling: Epic 10 drives Texture, Grade and Stylize.** A Geometry parameter's bind glyph stays
-dim and **refuses by name**, saying that ffmpeg aborts when both `crop` dimensions move. Story
-10.1's AC and the epic's headline are amended a second time — the headline has now lost *both* its
+dim and **refuses by name**, saying that ffmpeg aborts when both `crop` dimensions move. ~~Story
+10.1's AC and the epic's headline are amended a second time~~ — the headline has now lost *both* its
 examples, *grain surging on the kick* and *the frame breathing with the bass*, and the honest
 reading is that the epic was written from what the filters looked like they could do rather than
 from what they do.
+
+**Two amendments follow, and only one of them was made — corrected 2026-08-28.** The epic headline
+in `epics-effects.md` carries this ruling. **Story 10.1's AC in the same file — the FX-12 clause —
+did not.** It went on reading *"Geometry, Texture, Grade and Stylize are all bindable"* while every
+declared number in Geometry was refused, and Epic 10's retrospective found it two days later. That
+clause now carries the correction and records that this ruling claimed an amendment it had not
+performed. **The struck sentence asserted a set of two and executed one**, which is Epic 9's item
+42 recurring inside a ruling written during the epic that was meant to close it;
+`tests/test_enumeration_claims.py` now refuses a ruling that reports an amendment across a counted
+set without naming the set.
 
 **The way back is a composer change, not a compiler one, and it is a follow-up story with a
 measurement attached** — the same shape as R-25's grain recompose, and for the same reason: a

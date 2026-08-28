@@ -34,6 +34,44 @@ Each of these points at the document that owns it. None of them is restated here
 7. Re-run any constraint written more than about a week ago before planning around it; three Treatment premises were already stale at eight days (BUILD-HANDOFF §4).
 8. Report only what was actually verified; write "not verified" rather than implying something works (AGENTS.md; README honest status).
 
+## Standing practices with no mechanism
+
+Recorded 2026-08-28, closing Epic 9's action items 40 and 42. Four guards now cover what a machine
+can hold — `tests/test_stale_claims.py`, `test_spec_frontmatter.py`, `test_sprint_tracker.py`,
+`test_line_citations.py`, `test_enumeration_claims.py`. **These two cannot be mechanised, and are
+written down as practice rather than carried as open tasks**, because an item that is carried
+forever stops being read. That is the failure they are about.
+
+**1. The ledger is re-read at each epic retrospective, and only the part the epic touched.**
+
+Every unresolved `deferred-work.md` entry whose `source_spec` names a story of this epic, or whose
+evidence names a file inside the epic's diff range, is re-read against the code at HEAD. Each
+becomes one of three things in the same pass: **`resolved:`** with the commit and the measurement;
+**restated**, where its file, commit or severity has moved; or left standing with a dated
+**`rechecked: YYYY-MM-DD`** line. An entry nobody re-read carries no such line, and that absence is
+the honest signal. The retrospective reports the three counts.
+
+**Entries the epic did not touch are not audited.** Epic 9's sweep of all 59 was a human reading
+every one, and pretending that happens each epic is how the ledger drifted in the first place. The
+cheapest mechanisation was tried and rejected on evidence: scanning unresolved entries for names the
+package no longer has gave **22 hits and zero defects**, because the ledger names JavaScript, test
+functions and commit shas as freely as package symbols.
+
+**2. A constraint stated in prose is enumerated when it is written, never audited afterwards.**
+
+No scan can decide which of 911 constraint-shaped sentences are load-bearing; narrowing them to 135
+and then to 22 was three judgements, and nobody will make them twice. So: **when a comment,
+docstring or planning sentence states a rule about this codebase's own structure — a count, a sole
+writer, a forbidden import, an invariant a reader would rely on — the author adds a row to
+`tests/test_stated_constraints.py`'s `CONSTRAINTS` in the same commit**, naming the test that
+asserts it, or an empty string where none does.
+
+The empty string is not a failure; it is the enumeration Epic 10's item 23 asked for. That module
+already refuses an `asserted_by` naming a test that does not exist. **There is no gate that finds an
+unenumerated constraint and there will not be one** — the rows carrying an empty `asserted_by` are
+the standing backlog, and the list exists so the next person picks from it rather than re-deriving
+it.
+
 ## Facts established by measurement
 
 Measured 2026-08-24. These are not in `AGENTS.md` and cannot be re-derived by reasoning.
