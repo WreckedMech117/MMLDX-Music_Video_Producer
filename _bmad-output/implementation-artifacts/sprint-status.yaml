@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 08-16-2026 21:31
-last_updated: 08-28-2026 15:30
+last_updated: 08-28-2026 17:02
 project: MusicVideoProducer
 project_key: NOKEY
 tracking_system: file-system
@@ -216,9 +216,9 @@ action_items:
   - id: "epic-8-retro-item-11-correct-the-six-reasons-claims-in-three"
     epic: 8
     action: "Correct the six-reasons claims in three places to the measured 12 declared
-      / 9 read-reachable. The three places were never enumerated by this item and are not
-      recorded anywhere; spec-8-2-beats-on-the-waveform.md:39 still reads 'any of the six
-      reasons', found 2026-08-28."
+      / 9 read-reachable. The three places were never enumerated by this item and
+      are not recorded anywhere; spec-8-2-beats-on-the-waveform.md:39 still reads
+      'any of the six reasons', found 2026-08-28."
     owner: "Dev"
     status: done
     ref: "_bmad-output/implementation-artifacts/epic-8-retro-2026-08-24.md"
@@ -264,10 +264,10 @@ action_items:
   - id: "epic-8-retro-item-18-correct-the-envelope-size-everywhere-to"
     epic: 8
     action: "Correct the envelope size everywhere to the measured 405KB - three numbers
-      are in circulation and ROADMAP re-propagates the oldest. Everywhere is four places:
-      docs/project-context.md, docs/ROADMAP.md, the effects ARCHITECTURE-SPINE.md and
-      docs/BUILD-HANDOFF.md. This item reached the first three; the fourth is the one a new
-      session opens first and was closed by item 13. Enumerated 2026-08-28."
+      are in circulation and ROADMAP re-propagates the oldest. Everywhere is four
+      places: docs/project-context.md, docs/ROADMAP.md, the effects ARCHITECTURE-SPINE.md
+      and docs/BUILD-HANDOFF.md. This item reached the first three; the fourth is
+      the one a new session opens first and was closed by item 13. Enumerated 2026-08-28."
     owner: "Director"
     status: done
     ref: "_bmad-output/implementation-artifacts/epic-8-retro-2026-08-24.md"
@@ -326,9 +326,10 @@ action_items:
   - id: "epic-9-retro-item-26-add-the-stack-length-check-to-copy_shot_"
     epic: 9
     action: "Add the stack-length check to copy_shot_effects and correct the two docstrings
-      that assert the cap lives on 'both write doors' - it lives at three of five. The two
-      docstrings are _oversized_stack_refusals and _adopt_shot_effects, both in app.py;
-      copy_shot_effects has since moved to routes/shots.py. Enumerated 2026-08-28."
+      that assert the cap lives on 'both write doors' - it lives at three of five.
+      The two docstrings are _oversized_stack_refusals and _adopt_shot_effects, both
+      in app.py; copy_shot_effects has since moved to routes/shots.py. Enumerated
+      2026-08-28."
     owner: "Dev"
     status: done
     ref: "_bmad-output/implementation-artifacts/epic-9-retro-2026-08-26.md"
@@ -430,7 +431,7 @@ action_items:
       process failure this retro found is that one kind - tracker, spec frontmatter,
       architecture claims, action items, ledger, citations."
     owner: "Director"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-9-retro-2026-08-26.md"
   - id: "epic-9-retro-item-41-process-commit-subjects-carry-no-story-i"
     epic: 9
@@ -444,7 +445,7 @@ action_items:
     action: "PROCESS: an action item phrased 'everywhere' gets executed at the instances
       its author has in hand; it should carry the enumeration or say where it stopped."
     owner: "Director"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-9-retro-2026-08-26.md"
   - id: "epic-10-retro-item-43-fix-census-per-stored-card-not-per-whole"
     epic: 10
