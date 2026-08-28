@@ -152,6 +152,30 @@ and then left in a commit subject is a number nobody will find.**
   every pixel the handles do not, the ground outside the region included. At the minimum width
   *and* zero softness the softness handle has three pixels left, which is below the floor, so it is
   withdrawn and the panel names the box that still sets it.
+- **Never offset a `beaty_wav_bytes` fixture by a whole number of half-seconds.** That waveform is
+  **exactly periodic at 0.5 s**, so two Shots whose song offsets differ by a multiple of it are
+  driven by an identical signal and no assertion can tell them apart. Measured 2026-08-28, and it
+  already had a victim: `test_two_shots_with_one_binding_are_driven_by_their_own_stretches_of_the_song`
+  places its Shots **4.0 s apart — eight whole periods** — and passes only because `punch`'s running
+  average starts cold at the song's first tick, so the two scripts differ over roughly the first
+  second and are equal after it. Its real margin is one second of song, not the whole clip, and a
+  mutation shifting a Shot by any multiple of 0.5 s is invisible to it. Use an offset that is not a
+  multiple — 2.75 s and 3.95 s are the ones the newer fixtures use, and both say so in their
+  docstrings.
+- **A driven clip can outlive the analysis, and it is one project in ten.** An envelope holds
+  `ceil(seconds × 30)` rows while the export's last clip ends on the 24 fps cumulative grid, up to
+  half a video frame past the song. Swept over every song length from 1 to 600 s at 1 ms resolution:
+  **61,018 of 599,001 lengths** put the final clip's last tick past the final analysed row. Which
+  side a project lands on is a rounding accident of its song's duration, which is why
+  `held = min(tick, len(drive) - 1)` holds the last measured value rather than falling to nothing.
+- **Do not give the shared stub DOM a `getContext`.** It is tempting — no pytest test can execute a
+  canvas drawing without one — and it is a trap: it would silently switch `drawEffectBandStrip` on
+  inside dozens of existing workspace tests, which then die on the missing `window.getComputedStyle`.
+  The answer that shipped 2026-08-28 is a **separate, opt-in recording context**
+  (`recorded_drawing` in `tests/test_frontend_contract.py`): the drawing function is pasted into a
+  node module and called with a Proxy that appends every method call and property write to a log. It
+  **records and simulates nothing** — no paths, no state machine, no pixels — and it is fed
+  `api.js`'s own plan, so the geometry under test is the geometry that ships.
 - **The browser harnesses are not in `pytest`, and one of them was broken for four slices before
   anyone noticed.** `pyproject.toml` sets `testpaths = ["tests"]` and pytest's default
   `python_files = test_*.py`, so every `tests/e2e_*.py` harness is **outside the suite** — a green

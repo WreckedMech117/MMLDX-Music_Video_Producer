@@ -1740,11 +1740,20 @@ def test_a_shot_later_in_the_song_previews_its_own_stretch_of_the_measurement(tm
     """The preview's half of the arithmetic the export's sibling test proves.
 
     A preview is the whole Shot from its own first frame, so the filter graph's clock starts at
-    zero -- but the drive's clock is the song's. Move the Shot four seconds along a song whose
-    beats are half a second apart and the identical binding compiles a **different script**,
-    because it is listening to a different stretch of one measurement. Handed the song's start
-    whatever the Shot's, both would compile one script and the moved Shot would flash on the
-    opening's beats.
+    zero -- but the drive's clock is the song's. Move the Shot most of four seconds along a song
+    whose beats are half a second apart and the identical binding compiles a **different
+    script**, because it is listening to a different stretch of one measurement. Handed the
+    song's start whatever the Shot's, both would compile one script and the moved Shot would
+    flash on the opening's beats.
+
+    **It is moved to 3.95 s and not to 4 s, and the odd number is the point.** At 30 Hz a Shot
+    starting at 4 s starts exactly on analysis tick 120, and on a tick boundary the two halves of
+    the compiler's quantisation are both no-ops: `floor` and `ceil` pick the same tick, and that
+    tick's own second minus the Shot's start is exactly zero rather than negative. 3.95 s is tick
+    118.5 -- half way between two -- so the tick covering this Shot's first frame begins 0.0167 s
+    *before* it. The clip must still open on that tick, stamped at zero: the assertion that every
+    script starts at `0` therefore says something here that it could not say at 4 s, where it
+    holds however the walk rounds and however the timestamp is signed.
     """
     client, _store, _comfy, _app = make_client(tmp_path)
     project_id = a_measured_project_with_a_graded_shot(client, tmp_path)
@@ -1758,7 +1767,7 @@ def test_a_shot_later_in_the_song_previews_its_own_stretch_of_the_measurement(tm
     # The whole shot list back through `PUT /shots`, which is how the browser moves a clip -- and
     # which must not disturb the binding on the way past (`_adopt_shot_effects`).
     project = client.get(f"/api/projects/{project_id}").json()
-    project["shots"][0]["start"] = 4.0
+    project["shots"][0]["start"] = 3.95
     moved = client.put(f"/api/projects/{project_id}/shots", json={"shots": project["shots"]})
     assert moved.status_code == 200, moved.text
     assert client.post(f"/api/projects/{project_id}/shots/shot_a/approve").status_code == 200

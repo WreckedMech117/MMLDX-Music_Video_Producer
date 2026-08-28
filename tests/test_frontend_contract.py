@@ -3,9 +3,10 @@ import json
 import re
 import subprocess
 from dataclasses import asdict
+from html.parser import HTMLParser
 from itertools import pairwise
 from pathlib import Path
-from typing import get_args
+from typing import ClassVar, get_args
 
 import pytest
 from fastapi import HTTPException
@@ -124,9 +125,102 @@ def app_js_block(anchor: str, terminator: str = "\n}") -> str:
     return source.split(anchor, 1)[1].split(terminator, 1)[0]
 
 
+def app_js_function(name: str) -> str:
+    """The **whole** source of one top-level `app.js` function, so it can be executed.
+
+    `app_js_block` hands back a body for reading; this hands back a declaration for running. The
+    terminator is a `}` in the first column, which in this file only ever closes a top-level
+    function -- and the check that the slice really is a function is that node compiles it, which
+    is a loud failure rather than a quiet pass if the extraction ever stops lining up.
+    """
+    source = APP_JS.read_text(encoding="utf-8")
+    anchor = f"function {name}("
+    assert source.count("\n" + anchor) == 1, name
+    return anchor + source.split("\n" + anchor, 1)[1].split("\n}\n", 1)[0] + "\n}"
+
+
 def without_comments(source: str) -> str:
     """`source` with its `//` comment lines dropped, so assertions are about code only."""
     return "\n".join(line for line in source.splitlines() if not line.strip().startswith("//"))
+
+
+class _MarkupChildren(HTMLParser):
+    """Every direct child of the one element carrying a class, read off `index.html` itself.
+
+    A depth counter rather than a regex, because "a direct child" is a structural question and the
+    markup in this workspace nests several levels of comment and control inside a single row. The
+    whole document is walked, so an unbalanced tag surfaces as a leftover on the stack rather than
+    as a quietly short list of children.
+    """
+
+    VOID: ClassVar[set[str]] = {
+        "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
+        "source", "track", "wbr",
+    }
+
+    def __init__(self, wanted: str):
+        super().__init__(convert_charrefs=True)
+        self.wanted = wanted
+        self.stack: list[str] = []
+        self.depth: int | None = None
+        self.children: list[dict] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.VOID:
+            return
+        bag = dict(attrs)
+        classes = (bag.get("class") or "").split()
+        if self.depth is not None and len(self.stack) == self.depth:
+            self.children.append({"tag": tag, "classes": classes, "attributes": bag})
+        self.stack.append(tag)
+        if self.depth is None and self.wanted in classes:
+            self.depth = len(self.stack)
+
+    def handle_endtag(self, tag):
+        if tag in self.VOID:
+            return
+        if self.depth is not None and len(self.stack) == self.depth:
+            self.depth = None
+        if self.stack and self.stack[-1] == tag:
+            self.stack.pop()
+        elif tag in self.stack:
+            while self.stack and self.stack.pop() != tag:
+                pass
+
+
+def markup_children(class_name: str) -> list[dict]:
+    """The direct children of `index.html`'s one element carrying `class_name`."""
+    walk = _MarkupChildren(class_name)
+    walk.feed(INDEX_HTML.read_text(encoding="utf-8"))
+    assert not walk.stack, (
+        ("index.html does not close every tag it opens, so nothing structural can be read "
+         "off it"),
+        walk.stack,
+    )
+    assert walk.children, f"no element in index.html carries the {class_name} class"
+    return walk.children
+
+
+def css_track_list(value: str) -> list[str]:
+    """One `grid-template-*` value as its tracks, splitting on top-level whitespace only -- the
+    comma inside `minmax(120px, 1fr)` belongs to the track rather than between two of them."""
+    tracks: list[str] = []
+    current = ""
+    depth = 0
+    for character in value:
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+        if character.isspace() and depth == 0:
+            if current:
+                tracks.append(current)
+            current = ""
+        else:
+            current += character
+    if current:
+        tracks.append(current)
+    return tracks
 
 
 def scoped_control_group(document_tab: str) -> str:
@@ -156,6 +250,73 @@ def run_module(script: str):
         encoding="utf-8",
     )
     return json.loads(result.stdout)
+
+
+#: The palette tokens a canvas drawing reads off its own computed style, answered with sentinels
+#: rather than with the real hexes: what is being asserted is *which* token a stroke was drawn in,
+#: and a hex would make that a second copy of the stylesheet.
+DRAWING_TOKENS = {"--dim": "DIM", "--blue": "BLUE", "--acid": "ACID"}
+
+
+def recorded_drawing(name: str, plan: str, imports: str, device_pixels: float = 1) -> dict:
+    """Execute one of `app.js`'s canvas drawings and hand back the calls it made, in order.
+
+    **A recording context, not a canvas.** It records every method call and every property write
+    and simulates nothing -- no pixels, no paths, no state machine -- because the moment a stub
+    starts modelling a canvas it is a second implementation and the test is about the stub.
+
+    This exists because the two drawings in this workspace were guarded by a substring scan of
+    their own source and by nothing else: the stub DOM has no `getContext`, so no test called
+    either of them. A scan cannot see *order or presence of calls*, which is exactly what both of
+    the readout's shipped regressions were about -- the silenced-passage ground bar going missing,
+    and the rest hairline being drawn in front of the fill that then painted over it. Both were
+    found by a human looking at the picture; both are executable here.
+
+    `plan` is a JavaScript expression for the plan the drawing is handed -- built from `api.js`'s
+    own plan function, so the geometry under test is the geometry that ships. `imports` names what
+    to bring in from `api.js` for it.
+    """
+    return run_module("""
+      import { __IMPORTS__ } from './src/music_video_producer/web/assets/api.js';
+      const TOKENS = __TOKENS__;
+      const calls = [];
+      const context = new Proxy({}, {
+        get: (_bag, property) => (...args) => {
+          calls.push({ call: String(property), args: args.map((value) => (
+            typeof value === "number" ? Number(value.toFixed(4)) : value)) });
+        },
+        set: (_bag, property, value) => {
+          calls.push({ set: String(property), value: String(value) });
+          return true;
+        },
+      });
+      const canvas = { width: 0, height: 0, getContext: () => context };
+      globalThis.window = {
+        devicePixelRatio: __DPR__,
+        getComputedStyle: () => ({ getPropertyValue: (name) => (TOKENS[name] || "") }),
+      };
+      __SOURCE__
+      const plan = __PLAN__;
+      __NAME__(canvas, plan);
+      console.log(JSON.stringify({ calls, plan, canvas }));
+    """.replace("__IMPORTS__", imports)
+       .replace("__TOKENS__", json.dumps(DRAWING_TOKENS))
+       .replace("__DPR__", json.dumps(device_pixels))
+       .replace("__SOURCE__", app_js_function(name))
+       .replace("__PLAN__", plan)
+       .replace("__NAME__", name))
+
+
+def drawn(calls: list[dict], name: str) -> list[tuple[int, list]]:
+    """Every `(index, args)` for one recorded context method, in the order it was called."""
+    return [(index, item["args"]) for index, item in enumerate(calls) if item.get("call") == name]
+
+
+def painted_with(calls: list[dict], index: int, property_name: str) -> str:
+    """The value `property_name` last held before the call at `index` -- which token a stroke was
+    actually drawn in, rather than which tokens appear somewhere in the log."""
+    written = [item["value"] for item in calls[:index] if item.get("set") == property_name]
+    return written[-1] if written else ""
 
 
 # A stub DOM barely complete enough to boot `app.js` under node, so the workspace's own code can be
@@ -23057,6 +23218,64 @@ PREVIEW_BARE_SHOT = {
     "latest_output": "shots/b.mp4", "approved_output": "shots/b.mp4", "status": "complete",
 }
 
+#: The Shot the client half of the preview-key contract is asked about: an approved take, a window
+#: with a lead and a nudge, and a **bound** card, so that all six keyed inputs are live on one
+#: fixture -- the song is only part of a driven Shot's picture, and a table with an unbound base
+#: could not ask about it at all.
+PREVIEW_KEY_BASE = {
+    "id": "keyed", "start": 4, "duration": 4,
+    "latest_output": "shots/k.mp4", "approved_output": "shots/k.mp4", "status": "complete",
+    "latest_take_lead": 0.25, "trim_nudge": 0.125,
+    "effects": [{"effect": "monochrome", "enabled": True, "parameters": {"amount": 1},
+                 "bindings": [{"parameter": "amount", "drive": "punch", "depth": 0.5}]}],
+}
+PREVIEW_KEY_SONG = {"analysis": {"song_fingerprint": "fp-first"}}
+
+#: **The client direction of the preview-key contract, as a table rather than as a sentence.**
+#:
+#: The server direction is exhaustive already: every parameter of `preview_fingerprint` is
+#: classified below and a ninth input fails the test. The client direction was the comment *"server
+#: inputs the client keys on directly"* and nothing executed it, so zeroing four of
+#: `previewInputKey`'s six elements passed the whole file -- `effectiveOffset(shot)`,
+#: `Number(shot?.duration) || 0`, `shot?.approved_output || ""` and `Number(shot?.start) || 0` --
+#: which ships as a Director swapping the approved take, nudging a trim or dragging a boundary
+#: while the Monitor goes on playing the previous clip and reads *current*.
+#:
+#: Each key here is one such input; `keyed` in the test below **is this table's own keys**, so a
+#: seventh parameter classified as keyed arrives with the edit that proves the client follows it or
+#: no test passes. Each value is a list of `[shot, song]` JavaScript expression pairs handed to
+#: `previewInputKey`, every one differing from the base in that one input alone, and every one of
+#: which must produce a different key.
+PREVIEW_KEY_MOVERS = {
+    "take": ["[{ ...BASE, approved_output: 'shots/second.mp4' }, SONG]"],
+    "window_start": ["[{ ...BASE, start: 6.5 }, SONG]"],
+    "window_duration": ["[{ ...BASE, duration: 5.5 }, SONG]"],
+    # Two rows, because the offset is a sum and either term moves the cut: the lead the render
+    # gave the take, and the nudge the Director dialled into it. A key that followed only one of
+    # them would still be a Monitor showing frames the export will not ship.
+    "offset": [
+        "[{ ...BASE, latest_take_lead: 0.75 }, SONG]",
+        "[{ ...BASE, trim_nudge: -0.125 }, SONG]",
+    ],
+    "stack": ["[{ ...BASE, effects: [{ ...BASE.effects[0], parameters: { amount: 0.4 } }] }, SONG]"],
+    "song_fingerprint": ["[BASE, { analysis: { song_fingerprint: 'fp-second' } }]"],
+}
+
+#: And what must **not** move it. Without these the table above is satisfied by a key that hashes
+#: the whole Shot, which is the same defect from the other side: every redraw of a plan whose
+#: `status` had ticked over would throw away a perfectly good cached clip and re-ask the route for
+#: a picture that had not changed.
+PREVIEW_KEY_UNTOUCHED = {
+    # The Shot's id, which `previewInputKey`'s own first comment refuses by name: two Shots
+    # sharing a take, a window and a look are a picture of the same thing.
+    "the Shot's id": "{ ...BASE, id: 'elsewhere' }",
+    # A newer take exists and has not been approved. `approved_output` is the editorial decision
+    # and the only one the picture follows.
+    "an unapproved newer take": "{ ...BASE, latest_output: 'shots/newer.mp4' }",
+    "a render in flight": "{ ...BASE, status: 'running' }",
+    "the prompt the take was rendered from": "{ ...BASE, prompt: 'another sentence entirely' }",
+}
+
 
 def preview_answer(fingerprint: str) -> dict:
     """One `ShotPreviewResponse`, as the route composes it."""
@@ -23266,8 +23485,12 @@ def test_the_monitor_decides_the_preview_clip_without_asking_the_server_for_a_st
     # and `MANIFEST_WRITE_GUARDS`' idiom, applied to the one question a cache key answers.
     signature = inspect.signature(preview_fingerprint)
 
-    #: Server inputs the client keys on directly. Each is an element of `previewInputKey`.
-    keyed = ("take", "window_start", "window_duration", "offset", "stack", "song_fingerprint")
+    #: Server inputs the client keys on directly. Each is an element of `previewInputKey`, and
+    #: each is executed against the client in
+    #: `test_every_input_the_preview_key_claims_to_follow_moves_it` -- this list is that table's
+    #: own keys, so a seventh keyed input cannot be classified here without arriving with the edit
+    #: that proves the client follows it.
+    keyed = tuple(PREVIEW_KEY_MOVERS)
     #: Server inputs that reach the client's key inside another element rather than on their own.
     carried = {
         # A binding is stored inside its own `EffectSpec`, so it rides in `effectStackWrite`'s
@@ -23302,6 +23525,73 @@ def test_the_monitor_decides_the_preview_clip_without_asking_the_server_for_a_st
         ("`preview_fingerprint` gained or lost an input that nobody decided the client's key "
          "should follow. Add it to `keyed`, `carried` or `not_keyed` with the reason."),
         sorted(classified ^ set(signature.parameters)),
+    )
+
+
+def test_every_input_the_preview_key_claims_to_follow_moves_it():
+    """The **client** half of the preview-key contract, executed.
+
+    The test above makes the server half exhaustive -- every `preview_fingerprint` parameter is
+    classified and a ninth one fails it. Its client half was one line of prose, *"server inputs the
+    client keys on directly"*, and prose does not run: with only `stack` and `song_fingerprint`
+    exercised anywhere, four of `previewInputKey`'s six elements could each be replaced by a
+    constant and the whole file still passed --
+
+    * `shot?.approved_output || ""` -> `""`: the Director approves a different take and the
+      Monitor goes on playing the old one.
+    * `Number(shot?.start) || 0` and `Number(shot?.duration) || 0` -> `0`: a boundary drag moves
+      the window and the preview is a picture of the seconds that used to be there.
+    * `effectiveOffset(shot)` -> `0`: a trim nudge moves the cut and the clip on screen keeps the
+      frames the export will not ship.
+
+    In every one of those the corner reads *current*, because nothing is stale -- no request was
+    made, so there was nothing to be out of date. That is the 10.4 defect one axis over.
+
+    So each keyed input gets an edit that changes it and nothing else, and the key has to move; and
+    four edits that change something else entirely, where it must not, because "the key moved" on
+    its own is equally true of a key that hashes the whole Shot and re-renders on a status tick.
+    """
+    rows = [(name, index, expression)
+            for name, expressions in PREVIEW_KEY_MOVERS.items()
+            for index, expression in enumerate(expressions)]
+    read = run_module("""
+      import { previewInputKey } from './src/music_video_producer/web/assets/api.js';
+      const BASE = __BASE__;
+      const SONG = __SONG__;
+      console.log(JSON.stringify({
+        settled: previewInputKey(BASE, SONG),
+        moved: [__MOVED__].map((args) => previewInputKey(...args)),
+        untouched: [__UNTOUCHED__].map((shot) => previewInputKey(shot, SONG)),
+      }));
+    """.replace("__BASE__", json.dumps(PREVIEW_KEY_BASE))
+       .replace("__SONG__", json.dumps(PREVIEW_KEY_SONG))
+       .replace("__MOVED__", ", ".join(expression for _name, _index, expression in rows))
+       .replace("__UNTOUCHED__", ", ".join(PREVIEW_KEY_UNTOUCHED.values())))
+
+    settled = read["settled"]
+    assert settled
+    moved = [
+        (name, expression)
+        for (name, _index, expression), key in zip(rows, read["moved"], strict=True)
+        if key == settled
+    ]
+    assert not moved, (
+        ("`previewInputKey` does not follow an input it is documented as keying on: the Director "
+         "changes this and the Monitor keeps playing the clip it already has, reading current"),
+        moved,
+    )
+    # Distinct from each other as well as from the base, so two inputs cannot be collapsed into
+    # one element that answers for both.
+    assert len(set(read["moved"])) == len(rows), read["moved"]
+
+    stayed = [
+        label for label, key in zip(PREVIEW_KEY_UNTOUCHED, read["untouched"], strict=True)
+        if key != settled
+    ]
+    assert not stayed, (
+        ("`previewInputKey` moved for something that is not part of the picture, so every Shot "
+         "this happens to re-asks the route for a clip it is already holding"),
+        stayed,
     )
 
 
@@ -25673,3 +25963,258 @@ def test_the_readouts_drawing_takes_every_coordinate_from_the_plan():
     for banned in ("DRIVE_SOFTNESS", "DRIVE_RELEASE", "DRIVE_TRANSIENT", "band_series",
                    "drive_series"):
         assert banned not in source, banned
+
+
+def drive_drawing(over: dict | None = None, binding: dict | None = False,
+                  device_pixels: float = 1) -> dict:
+    """Execute `drawDriveReadout` against the compiled fixture and report every call it made.
+
+    The plan is `api.js`'s own, built from the same served binding the tests above read: the
+    geometry under test is the geometry that ships, and nothing here decides a pixel.
+    """
+    served = DRIVE_SERVED["bindings"][0] if binding is False else binding
+    plan = (
+        "driveReadoutPlan({{ binding: {binding}, seconds: {seconds}, ...{box}, ...{over} }})"
+    ).format(
+        binding=json.dumps(served),
+        seconds=json.dumps(DRIVE_SERVED["seconds"]),
+        box=json.dumps(DRIVE_BOX),
+        over=json.dumps(over or {}),
+    )
+    return recorded_drawing("drawDriveReadout", plan, "driveReadoutPlan", device_pixels)
+
+
+def test_the_readouts_drawing_is_executed_and_puts_its_marks_down_in_the_order_it_claims():
+    """The readout, **drawn** -- against a recording context rather than read as text.
+
+    The test above holds the drawing to `plan.` fields by scanning its source, and a scan is the
+    right shape for *that* claim. It is the wrong shape for every claim this epic's two shipped
+    regressions were about, because both were about which marks were made and in what order:
+
+    * the silenced-passage ground bar was deleted, and a scan for banned identifiers saw nothing
+      missing -- below the Trigger Floor a `punch` drive is exactly zero, so a silenced run's own
+      line lies *on* the rest hairline in the same token, and without the band underneath it "the
+      floor shut this" is pixel-for-pixel identical to a passage nobody measured;
+    * the rest hairline was drawn *before* the envelope, and the fill's own bottom edge then
+      painted over it along its whole width -- the pixel census counted ten `--dim` pixels where a
+      full-width line should have left more than a thousand.
+
+    Both were found by a human looking at the picture. Both are executed here.
+    """
+    read = drive_drawing({"playhead": 1.0})
+    calls, plan = read["calls"], read["plan"]
+
+    # The canvas is sized in device pixels and drawn in CSS pixels, which is the whole of the
+    # transform: every coordinate below is a plan coordinate, unscaled.
+    assert read["canvas"] == {"width": 200, "height": 34}
+    assert [args for _index, args in drawn(calls, "setTransform")] == [[1, 0, 0, 1, 0, 0]]
+    assert [args for _index, args in drawn(calls, "clearRect")] == [
+        [0, 0, plan["width"], plan["height"]]]
+
+    # **The ground under every silenced passage**, one band per run, exactly where the plan puts
+    # it and nowhere else. This is the mutation that survived: delete the loop and the readout
+    # still draws an envelope, a rest line and a playhead, and every source assertion passes.
+    grounds = drawn(calls, "fillRect")
+    assert plan["silence"], "the fixture no longer has a passage the Trigger Floor shut"
+    assert [args for _index, args in grounds] == [
+        [span["from"], plan["ground"], max(1, span["to"] - span["from"]),
+         plan["height"] - plan["ground"]]
+        for span in plan["silence"]
+    ], "the silenced-passage ground bar is not the band the plan asked for"
+    for index, _args in grounds:
+        assert painted_with(calls, index, "fillStyle") == DRAWING_TOKENS["--dim"]
+        assert painted_with(calls, index, "globalAlpha") == "0.55"
+
+    fills = [index for index, _args in drawn(calls, "fill")]
+    strokes = [index for index, _args in drawn(calls, "stroke")]
+    # Laid down *first*, so the envelope draws over it rather than the other way round.
+    assert grounds[-1][0] < fills[0], "the ground bar is painted over the envelope it sits under"
+
+    # One filled and one stroked run per segment, each in the token its own `silenced` flag names:
+    # `--dim` where the floor was shut, `--blue` where it was open. A silenced passage that looked
+    # merely low is the readout losing its reason for existing.
+    expected = [DRAWING_TOKENS["--dim" if segment["silenced"] else "--blue"]
+                for segment in plan["segments"]]
+    assert [painted_with(calls, index, "fillStyle") for index in fills] == expected
+    assert {painted_with(calls, index, "globalAlpha") for index in fills} == {"0.28"}
+
+    # **The rest hairline, after the envelope.** Identified by the only mark in this drawing that
+    # runs the full width of the canvas, so the assertion is about the line rather than about the
+    # order the source happens to be written in.
+    across = [index for index, args in drawn(calls, "lineTo")
+              if args == [plan["width"], plan["rest"]]]
+    assert len(across) == 1, "the rest line no longer runs the full width of the readout"
+    hairline = min(index for index in strokes if index > across[0])
+    assert painted_with(calls, hairline, "strokeStyle") == DRAWING_TOKENS["--dim"]
+    assert hairline > fills[-1], (
+        "the rest hairline is drawn before the envelope fill whose bottom edge then paints over "
+        "it along its whole width -- the regression the pixel census caught on 2026-08-27")
+    # The envelope's own strokes are the ones before it, and they carry the same tokens.
+    assert [painted_with(calls, index, "strokeStyle")
+            for index in strokes if index < hairline] == expected
+
+    # The playhead last, through everything, in the token the timeline already uses for it, and on
+    # a half pixel so a 1px stroke lands on one column rather than across two.
+    head = strokes[-1]
+    assert head > hairline
+    assert painted_with(calls, head, "strokeStyle") == DRAWING_TOKENS["--acid"]
+    assert drawn(calls, "moveTo")[-1][1] == [round(plan["playhead"]) + 0.5, 0]
+    assert drawn(calls, "lineTo")[-1][1] == [round(plan["playhead"]) + 0.5, plan["height"]]
+
+
+def test_the_readout_draws_a_silenced_run_of_one_sample_and_nothing_at_all_when_absent():
+    """The two edges of the same drawing: the mark that is one pixel wide, and the picture that is
+    not drawn.
+
+    A silenced run of a single sample has zero width in the plan, and `Math.max(1, ...)` is what
+    keeps it visible -- the spectrum strip's own lesson from one slice ago, where a 1px bar was
+    swallowed whole and the baseline looked correct because everything wider than it was.
+
+    And **absent, not empty** (FX-22) held at the drawing rather than only at the sync: a plan that
+    is not shown makes no mark, sizes no canvas and clears no rectangle, so there is no
+    zero-height box and no flat line where a readout would be.
+    """
+    single = {**DRIVE_SERVED["bindings"][0],
+              "silenced": [True, False, False, False, False, False, False, False]}
+    read = drive_drawing({"playhead": 5.0}, binding=single)
+    plan = read["plan"]
+
+    assert [span["to"] - span["from"] for span in plan["silence"]] == [0]
+    assert [args for _index, args in drawn(read["calls"], "fillRect")] == [
+        [0, plan["ground"], 1, plan["height"] - plan["ground"]]]
+    # The playhead is outside this Shot's window, so there is no `--acid` mark anywhere: a line
+    # pinned to an edge would say the picture is at its start when it is somewhere else.
+    assert plan["playhead"] is None
+    assert DRAWING_TOKENS["--acid"] not in [
+        item.get("value") for item in read["calls"] if "set" in item]
+
+    absent = drive_drawing(binding=None)
+    assert absent["plan"]["shown"] is False
+    assert absent["calls"] == [], absent["calls"]
+    assert absent["canvas"] == {"width": 0, "height": 0}
+
+
+def test_the_readout_scales_the_canvas_for_the_display_and_keeps_drawing_in_css_pixels():
+    """A Retina display doubles the backing store and changes not one coordinate.
+
+    Without the transform every mark would land in the top-left quarter of a canvas twice the size
+    it was measured at, which is a picture that is wrong everywhere and looks plausible in a
+    screenshot cropped to it.
+    """
+    read = drive_drawing({"playhead": 1.0}, device_pixels=2)
+    plan = read["plan"]
+
+    assert read["canvas"] == {"width": 400, "height": 68}
+    assert [args for _index, args in drawn(read["calls"], "setTransform")] == [[2, 0, 0, 2, 0, 0]]
+    # The plan is still the measured box, and so is every mark made against it.
+    assert (plan["width"], plan["height"]) == (DRIVE_BOX["width"], DRIVE_BOX["height"])
+    assert [args for _index, args in drawn(read["calls"], "clearRect")] == [
+        [0, 0, DRIVE_BOX["width"], DRIVE_BOX["height"]]]
+
+
+def test_the_spectrum_strips_blue_is_the_falloff_rather_than_a_picture_of_it():
+    """The other canvas in this workspace, executed for the property its own comment turns on.
+
+    `drawEffectBandStrip` draws the bars twice: once in `--dim`, and once in `--blue` **clipped to
+    the weight profile**, so the blue part of each bar is exactly that band's weight times its
+    level. Remove the clip and the picture becomes a hard-edged rectangle over a soft band -- a
+    drawing that says the export will treat every band inside the region alike when it will not,
+    which is this epic's recurring failure and one no substring scan can see, because `clip` is a
+    call rather than an identifier and both passes are still there.
+    """
+    plan = (
+        "effectBandStripPlan({{ bands: {bands}, edges: {edges}, settings: {settings}, "
+        "values: {values}, ...{box} }})"
+    ).format(
+        bands=json.dumps(EFFECTS_BAND_AVERAGE),
+        edges=json.dumps(EFFECTS_BAND_EDGES),
+        settings=json.dumps(EFFECT_CATALOGUE["binding_settings"]),
+        values=json.dumps(BOUND_AMOUNT),
+        box=json.dumps(STRIP_BOX),
+    )
+    read = recorded_drawing("drawEffectBandStrip", plan, "effectBandStripPlan")
+    calls = read["calls"]
+
+    assert read["plan"]["shown"] is True
+    bars = drawn(calls, "fillRect")
+    clips = [index for index, _args in drawn(calls, "clip")]
+    assert len(clips) == 1, "the falloff is illustrated rather than clipped"
+
+    # Each band's bar is drawn once in `--dim` before the clip and once in `--blue` after it, and
+    # the two passes are the same rectangles: the blue is the dim bar seen through the profile.
+    count = read["plan"]["count"]
+    dim = [args for index, args in bars if index < clips[0]]
+    blue = [args for index, args in bars if index > clips[0]][:count]
+    assert len(dim) == count == len(read["plan"]["bars"])
+    assert dim == blue, "the clipped pass draws different bars from the ones under it"
+    assert {painted_with(calls, index, "fillStyle") for index, _args in bars[:count]} == {
+        DRAWING_TOKENS["--dim"]}
+    assert {painted_with(calls, index, "fillStyle")
+            for index, _args in bars[count:count * 2]} == {DRAWING_TOKENS["--blue"]}
+    # And the clip is undone afterwards, or every handle drawn below would be cut by it.
+    assert next(index for index, _args in drawn(calls, "restore")) > clips[0]
+
+
+def test_every_child_of_the_timeline_column_is_placed_on_a_track_of_its_own():
+    """Epic 10's Monitor-collapse fix, held by something that runs.
+
+    `.timeline-main` is a four-track grid and the Drive readout is the second track. The readout
+    ships `hidden`, and **a hidden grid child does not hold its track**: with auto-placement the
+    three remaining children fell into tracks 1-3, so `.timeline-scroll` -- the tracks viewport --
+    landed in the readout's own `auto` track while the `minmax(140px, 1.25fr)` track meant for it
+    sat empty, and the Monitor collapsed from 218px to its 120px floor on every Shot with no
+    binding, which is every Shot in every project until one is bound. Measured in the browser on
+    2026-08-27. Deleting all four `grid-row` rules -- the exact pre-fix state -- passed the whole
+    suite, and no pytest test in this repository mentioned `grid-row` at all.
+
+    **The guard is derived from the markup rather than from the four selectors**, because the
+    defect is *a child that does not name its row*: a fifth element added to this column with no
+    rule of its own reproduces it exactly, and a guard listing today's four would pass over it.
+    """
+    styles = STYLES_CSS.read_text(encoding="utf-8")
+    column = [body for selector, body in css_rules(styles) if selector == ".timeline-main"]
+    assert len(column) == 1, "`.timeline-main` is declared more than once"
+    tracks = re.search(r"grid-template-rows:([^;]+);", column[0])
+    assert tracks, "`.timeline-main` is no longer a grid with named tracks"
+    tracks = css_track_list(tracks.group(1))
+
+    placed = {}
+    for selector, body in css_rules(styles):
+        child = re.fullmatch(r"\.timeline-main > \.([\w-]+)", selector.strip())
+        row = re.search(r"grid-row:\s*(\d+)\s*;", body)
+        if child and row:
+            placed[child.group(1)] = int(row.group(1))
+
+    children = markup_children("timeline-main")
+    unplaced = [child for child in children
+                if not any(name in placed for name in child["classes"])]
+    assert not unplaced, (
+        ("a child of `.timeline-main` names no `grid-row`, so it is auto-placed -- and the moment "
+         "any child of this column is `hidden` the ones after it slide into the wrong tracks, "
+         "which is how the Monitor collapsed to its 120px floor on 2026-08-27"),
+        [child["classes"] or child["tag"] for child in unplaced],
+    )
+    # One track each, in markup order, covering the whole grid: a child sharing a track with
+    # another is the same defect said differently, and a rule for a class that is no longer in
+    # this column is a rule that has stopped guarding anything.
+    rows = [next(placed[name] for name in child["classes"] if name in placed)
+            for child in children]
+    assert rows == list(range(1, len(children) + 1)), (rows, tracks)
+    assert len(tracks) == len(children), (
+        ("the column has a track for something that is not in the markup, or a child with no "
+         "track to put it on"),
+        tracks,
+        [child["classes"] for child in children],
+    )
+    assert set(placed) == {name for child in children for name in child["classes"]
+                           if name in placed}
+    assert len(placed) == len(children), (
+        "a `grid-row` rule places something that is not a child of this column any more",
+        sorted(placed),
+    )
+
+    # And the reason the placement has to be explicit is still live: at least one of these
+    # children ships `hidden`, which takes it out of the flow entirely.
+    assert [child["classes"] for child in children if "hidden" in child["attributes"]], (
+        "no child of `.timeline-main` ships `hidden` any more -- if that is deliberate, this "
+        "test's reason has changed and its comment needs to say what the new one is")

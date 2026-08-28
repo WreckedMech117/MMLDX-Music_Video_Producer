@@ -29,6 +29,7 @@ and one that silently gained the wrong filter becomes a binding that does nothin
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import subprocess
 from pathlib import Path
 
@@ -75,6 +76,37 @@ ENVELOPE = {
     "bands": [
         [0.10, 0.90, 0.20, 0.10, 0.80, 0.10, 0.30, 0.10],
         [0.00, 0.10, 0.00, 0.00, 0.10, 0.00, 0.00, 0.00],
+    ],
+}
+
+#: The same shape at the same rate, carrying a **section** rather than hits: band 0 sits at 0.9
+#: for four ticks and then drops to nothing for four. `punch` would read one transient at tick 0
+#: and nothing else; `sustain` reads a section that arrives, holds, and ends, which is the only
+#: shape in which the gate's attack and its release are both visible in one script.
+SUSTAIN_ENVELOPE = {
+    "version": 1,
+    "analysis_rate": 4.0,
+    "band_count": 2,
+    "bands": [
+        [0.90, 0.90, 0.90, 0.90, 0.00, 0.00, 0.00, 0.00],
+        [0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00],
+    ],
+}
+
+#: One second of song at 4 Hz, quiet until its **last** tick, which is a hit.
+#:
+#: For the clip that outlives its own analysis. An envelope is `ceil`ed to whole analysis frames
+#: and a Shot may legitimately end after the last one, so the walk holds the last measured value
+#: rather than falling to nothing — and the hit is put on the final tick precisely so that "held"
+#: and "fell to nothing" are the two ends of the parameter's range rather than two numbers a
+#: reader has to compare digit by digit.
+TAIL_ENVELOPE = {
+    "version": 1,
+    "analysis_rate": 4.0,
+    "band_count": 2,
+    "bands": [
+        [0.10, 0.10, 0.10, 0.90],
+        [0.00, 0.00, 0.00, 0.00],
     ],
 }
 
@@ -295,6 +327,72 @@ def test_one_binding_compiles_to_this_exact_script():
     )
 
 
+def test_the_sustain_gate_compiles_to_this_exact_script_and_lets_go_slower_than_it_takes_hold():
+    """The pin `sustain` did not have, and the property it carries is the one stated in the
+    comment above `DRIVE_SUSTAIN_ATTACK_SECONDS`: *"Release is slower than attack for the same
+    reason a fader is: a section that has arrived should not flicker out on one quiet bar."*
+
+    **What a diff here means.** Every number below is the gate's own ramp, so a changed line is a
+    changed attack or a changed release and nothing else: the band selection is the same one the
+    punch pin uses (centred at 0 and narrow, so band 1's weight is `exp(-70)`), the parameter is
+    Saturation at a resting 1.0 with a depth of 1.0, and the value written is therefore `1 + the
+    gate`. Swapping the two constants — 0.35 attack and 0.7 release for 0.7 and 0.35 — rewrites
+    lines 2 through 6 and nothing else in this repository notices, which is what this pin is for.
+
+    Worked through with a pencil against `SUSTAIN_ENVELOPE` at a floor of 0.5, a hold of 0.5 s
+    and a sustain of 0.25 s, one tick being 0.25 s: the band is above the floor from tick 0, so
+    the gate has held for its half second by tick 1 and engages there. It then rises at
+    `0.25 / 0.35` per tick — 0.714286, then the remaining 0.285714 — reaching full at tick 2. The
+    band drops at tick 4, which spends the whole 0.25 s of sustain in one tick, so the gate lets
+    go there and falls at `0.25 / 0.7` per tick — 0.357143 each — taking **three** ticks to reach
+    nothing against the two it took to arrive. That asymmetry is the property, and it is asserted
+    below on the numbers as well as pinned in the text, so a reader who changes the constants
+    deliberately is told which of the two facts they have broken.
+    """
+    script = stages(
+        [
+            bound(
+                "saturation",
+                "amount",
+                {"amount": 1.0},
+                drive="sustain",
+                depth=1.0,
+                band_centre=0.0,
+                band_width=0.2,
+                floor=0.5,
+                hold=0.5,
+                sustain=0.25,
+            )
+        ],
+        envelope=SUSTAIN_ENVELOPE,
+    ).scripts[0]
+
+    assert script.target == "eq@b0"
+    assert script.text == (
+        "0 eq@b0 saturation 1;\n"
+        "0.25 eq@b0 saturation 1.714286;\n"
+        "0.5 eq@b0 saturation 2;\n"
+        "0.75 eq@b0 saturation 2;\n"
+        "1 eq@b0 saturation 1.642857;\n"
+        "1.25 eq@b0 saturation 1.285714;\n"
+        "1.5 eq@b0 saturation 1;\n"
+        "1.75 eq@b0 saturation 1;\n"
+    )
+
+    # The same property read off the numbers, in the fader's own terms: the fastest the gate ever
+    # moves toward full is faster than the fastest it ever moves back toward nothing.
+    #
+    # **Read over every step rather than at two chosen lines**, because a swap of the constants
+    # moves the ramps as well as their slopes: the first draft of this compared line 2 against
+    # line 5 by index, and the swapped pair — which reaches full one tick later and lets go one
+    # tick sooner — satisfied that comparison exactly as the correct pair does. The steepest
+    # step in each direction is the one reading of the property that does not depend on where
+    # the ramps happen to land.
+    values = [float(line[:-1].split(" ")[3]) for line in script.text.splitlines()]
+    steps = [later - earlier for earlier, later in itertools.pairwise(values)]
+    assert max(steps) > -min(steps), steps
+
+
 def test_the_compiler_is_a_function_of_an_envelope_a_binding_and_a_clips_seconds():
     """Called directly, with nothing but the three things AD-22 names.
 
@@ -425,6 +523,100 @@ def test_the_song_second_a_clip_starts_at_is_the_shots_start_plus_the_clips_offs
     # And a Shot that was never split adds nothing at all: it compiles from the song's own start.
     unsplit = stages(stack, shot_start=0.0, clip_offset=0.0, clip_seconds=1.0)
     assert unsplit.scripts[0].text != from_shot.scripts[0].text
+
+
+def test_a_clip_that_starts_between_two_ticks_opens_on_the_tick_that_covers_it():
+    """The rule `drive_samples` states and no fixture used to put it in the state where it holds:
+    *"a first line at zero carrying the tick that covers `song_start`"*.
+
+    **Every other binding fixture in this repository starts a Shot on an analysis-tick boundary**
+    — 0.0, 0.5 and 1.0 here at 4 Hz, 0.0 and 4.0 at 30 Hz in the route and preview files — and on
+    a boundary `floor` and `ceil` are the same function and `moment - song_start` is never
+    negative. Both halves of the quantisation are then unguarded. A Director does not place Shots
+    on ticks: a boundary dragged in the timeline lands wherever the pointer was.
+
+    So this clip starts at 0.375 s, which at 4 Hz is half way between tick 1 and tick 2, and the
+    two things that can go wrong there are pinned in one script:
+
+    * **The opening tick.** Tick 1 is the tick that *covers* 0.375 s — it is the drive the clip's
+      first frame is actually sitting in — so the first line is that tick, stamped at zero. Under
+      `ceil` the walk starts at tick 2 instead, the clip begins at its resting value, and the hit
+      at tick 1 is lost from a clip that is playing over it. The first line here carries 2, the
+      full drive of that hit, and that is the whole of the difference.
+    * **The negative timestamp.** Tick 1 sits 0.125 s *before* this clip's first frame, so
+      `moment - song_start` is -0.125 and the clamp is the only thing between that and a line
+      reading `-0.125` — which `sendcmd` rejects, taking the whole render with it rather than
+      only the drive.
+
+    Read `stages`' own numbers: the drive on `ENVELOPE` is `0, 1, 0.146974, 0.021601, 1, ...` and
+    Saturation at a resting 1.0 with a depth of 1.0 writes `1 + the drive`.
+    """
+    binding = ParameterBinding(
+        effect_id="saturation",
+        parameter="amount",
+        drive="punch",
+        depth=1.0,
+        band_centre=0.0,
+        band_width=0.2,
+    )
+    text = sendcmd_script(
+        ENVELOPE,
+        binding,
+        target="eq@b0",
+        resting=1.0,
+        context=StageContext(width=EXPORT_WIDTH, height=EXPORT_HEIGHT),
+        song_start=0.375,
+        clip_seconds=0.75,
+    )
+    assert text == (
+        "0 eq@b0 saturation 2;\n"
+        "0.125 eq@b0 saturation 1.146974;\n"
+        "0.375 eq@b0 saturation 1.021601;\n"
+        "0.625 eq@b0 saturation 2;\n"
+    )
+    # Said once more as the property rather than as the text, because these are the two lines a
+    # reader of a diff needs to be able to name: no timestamp is negative, and the first one is
+    # zero however far into a tick the clip begins.
+    moments = [float(line.split(" ", 1)[0]) for line in text.splitlines()]
+    assert moments[0] == 0.0
+    assert min(moments) >= 0.0
+
+
+def test_a_clip_that_outlives_the_analysis_holds_the_last_measured_value():
+    """*"The last measured value held past the end of the analysis"* — `drive_samples`' own
+    words, and until now nothing put a clip past that end.
+
+    Every other fixture's song is at least twice its longest clip, so the tail branch is dead
+    code in the whole suite. It is not dead in an export, and this is measured rather than
+    assumed: an envelope holds `ceil(seconds * 30)` rows while the export's last clip ends on the
+    24 fps cumulative grid at `round(seconds * 24) / 24`, which is up to half a video frame past
+    the song itself. Swept over every song length from 1 s to 600 s at millisecond resolution,
+    **61,018 of 599,001 — a bit over one length in ten — put the final clip's last tick past the
+    final analysed row.** Which side of that a given project lands on is a rounding accident of
+    its song's duration, so this is a fixture-shaped question and not a rare one.
+
+    `TAIL_ENVELOPE` is one second long and its hit is on the last tick, so what happens in that
+    fraction of a second is legible: the drive is **full** there. Held, the parameter stays at
+    the top of its drive to the last frame. Falling to nothing instead, it snaps back to its
+    resting value part-way through the clip's last quarter-second — which is a visible flinch on
+    the final frames of a music video, and is what the pin below says out loud.
+    """
+    text = stages(
+        [bound("contrast", "amount", {"amount": 1.0}, depth=1.0, band_centre=0.0,
+               band_width=0.2)],
+        envelope=TAIL_ENVELOPE,
+        clip_seconds=1.5,
+    ).scripts[0].text
+
+    # Four analysed ticks (1 s), six compiled lines (1.5 s): the last two are past the analysis.
+    assert text == (
+        "0 eq@b0 contrast 1;\n"
+        "0.25 eq@b0 contrast 1;\n"
+        "0.5 eq@b0 contrast 1;\n"
+        "0.75 eq@b0 contrast 2;\n"
+        "1 eq@b0 contrast 2;\n"
+        "1.25 eq@b0 contrast 2;\n"
+    )
 
 
 def test_two_clips_of_one_shot_are_two_files_even_in_one_directory():

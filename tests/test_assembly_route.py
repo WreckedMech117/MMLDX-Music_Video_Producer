@@ -44,7 +44,7 @@ from music_video_producer.assembly import (
 from music_video_producer.batch import render_timing_summary
 from music_video_producer.comfy import ComfyError
 from music_video_producer.config import Settings
-from music_video_producer.models import EffectSpec, Project, RenderJob, shot_label
+from music_video_producer.models import EffectSpec, Project, RenderJob, Shot, shot_label
 from music_video_producer.store import ProjectStore
 
 
@@ -2570,6 +2570,145 @@ def test_two_shots_with_one_binding_are_driven_by_their_own_stretches_of_the_son
     for text in second.values():
         assert text.startswith("0 eq@b0 brightness "), text[:60]
         assert next(iter(first.values())).splitlines()[0].split()[1] == "eq@b0"
+
+
+#: Where the overlay Shot sits inside `shot_a`'s window, in seconds of song.
+#:
+#: Both ends are chosen and neither is arbitrary. **On the 24 fps export grid and off the 30 Hz
+#: analysis grid**: 1.25 s and 2.75 s are exactly 30 and 66 frames, so the split clip is cut the
+#: same length the unsplit Shot's own frames measure and the two are comparable line for line —
+#: while 2.75 x 30 is 82.5, half way between two analysis ticks, which is the state every binding
+#: fixture in this repository used to avoid by accident. And 2.75 s is **not** a whole number of
+#: `beaty_wav_bytes`' half-second bursts, so the stretch of song a doubled offset would reach is
+#: half a beat out of phase with the one the clip actually plays over rather than a copy of it.
+OVERLAY_START = 1.25
+OVERLAY_END = 2.75
+
+
+def an_overlay_laid_over_the_bound_shots_middle(store, project_id: str, shots_dir: Path):
+    """A third Shot covering the middle of `shot_a`, so `shot_a` resolves to **two clips**.
+
+    `assembly_plan` cuts a Shot around any later-starting Shot nested inside it and the
+    underneath one resumes when the overlay ends -- so this is the ordinary way one Shot becomes
+    two clips, and it is the case `build_effect_stages`' `shot_start` plus `clip_offset`
+    arithmetic exists for.
+
+    Laid in through the store for the reason the buried fixture gives: `PUT .../shots` is not the
+    gesture under test here, and the overlay needs an approved take with its own window snapshot.
+    """
+    synthesize_take(shots_dir / "shot_c-h3_00001-audio.mp4", 4.458, colour="green")
+    output = f"music-video-producer/{project_id}/shots/shot_c-h3_00001-audio.mp4"
+    project = store.get(project_id)
+    project.shots.append(
+        Shot(
+            id="shot_c",
+            start=OVERLAY_START,
+            duration=OVERLAY_END - OVERLAY_START,
+            prompt="Green room",
+            status="complete",
+            latest_output=output,
+            approved_output=output,
+            approved_start=OVERLAY_START,
+            approved_duration=OVERLAY_END - OVERLAY_START,
+        )
+    )
+    store.save(project)
+
+
+def scripts_each_bound_clip_compiled(client, monkeypatch, project_id: str) -> list[str]:
+    """One export, and the `sendcmd` script each bound **clip** was handed, in clip order.
+
+    Every clip of one export shares one working directory and a script's filename is a digest of
+    its own text, so "this clip's script" is the file that was not there before this clip's trim
+    ran. Read at the moment the trim spawns, because the route deletes the directory in its own
+    `finally`; a clip that compiled no script is handed no working directory at all and does not
+    appear here.
+    """
+    compiled: list[str] = []
+    seen: set[str] = set()
+    real_exec = asyncio.create_subprocess_exec
+
+    async def watched(*args, **kwargs):
+        cwd = kwargs.get("cwd")
+        if cwd is not None:
+            written = {
+                path.name: path.read_text(encoding="utf-8")
+                for path in Path(cwd).glob("*.cmds")
+            }
+            fresh = sorted(name for name in written if name not in seen)
+            seen.update(fresh)
+            assert len(fresh) == 1, (fresh, sorted(seen))
+            compiled.append(written[fresh[0]])
+        return await real_exec(*args, **kwargs)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(asyncio, "create_subprocess_exec", watched)
+        response = client.post(f"/api/projects/{project_id}/assemble", json={"preset": "draft"})
+    assert response.status_code == 200, response.text
+    return compiled
+
+
+def driven_values(script: str) -> list[str]:
+    """Every command's argument in a script, in order -- the drive, as the export writes it."""
+    return [line[:-1].split(" ")[3] for line in script.splitlines()]
+
+
+def test_a_shot_split_by_an_overlay_drives_its_second_clip_from_its_own_place_in_the_song(
+    tmp_path: Path, monkeypatch
+):
+    """The export's own clip arithmetic, exercised where its two terms are not both zero.
+
+    `app.py` hands `build_effect_stages` the Shot's `approved_start` and the clip's offset inside
+    it, and the compiler adds them to get the song second this clip's first frame lands on. Until
+    an overlay splits a Shot, **every bound Shot in every route-level test resolves to exactly
+    one clip** -- so `clip.start == clip.approved_start`, `clip_offset` is 0, and the two terms
+    collapse into each other. Handing the compiler `clip.start` instead compiles the identical
+    text for every other test in this file, and would drive a split Shot's second clip from
+    *twice* its own offset into the song: 5.5 s here rather than 2.75 s, half a beat out of
+    phase.
+
+    The proof is the one `test_sendcmd` makes on the compiler directly, made here on what the
+    **route** hands it, and it needs no second derivation of the drive: the same Shot is exported
+    twice, once whole and once split. Whole, it compiles one script over its four seconds of
+    song. Split, its two clips must compile the **head** and the **tail** of exactly that script
+    -- the same values, at the same places in the song, re-timed to each clip's own zero. A clip
+    driven from anywhere else in the song is a run of values that is nowhere in the whole Shot's.
+
+    Two more things are true here because of where the overlay ends, and both are stated so a
+    reader knows what a diff means. 2.75 s is **half way between two analysis ticks** at 30 Hz,
+    so the tick that covers the second clip's first frame begins 0.0167 s *before* that frame:
+    the walk must open on that tick -- `floor`, not `ceil` -- and must stamp it at zero rather
+    than at a negative second `sendcmd` would reject. Both are asserted below, and neither could
+    fail on a Shot whose start lands on a tick.
+    """
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id, shots_dir = a_project_ready_to_be_bound(client, store, tmp_path)
+    assert bind_exposure(client, project_id).status_code == 200
+
+    whole = scripts_each_bound_clip_compiled(client, monkeypatch, project_id)
+    assert len(whole) == 1, "shot_a should be one clip before the overlay is laid over it"
+
+    an_overlay_laid_over_the_bound_shots_middle(store, project_id, shots_dir)
+    split = scripts_each_bound_clip_compiled(client, monkeypatch, project_id)
+
+    assert len(split) == 2, "the overlay did not split shot_a, so this test proves nothing"
+    head, tail = split
+    assert head != tail
+    # Each clip's own clock starts at zero, whichever tick it opens on (`setpts=PTS-STARTPTS`).
+    assert head.startswith("0 eq@b0 brightness ")
+    assert tail.startswith("0 eq@b0 brightness ")
+    assert all(not line.startswith("-") for line in tail.splitlines()), tail[:80]
+
+    # The two clips are the two ends of the one script, value for value: the first clip plays the
+    # song from where the Shot starts, and the second picks it up where the overlay lets go.
+    whole_values = driven_values(whole[0])
+    head_values = driven_values(head)
+    tail_values = driven_values(tail)
+    assert head_values == whole_values[: len(head_values)]
+    assert tail_values == whole_values[-len(tail_values):]
+    # And the tail is a real stretch of drive rather than a run of one repeated number, which is
+    # the one way the comparison above could hold while proving nothing.
+    assert len(set(tail_values)) > 1, tail_values
 def test_a_disabled_bound_card_neither_drives_an_export_nor_refuses_one(tmp_path: Path):
     """A card the Director switched off composes no stage, so nothing addressed it and nothing
     was driven -- the rule the look record already applies, applied to the question of whether an
