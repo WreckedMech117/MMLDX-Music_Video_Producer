@@ -118,6 +118,7 @@ from ..batch import PENDING_SUBMISSION_PROMPT_ID, accept_submission, prompt_is_m
 from ..comfy import ComfyError
 from ..director import DirectorError, DirectorUnavailable
 from ..effects import (
+    ONE_SIDED_TRANSITION_FRAMES,
     TRANSITION_CATALOGUE,
     TRANSITION_PAIR_ONLY_REFUSAL,
     EffectRefusal,
@@ -876,6 +877,12 @@ def register(ctx: RouterContext) -> None:
                     label=entry.label,
                     xfade=entry.xfade,
                     pair_only=entry.pair_only,
+                    # The ceiling, not the length that will run: the export clamps it to the
+                    # clip's own frames and records what it clamped to. `None` where there is no
+                    # one-sided form to have a length (story 11.4).
+                    one_sided_frames=(
+                        None if entry.pair_only else ONE_SIDED_TRANSITION_FRAMES
+                    ),
                 )
                 for entry in TRANSITION_CATALOGUE.values()
             ],

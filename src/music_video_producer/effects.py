@@ -292,6 +292,10 @@ __all__ = [
     "MAX_LUMA_CODE",
     "MIN_LUMA_CODE",
     "NOT_A_NUMBER",
+    "ONE_SIDED_BLUR_SIGMA",
+    "ONE_SIDED_FORMS",
+    "ONE_SIDED_TRANSITION_FRAMES",
+    "ONE_SIDED_TRANSITION_LABEL",
     "PREVIEW_FINGERPRINT_INPUTS",
     "PRE_PAD_FAMILIES",
     "PRE_SCALE_FAMILIES",
@@ -310,6 +314,7 @@ __all__ = [
     "LutEntry",
     "LutParameter",
     "NumberParameter",
+    "OneSidedTransition",
     "ParameterBinding",
     "ParameterDrive",
     "ResolvedEffect",
@@ -330,6 +335,7 @@ __all__ = [
     "lut_directory",
     "lut_file_argument",
     "lut_id_for_name",
+    "one_sided_transition_stages",
     "preview_fingerprint",
     "sendcmd_script",
     "song_fingerprint",
@@ -2516,8 +2522,18 @@ class TransitionDefinition:
     list and refuse one-sided use with their reason**, rather than being silently absent from a
     list a Director is trying to learn -- an absence teaches nothing and reads as an oversight.
 
-    The four that are not pair-only have real one-sided forms (`fade` to and from black or white,
-    and a `gblur` ramp for the blur), and building those is Story 11.4's job, not this one's.
+    ~~The four that are not pair-only have real one-sided forms (`fade` to and from black or
+    white, and a `gblur` ramp for the blur), and building those is Story 11.4's job, not this
+    one's.~~ **Shipped 2026-08-29 by story 11.4**, and the sentence needed correcting in two ways
+    rather than one, which is why it is struck rather than re-tensed.
+
+    The forms are on `one_sided` below and are composed by `one_sided_transition_stages`. And the
+    parenthetical named **three** mechanisms for **four** entries: the fourth is `dissolve`, whose
+    one-sided form nothing in R-34, story 11.4 or its spec ever stated. A cross-fade with nothing
+    to cross into is a fade to black, which is what "Fade through black" is already called -- so
+    left unexamined the catalogue would have shipped two names for one picture, which is the
+    substitution FX-18 forbids and R-34's own `hblur` argument one level up. They are separated by
+    *when* the black arrives, measured against `xfade`'s own output: see `ONE_SIDED_FORMS`.
     """
 
     transition_id: str
@@ -2526,14 +2542,53 @@ class TransitionDefinition:
     #: ffmpeg 7.0: all twelve are offered, and no isotropic blur is.
     xfade: str
     pair_only: bool = False
+    #: Which of `ONE_SIDED_FORMS` this entry becomes on a boundary with no Overlap (story 11.4),
+    #: or `""` when it has none.
+    #:
+    #: **It is the same fact as `pair_only`, stated as the thing that decides the picture rather
+    #: than as a permission**, and `test_a_pair_only_entry_is_exactly_one_with_no_one_sided_form`
+    #: holds the two together -- a thirteenth entry that set one and forgot the other would be
+    #: settable and then compose nothing, at rc 0.
+    #:
+    #: **No two entries share a form**, which is FX-18's *never quietly substituted* applied where
+    #: it is easiest to break. One-sided there is only one picture to work with, so two names
+    #: composing the same filter would be the catalogue substituting one for the other -- exactly
+    #: R-34's complaint about calling `hblur` "Blur", one level up. See `ONE_SIDED_FORMS`.
+    one_sided: str = ""
 
+
+#: The one-sided forms, as tags, with the composition each names and the measurement behind it.
+#:
+#: **A one-sided transition is the named transition with the second picture absent** -- that is the
+#: rule that keeps FX-18's *never quietly substituted* true here, and it was measured rather than
+#: reasoned. On this machine's ffmpeg 7.0, 24 frames of `testsrc2` against a black second input:
+#:
+#: * `xfade=transition=fade` against black tracks a plain `fade=t=out` over the whole length to
+#:   within 0.9 of a luma level per frame (110.9 -> 19.6 against 110.9 -> 20.0). So `fade_out`
+#:   **is** a dissolve with nothing to dissolve into, and it never reaches black -- which is what
+#:   makes it a different picture from the two below rather than a second spelling of them;
+#: * `xfade=transition=fadeblack` against black is fully black by frame 5 of 24 and stays there
+#:   until the incoming picture arrives. The one-sided form is the same shape with a linear ramp
+#:   and the midpoint as the arrival: black at `frames // 2`, **held** to the cut. "Through black"
+#:   is a state the picture sits in, and a Director who asked to go through black and got a slow
+#:   fade that never arrived would have been given a dissolve under another name.
+#:
+#: `blur_ramp` is R-34's, and it is the one form that is not derivable this way: `xfade=hblur`
+#: against black blurs *and* darkens, and R-34 asked for the blur alone -- "frames bit-identical
+#: outside the ramp", which is measured in
+#: `test_a_one_sided_blur_leaves_every_frame_before_the_ramp_bit_identical`.
+ONE_SIDED_FORMS = ("fade_out", "dip_black", "dip_white", "blur_ramp")
 
 _TRANSITIONS: tuple[TransitionDefinition, ...] = (
-    TransitionDefinition("dissolve", "Dissolve", "fade"),
-    TransitionDefinition("fade_black", "Fade through black", "fadeblack"),
-    TransitionDefinition("fade_white", "Fade through white", "fadewhite"),
+    TransitionDefinition("dissolve", "Dissolve", "fade", one_sided="fade_out"),
+    TransitionDefinition(
+        "fade_black", "Fade through black", "fadeblack", one_sided="dip_black"
+    ),
+    TransitionDefinition(
+        "fade_white", "Fade through white", "fadewhite", one_sided="dip_white"
+    ),
     # Horizontal, and the label says so. See the section comment above.
-    TransitionDefinition("blur_wipe", "Blur wipe", "hblur"),
+    TransitionDefinition("blur_wipe", "Blur wipe", "hblur", one_sided="blur_ramp"),
     TransitionDefinition("wipe_left", "Wipe left", "wipeleft", pair_only=True),
     TransitionDefinition("wipe_right", "Wipe right", "wiperight", pair_only=True),
     TransitionDefinition("wipe_up", "Wipe up", "wipeup", pair_only=True),
@@ -2561,8 +2616,17 @@ TRANSITION_UNKNOWN_REFUSAL = (
     "{known}."
 )
 #: FX-19's other half, and the whole reason a pair-only entry is *in* the list rather than absent
-#: from it. Said at the write, which is the moment a Director is choosing, and it names the
-#: gesture that makes the geometry as well as the entries that do not need it.
+#: from it. It names the gesture that makes the geometry as well as the entries that do not need
+#: it.
+#:
+#: **Said in two places, and it is one sentence on purpose** (*extended 2026-08-29 by story
+#: 11.4*). At the **write**, which is the moment a Director is choosing -- `replace_shot_transitions`
+#: refuses there rather than letting them watch an export do nothing. And at the **export**, on
+#: `ExportLook.transitions`, because the write's check is necessary and not sufficient: FX-16 and
+#: R-36 keep a stored type when the two clips are dragged apart, so a wipe authored across an
+#: Overlap outlives the Overlap. `app._compose_one_sided_transitions` formats this constant rather
+#: than wording it again, because two wordings for one condition teach a Director that the
+#: application holds two opinions about it.
 TRANSITION_PAIR_ONLY_REFUSAL = (
     "{label} moves two pictures across each other, so it only exists where two shots overlap, "
     "and {shot} does not overlap the shot after it. Drag the two clips across each other to "
@@ -2585,6 +2649,176 @@ def transition_definition(transition_id: str) -> TransitionDefinition:
             )
         )
     return entry
+
+
+# ------------------------------------------------------------------------------------------
+# One-sided transitions (story 11.4, AD-19). A Transition with no Overlap under it treats its own
+# clip's final frames and then hard-cuts: a **single-input filter on that clip's own
+# intermediate**, spliced into the chain `assembly.trim_args` already builds, with no `xfade`, no
+# second input and no change to any frame count.
+#
+# **Where the length comes from, which AD-19 did not say.** A paired transition's length *is* the
+# Overlap's, so AD-19 refuses to store one: a stored number would be a second answer to a question
+# the timeline already answers. A one-sided transition has no Overlap, and this catalogue's
+# `ONE_SIDED_TRANSITION_FRAMES` is the answer instead -- **a server-side constant, not a stored
+# field**, served to any client by `GET .../shots/{id}/transitions` beside the type it belongs to,
+# recorded on `ExportLook.transitions` by the export that ran it, and clamped to the clip's own
+# frames on the grid so it can never reach past the picture it is treating. So there is still
+# exactly one source for either length and neither of them is a number sitting in a manifest that
+# nothing reads. See AD-19's 2026-08-29 amendment.
+# ------------------------------------------------------------------------------------------
+
+#: How long a one-sided transition runs, in frames on the assembly grid -- half a second at 24 fps.
+#:
+#: **Frames rather than seconds** because the treatment is spliced into a chain whose length is
+#: `plan.frames[index]`, and a seconds figure would have to be rounded back onto that grid by
+#: whoever read it. `fade` takes `start_frame`/`nb_frames` and the compiled `sendcmd` times are
+#: computed from frame indices, so nothing here ever rounds.
+#:
+#: Half a second is the short arm of the transition-cost measurement recorded in
+#: `docs/BUILD-HANDOFF.md` (12 frames, 0.5 s) and a conventional short dissolve. It costs the
+#: export nothing measurable: a one-sided transition adds one filter to a chain that was already
+#: being encoded, and opens no second input, which is where the +39.4 ms of a paired segment goes.
+ONE_SIDED_TRANSITION_FRAMES = 12
+
+#: The sigma `blur_ramp` reaches at the last frame of the ramp. It is a **pixel** figure, so it
+#: covers a larger fraction of a 640-wide frame than of a 1056-wide one -- the same
+#: resolution-dependence the five pixel-denominated effect parameters carry, and answered there by
+#: `StageContext.reference_width`. Nothing scales it today because every export composes at the
+#: delivery grid; a preview of a one-sided transition would need to, and that is story 11.5's.
+ONE_SIDED_BLUR_SIGMA = 20.0
+
+#: The instance label the one-sided blur's `gblur` carries, and the whole of the namespace this
+#: composition claims. Deliberately not `b`-prefixed: `build_effect_stages` names a bound filter's
+#: instance `b{leg}{slot}` and owns every one of those, and a Shot may carry a Parameter Binding
+#: *and* a one-sided transition in one chain.
+ONE_SIDED_TRANSITION_LABEL = "xo"
+
+
+@dataclass(frozen=True, slots=True)
+class OneSidedTransition:
+    """One clip's own transition-out treatment: what to splice in, and how long it ran.
+
+    `geometry` and `treatment` are `EffectStages`' own two groups and are appended to whatever the
+    Shot's Effect Stack already composed -- **after** it, because the transition treats the
+    finished picture rather than a stage of it. `scripts` is the same list `EffectStages.scripts`
+    is: the caller writes each file beside the render's other inputs and runs ffmpeg with its
+    working directory set there, exactly as it already does for a Parameter Binding.
+
+    `frames` is what actually ran after the clamp, which is the number the export records. It is
+    not always `ONE_SIDED_TRANSITION_FRAMES`: a clip shorter than that gets its own whole length,
+    which is FX-18's *"bounded by the Shot's own duration"* as arithmetic rather than as a promise.
+    """
+
+    geometry: tuple[str, ...]
+    treatment: tuple[str, ...]
+    scripts: tuple[DriveScript, ...]
+    frames: int
+
+
+def one_sided_transition_stages(
+    transition_id: str, *, clip_frames: int, fps: int
+) -> OneSidedTransition | None:
+    """A transition with no Overlap under it, as stages on the clip's own chain -- or `None`.
+
+    `None` means **this type has no one-sided form**: a wipe and a slide move one picture across
+    another and there is no version of either with one picture (R-34). The caller says so in
+    `TRANSITION_PAIR_ONLY_REFUSAL`, which is the sentence the write route already says at the
+    moment a Director picks one, and nothing is substituted -- FX-18's rule, and the reason a
+    pair-only entry is in the catalogue at all rather than absent from it.
+
+    **It changes no frame count and consumes no timeline length.** Every stage below is a
+    single-input filter that passes each frame through; `clip_frames` is read only to decide where
+    the treatment starts, and the caller splices the result into the chain `trim_args` was already
+    going to build for this clip. `assembly.py` is not involved and `assembly_plan` is not
+    consulted, which is what lets story 11.4 be built without touching the frame grid at all.
+
+    `clip_frames` is the clip's own frames on the grid (`plan.frames[index]`), not the Shot's
+    window in seconds: the clamp has to be against what ffmpeg will actually write, because a
+    `start_frame` past the last frame is a treatment that silently does nothing at rc 0 -- this
+    pipeline's recurring failure, and the one the frames-rather-than-seconds choice above removes.
+
+    `fps` arrives from the caller for the same reason every other number in this module does: this
+    is a leaf and `assembly.ASSEMBLY_FPS` is not importable from here. It is used only to turn a
+    frame index into a `sendcmd` timestamp.
+    """
+    entry = transition_definition(transition_id)
+    if not entry.one_sided:
+        return None
+    frames = max(1, min(ONE_SIDED_TRANSITION_FRAMES, clip_frames))
+    start = max(0, clip_frames - frames)
+    if entry.one_sided == "blur_ramp":
+        script = _one_sided_blur_script(start=start, frames=frames, fps=fps)
+        return OneSidedTransition(
+            geometry=(f"sendcmd=f={script.filename}",),
+            treatment=(f"gblur@{ONE_SIDED_TRANSITION_LABEL}=sigma=0",),
+            scripts=(script,),
+            frames=frames,
+        )
+    # `fade_out` spends the whole length arriving; the two dips arrive at the midpoint and hold.
+    # See `ONE_SIDED_FORMS` for the measurement that separates them.
+    ramp = frames if entry.one_sided == "fade_out" else max(1, frames // 2)
+    # **A known and measured boundary, recorded rather than papered over:** these stages ride
+    # `treatment_stages`, which AD-17 fixes *before* `pad` so grain and a vignette leave the
+    # letterbox bars at pure black. A fade to **white** on a Shot whose aspect differs from the
+    # export target therefore whitens the picture and leaves the bars black -- measured 2026-08-29
+    # on a 4:3 source into 16:9, last frame of the ramp: picture 235, bars 16. The *paired*
+    # `xfade=fadewhite` runs after both legs are padded and whitens the whole frame, so the two
+    # forms of one type differ on a letterboxed Shot. Closing it means a third insertion point
+    # after `pad`, which is a change to AD-17 and to `normalized_stages`' signature -- larger than
+    # this story, and worth nothing until a Director meets it. `fade_out` and `dip_black` are
+    # unaffected: the bars are already the colour they fade to.
+    colour = "white" if entry.one_sided == "dip_white" else "black"
+    return OneSidedTransition(
+        geometry=(),
+        treatment=(f"fade=t=out:start_frame={start}:nb_frames={ramp}:color={colour}",),
+        scripts=(),
+        frames=frames,
+    )
+
+
+def _one_sided_blur_script(*, start: int, frames: int, fps: int) -> DriveScript:
+    """The `gblur.sigma` ramp R-34 measured, as the `sendcmd` file that drives it.
+
+    **The target carries the class and the `@`**, and that is not decoration. Measured 2026-08-27
+    for `StageContext.named` and reproduced here on 2026-08-29 while this function was being
+    written: a command addressed to the bare instance name `xo` reports *"Command reply for
+    command #0: ret:Function not implemented"* at `-v verbose` and is otherwise **rc 0, silent at
+    `-v error`, and byte-identical to the undriven chain** -- `avfilter_graph_send_command` matches
+    a target against the filter's own name and returns `ENOSYS` when nothing matched. That is Epic
+    10's mistargeted-`sendcmd` class exactly, and it is why the target is built here, in the same
+    function that writes the `@label` it addresses, rather than assembled by a caller.
+
+    The times are **clip-local**, because `trim_args` prepends `setpts=PTS-STARTPTS` to every clip
+    cut at an offset and the graph's clock is therefore zero at that clip's first frame --
+    `sendcmd_script`'s constraint, met the same way. Verified against a `trim=start_frame=24` head:
+    the ramp lands on the last frames of the *written* clip either way.
+
+    The first line sets sigma to zero, so the ramp's own first frame is bit-identical to the
+    untreated one and the blur grows from nothing rather than snapping on. `gblur=sigma=0` is a
+    measured no-op, `framemd5`-identical to the same chain without it over 24 frames.
+
+    The filename carries the ramp's own geometry and a digest of the text, which is
+    `_drive_script_name`'s rule and is there for its reason: an export writes every clip's scripts
+    into one directory, so two clips whose ramps differ must not share a name, and two whose ramps
+    are identical should share one file.
+    """
+    span = frames - 1
+    lines = [
+        f"{_number((start + step) / fps)} gblur@{ONE_SIDED_TRANSITION_LABEL} sigma "
+        f"{_number(ONE_SIDED_BLUR_SIGMA * step / span if span else ONE_SIDED_BLUR_SIGMA)};"
+        for step in range(frames)
+    ]
+    text = "\n".join(lines) + "\n"
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return DriveScript(
+        filename=(
+            f"transition-{ONE_SIDED_TRANSITION_LABEL}-{start}-{frames}"
+            f"-{digest[:DRIVE_SCRIPT_DIGEST_CHARACTERS]}{DRIVE_SCRIPT_SUFFIX}"
+        ),
+        target=f"gblur@{ONE_SIDED_TRANSITION_LABEL}",
+        text=text,
+    )
 
 
 # ------------------------------------------------------------------------------------------

@@ -26088,6 +26088,8 @@ def test_the_route_alone_sets_and_clears_a_transition_and_keeps_the_pair_in_step
     shows one blend rather than two halves that can disagree. The outgoing field stays the
     authoritative one — it is the only side the export reads — and clearing one clears both.
     """
+    from music_video_producer.effects import ONE_SIDED_TRANSITION_FRAMES
+
     client, _store, _ = make_client(tmp_path)
     project_id = overlapping_project(client)
 
@@ -26107,9 +26109,21 @@ def test_the_route_alone_sets_and_clears_a_transition_and_keeps_the_pair_in_step
     # The catalogue rides on the read, which is what makes "without any interface" true: a client
     # that could set a transition but not discover the vocabulary would have to read the source.
     assert len(read["catalogue"]) == 12
+    # *Amended 2026-08-29 by story 11.4, which added the field.* This compared the whole entry
+    # and would have to be amended by any change to the wire — which is the point of comparing the
+    # whole entry, so it is amended rather than loosened. `one_sided_frames` is the ceiling a
+    # one-sided treatment runs to, carried so that story 11.4's "bounded by nothing invisible" is
+    # true of a client with no source in front of it.
     assert {"transition_id": "blur_wipe", "label": "Blur wipe", "xfade": "hblur",
-            "pair_only": False} in read["catalogue"]
+            "pair_only": False,
+            "one_sided_frames": ONE_SIDED_TRANSITION_FRAMES} in read["catalogue"]
     assert sum(1 for entry in read["catalogue"] if entry["pair_only"]) == 8
+    # And a pair-only entry carries no length, because it has no one-sided form to have one:
+    # the two fields are one fact and cannot come apart on the wire either.
+    assert all(
+        (entry["one_sided_frames"] is None) == entry["pair_only"]
+        for entry in read["catalogue"]
+    )
 
     cleared = client.put(transitions_url(project_id), json={"transition_out": None})
     assert cleared.status_code == 200, cleared.text

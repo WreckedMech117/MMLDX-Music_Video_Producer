@@ -113,6 +113,31 @@ def synthesize_take(path: Path, seconds: float, size: str = "128x72", colour: st
     )
 
 
+def synthesize_detailed_take(path: Path, seconds: float, size: str = "128x72"):
+    """A take with **detail** in it, which a blur needs and a colour source does not have.
+
+    `synthesize_take` writes a flat colour field, and every other test here is right to: it is
+    what a real take is in miniature, and a flat picture makes a fade, a grade and a `sendcmd`
+    ramp all measurable. A **blur** is the one treatment it cannot measure -- a Gaussian blur of a
+    uniform field is that same uniform field, at any sigma -- and the first draft of
+    `test_a_one_sided_blur_ramp_...` read a working ramp as "the ramp was discarded" for exactly
+    that reason, which is the fixture-makes-its-own-defect-impossible shape in its other
+    direction: here the fixture made a *pass* impossible, and it could as easily have hidden a
+    real failure behind a control that also did nothing.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-v", "error",
+            "-f", "lavfi", "-i", f"testsrc2=size={size}:rate=24",
+            "-t", f"{seconds}", "-pix_fmt", "yuv420p",
+            path.as_posix(),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
 def probe(path: Path, entries: str) -> str:
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", entries, "-of", "csv=p=0", path.as_posix()],
@@ -2977,6 +3002,11 @@ def kept_intermediates(monkeypatch, keep_root: Path) -> list[Path]:
 
     Returns the list the copies land in — `clip_000.mp4`, `clip_001.mp4`, … in plan order, which
     is the order `plan.clips` is in, so the transition segment is at its own plan index.
+
+    **The `.cmds` scripts are copied too, under their own names** (story 11.4). A compiled drive
+    script and a one-sided blur's ramp are both read by ffmpeg as a bare relative name with the
+    workdir as its cwd, so a test that wants to re-run a recorded argv needs the file that argv
+    names sitting beside it — and the workdir is gone by the time the request returns.
     """
     import shutil as shutil_module
 
@@ -2990,6 +3020,8 @@ def kept_intermediates(monkeypatch, keep_root: Path) -> list[Path]:
                 copy = keep_root / f"kept-{item.name}"
                 copy.write_bytes(item.read_bytes())
                 copies.append(copy)
+            for script in sorted(source.glob("*.cmds")):
+                (keep_root / script.name).write_bytes(script.read_bytes())
         return real_rmtree(path, *args, **kwargs)
 
     monkeypatch.setattr(shutil_module, "rmtree", keep)
@@ -3475,4 +3507,396 @@ def test_a_stored_transition_the_catalogue_does_not_know_refuses_the_export_by_n
         ),
     )
     assert store.get(project_id).jobs == []
+    assert comfy.prompts == []
+
+
+# ------------------------------------------------------------------------------------------
+# One-sided transitions, through real ffmpeg (story 11.4). **This is again the half a pinned argv
+# cannot do**, and for a nastier reason than the paired case: a treatment that composed cleanly
+# and did nothing is rc 0, the right frame count, the right pixel format and a byte-identical
+# picture. Identical checksums are the *default* outcome of getting this wrong, so every test
+# below compares against a control render of the same chain with only the treatment removed, and
+# does it on the **filter graph's own frames** rather than on an encoded file -- R-20, and
+# measured again here: comparing the encoded intermediates instead reports 21 frames moved where
+# 11 did, because libx264's lookahead spreads a change backwards.
+# ------------------------------------------------------------------------------------------
+
+
+def graph_frames(command: list[str], cwd: Path | None = None) -> list[str]:
+    """One md5 per frame of what a recorded export argv's **filter graph** produced.
+
+    The argv is re-run with its encoder and output replaced by `framemd5`, so what comes back is
+    the chain's frames rather than a file libx264 wrote -- which is the only surface a
+    "bit-identical outside the treatment" claim may be made on (R-20, `docs/BUILD-HANDOFF.md`).
+    Everything before `-c:v` is kept exactly as the export ran it, `-frames:v` included.
+    """
+    kept = command[: command.index("-c:v")]
+    output = subprocess.run(
+        [*kept, "-f", "framemd5", "-"],
+        check=True, capture_output=True, text=True,
+        cwd=None if cwd is None else cwd.as_posix(),
+    ).stdout
+    return [
+        line.split(",")[-1].strip()
+        for line in output.splitlines()
+        if line and not line.startswith("#")
+    ]
+
+
+def without_the_treatment(command: list[str], *stages: str) -> list[str]:
+    """The same argv with named stages cut out of its `-vf` chain, and nothing else touched.
+
+    The control for every claim below. Built by *removing* from the argv the export actually ran
+    rather than by composing a second chain, because a control composed separately would agree
+    with an export whose chain had grown a stage nobody asked for -- which is exactly what these
+    tests are looking for.
+    """
+    spot = command.index("-vf") + 1
+    remaining = [stage for stage in command[spot].split(",") if stage not in stages]
+    assert len(remaining) == len(command[spot].split(",")) - len(stages), (
+        f"a stage named for removal was not in the chain: {command[spot]}"
+    )
+    return [*command[:spot], ",".join(remaining), *command[spot + 1:]]
+
+
+def test_a_one_sided_transition_treats_its_own_final_frames_and_changes_no_count(
+    tmp_path: Path, monkeypatch
+):
+    """**Story 11.4's whole acceptance, on the written file and on the graph's frames.**
+
+    Two Shots that do not overlap, a transition out on the first: its own last frames are treated
+    and then the cut happens. The claims, in the order they can go wrong:
+
+    * **the plan is untouched.** Two entries, not three, and the frame total is the song's. A
+      one-sided transition consumes no timeline length and borrows nothing from its neighbour
+      (FX-18, FX-NFR-1), which here means `assembly_plan` never hears about it at all;
+    * **the clip's own count is unchanged.** 96 frames asked for, 96 decoded off the intermediate
+      the export actually wrote -- not the argv's cap, which caps from above only;
+    * **it is still concat-identical**, so the join stays `-c:v copy`: same codec, profile, pixel
+      format, geometry, rate and SAR as an ordinary `trim_args` intermediate built from the same
+      take, compared against one rather than against values written down here;
+    * **and it changed the picture.** The last twelve frames differ from a control render of the
+      identical chain with only the `fade` stage removed, and **every frame before them is
+      bit-identical** -- which is the half that catches a treatment that ran over the whole clip
+      instead of its tail.
+
+    The neighbour is the control for the other direction: shot_b carries no transition and its
+    argv is the argv this route has always built, character for character.
+    """
+    from music_video_producer.assembly import trim_args
+    from music_video_producer.effects import ONE_SIDED_TRANSITION_FRAMES
+
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    assert set_transition(client, project_id, "shot_a", "fade_black").status_code == 200
+
+    survivors = kept_intermediates(monkeypatch, tmp_path)
+    commands, response = recorded_trims(client, monkeypatch, project_id)
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    # The plan is what it was: two clips, the song's frames, no segment anywhere.
+    assert body["clip_count"] == 2
+    assert body["total_frames"] == 192
+    assert len(commands) == 2 and len(survivors) == 2
+
+    treated, plain = commands
+    fade = f"fade=t=out:start_frame={96 - ONE_SIDED_TRANSITION_FRAMES}:nb_frames=6:color=black"
+    assert fade in treated[treated.index("-vf") + 1].split(",")
+    # The Shot with no transition is untouched, which is R-20's guarantee still holding.
+    assert plain == trim_args(
+        Path(plain[plain.index("-i") + 1]), Path(plain[-1]), 96, 192, 108
+    )
+
+    # The count on the file, decoded.
+    assert rendered_frames(survivors[0]) == 96
+    shape = "stream=codec_name,profile,pix_fmt,width,height,r_frame_rate,sample_aspect_ratio"
+    neighbour = tmp_path / "neighbour.mp4"
+    subprocess.run(
+        trim_args(Path(treated[treated.index("-i") + 1]), neighbour, 96, 192, 108),
+        check=True, capture_output=True,
+    )
+    assert probe(survivors[0], shape) == probe(neighbour, shape)
+
+    # The picture, against the same chain with only the treatment taken out.
+    control = graph_frames(without_the_treatment(treated, fade))
+    treated_frames = graph_frames(treated)
+    assert len(control) == len(treated_frames) == 96
+    moved = [index for index in range(96) if control[index] != treated_frames[index]]
+    assert moved, "the transition composed and changed nothing, which is rc 0 and wrong"
+    assert min(moved) >= 96 - ONE_SIDED_TRANSITION_FRAMES
+    assert control[: 96 - ONE_SIDED_TRANSITION_FRAMES] == (
+        treated_frames[: 96 - ONE_SIDED_TRANSITION_FRAMES]
+    )
+
+    # And the export says what it did, with the length it ran for.
+    assert body["job"]["look"]["transitions"] == [
+        f"shot_a=fade_black one-sided over {ONE_SIDED_TRANSITION_FRAMES} frames"
+    ]
+    export = tmp_path / "projects" / project_id / "media" / body["export"]
+    assert abs(float(probe(export, "format=duration")) - 8.0) <= 1 / 24
+    assert comfy.prompts == []
+
+
+def test_a_one_sided_blur_ramp_addresses_a_label_in_its_own_chain_and_leaves_the_rest_alone(
+    tmp_path: Path, monkeypatch
+):
+    """**Epic 10's discipline, inherited whole** (R-25, `DriveScript.target`).
+
+    A one-sided blur wipe is the one form that is driven rather than composed: `gblur` has no
+    ramp of its own, so its `sigma` is moved by a compiled `sendcmd` script. Every target must
+    appear as an `@label` in the chain composed by the same call, because a command aimed at a
+    target that is not in the graph is **discarded in silence at rc 0**.
+
+    Reproduced while writing this, on this machine's ffmpeg 7.0: addressing the bare instance name
+    `xo` instead of `gblur@xo` gives *"Command reply for command #0: ret:Function not
+    implemented"* at `-v verbose`, nothing at all at `-v error`, rc 0, the right frame count, and
+    a picture byte-identical to the undriven chain. `avfilter_graph_send_command` matches a target
+    against the filter's own name and answers `ENOSYS` when nothing matched.
+
+    So three things are asserted and none of them is the exit code: the target string appears
+    verbatim in the composed chain; the file that chain names by a bare relative name is sitting
+    in the directory ffmpeg was standing in; and the frames outside the ramp are bit-identical to
+    a control while the frames inside it are not.
+    """
+    from music_video_producer.effects import (
+        ONE_SIDED_TRANSITION_FRAMES,
+        ONE_SIDED_TRANSITION_LABEL,
+        one_sided_transition_stages,
+    )
+
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    # Detail, because a blur of a flat colour field is that flat colour field. Replacing the take
+    # in place moves no window, so the approval snapshot still describes it and nothing is stale.
+    synthesize_detailed_take(shots_dir / "shot_a-h3_00001-audio.mp4", 4.458)
+    assert set_transition(client, project_id, "shot_a", "blur_wipe").status_code == 200
+
+    survivors = kept_intermediates(monkeypatch, tmp_path)
+    commands, response = recorded_trims(client, monkeypatch, project_id)
+    assert response.status_code == 200, response.text
+    assert len(commands) == 2 and len(survivors) == 2
+
+    treated = commands[0]
+    chain = treated[treated.index("-vf") + 1]
+    composed = one_sided_transition_stages("blur_wipe", clip_frames=96, fps=24)
+    script = composed.scripts[0]
+
+    # The target, in the chain produced by the same call. Nothing else can catch a typo in it.
+    assert script.target == f"gblur@{ONE_SIDED_TRANSITION_LABEL}"
+    assert f"{script.target}=sigma=0" in chain.split(",")
+    assert f"sendcmd=f={script.filename}" in chain.split(",")
+    # A bare relative name, and the file of that name was in the directory ffmpeg stood in.
+    assert "/" not in script.filename and ":" not in script.filename
+    kept_script = tmp_path / script.filename
+    assert kept_script.is_file()
+    assert kept_script.read_text(encoding="utf-8") == script.text
+
+    assert rendered_frames(survivors[0]) == 96
+    control = graph_frames(
+        without_the_treatment(
+            treated, f"sendcmd=f={script.filename}", f"{script.target}=sigma=0"
+        ),
+        cwd=tmp_path,
+    )
+    treated_frames = graph_frames(treated, cwd=tmp_path)
+    moved = [index for index in range(96) if control[index] != treated_frames[index]]
+    assert moved, "the ramp was discarded, which is exactly what rc 0 will not tell you"
+    assert min(moved) >= 96 - ONE_SIDED_TRANSITION_FRAMES
+    assert control[: 96 - ONE_SIDED_TRANSITION_FRAMES] == (
+        treated_frames[: 96 - ONE_SIDED_TRANSITION_FRAMES]
+    )
+    # The ramp's own first frame is the identity, so it grows from nothing rather than snapping
+    # on: `sigma=0` is a measured no-op and the first command sets exactly that.
+    assert control[96 - ONE_SIDED_TRANSITION_FRAMES] == (
+        treated_frames[96 - ONE_SIDED_TRANSITION_FRAMES]
+    )
+    assert comfy.prompts == []
+
+
+def test_a_pair_only_type_left_one_sided_is_refused_with_its_reason_and_nothing_substituted(
+    tmp_path: Path, monkeypatch
+):
+    """FX-18 and FX-19 at the export: **a type with no one-sided form does not degrade.**
+
+    Reachable without a hand-edited manifest, which is why it is refused here rather than only at
+    the write. A Director authors "Wipe left" across an Overlap -- the write route agrees, because
+    there are two pictures to move across each other -- and then drags the clips apart. FX-16 and
+    R-36 keep the stored type, so the boundary now holds a wipe with nothing to wipe onto.
+
+    The export runs (R-37's rule: a perfectly good hard cut is already there, and refusing costs a
+    Director a render over one geometry), the argv is the argv a Shot with no transition gets, and
+    the sentence is the one the write route already says -- `TRANSITION_PAIR_ONLY_REFUSAL`, reused
+    rather than reworded, because two wordings for one condition is how a Director learns that the
+    application has two opinions.
+    """
+    from music_video_producer.app import TRANSITION_REFUSED_RECORD
+    from music_video_producer.assembly import trim_args
+    from music_video_producer.effects import (
+        TRANSITION_CATALOGUE,
+        TRANSITION_PAIR_ONLY_REFUSAL,
+    )
+
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    overlap_the_two_shots(client, store, tmp_path, project_id, overlap=0.5)
+    assert set_transition(client, project_id, "shot_a", "wipe_left").status_code == 200
+    # And now the Overlap goes away, exactly as dragging the clip would take it away. Read back
+    # *after* the un-approvals, because a whole-shots write carries the manifest's version and one
+    # dumped before them is a 409 rather than a fixture that happens to work.
+    for shot_id in ("shot_a", "shot_b"):
+        client.post(f"/api/projects/{project_id}/shots/{shot_id}/unapprove")
+    shots = [shot.model_dump(mode="json") for shot in store.get(project_id).shots]
+    shots[1]["start"] = 4.0
+    shots[1]["duration"] = 4.0
+    assert client.put(
+        f"/api/projects/{project_id}/shots", json={"shots": shots}
+    ).status_code == 200
+    for shot_id in ("shot_a", "shot_b"):
+        assert client.post(
+            f"/api/projects/{project_id}/shots/{shot_id}/approve"
+        ).status_code == 200
+    assert store.get(project_id).shots[0].transition_out.type == "wipe_left"
+
+    commands, response = recorded_trims(client, monkeypatch, project_id)
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    assert body["clip_count"] == 2 and body["total_frames"] == 192
+    # Nothing was substituted: both argvs are the ones a project with no transition builds.
+    for command in commands:
+        assert command == trim_args(
+            Path(command[command.index("-i") + 1]), Path(command[-1]), 96, 192, 108
+        )
+    stored = store.get(project_id)
+    assert body["job"]["look"]["transitions"] == [
+        TRANSITION_REFUSED_RECORD.format(
+            shot=TRANSITION_PAIR_ONLY_REFUSAL.format(
+                label="Wipe left",
+                shot=shot_label(stored, stored.shots[0]),
+                alternatives=", ".join(
+                    sorted(
+                        entry.label
+                        for entry in TRANSITION_CATALOGUE.values()
+                        if not entry.pair_only
+                    )
+                ),
+            )
+        )
+    ]
+    assert comfy.prompts == []
+
+
+def test_a_pair_that_disagrees_across_an_overlap_is_reported_once_and_never_refuses(
+    tmp_path: Path
+):
+    """**Story 11.3's third criterion and AD-30's second half**, which had no code until now.
+
+    A manifest whose pair disagrees -- hand-edited here, and a partially-applied write in the
+    wild -- exports. The outgoing Shot's `transition_out` is what runs, which is the read path
+    story 11.1 shipped; this is the half that stops the disagreement being swallowed.
+
+    **Once** is the load-bearing word, so the count is asserted rather than the presence. The walk
+    is over consecutive Shots in song order, so one diverging pair is one line however many clips
+    either Shot resolves into.
+    """
+    from music_video_producer.app import TRANSITION_DIVERGED_RECORD
+
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    overlap_the_two_shots(client, store, tmp_path, project_id, overlap=0.5)
+    assert set_transition(client, project_id, "shot_a", "dissolve").status_code == 200
+    # The mirror, edited behind the route's back -- which is the only way to reach this state,
+    # and precisely why AD-30 says an editable manifest must not make an export undecidable.
+    project = store.get(project_id)
+    assert project.shots[1].transition_in.type == "dissolve"
+    project.shots[1].transition_in = TransitionSpec(type="fade_white")
+    store.save(project)
+
+    response = client.post(f"/api/projects/{project_id}/assemble")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    stored = store.get(project_id)
+
+    diverged = [
+        line for line in body["job"]["look"]["transitions"] if line.startswith("diverged: ")
+    ]
+    assert len(diverged) == 1, body["job"]["look"]["transitions"]
+    assert diverged[0] == TRANSITION_DIVERGED_RECORD.format(
+        before=shot_label(stored, stored.shots[0]),
+        after=shot_label(stored, stored.shots[1]),
+        out="dissolve",
+        incoming="fade_white",
+    )
+    # The outgoing Shot's type is what ran, and the blend is still in the plan beside the report.
+    assert "shot_a=dissolve" in body["job"]["look"]["transitions"]
+    assert body["clip_count"] == 3
+    export = tmp_path / "projects" / project_id / "media" / body["export"]
+    assert abs(float(probe(export, "format=duration")) - 8.0) <= 1 / 24
+    assert comfy.prompts == []
+
+
+def test_an_unset_or_agreeing_mirror_is_not_a_divergence(tmp_path: Path):
+    """The narrow half of the definition, which is where this report can go wrong.
+
+    Three states that are **not** divergences and must produce no line at all:
+
+    * a mirror that agrees, which is every pair the route itself writes;
+    * a mirror that is simply **unset** -- the ordinary state of a one-sided transition and of any
+      pair a client wrote one end of. Reporting it would make the report fire on the ordinary
+      state, which is the failure mode of every report nobody reads;
+    * two fields that differ with **no Overlap** between the Shots: there is no pair there to
+      disagree, only the outgoing Shot's own one-sided treatment and an incoming field the export
+      never reads.
+
+    The third is the one a reading of AD-30 alone would get wrong, so it is asserted with the two
+    fields genuinely holding different types.
+    """
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    overlap_the_two_shots(client, store, tmp_path, project_id, overlap=0.5)
+    assert set_transition(client, project_id, "shot_a", "dissolve").status_code == 200
+
+    def transitions_after_export() -> list[str]:
+        response = client.post(f"/api/projects/{project_id}/assemble")
+        assert response.status_code == 200, response.text
+        return response.json()["job"]["look"]["transitions"]
+
+    # Agreeing, which is what the route writes.
+    assert transitions_after_export() == ["shot_a=dissolve"]
+
+    # Unset, which is a one-sided transition rather than a disagreement.
+    #
+    # **The other Shot keeps a mirror, and that is not decoration.** A first draft cleared the
+    # only `transition_in` in the project, which empties the whole mapping — and the report's own
+    # "this project mirrors nothing" early return then answered before the unset case was ever
+    # reached. Mutating `incoming is None` out of the predicate **survived** against that fixture:
+    # it made its own defect impossible, which is the shape this repository has now met roughly
+    # twenty times. `shot_a` carries an incoming type nothing reads (it is the first Shot, so no
+    # pair points at it) purely so the mapping is non-empty while this pair's mirror is absent.
+    project = store.get(project_id)
+    project.shots[0].transition_in = TransitionSpec(type="fade_black")
+    project.shots[1].transition_in = None
+    store.save(project)
+    assert transitions_after_export() == ["shot_a=dissolve"]
+
+    # Differing, with the Overlap dragged away: not a pair, so not a divergence.
+    project = store.get(project_id)
+    project.shots[1].transition_in = TransitionSpec(type="wipe_up")
+    store.save(project)
+    for shot_id in ("shot_a", "shot_b"):
+        client.post(f"/api/projects/{project_id}/shots/{shot_id}/unapprove")
+    shots = [shot.model_dump(mode="json") for shot in store.get(project_id).shots]
+    shots[1]["start"] = 4.0
+    shots[1]["duration"] = 4.0
+    assert client.put(
+        f"/api/projects/{project_id}/shots", json={"shots": shots}
+    ).status_code == 200
+    for shot_id in ("shot_a", "shot_b"):
+        assert client.post(
+            f"/api/projects/{project_id}/shots/{shot_id}/approve"
+        ).status_code == 200
+    recorded = transitions_after_export()
+    assert not [line for line in recorded if line.startswith("diverged: ")], recorded
+    assert recorded == ["shot_a=dissolve one-sided over 12 frames"]
     assert comfy.prompts == []

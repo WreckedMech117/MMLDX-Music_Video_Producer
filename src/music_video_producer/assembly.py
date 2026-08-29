@@ -537,9 +537,12 @@ def _paired_transitions(
             continue
         if overlap_end - overlap_start <= BOUNDARY_TOLERANCE_SECONDS:
             # No Overlap, so no paired transition. A stored type on a boundary with no Overlap is
-            # a **one-sided** treatment of this clip's own frames (AD-19, FX-16) -- story 11.4 --
-            # and it is not this slice's, so nothing is composed and nothing is refused either:
-            # a sentence here would report a defect where a Director has simply not dragged yet.
+            # a **one-sided** treatment of this clip's own frames (AD-19, FX-16) -- story 11.4,
+            # shipped 2026-08-29 -- and it is composed in `app._compose_one_sided_transitions`,
+            # onto the clip's own chain, with no entry here and nothing refused. Nothing about
+            # this module changes when a boundary is one-sided, which is the property that let
+            # story 11.4 be built without going near the frame grid: it is a filter spliced into
+            # an argv this function's output was already going to produce.
             continue
         # Every input window that covers any of the Overlap's interior. The two legs are two of
         # them by construction, so anything past two is the third picture R-37 is about. The

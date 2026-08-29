@@ -690,6 +690,17 @@ class TransitionSpec(BaseModel):
     count at all. Either way the geometry is already on the timeline, and this model's whole job
     is to say *what kind* of blend it is.
 
+    *Reaffirmed 2026-08-29 by story 11.4, which is the story that could have added one.* A
+    one-sided transition has no Overlap, so the argument above does not reach it and a stored
+    length would have been the *only* source rather than a second one — the spec that commissioned
+    the story said so and invited the field. It is still not here, because a one-sided length is
+    not a thing the Director expresses: there is no gesture that sets it, and a number nobody
+    authored sitting in a manifest is exactly the invisible source AD-19 is about, one step
+    further from view. It is a catalogue constant instead —
+    `effects.ONE_SIDED_TRANSITION_FRAMES`, served on the wire beside the type it belongs to,
+    clamped to the clip's own frames, and recorded by the export that ran it. See AD-19's
+    2026-08-29 amendment for the reasoning in full.
+
     `type` is a free string on the model for `EffectSpec.effect`'s reason, and it is the same
     reason: the catalogue lives in `effects.py` (`TRANSITION_CATALOGUE`) and is the only thing
     entitled to say which types exist, which are pair-only, and which `xfade` name each resolves
@@ -1866,7 +1877,26 @@ class ExportLook(BaseModel):
     #: more than two clips cover one instant the blend is not composed and the boundary stays the
     #: hard cut it is today (R-37) — the export is not refused over one geometry — so this record
     #: is the only place that says a transition the manifest holds did not run. It reads
-    #: `"<shot_id>=refused: <sentence>"`, carrying `assembly.TRANSITION_CROWDED_REFUSAL` whole.
+    #: `"refused: <sentence>"`, carrying the refusal whole.
+    #:
+    #: *Corrected 2026-08-29.* That line said the refused form reads ~~`"<shot_id>=refused:
+    #: <sentence>"`~~. It does not and never did: `app.TRANSITION_REFUSED_RECORD` is
+    #: `"refused: {shot}"` and the sentence it carries already names both Shots by label, which is
+    #: why it was written that way. Found by reading it beside the two forms below.
+    #:
+    #: **Four forms now, one slot, and they are told apart by their own text** (2026-08-29):
+    #:
+    #: * `"<shot_id>=<type>"` — a paired blend that composed a segment (story 11.1);
+    #: * `"<shot_id>=<type> one-sided over <n> frames"` — a Transition with no Overlap under it,
+    #:   which treated that Shot's own final frames and then hard-cut (story 11.4). The frame count
+    #:   is the one that actually ran after the clamp against the clip's own length, and it is here
+    #:   because story 11.4 requires that length be bounded *"by nothing invisible"*;
+    #: * `"refused: <sentence>"` — a Transition the manifest holds that did not run, whether its
+    #:   geometry had no pair of legs to blend (R-37) or its type has no one-sided form and the
+    #:   Overlap it was authored across has since been dragged away (FX-19, R-34, R-36);
+    #: * `"diverged: …"` — a Pair whose two halves disagree across an Overlap. The export is **not**
+    #:   refused: `transition_out` is authoritative, is what ran, and this says so (AD-30, story
+    #:   11.3). An *unset* mirror is not a divergence and is never reported.
     transitions: list[str] = Field(default_factory=list)
 
 

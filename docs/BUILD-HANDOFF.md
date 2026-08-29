@@ -176,6 +176,21 @@ and then left in a commit subject is a number nobody will find.**
   node module and called with a Proxy that appends every method call and property write to a log. It
   **records and simulates nothing** — no paths, no state machine, no pixels — and it is fed
   `api.js`'s own plan, so the geometry under test is the geometry that ships.
+- **A `sendcmd` at a bare instance name is discarded at rc 0 — the fifth of these.** `xo sigma 20`
+  where `gblur@xo sigma 20` belongs prints *"ret:Function not implemented"* at `-v verbose` and
+  **nothing at `-v error`**, with the right frame count and a byte-identical picture.
+  `avfilter_graph_send_command` matches against the **filter's** name, not the label alone. Found
+  2026-08-29 while writing the one-sided blur ramp.
+- **A blur cannot be measured on a flat colour field, and every fixture take is one.**
+  `synthesize_take` writes `color=c=red`; a Gaussian blur of a uniform field *is* that field, so a
+  working ramp reads as a discarded one. `synthesize_detailed_take` (`testsrc2`) exists for the one
+  test that needs detail. The general rule: **a fixture must contain the thing the filter acts on**,
+  which is the same failure as a fixture that makes its own defect impossible, one layer down.
+- **Compare filter-graph frames, not encoded frames, when asking what a filter changed.** Measured
+  2026-08-29: a treatment that moves 11 frames reads as **21** moved frames once encoded, because
+  libx264's lookahead spreads a change backwards across the GOP. Replace the encoder with
+  `-f framemd5` and the count is exact. This is why R-20 says a determinism claim is made about the
+  graph and never about the mp4 — the same fact, met from the other side.
 - **`xfade` emits `yuv444p`, and `concat -c copy` joins it to `yuv420p` without a word.** Measured
   2026-08-29 and reproduced independently. Two legs each ending `format=yuv420p`, blended by
   `xfade` with nothing after it, encode as **`yuv444p` / High 4:4:4 Predictive** — rc 0, correct
@@ -193,6 +208,42 @@ and then left in a commit subject is a number nobody will find.**
   `xfade` truncating to its shorter leg (Epic 11). The pattern is now established well enough to
   state as a rule: **in this pipeline, ffmpeg's exit code is evidence of nothing.** Assert the
   rendered artefact — frame count, pixel format, checksum against a control — never the return code.
+- **A `sendcmd` at a bare instance name is discarded at rc 0 — the same failure as a missing
+  label, from a different mistake.** Measured 2026-08-29 while story 11.4's blur ramp was written,
+  and it is the fifth wrong-output-at-exit-code-0 this project has met. A command written
+  `xo sigma 20` where `gblur@xo sigma 20` belongs reports **`Command reply for command #0:
+  ret:Function not implemented`** at `-v verbose`, **nothing at all at `-v error`**, rc 0, the
+  right frame count, and a picture **byte-identical** to the undriven chain.
+  `avfilter_graph_send_command` matches a target against the *filter's own name* and returns
+  `ENOSYS` when nothing matched — so an instance label alone reaches nothing, exactly as
+  `StageContext.named`'s docstring recorded for `b0` in Epic 10. **The target must carry the class
+  and the `@`**, and the discipline that catches it is unchanged: assert the target string appears
+  in the chain the same call composed.
+
+- **A blur cannot be measured on a flat colour field, and the test fixtures are flat colour
+  fields.** `synthesize_take` writes `color=c=red`, which is right for every other treatment in
+  this suite: a fade, a grade and a `sendcmd` ramp all move a flat picture. A Gaussian blur of a
+  uniform field is that uniform field, at any sigma — so the first run of
+  `test_a_one_sided_blur_ramp_…` read a working ramp as *"the ramp was discarded"*. This is the
+  fixture-makes-its-own-defect-impossible shape running the other way: the fixture made a **pass**
+  impossible, and a control that also did nothing would have hidden a real failure just as well.
+  `synthesize_detailed_take` (`testsrc2`) exists for that one test.
+
+- **A treatment's "bit-identical outside the ramp" claim must be made on the graph's frames, not
+  on the encoded intermediate.** Measured 2026-08-29 on a 96-frame clip with a 12-frame ramp on
+  its tail: comparing `framemd5` of the two **encoded** files reports **21** frames moved;
+  comparing the two **filter graphs** (`-f framemd5` in place of the encoder, everything before
+  `-c:v` untouched) reports **11**. libx264's lookahead spreads a change backwards, so the extra
+  ten are the encoder and not the filter. This is R-20's rule met in a new place — a determinism
+  claim belongs on the filter graph — and the eleven rather than twelve is right too: the ramp's
+  first frame is the identity by construction.
+
+- **A one-sided transition costs the export nothing new.** It is one more single-input filter in a
+  chain that was already being encoded and opens no second input, which is where the +39.4 ms
+  fixed cost of a paired segment goes (below). It adds no entry to `plan.clips`, no frame to any
+  count and no timeline length: `assembly_plan` is not consulted and `assembly.py` is unchanged by
+  the whole of story 11.4.
+
 - **A transition segment costs ~40 ms per overlap, and almost nothing per second of dissolve.**
   The debt the spine's *Deferred* section and §6 both recorded — *"full-resolution export cost of a
   reactive binding and of transition segments, measure before E and F merge"* — is now discharged on

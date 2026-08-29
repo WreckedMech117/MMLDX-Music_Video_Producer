@@ -148,7 +148,7 @@ CONSTRAINTS: tuple[Constraint, ...] = (
     ),
     Constraint(
         "models.py, `ExportLook.transitions`",
-        "one entry per transition the export composed, and one per transition it refused",
+        "four forms in one slot: composed, one-sided, refused, diverged - and empty means none",
         "test_the_export_with_a_transition_matches_the_song_and_records_what_it_blended",
         "**Amended 2026-08-28 by story 11.1, the story this row predicted.** The claim used to "
         "read ~~'present and empty — genuinely, on every record this build writes'~~ and the note "
@@ -160,7 +160,18 @@ CONSTRAINTS: tuple[Constraint, ...] = (
         "`test_more_than_two_clips_over_one_instant_still_exports_and_says_what_it_refused` "
         "asserts the refusal line, and "
         "`test_a_shot_with_no_transition_exports_exactly_what_it_exported_before` asserts the "
-        "empty one — so the slot can no longer go false in either direction in silence.",
+        "empty one — so the slot can no longer go false in either direction in silence. "
+        "**Amended again 2026-08-29 by story 11.4 and story 11.3's third criterion**, which put "
+        "two more forms in the same slot and so falsified the claim as it was worded — a row "
+        "reading 'composed, and refused' would have gone on passing while two thirds of what the "
+        "slot can hold went unnamed. "
+        "`test_a_one_sided_transition_treats_its_own_final_frames_and_changes_no_count` asserts "
+        "the one-sided form with its length, "
+        "`test_a_pair_only_type_left_one_sided_is_refused_with_its_reason_and_nothing_substituted` "
+        "the second reason a record can read `refused:`, and "
+        "`test_a_pair_that_disagrees_across_an_overlap_is_reported_once_and_never_refuses` and "
+        "`test_an_unset_or_agreeing_mirror_is_not_a_divergence` the diverged form in both "
+        "directions — including the three states that must produce no line at all.",
     ),
     Constraint(
         "models.py / app.py, `SHOT_PLAN_CONTENT_FIELDS` and `_withheld_fields`",

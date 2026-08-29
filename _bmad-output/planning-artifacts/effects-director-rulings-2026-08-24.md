@@ -763,6 +763,65 @@ silently absent from a list a Director is trying to learn. The one-sided forms a
 composition: `fade` for black and white, and a `sendcmd`-driven `gblur.sigma` ramp for the blur —
 measured working, frames bit-identical outside the ramp.
 
+> **Amended 2026-08-29 by the implementer of story 11.4: that last sentence names three
+> compositions for four entries, and the missing one is `dissolve`.** Twelve entries, eight
+> pair-only, four with a one-sided form — and the forms listed are black, white and blur. Nothing
+> in this ruling, in story 11.4, or in the spec that commissioned it ever says what a Dissolve
+> does with one picture.
+>
+> **It matters because the obvious answer is the substitution this ruling is about.** A cross-fade
+> with nothing to cross into is a fade to black, and "fade to black" is already the name of
+> another entry — so the catalogue would have shipped **two names for one picture**, which is
+> exactly the complaint made two paragraphs above about calling a horizontal-only effect "Blur",
+> one level up and harder to see because both names are honest about the paired case.
+>
+> **Resolved by measuring `xfade`'s own output against a black second input**, on this machine's
+> ffmpeg 7.0, 24 frames of `testsrc2` (mean luma per frame):
+>
+> * `transition=fade` tracks a plain `fade=t=out` over the whole length to within 0.9 of a luma
+>   level per frame — 110.9 → 19.6 against 110.9 → 20.0. **A dissolve never arrives at black**;
+> * `transition=fadeblack` is fully black by frame 5 of 24 and **stays there** until the incoming
+>   picture arrives.
+>
+> So the two are separated by *when* the black arrives, and both one-sided forms are the paired
+> operation with the second picture absent: `fade_out` ramps over the whole treatment and does not
+> reach black; `dip_black`/`dip_white` reach the colour at the midpoint and hold it to the cut.
+> Three distinct pictures, no name borrowed. `effects.ONE_SIDED_FORMS` carries the measurement,
+> and one test holds `pair_only` and `one_sided` together so a thirteenth entry cannot set one and
+> forget the other.
+>
+> **The alternative was to make `dissolve` pair-only**, which is what this epic's own rule implies
+> — *a type with no meaningful one-sided form is pair-only*. It was declined because a dissolve
+> **does** have a meaningful one-sided form once the arrival is what separates it, and because
+> refusing the most-used transition on every boundary with no Overlap is a Director-facing change
+> that belongs to the Director rather than to an implementer. **If the distinction above is judged
+> too thin to be a real difference, the correct fix is `pair_only=True` on `dissolve` and not a
+> substitution**, and it is one line plus the two tests that name the four.
+
+> **Amended 2026-08-29 — the ruling named twelve transitions and three one-sided compositions, and
+> never said what a Dissolve does with one picture.** The implementer found the gap and refused to
+> close it silently, which was right: the obvious answer — a cross-fade with nothing to cross into
+> becomes a fade to black — is *another entry's name*, and is exactly the substitution this ruling
+> exists to forbid.
+>
+> **Measured over a 24-frame treatment against a black leg**, mean luma per frame:
+>
+> | | frame 1 | 6 | 12 | 18 | 24 |
+> |---|---|---|---|---|---|
+> | `fade` (Dissolve) | 120.9 | 98.9 | 72.8 | 46.2 | **20.0** |
+> | `fadeblack` (Dip to black) | 120.8 | **0** | ~4 | ~10 | ~15 |
+>
+> Three distinct pictures, and no borrowed name. **Ruled: keep it.** One-sided, a **Dissolve ramps
+> down and hard-cuts at roughly 16 % luma** — a partial fade, deliberately not reaching black, which
+> is what distinguishes it from the dip. `Dip to black` and `Dip to white` reach the colour at the
+> midpoint and hold it to the cut.
+>
+> **The argument against, recorded because it is real:** "dissolve" arguably names a blend between
+> two pictures and there is only one here. The alternative was `pair_only=True`, which is the shape
+> wipes and slides already take — honest about the name, but it refuses the most-used transition on
+> every boundary without an Overlap, which is most boundaries. If that judgement is ever revisited,
+> the fix is one flag and two tests, **not** a substitution.
+
 ## R-35 — A boundary preview is a second route and a second fingerprint
 
 Story 11.5 needs a window spanning a cut with two takes in it. `preview_fingerprint` takes **one**

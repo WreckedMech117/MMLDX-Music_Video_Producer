@@ -56,6 +56,9 @@ from music_video_producer.effects import (
     FAMILY_TEXTURE,
     LOOK_PROBE_HEIGHT,
     LOOK_PROBE_WIDTH,
+    ONE_SIDED_FORMS,
+    ONE_SIDED_TRANSITION_FRAMES,
+    ONE_SIDED_TRANSITION_LABEL,
     PRE_PAD_FAMILIES,
     PRE_SCALE_FAMILIES,
     PREVIEW_FINGERPRINT_INPUTS,
@@ -77,6 +80,7 @@ from music_video_producer.effects import (
     lut_directory,
     lut_file_argument,
     lut_id_for_name,
+    one_sided_transition_stages,
     preview_fingerprint,
     transition_definition,
     validate_stack,
@@ -3283,6 +3287,113 @@ def test_two_legs_of_one_transition_compose_in_separate_slot_namespaces():
     )
     assert "[fx0a]" in " ".join((*plain.geometry, *plain.treatment))
     assert [script.target for script in plain.scripts] == ["eq@b1"]
+
+
+def test_a_pair_only_entry_is_exactly_one_with_no_one_sided_form():
+    """The two fields that say the same thing, held together so a thirteenth entry cannot split
+    them.
+
+    `pair_only` is what the write route refuses on; `one_sided` is what the export composes from.
+    An entry that set one and forgot the other would be settable on a boundary with no Overlap
+    and then compose nothing there -- rc 0, right frame count, unchanged picture, which is this
+    pipeline's own recurring failure and the reason this is a test rather than a convention.
+
+    The forms are also **distinct**, which is FX-18's *never quietly substituted* where it is
+    easiest to break: one-sided there is only one picture to work with, so two names composing the
+    same filter would be the catalogue substituting one for the other -- R-34's complaint about
+    calling `hblur` "Blur", one level up. Dissolve and Fade through black are the pair that would
+    collide if nobody said so: both are a `fade` to black, and they are separated by *when* the
+    black arrives -- the end of the treatment for a dissolve, its midpoint for a dip.
+    """
+    for entry in TRANSITION_CATALOGUE.values():
+        assert entry.pair_only == (entry.one_sided == ""), entry
+        assert entry.one_sided in ("", *ONE_SIDED_FORMS), entry
+    forms = [entry.one_sided for entry in TRANSITION_CATALOGUE.values() if entry.one_sided]
+    assert sorted(forms) == sorted(ONE_SIDED_FORMS)
+    assert len(set(forms)) == len(forms)
+
+    # Written out rather than derived, for this module's standing reason.
+    assert one_sided_transition_stages("dissolve", clip_frames=96, fps=24).treatment == (
+        "fade=t=out:start_frame=84:nb_frames=12:color=black",
+    )
+    assert one_sided_transition_stages("fade_black", clip_frames=96, fps=24).treatment == (
+        "fade=t=out:start_frame=84:nb_frames=6:color=black",
+    )
+    assert one_sided_transition_stages("fade_white", clip_frames=96, fps=24).treatment == (
+        "fade=t=out:start_frame=84:nb_frames=6:color=white",
+    )
+    # And a wipe has no one-sided form at all: `None`, so the caller says so in the catalogue's
+    # own sentence rather than being handed something to render.
+    for transition_id in ("wipe_left", "wipe_right", "slide_up", "slide_down"):
+        assert one_sided_transition_stages(transition_id, clip_frames=96, fps=24) is None
+
+
+def test_a_one_sided_transition_is_bounded_by_the_clips_own_frames():
+    """Story 11.4's *"bounded by the Shot's own duration and by nothing invisible"*, as arithmetic.
+
+    The ceiling is a catalogue constant rather than a stored field (AD-19's 2026-08-29
+    amendment), and the floor is the clip itself: a clip shorter than the ceiling is treated over
+    its whole length rather than from a negative `start_frame`, which would be a stage ffmpeg
+    accepts and a treatment that starts before the clip does.
+
+    **The clamp is against frames and not seconds**, which is the whole reason the constant is
+    declared in frames: a `start_frame` past the last frame written composes cleanly, renders at
+    rc 0 and changes nothing at all.
+    """
+    long_clip = one_sided_transition_stages("dissolve", clip_frames=240, fps=24)
+    assert long_clip.frames == ONE_SIDED_TRANSITION_FRAMES
+    assert long_clip.treatment == ("fade=t=out:start_frame=228:nb_frames=12:color=black",)
+    short_clip = one_sided_transition_stages("dissolve", clip_frames=5, fps=24)
+    assert short_clip.frames == 5
+    assert short_clip.treatment == ("fade=t=out:start_frame=0:nb_frames=5:color=black",)
+    # One frame is the smallest clip the export can hold (`ASSEMBLY_TOO_SHORT_REFUSAL` refuses
+    # anything shorter), and even a dip has to keep a ramp of at least one frame in it.
+    single = one_sided_transition_stages("fade_black", clip_frames=1, fps=24)
+    assert single.frames == 1
+    assert single.treatment == ("fade=t=out:start_frame=0:nb_frames=1:color=black",)
+
+
+def test_a_one_sided_blur_addresses_a_label_the_same_call_composes():
+    """R-25's delegated decision, applied to the one one-sided form that is driven.
+
+    *"Every `sendcmd` target string must appear as an `@label` in the composed chain produced by
+    the same call"* -- because a command aimed at a target that is not in the graph is ignored in
+    silence, and that assertion is the only thing standing between a typo and an export that is
+    quietly untreated.
+
+    **The target carries the class**, and the sentence above is why that is not decoration.
+    Measured 2026-08-29 while this was written: `xo sigma 20` where `gblur@xo sigma 20` belongs
+    reports *"ret:Function not implemented"* at `-v verbose` and is otherwise rc 0, silent, and
+    byte-identical -- `avfilter_graph_send_command` matches a target against the filter's own name.
+
+    The script's first line is the identity, so the ramp grows from nothing, and its last is the
+    full sigma -- both written out rather than derived.
+    """
+    composed = one_sided_transition_stages("blur_wipe", clip_frames=96, fps=24)
+    assert composed.treatment == (f"gblur@{ONE_SIDED_TRANSITION_LABEL}=sigma=0",)
+    assert len(composed.scripts) == 1
+    script = composed.scripts[0]
+    assert composed.geometry == (f"sendcmd=f={script.filename}",)
+
+    chain = ",".join((*composed.geometry, *composed.treatment))
+    assert f"@{script.target.split('@')[1]}" in chain
+    assert script.target in chain
+    assert script.target == f"gblur@{ONE_SIDED_TRANSITION_LABEL}"
+    for line in script.text.splitlines():
+        assert line.split(" ")[1] == script.target, line
+
+    lines = script.text.splitlines()
+    assert len(lines) == ONE_SIDED_TRANSITION_FRAMES
+    assert lines[0] == f"3.5 gblur@{ONE_SIDED_TRANSITION_LABEL} sigma 0;"
+    assert lines[-1] == f"3.958333 gblur@{ONE_SIDED_TRANSITION_LABEL} sigma 20;"
+
+    # A bare relative name, which is what `sendcmd=f=` takes with the process cwd set to the
+    # file's own directory (AD-22, R-30). Every character is one that needs no escaping.
+    assert set(script.filename) <= set("abcdefghijklmnopqrstuvwxyz0123456789_.-")
+    # And two different ramps are two files: the digest is of the text, so an export writing a
+    # short clip's ramp and a long clip's into one directory cannot have one drive the other.
+    other = one_sided_transition_stages("blur_wipe", clip_frames=40, fps=24)
+    assert other.scripts[0].filename != script.filename
 
 
 def test_the_transition_catalogue_is_twelve_and_names_hblur_for_what_it_is():

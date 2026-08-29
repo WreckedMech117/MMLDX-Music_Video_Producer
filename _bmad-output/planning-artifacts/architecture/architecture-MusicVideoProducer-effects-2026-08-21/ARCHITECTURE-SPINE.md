@@ -167,6 +167,60 @@ Binding, read-only. Not re-derived here.
 - **Prevents:** a second, invisible source of transition length, and transitions that fail on external clips
 - **Rule:** A paired transition's duration **is** the Overlap's duration. There is no stored duration field for it and no borrowing from the over-render margin — external clips carry no margin (`app.py`'s own note) and a margin-derived length is invisible to the Director. A transition-out with no Overlap is **one-sided**: a filter applied to the tail of that clip's own intermediate, single-input, no `xfade`, no change to frame count, no frames taken from a neighbour. Both cases leave every clip's timeline position untouched, which is how FX-NFR-1 is satisfied structurally rather than arithmetically.
 
+> **Amended 2026-08-29 by story 11.4 — this Rule states a one-sided transition's *shape* and never
+> says how long it is, and story 11.4 requires that its length be *"bounded by the Shot's own
+> duration and by nothing invisible."*** The gap is real: every clause above is about the paired
+> case having a length, and the one-sided sentence describes a filter with no duration in it at
+> all. **Nothing here was wrong; the Rule was silent, and a silence in the AD that owns transition
+> geometry is where a stored duration field gets added by whoever needs one next.**
+>
+> **A one-sided transition's length is `effects.ONE_SIDED_TRANSITION_FRAMES`, clamped to the
+> clip's own frames on the assembly grid.** Twelve frames, half a second at 24 fps. It is a
+> **catalogue constant, not a stored field**, and it is not the sentence above being relaxed — it
+> is the third case that sentence did not enumerate.
+>
+> **The stored-length option was open and was declined, and the reason is the one this AD already
+> makes.** The slice's own spec argued a field would be legitimate here — AD-19 refuses a stored
+> paired duration because the Overlap already answers the question, and a one-sided transition has
+> no Overlap, so a stored length would be the *only* answer rather than a second one. That
+> argument is sound as far as it goes. What it misses is what this AD is actually protecting,
+> which is not "one source" but *"a second, **invisible** source of transition length"* — the word
+> is in the *Prevents* line. **A paired length is visible because the Director dragged it.** A
+> stored one-sided length is authored by no gesture: there is no drag that sets it, no interface
+> that shows it, and a Director who never looked at a manifest would have no way to know a number
+> was in there deciding their picture. It would be *more* invisible than the margin-derived length
+> the Rule already refuses, not less.
+>
+> **So the length is made visible instead of storable**, in three places, none of which is a
+> manifest field:
+>
+> * `GET /api/projects/{id}/shots/{shot_id}/transitions` carries `one_sided_frames` on every
+>   catalogue entry beside `pair_only` — so a client with no source in front of it can draw the
+>   row story 11.4 asks for, *"No overlap — this treats shot 04's last frames, then cuts"*, with
+>   the length in it and without hard-coding one;
+> * the **clamp** is against `plan.frames[index]`, the frames ffmpeg will actually write for that
+>   clip, so the bound is the Shot's own duration by arithmetic rather than by promise. A clip
+>   shorter than twelve frames is treated over its whole length;
+> * and `ExportLook.transitions` records the number that **ran** —
+>   `"<shot_id>=<type> one-sided over <n> frames"` — so the export says what it did rather than
+>   leaving it to be re-derived from a constant that may since have moved.
+>
+> **What would reopen this.** If a Director ever gets a gesture that sets a one-sided length — a
+> handle on the clip's own tail, not a number box — then that gesture is the visible source and a
+> stored field is its natural home, exactly as the Overlap is the paired case's. Until such a
+> gesture exists, storing the number would be adding the field first and the way to author it
+> never.
+>
+> **A second thing this Rule did not say, found the same day:** *which* transitions have a
+> one-sided form. R-34 names the composition for three of the four non-pair-only entries — `fade`
+> for black and white, a `gblur` ramp for the blur — and is silent about `dissolve`, whose
+> degenerate form is a fade to black and therefore collides with `fade_black` by name. They are
+> separated by when the black arrives (the end of the treatment for a dissolve, its midpoint for a
+> dip), measured against `xfade`'s own output against a black second input. See
+> `effects.ONE_SIDED_FORMS`. **A type with no one-sided form is `pair_only` and refuses with its
+> reason**, which is the rule the epic's spec states and which `pair_only` and `one_sided` are now
+> held to by one test.
+
 ### AD-20 — The Song Envelope is a sidecar, never a manifest field
 
 - **Binds:** FX-1, FX-2, FX-3, FX-13
@@ -273,6 +327,34 @@ Binding, read-only. Not re-derived here.
 - **Binds:** FX-17, FX-18, FX-19
 - **Prevents:** two Shots disagreeing about one blend, with no rule for which wins
 - **Rule:** `transition_out` on the earlier Shot is **authoritative** for a paired transition; the later Shot's `transition_in` is a mirror the write path keeps in step (FX-17). At export, only the outgoing Shot's field is read. A manifest whose pair disagrees — hand-edited, or a partially-applied write — is not a refusal: the outgoing Shot's value is used and the divergence is reported once, so an editable manifest cannot produce an undecidable export. One-sided transitions have no pair and each Shot owns its own field.
+
+> **Amended 2026-08-29 — the read half shipped with story 11.1 and the *reported once* half did
+> not, and the gap was invisible because the Rule reads as one sentence.** `ExportSubject.transitions`
+> has carried only `transition_out` since 2026-08-28, so the export was already decidable; nothing
+> read `transition_in` at all, so a manifest whose pair disagreed was resolved **silently**, which
+> is the half of this Rule that makes the other half safe to have. `_report_transition_divergence`
+> is that half: one record on `ExportLook.transitions` per diverging pair, and `[]` returned, so
+> the export is not refused.
+>
+> **Two things the Rule's wording leaves to be got wrong, both settled here rather than left for
+> the next reader.**
+>
+> **What "diverged" means is narrower than the sentence suggests.** A pair diverges when an
+> Overlap exists, **both** fields are set, and they differ. An **unset** mirror is not a
+> divergence — it is the ordinary state of a one-sided transition and of any pair a client wrote
+> one end of, and reporting it would make this line fire on nearly every export that carries a
+> transition at all, which is how a report becomes something nobody reads. Two fields that differ
+> with **no Overlap** between the Shots are not a divergence either: there is no pair there, only
+> the outgoing Shot's own one-sided treatment and an incoming field the export never reads.
+>
+> **"Once" is per diverging *pair*.** The walk is over consecutive Shots in song order, not over
+> `plan.clips`: a Shot that another nests inside resolves into two clips and a per-clip walk would
+> say it twice. Three consecutive Shots each disagreeing with the next is three pairs and three
+> lines, which is right.
+>
+> **The mirror is carried on `ExportSubject` as its own field, read by one function.** Folding it
+> into `transitions` would have made the authoritative half reachable by accident from any
+> composer, which is the shape this AD exists to make impossible.
 
 ### AD-31 — Family order is enforced on read, never trusted from storage
 
