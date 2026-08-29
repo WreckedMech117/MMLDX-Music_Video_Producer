@@ -173,7 +173,7 @@ def test_the_absence_scan_can_tell_absent_then_from_absent_still():
     `xfade` is Epic 11's and is in nothing at all.
     """
     false_now = "Planned — Epic 11. There is no generator for `sendcmd_script` and no caller."
-    still_true = "Planned — Epic 11. There is no generator for `xfade` and no caller."
+    still_true = "Planned — Epic 11. There is no generator for `zzz_never_a_symbol_here` and no caller."
 
     assert [name for _, name, _ in stale_absence_claims("probe", false_now)] == ["sendcmd_script"]
     assert stale_absence_claims("probe", still_true) == []
@@ -310,6 +310,23 @@ RULINGS_LAST = max(
 )
 
 
+#: **A control may not borrow a real identifier whose presence is what the scan watches.**
+#:
+#: This probe said *"There is no generator for `xfade` and no caller"* until 2026-08-28, chosen
+#: because `xfade` appeared nowhere in the package -- which made it a perfect negative control right
+#: up until Epic 11's first slice added `xfade` to `assembly.py`, at which point the claim became
+#: genuinely false and the scan correctly fired on its own fixture. The test was red for a reason
+#: that was not a defect, during someone else's work, on a module they did not own.
+#:
+#: It is the second instance of one mistake in this module: the range control hard-coded the
+#: rulings file's last id and failed every time a ruling was added. Both billed the guard's
+#: maintenance to whoever did the work the guard exists to protect, which is exactly how a check
+#: earns a reputation for noise and then gets deleted.
+#:
+#: The rule that came out of it: **a control names something that can never exist** -- here a
+#: deliberately impossible identifier -- so it tests the scan's mechanism without depending on the
+#: state of the thing under observation. The positive controls above are safe as they are, because
+#: they assert a claim *does* fire about a name that is present and will stay present.
 @pytest.mark.parametrize(
     ("text", "fires"),
     [

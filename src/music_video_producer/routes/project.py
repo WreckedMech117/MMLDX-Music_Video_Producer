@@ -30,6 +30,7 @@ from ..app import (
     _adopt_expansion_maps,
     _adopt_job_measurements,
     _adopt_shot_effects,
+    _adopt_shot_transitions,
     _adopt_song_analysis,
     _adopt_song_recovery_slots,
     _adopt_song_vocal_type,
@@ -398,6 +399,17 @@ def register(ctx: RouterContext) -> None:
         _adopt_shot_effects(
             project, {shot.id: shot for shot in current.shots}, looks=discovered_looks
         )
+        # The Transition pair is server-owned here for the **fifteenth** recorded time this route
+        # has been the hole for a field a narrower sibling guards, and this guard lands in the
+        # same commit as the fields rather than after the first save that eats one (AD-16). Both
+        # default to `None`, so an ordinary save from any existing client would clear every
+        # transition in the project; a body that invented one would write a catalogue id past
+        # `transition_definition`, which is the only thing between a client's string and an
+        # `xfade` argument. A Shot this project does not yet hold gets neither — a transition is a
+        # fact about a boundary between two named Shots and a new Shot is on no such boundary,
+        # which is the anchor adoption's rule rather than the Effect Stack's. See
+        # `_adopt_shot_transitions`.
+        _adopt_shot_transitions(project, {shot.id: shot for shot in current.shots})
         # Every recorded fact about a job is server-owned here — the *eleventh* and now the
         # *fourteenth* time this one route has been the hole for a field nothing else may write,
         # and the third time this particular helper has had to grow to close it. A body carries

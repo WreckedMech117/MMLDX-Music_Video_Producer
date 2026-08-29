@@ -297,6 +297,9 @@ __all__ = [
     "PRE_SCALE_FAMILIES",
     "SEAM_SEED_PER_SECOND",
     "SHARPEN_MATRIX",
+    "TRANSITION_CATALOGUE",
+    "TRANSITION_PAIR_ONLY_REFUSAL",
+    "TRANSITION_UNKNOWN_REFUSAL",
     "ChoiceParameter",
     "DriveReadout",
     "DriveSample",
@@ -311,6 +314,7 @@ __all__ = [
     "ParameterDrive",
     "ResolvedEffect",
     "StageContext",
+    "TransitionDefinition",
     "agreed_bindings",
     "band_series",
     "binding_drive",
@@ -330,6 +334,7 @@ __all__ = [
     "sendcmd_script",
     "song_fingerprint",
     "song_fingerprints_match",
+    "transition_definition",
     "validate_stack",
     "write_default_luts",
 ]
@@ -1186,6 +1191,21 @@ class StageContext:
     reference_width: int = 0
     driven: bool = False
     labels: Mapping[str, str] = field(default_factory=dict)
+    #: Which leg of a two-input graph this chain is, and `""` — the default — for the one-input
+    #: chain every clip in this application composes today (R-41).
+    #:
+    #: **`slot` alone is not unique inside a transition segment.** A transition reads both takes
+    #: in one invocation, each leg through its own full effect chain, and both legs start at slot
+    #: 0. Two graded Shots would then emit `[fx0a]` twice in one `-filter_complex`, which is at
+    #: least loud; two *bound* Shots would emit **one** `sendcmd` target — `eq@b0` — addressing
+    #: the filters of both legs, which is silent at rc 0 and is exactly the class
+    #: `DriveScript.target`'s docstring says nothing else can catch.
+    #:
+    #: So the namespace gains a leg prefix: `fxA0`/`fxB0` for a branch's links, `@bA0`/`@bB0` for
+    #: a bound filter's instance. Empty for every existing caller, so an ordinary clip's argv and
+    #: its cached previews are byte-identical — which is R-20's guarantee still holding, and the
+    #: reason the prefix is a *prefix on an empty string* rather than a renumbering.
+    leg: str = ""
 
     def named(self, filter_name: str) -> str:
         """One filter's name, with the instance label a binding needs — and without it otherwise.
@@ -1408,9 +1428,11 @@ def _branch_stage(
     4:2:0-native do not, and compose the text they always composed.
 
     The labels carry `context.slot` because two Blooms in one stack are a legal stack and two
-    branches named alike are an ffmpeg error.
+    branches named alike are an ffmpeg error — and `context.leg` in front of it, because the two
+    legs of a transition segment are two chains in one graph and both of them start at slot 0
+    (R-41). It is empty for every one-input chain, so this text is unchanged wherever it was.
     """
-    tag = f"fx{context.slot}"
+    tag = f"fx{context.leg}{context.slot}"
     inputs = f"[{tag}c][{tag}a]" if leg_on_top else f"[{tag}a][{tag}c]"
     head = f"{BRANCH_LEG_FORMAT}," if pin_format else ""
     tail = f",{BRANCH_LEG_FORMAT}" if pin_format else ""
@@ -2465,6 +2487,104 @@ for _definition in _CATALOGUE:
         )
     EFFECT_CATALOGUE[_definition.effect_id] = _definition
 del _definition
+
+
+# ------------------------------------------------------------------------------------------
+# The Transition catalogue (FX-19, R-34). Twelve entries, named in the Director's language, each
+# resolving to one `xfade` transition. It lives here for `EFFECT_CATALOGUE`'s reason and under
+# the same rule: this is the only thing entitled to say which transitions exist, so
+# `models.TransitionSpec.type` is a free string and `assembly.py` is handed a resolved `xfade`
+# name the way `trim_args` is handed finished stage strings.
+#
+# **`hblur` is catalogued as "Blur wipe", and the name is the ruling** (R-34). ffmpeg offers 58
+# `xfade` transitions and **not one isotropic blur** -- `hblur` is horizontal, measured. FX-18
+# says a named type is never quietly substituted, and calling a horizontal-only effect "Blur" is
+# exactly that substitution, made by the catalogue rather than by the renderer.
+#
+# Twelve is the smallest set in which *directional* means a direction the Director picks rather
+# than two of four: wipe and slide in all four, plus the four that have no direction.
+# ------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class TransitionDefinition:
+    """One catalogue entry: the id a manifest stores, the name a Director reads, the `xfade`
+    name ffmpeg knows, and whether it has a one-sided form.
+
+    `pair_only` is FX-19's requirement read literally: a wipe and a slide move one picture across
+    another, so there is no meaningful version of either with only one picture. They are **in the
+    list and refuse one-sided use with their reason**, rather than being silently absent from a
+    list a Director is trying to learn -- an absence teaches nothing and reads as an oversight.
+
+    The four that are not pair-only have real one-sided forms (`fade` to and from black or white,
+    and a `gblur` ramp for the blur), and building those is Story 11.4's job, not this one's.
+    """
+
+    transition_id: str
+    label: str
+    #: The `xfade=transition=` name. Verified against `ffmpeg -h filter=xfade` on this machine's
+    #: ffmpeg 7.0: all twelve are offered, and no isotropic blur is.
+    xfade: str
+    pair_only: bool = False
+
+
+_TRANSITIONS: tuple[TransitionDefinition, ...] = (
+    TransitionDefinition("dissolve", "Dissolve", "fade"),
+    TransitionDefinition("fade_black", "Fade through black", "fadeblack"),
+    TransitionDefinition("fade_white", "Fade through white", "fadewhite"),
+    # Horizontal, and the label says so. See the section comment above.
+    TransitionDefinition("blur_wipe", "Blur wipe", "hblur"),
+    TransitionDefinition("wipe_left", "Wipe left", "wipeleft", pair_only=True),
+    TransitionDefinition("wipe_right", "Wipe right", "wiperight", pair_only=True),
+    TransitionDefinition("wipe_up", "Wipe up", "wipeup", pair_only=True),
+    TransitionDefinition("wipe_down", "Wipe down", "wipedown", pair_only=True),
+    TransitionDefinition("slide_left", "Slide left", "slideleft", pair_only=True),
+    TransitionDefinition("slide_right", "Slide right", "slideright", pair_only=True),
+    TransitionDefinition("slide_up", "Slide up", "slideup", pair_only=True),
+    TransitionDefinition("slide_down", "Slide down", "slidedown", pair_only=True),
+)
+
+TRANSITION_CATALOGUE: dict[str, TransitionDefinition] = {}
+for _transition in _TRANSITIONS:
+    if _transition.transition_id in TRANSITION_CATALOGUE:
+        raise RuntimeError(
+            f"Two transition entries claim the id {_transition.transition_id!r}."
+        )
+    TRANSITION_CATALOGUE[_transition.transition_id] = _transition
+del _transition
+
+#: The refusal for a type no catalogue entry claims. It prints the whole list, because a Director
+#: who misspelled one needs the spelling and a client that invented one needs the vocabulary --
+#: the shape `EFFECT_UNKNOWN_REFUSAL` already uses one catalogue over.
+TRANSITION_UNKNOWN_REFUSAL = (
+    "There is no transition called '{transition}'. The transitions this application offers are: "
+    "{known}."
+)
+#: FX-19's other half, and the whole reason a pair-only entry is *in* the list rather than absent
+#: from it. Said at the write, which is the moment a Director is choosing, and it names the
+#: gesture that makes the geometry as well as the entries that do not need it.
+TRANSITION_PAIR_ONLY_REFUSAL = (
+    "{label} moves two pictures across each other, so it only exists where two shots overlap, "
+    "and {shot} does not overlap the shot after it. Drag the two clips across each other to "
+    "make the overlap, or choose one that treats a single shot's own frames: {alternatives}."
+)
+
+
+def transition_definition(transition_id: str) -> TransitionDefinition:
+    """One catalogue entry, or `EffectRefusal` naming every id there is.
+
+    `EffectRefusal` rather than a second exception class: it is this module's word for "the
+    catalogue will not agree to that", and a route that already catches one for a stack catches
+    the same one for a transition, in the same sentence-carrying 422.
+    """
+    entry = TRANSITION_CATALOGUE.get(transition_id)
+    if entry is None:
+        raise EffectRefusal(
+            TRANSITION_UNKNOWN_REFUSAL.format(
+                transition=transition_id, known=", ".join(sorted(TRANSITION_CATALOGUE))
+            )
+        )
+    return entry
 
 
 # ------------------------------------------------------------------------------------------
@@ -3689,6 +3809,7 @@ def build_effect_stages(
     envelope: Mapping[str, Any] | None = None,
     shot_start: float = 0.0,
     clip_seconds: float = 0.0,
+    leg: str = "",
 ) -> EffectStages:
     """A stack, the export's geometry and the clip's place in its Shot in; the stages out.
 
@@ -3739,6 +3860,12 @@ def build_effect_stages(
 
     A binding with no envelope to resolve against is refused by name rather than composed inert,
     which is FX-15 read the only way it can be read here: a binding is never silently dropped.
+
+    **`leg` is the one argument a transition segment adds** (R-41), and it names which of the two
+    chains in one `-filter_complex` this is. It reaches nothing but the two names a slot decides —
+    a branch's link labels and a bound filter's instance — and it defaults to `""`, so every
+    existing caller composes character for character what it composed before. See
+    `StageContext.leg` for the two failures it exists to prevent, one loud and one silent.
     """
     resolved = validate_stack(stack, luts=luts)
     entries = {entry.lut_id: entry for entry in luts}
@@ -3797,9 +3924,10 @@ def build_effect_stages(
                 reference_width=reference_width,
                 driven=bool(effect.bindings),
                 labels={
-                    _bound_parameter(binding).drive.filter_name: f"b{slot}"
+                    _bound_parameter(binding).drive.filter_name: f"b{leg}{slot}"
                     for binding in effect.bindings
                 },
+                leg=leg,
             )
             for binding in effect.bindings:
                 scripts.append(

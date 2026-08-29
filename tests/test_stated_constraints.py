@@ -22,9 +22,17 @@ in this codebase*, *never imports*, *may not import* — gives **135**, of which
 from that 135: each is a claim that, if it silently stopped holding, would change what the
 application does rather than only what a comment says.
 
-**The headline: of the twenty-two, seven were asserted before this pass, three are closed by the
-leaf-module guard added beside it, and twelve remain unenforced and are named as such.** Nothing
-here tries to close the twelve — item 23 asked for the list, not the fixes.
+**The headline: of the twenty-two, ~~seven~~ eight were asserted before this pass, three are
+closed by the leaf-module guard added beside it, and ~~twelve~~ eleven remain unenforced and are
+named as such.** Nothing here tried to close the twelve — item 23 asked for the list, not the
+fixes.
+
+*Amended 2026-08-28 by story 11.1, which closed one of the twelve.* `ExportLook.transitions`'
+row said *"the day Epic 11 fills it, this comment goes false with nothing to say so"*; that day
+came, the slot is now asserted in both directions, and the count moved with it. **This is the
+mechanism working rather than an exception to it**: the row named the change that would falsify
+it, the change carried the correction, and `test_the_enumeration_reports_its_own_split` is what
+made carrying it compulsory.
 
 **What this module does not do.** It does not check that an `unenforced` entry is still unenforced
 — a test written for one later would make this file's verdict stale in the safe direction, and
@@ -140,11 +148,19 @@ CONSTRAINTS: tuple[Constraint, ...] = (
     ),
     Constraint(
         "models.py, `ExportLook.transitions`",
-        "present and empty — genuinely, on every record this build writes",
-        "",
-        "True today and the one of the pair that survived Epic 10. `bindings` is asserted "
-        "non-empty by `test_assembly_route.py`; nothing asserts `transitions` is still empty, so "
-        "the day Epic 11 fills it, this comment goes false with nothing to say so.",
+        "one entry per transition the export composed, and one per transition it refused",
+        "test_the_export_with_a_transition_matches_the_song_and_records_what_it_blended",
+        "**Amended 2026-08-28 by story 11.1, the story this row predicted.** The claim used to "
+        "read ~~'present and empty — genuinely, on every record this build writes'~~ and the note "
+        "said: *'the day Epic 11 fills it, this comment goes false with nothing to say so.'* That "
+        "day is this commit, and the amendment lands in it — which is the whole of what this row "
+        "was for. Both directions are now executed: "
+        "`test_the_export_with_a_transition_matches_the_song_and_records_what_it_blended` "
+        "asserts a real non-empty value, "
+        "`test_more_than_two_clips_over_one_instant_still_exports_and_says_what_it_refused` "
+        "asserts the refusal line, and "
+        "`test_a_shot_with_no_transition_exports_exactly_what_it_exported_before` asserts the "
+        "empty one — so the slot can no longer go false in either direction in silence.",
     ),
     Constraint(
         "models.py / app.py, `SHOT_PLAN_CONTENT_FIELDS` and `_withheld_fields`",
@@ -240,9 +256,12 @@ def test_every_constraint_marked_asserted_names_a_test_that_exists(constraint):
 def test_the_enumeration_reports_its_own_split():
     """The count in the module docstring, so the headline cannot drift from the table.
 
-    Seven asserted before this pass, three by the guard it added, twelve unenforced. If a later
-    change closes one of the twelve, this fails and the docstring is corrected with it — which is
-    item 21's rule applied to the document item 23 asked for.
+    ~~Seven~~ **eight** asserted before this pass, three by the guard it added, ~~twelve~~
+    **eleven** unenforced. If a later change closes one of the remaining eleven, this fails and
+    the docstring is corrected with it — which is item 21's rule applied to the document item 23
+    asked for, and it has already fired once: story 11.1 closed `ExportLook.transitions`' row on
+    2026-08-28, exactly as that row predicted, and this test is what made the correction land in
+    the same commit rather than a retrospective later.
     """
     added_here = {
         "test_the_leaf_module_imports_the_standard_library_and_its_one_allowance",
@@ -252,8 +271,8 @@ def test_the_enumeration_reports_its_own_split():
 
     assert len(CONSTRAINTS) == 22
     assert len(by_new_guards) == 3
-    assert len(asserted) - len(by_new_guards) == 7
-    assert len(CONSTRAINTS) - len(asserted) == 12
+    assert len(asserted) - len(by_new_guards) == 8
+    assert len(CONSTRAINTS) - len(asserted) == 11
 
 
 def test_no_constraint_is_listed_twice():

@@ -66,6 +66,9 @@ from ..app import (
     SHOT_EFFECTS_COPY_WITHOUT_TARGETS_REFUSAL,
     SHOT_EFFECTS_LOCKED_REFUSAL,
     SHOT_EFFECTS_TOO_MANY_REFUSAL,
+    SHOT_TRANSITION_ABSENT_REFUSAL,
+    SHOT_TRANSITION_LOCKED_REFUSAL,
+    SHOT_TRANSITION_UNSAID,
     TAKE_MISSING_FILE_REFUSAL,
     TAKE_NOT_RENDERED_REFUSAL,
     UNAPPROVE_NOT_APPROVED_REFUSAL,
@@ -81,8 +84,12 @@ from ..app import (
     ShotEffectsResponse,
     ShotExpansionResult,
     ShotListRequest,
+    ShotTransitionsRequest,
+    ShotTransitionsResponse,
+    TransitionCatalogueEntry,
     _adopt_expansion_maps,
     _adopt_shot_effects,
+    _adopt_shot_transitions,
     _names_an_undiscovered_look,
     _require_approval_unchanged,
     _require_in_flight_status_kept,
@@ -102,11 +109,22 @@ from ..app import (
     shot_render_in_flight,
     stack_is_driven,
 )
-from ..assembly import ASSEMBLY_FPS, clip_frames_on_grid
+from ..assembly import (
+    ASSEMBLY_FPS,
+    BOUNDARY_TOLERANCE_SECONDS,
+    clip_frames_on_grid,
+)
 from ..batch import PENDING_SUBMISSION_PROMPT_ID, accept_submission, prompt_is_missing, shot_label
 from ..comfy import ComfyError
 from ..director import DirectorError, DirectorUnavailable
-from ..effects import EffectRefusal, drive_readout, validate_stack
+from ..effects import (
+    TRANSITION_CATALOGUE,
+    TRANSITION_PAIR_ONLY_REFUSAL,
+    EffectRefusal,
+    drive_readout,
+    transition_definition,
+    validate_stack,
+)
 from ..h3_prompt import check as h3_check
 from ..h3_prompt import normalize_audio_fields
 from ..models import (
@@ -185,6 +203,13 @@ def register(ctx: RouterContext) -> None:
         # hold keeps the validated stack it arrived with rather than being saved ungraded. See
         # `_adopt_shot_effects`.
         _adopt_shot_effects(project, previous, looks=discovered_looks)
+        # And the Transition pair, on the same snapshot and for a sharper version of the same
+        # reason. **Dragging a clip is what authors an Overlap**, and dragging writes the whole
+        # shot list back through here — so without this guard the single gesture that *makes* the
+        # geometry a transition needs would destroy the transition, at 200, every time. See
+        # `_adopt_shot_transitions`, including why a Shot this plan does not yet hold gets `None`
+        # here where it keeps its Effect Stack.
+        _adopt_shot_transitions(project, previous)
         # **This is the route the live defect came in on.** Attach, detach and re-role are all one
         # gesture in the browser — mutate the shot's `citations`, write the whole shot list — so
         # this is where "re-expand automatically when an asset is attached" has to happen. The
@@ -819,6 +844,158 @@ def register(ctx: RouterContext) -> None:
         if adoption.refusal:
             raise HTTPException(status_code=422, detail=adoption.refusal)
         shot.effects = adoption.stack
+        return store.save(project)
+
+    @app.get(
+        "/api/projects/{project_id}/shots/{shot_id}/transitions",
+        response_model=ShotTransitionsResponse,
+    )
+    def read_shot_transitions(project_id: str, shot_id: str) -> ShotTransitionsResponse:
+        """One Shot's Transition pair, and the twelve this application offers.
+
+        A read of the manifest plus a constant — no validation, no verdict about whether the
+        stored type still exists, `read_shot_effects`' rule and AD-21's: the verdict belongs to
+        the moment of composing, where `_transition_catalogue_refusals` re-derives it and refuses
+        by name. A stored "this is valid" flag is the thing this codebase refuses to keep.
+
+        **The catalogue rides along** because story 11.1's own last acceptance criterion is that
+        the route is sufficient without any interface, and a client that can set a transition but
+        cannot discover the vocabulary is not sufficient. It costs no disk read.
+        """
+        project = get_project(project_id)
+        shot = next((item for item in project.shots if item.id == shot_id), None)
+        if not shot:
+            raise HTTPException(status_code=404, detail="Shot not found")
+        return ShotTransitionsResponse(
+            shot_id=shot.id,
+            transition_out=shot.transition_out,
+            transition_in=shot.transition_in,
+            catalogue=[
+                TransitionCatalogueEntry(
+                    transition_id=entry.transition_id,
+                    label=entry.label,
+                    xfade=entry.xfade,
+                    pair_only=entry.pair_only,
+                )
+                for entry in TRANSITION_CATALOGUE.values()
+            ],
+        )
+
+    @app.put(
+        "/api/projects/{project_id}/shots/{shot_id}/transitions",
+        response_model=Project,
+    )
+    def replace_shot_transitions(
+        project_id: str, shot_id: str, request: ShotTransitionsRequest
+    ) -> Project:
+        """Write one Shot's Transition — validated against the catalogue before a byte is stored.
+
+        **The one route that writes either field** (AD-16), which is what keeps a transition out of
+        reach of everything that is not a Director: the two generic manifest writes re-adopt the
+        stored pair for every Shot they hold and give a new Shot none
+        (`app._adopt_shot_transitions`), no tool schema declares either field, and the Director's
+        context withholds both. Set a type to author a blend; send `null` to clear it. That is the
+        whole of what story 11.1 needs, with no interface at all.
+
+        **The mirror is kept in step here** (AD-30). `transition_out` on the earlier Shot is
+        authoritative and is the only side the export reads; writing it also writes the *following*
+        Shot's `transition_in`, so a panel drawn on either Shot shows one blend rather than two
+        halves that can disagree. Following in **song order**, `timeline.ordered_shots`', because
+        that is the order `assembly_plan` resolves and a mirror written to the neighbour in list
+        order would name a different Shot than the export blends. Writing `transition_in` directly
+        mirrors backwards the same way, so a client may write either end.
+
+        The order of the gates is `replace_shot_effects`': the Shot first, so a request naming
+        nothing is a 404 rather than a lecture about locks; the lock next, because it is a decision
+        the Director made and it holds whatever the body says (422, on the 2026-08-18 ruling that
+        names `locked` on the unprocessable side); then the body's own shape; then the catalogue,
+        which owns which transitions exist and is the same function the export runs again.
+
+        **A pair-only type is refused where there is no Overlap to move two pictures across**
+        (FX-19, R-34) — the reason such an entry is in the catalogue at all rather than absent
+        from it. Judged against the geometry as it stands at the write, which is when the Director
+        is choosing; it is necessary and not sufficient, because dragging the clip apart afterwards
+        is FX-16's own case and story 11.4's, and nothing here pretends otherwise. What it does
+        buy is that a Director who picks "Wipe left" on a boundary with no Overlap is told why, at
+        the moment they pick it, instead of watching an export do nothing.
+
+        **Nothing is stored until every gate passes**, and `store.save` is the last statement — so
+        a 422 leaves the manifest untouched, exactly as the sibling route does.
+        """
+        project = get_project(project_id)
+        shot = next((item for item in project.shots if item.id == shot_id), None)
+        if not shot:
+            raise HTTPException(status_code=404, detail="Shot not found")
+        if shot.locked:
+            raise HTTPException(
+                status_code=422,
+                detail=SHOT_TRANSITION_LOCKED_REFUSAL.format(
+                    shot=shot_label(project, shot)
+                ),
+            )
+        said = {
+            side: value
+            for side, value in (
+                ("transition_out", request.transition_out),
+                ("transition_in", request.transition_in),
+            )
+            if value is not SHOT_TRANSITION_UNSAID
+        }
+        if not said:
+            raise HTTPException(
+                status_code=422,
+                detail=SHOT_TRANSITION_ABSENT_REFUSAL.format(
+                    shot=shot_label(project, shot)
+                ),
+            )
+        ordered = ordered_shots(project)
+        position = next(
+            (spot for spot, item in enumerate(ordered) if item.id == shot.id), None
+        )
+        for side, value in said.items():
+            if value is None:
+                continue
+            try:
+                entry = transition_definition(value.type)
+            except EffectRefusal as refusal:
+                raise HTTPException(status_code=422, detail=str(refusal)) from refusal
+            # The pair-only check, against the boundary this side names: `transition_out` is the
+            # seam with the Shot that follows, `transition_in` the seam with the one before.
+            neighbour = None
+            if position is not None:
+                if side == "transition_out" and position + 1 < len(ordered):
+                    neighbour = (shot, ordered[position + 1])
+                elif side == "transition_in" and position > 0:
+                    neighbour = (ordered[position - 1], shot)
+            overlapping = (
+                neighbour is not None
+                and neighbour[0].end - neighbour[1].start > BOUNDARY_TOLERANCE_SECONDS
+            )
+            if entry.pair_only and not overlapping:
+                raise HTTPException(
+                    status_code=422,
+                    detail=TRANSITION_PAIR_ONLY_REFUSAL.format(
+                        label=entry.label,
+                        shot=shot_label(project, shot),
+                        alternatives=", ".join(
+                            sorted(
+                                item.label
+                                for item in TRANSITION_CATALOGUE.values()
+                                if not item.pair_only
+                            )
+                        ),
+                    ),
+                )
+        # Written after every refusal can no longer be raised, and both sides of one blend are
+        # written together whichever end the client named (AD-30).
+        for side, value in said.items():
+            setattr(shot, side, value)
+            if position is None:
+                continue
+            if side == "transition_out" and position + 1 < len(ordered):
+                ordered[position + 1].transition_in = value
+            elif side == "transition_in" and position > 0:
+                ordered[position - 1].transition_out = value
         return store.save(project)
 
     @app.put(

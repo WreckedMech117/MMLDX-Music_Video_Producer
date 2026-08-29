@@ -59,6 +59,8 @@ from music_video_producer.effects import (
     PRE_PAD_FAMILIES,
     PRE_SCALE_FAMILIES,
     PREVIEW_FINGERPRINT_INPUTS,
+    TRANSITION_CATALOGUE,
+    TRANSITION_UNKNOWN_REFUSAL,
     ChoiceParameter,
     EffectRefusal,
     EffectStages,
@@ -76,6 +78,7 @@ from music_video_producer.effects import (
     lut_file_argument,
     lut_id_for_name,
     preview_fingerprint,
+    transition_definition,
     validate_stack,
     write_default_luts,
 )
@@ -3196,3 +3199,131 @@ def test_the_sendcmd_stage_sits_ahead_of_every_filter_it_drives():
                 f"{script.target}=" in stage or f"{script.target}@" in stage
                 for stage in (*stages.geometry, *stages.treatment)
             ), (script.target, stages)
+
+
+def test_two_legs_of_one_transition_compose_in_separate_slot_namespaces():
+    """**R-41, and the two failures it exists to prevent — one loud and one silent.**
+
+    A transition segment reads both takes in one invocation, each leg through its own full effect
+    chain, in **one** `-filter_complex`. `_branch_stage` names a branch's links `fx{slot}a` and
+    `build_effect_stages` names a bound filter's instance `b{slot}`, where `slot` is the position
+    in *that Shot's own* chain — and both legs start at slot 0.
+
+    * Two **graded** Shots would emit `[fx0a]` twice in one graph. That is at least loud.
+    * Two **bound** Shots would emit one `sendcmd` target — `eq@b0` — addressing the filters of
+      both legs. That is silent at rc 0, and it is the class `DriveScript.target`'s docstring says
+      nothing else can catch: a command aimed at a target that does not exist is accepted, ignored
+      and reported nowhere, and one aimed at *two* filters drives both.
+
+    So the namespace takes a leg prefix, and the delegated decision from 2026-08-27 is extended
+    with it: **every `sendcmd` target must appear as an `@label` in the chain produced by the same
+    call**, asserted here over a two-leg composition rather than one.
+
+    `leg=""` — every existing caller — composes character for character what it always composed,
+    which is the assertion at the end and is what keeps an unbound, ungraded Shot byte-identical
+    in argv and valid in cache (R-20).
+    """
+    envelope = {"analysis_rate": 30.0, "band_count": 2, "bands": [[0.1] * 60, [0.2] * 60]}
+    stack = [
+        {"effect": "bloom", "parameters": {"intensity": 0.4}},
+        {
+            "effect": "exposure",
+            "parameters": {"amount": 0.2},
+            "bindings": [{"parameter": "amount", "drive": "punch", "depth": 0.5}],
+        },
+    ]
+    legs = {
+        leg: build_effect_stages(
+            stack,
+            width=1920,
+            height=1080,
+            envelope=envelope,
+            shot_start=0.0,
+            clip_seconds=2.0,
+            leg=leg,
+        )
+        for leg in ("A", "B")
+    }
+
+    # The loud failure: one graph, two branches, and no label claimed twice.
+    graph = " ".join(
+        stage for stages in legs.values() for stage in (*stages.geometry, *stages.treatment)
+    )
+    assert "[fxA0a]" in graph and "[fxB0a]" in graph
+    assert "[fx0a]" not in graph, "both legs claimed one branch label"
+
+    # The silent failure: two legs, two targets, and neither reaches the other's filters.
+    targets = {
+        leg: [script.target for script in stages.scripts] for leg, stages in legs.items()
+    }
+    assert targets == {"A": ["eq@bA1"], "B": ["eq@bB1"]}
+    for leg, stages in legs.items():
+        for script in stages.scripts:
+            # The target is an `@label` in the chain composed by **this** call...
+            assert any(
+                f"{script.target}=" in stage
+                for stage in (*stages.geometry, *stages.treatment)
+            ), (script.target, stages)
+            # ...and in no stage of the other leg, which is the half a one-leg assertion cannot
+            # make and the half the silent defect lives in.
+            other = legs["B" if leg == "A" else "A"]
+            assert not any(
+                script.target in stage for stage in (*other.geometry, *other.treatment)
+            ), (script.target, other)
+
+    # And the compiled scripts are two files, not one: `_drive_script_name` carries a digest of
+    # the script's own text, and the target is written into every line of it, so two legs that
+    # address different filters cannot share a file and silently drive one leg twice.
+    assert len({script.filename for stages in legs.values() for script in stages.scripts}) == 2
+
+    # The identity that keeps every existing export byte-identical: no leg is the chain this
+    # module has always composed, character for character.
+    plain = build_effect_stages(
+        stack, width=1920, height=1080, envelope=envelope, shot_start=0.0, clip_seconds=2.0
+    )
+    assert "[fx0a]" in " ".join((*plain.geometry, *plain.treatment))
+    assert [script.target for script in plain.scripts] == ["eq@b1"]
+
+
+def test_the_transition_catalogue_is_twelve_and_names_hblur_for_what_it_is():
+    """R-34, as data rather than as prose.
+
+    Twelve is the smallest set in which *directional* means a direction the Director picks rather
+    than two of four: wipe and slide in all four, plus the four that have no direction. Every id
+    resolves to a distinct `xfade` name, so FX-18's "a named type is never quietly substituted"
+    holds at the catalogue as well as at the renderer.
+
+    **`hblur` is catalogued as "Blur wipe".** ffmpeg offers 58 `xfade` transitions and not one
+    isotropic blur; calling a horizontal-only effect "Blur" would be exactly the substitution
+    FX-18 forbids, made by the catalogue instead of by the renderer.
+
+    Wipes and slides are the pair-only entries — present in the list and refusing one-sided use
+    with their reason, rather than silently absent from a list a Director is trying to learn.
+    """
+    assert len(TRANSITION_CATALOGUE) == 12
+    assert len({entry.xfade for entry in TRANSITION_CATALOGUE.values()}) == 12
+    assert len({entry.label for entry in TRANSITION_CATALOGUE.values()}) == 12
+    assert TRANSITION_CATALOGUE["blur_wipe"].label == "Blur wipe"
+    assert TRANSITION_CATALOGUE["blur_wipe"].xfade == "hblur"
+    assert {
+        transition_id
+        for transition_id, entry in TRANSITION_CATALOGUE.items()
+        if entry.pair_only
+    } == {
+        f"{kind}_{direction}"
+        for kind in ("wipe", "slide")
+        for direction in ("left", "right", "up", "down")
+    }
+    assert {
+        transition_id
+        for transition_id, entry in TRANSITION_CATALOGUE.items()
+        if not entry.pair_only
+    } == {"dissolve", "fade_black", "fade_white", "blur_wipe"}
+
+    # An id no entry claims is refused by the catalogue's own sentence, which prints the whole
+    # vocabulary — the shape `EFFECT_UNKNOWN_REFUSAL` already uses one catalogue over.
+    with pytest.raises(EffectRefusal) as refusal:
+        transition_definition("crossfade")
+    assert str(refusal.value) == TRANSITION_UNKNOWN_REFUSAL.format(
+        transition="crossfade", known=", ".join(sorted(TRANSITION_CATALOGUE))
+    )

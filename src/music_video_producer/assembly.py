@@ -19,8 +19,9 @@ Two design facts worth stating once:
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from dataclasses import field as dataclass_field
 from pathlib import Path
 
 #: Every adapter this application ships renders 24 fps — both H3 canonical exports, the
@@ -113,6 +114,51 @@ ASSEMBLY_OFFSET_OVERRUN_REFUSAL = (
     "{offset:.3f}s of trim offset plus the {duration:.3f}s window needs {needed:.3f}s. "
     "Ease the trim nudge back, or re-render for a longer take."
 )
+#: R-37, and the one refusal in this module that refuses **something other than the export**.
+#:
+#: A Transition is a blend of exactly two pictures. Where a third clip covers any part of the
+#: Overlap the two shots make, there is no pair of legs to blend: `assembly_plan` already resolves
+#: that geometry into more than two visible ranges, and story 9.7 shipped composing them apart on
+#: purpose. Refusing the *export* over it would be **stricter than `assembly_plan` itself** and
+#: would cost a Director a render over one geometry, so the boundary stays the hard cut it is
+#: today and this sentence is recorded on `ExportLook.transitions` instead — which is the only
+#: place that can say a transition the manifest holds did not run.
+#:
+#: The wording is `timeline.SNAP_NESTED`'s argument in this module's vocabulary, and it is
+#: deliberately **not** that constant reused: `SNAP_NESTED` states that one window *sits entirely
+#: inside* another, which is one of the shapes reaching here and not the common one -- three
+#: consecutive shots each dragged over the next until the two overlaps touch is the ordinary way
+#: to reach this, and no window is nested in it. A refusal that stated a falsehood about the
+#: geometry would be worse than a second sentence. The remedy is `SNAP_NESTED`'s own, because it
+#: is the same remedy: move one of them out from under the others.
+#: The other geometry a transition has no legs for: the incoming Shot laid **wholly inside** the
+#: outgoing one. There is then no head to blend into — the Overlap swallows the later Shot's whole
+#: window — so the third entry would have negative length, which is the defect the first run of
+#: `test_a_shot_swallowed_whole_...` produced (`frames=[48, 144, -96, 96]`, a frame count below
+#: zero reaching the grid sum).
+#:
+#: **This is as close to reusing `timeline.SNAP_NESTED` as this module can get, and the distance
+#: is worth stating.** R-37 asks for that constant's wording, and `assembly.py` **may not import
+#: it**: it is one of AD-25's leaf modules and `tests/test_module_boundaries.py` enforces
+#: "the standard library and nothing else from this package" as a guard rather than a discipline.
+#: So the first sentence and the remedy are `SNAP_NESTED`'s own, character for character, and
+#: `test_the_nested_refusal_says_what_the_snapper_says` holds the two together across the boundary
+#: the import cannot cross. What is *not* borrowed is the middle: the snapper's *"there is no
+#: single point here to place"* is about placing a cut, and a Director who asked for a blend and
+#: was told about cut placement would be reading a true remedy with a false reason attached.
+TRANSITION_NESTED_REFUSAL = (
+    "{after} sits entirely inside {before} — {before} runs {start:.3f}s to {end:.3f}s and "
+    "{after}'s {inner_start:.3f}s to {inner_end:.3f}s is within it. A transition blends the tail "
+    "of one shot into the head of the next, and a clip laid wholly over another leaves neither, "
+    "so this boundary stays a hard cut. "
+    "Move one of them out from under the other."
+)
+TRANSITION_CROWDED_REFUSAL = (
+    "{before} and {after} overlap from {start:.3f}s to {end:.3f}s, but {count} clips cover part "
+    "of that stretch. A transition blends exactly two pictures, so there is no single pair here "
+    "to blend and this boundary stays a hard cut. Move the others out from under it, or shorten "
+    "the overlap so only these two share it."
+)
 ASSEMBLY_NO_AUDIO_TO_MIX_REFUSAL = (
     "{shot}'s take audio is accepted into the mix, but its take carries no audio stream. "
     "Un-accept it, or re-render the shot."
@@ -167,6 +213,77 @@ class ClipWindow:
     @property
     def end(self) -> float:
         return self.start + self.duration
+
+
+@dataclass(frozen=True, slots=True)
+class TransitionChoice:
+    """A Transition, as `assembly_plan` needs it: an id to record and an `xfade` name to run.
+
+    **Resolved by the caller, never by this module.** `effects.TRANSITION_CATALOGUE` owns which
+    transitions exist and which `xfade` each is, exactly as it owns which effects exist -- and
+    this module goes on importing nothing from it, the way `trim_args` receives two lists of
+    finished stage strings rather than a stack. The route looks the type up and hands over the
+    two strings; the grid arithmetic below cannot be reached by a catalogue at all.
+    """
+
+    transition_id: str
+    xfade: str
+
+
+@dataclass(slots=True)
+class TransitionClip:
+    """One Overlap resolved as a blend: both legs, already windowed to the Overlap, and the
+    `xfade` that joins them.
+
+    **It rides in `plan.clips`, as a union entry, and not in a sibling list** (R-39). The frame
+    grid's whole guarantee is that `sum(plan.frames)` telescopes over *one* ordered list of
+    boundaries; two lists would let the audio-overlay accumulator and the grid sum be computed
+    from sources that can disagree, and FX-NFR-1 is the one thing this epic may not get wrong. The
+    cost -- every `zip(plan.clips, plan.frames)` site has to decide what a transition entry means
+    to it -- is paid deliberately, and it is paid in the visible currency: this is a different
+    type, so a site that has not decided does not compile rather than doing the wrong thing
+    quietly. That is the whole reason it is not a flag on `ClipWindow`.
+
+    `before` is the earlier Shot's **tail** and `after` the later Shot's **head**, both already
+    `replace`d onto the Overlap's own window with their take offsets advanced by exactly the
+    seconds skipped -- the same arithmetic `assembly_plan`'s resolution loop has always used to
+    split a clip. So each leg is an ordinary `ClipWindow` that happens to be one of a pair, and
+    everything that reads a clip (its source, its offset, whether its take audio is accepted)
+    reads it unchanged.
+
+    **The frames are provably available and no over-render margin is borrowed** (AD-19, R-38).
+    `app._window_refusals` runs `assembly_refusals` over the **full Shot windows**, before any
+    overlap is resolved, so `take_cut_refusal` has already proved each take holds its whole
+    window -- and the Overlap is inside both windows by construction. Re-cutting the blend from
+    the finished intermediates is not merely costlier, it is impossible: the earlier clip is
+    truncated at the later one's start, so `before`'s frames are in no intermediate at all.
+    """
+
+    before: ClipWindow
+    after: ClipWindow
+    choice: TransitionChoice
+
+    @property
+    def start(self) -> float:
+        """The Overlap's start, which is the later Shot's own window start.
+
+        Read off `after` rather than stored, so this entry cannot come to a second opinion about
+        where it is. Both legs carry the identical window -- that is what makes them legs.
+        """
+        return self.after.start
+
+    @property
+    def duration(self) -> float:
+        return self.after.duration
+
+    @property
+    def end(self) -> float:
+        return self.after.end
+
+    @property
+    def label(self) -> str:
+        """Both shots, in the order they play, for a sentence that names the boundary."""
+        return f"{self.before.label} into {self.after.label}"
 
 
 def take_cut_refusal(
@@ -331,19 +448,170 @@ def clip_frames_on_grid(start: float, end: float) -> int:
 class AssemblyPlan:
     """What will actually run: sources, per-clip frame counts, and the normalized geometry."""
 
-    clips: list[ClipWindow]
+    #: **One ordered list, holding either kind of entry** (R-39, AD-18). A `TransitionClip` is a
+    #: union member here rather than a sibling list, because `frames` is zipped 1:1 with this and
+    #: the grid's guarantee telescopes over one sequence of boundaries. Every consumer decides
+    #: what a transition entry means to it, and the type is what makes that decision compulsory.
+    clips: list[ClipWindow | TransitionClip]
     frames: list[int]
     width: int
     height: int
     song_seconds: float
+    #: Every Transition the manifest asked for that this plan did **not** compose, one sentence
+    #: each (R-37). Empty is the ordinary answer. The plan is still complete and still assembles;
+    #: these are recorded on `ExportLook.transitions` so a boundary that quietly stayed a hard cut
+    #: is not a silence. See `TRANSITION_CROWDED_REFUSAL`.
+    transition_refusals: list[str] = dataclass_field(default_factory=list)
 
     @property
     def total_frames(self) -> int:
         return sum(self.frames)
 
 
+def _paired_transitions(
+    ordered: list[ClipWindow],
+    resolved: list[ClipWindow],
+    transitions: Mapping[str, TransitionChoice],
+) -> tuple[list[ClipWindow | TransitionClip], list[str]]:
+    """The resolved clips with each authored Overlap turned into a blend, and what was refused.
+
+    **This runs after the resolution loop, not instead of it**, and that is the whole reason the
+    grid is untouched. The loop above has already cut the earlier clip at the later one's start
+    (the Director's layers ruling, 2026-08-20), so the Overlap's seconds live entirely inside the
+    *later* clip's resolved range. Making a transition is therefore one split of one entry --
+    `[b_start, a_end]` comes out as a `TransitionClip` and `[a_end, b_end]` stays as the later
+    clip -- plus one `replace` producing the earlier Shot's tail as the first leg. Every boundary
+    is still some clip's own start or its own end (`a_end` is the earlier Shot's end, `b_start`
+    the later Shot's start), so `clip_frames_on_grid` telescopes exactly as it did and
+    `sum(frames)` is the number it was.
+
+    That is what "no new geometry" means, and what it does not: **`assembly_plan` emits two
+    entries at an Overlap today and three with a transition** (R-39's correction to AD-18's
+    reading). The third entry is a change to what this function emits; the grid is what stays.
+
+    `transitions` is keyed by the **outgoing** Shot's id, which is AD-30: `transition_out` on the
+    earlier Shot is authoritative and the later Shot's `transition_in` is a mirror. Only the
+    outgoing field is read here, so a manifest whose pair disagrees has a decidable export.
+
+    Two geometries are refused, both by returning the boundary to the hard cut it already is:
+
+    * **more than two clips over one instant** -- `TRANSITION_CROWDED_REFUSAL`, R-37. Counted over
+      the *input* windows, because that is where the third clip is visible: by the time the
+      resolution loop has run, a third clip has already eaten a piece of the Overlap and the
+      damage reads as an ordinary short clip.
+    * **the later Shot swallowed whole** -- an Overlap that reaches past the later Shot's own end
+      leaves no `[a_end, b_end]` remainder, so there is no third entry and the "transition" would
+      be the entire clip. It is the nested case `timeline.SNAP_NESTED` refuses on the timeline,
+      met here from the other side, and it is counted by the same sentence: a window nested inside
+      another is covered by more than two clips wherever the third one is.
+    """
+    if not transitions:
+        return list(resolved), []
+    entries: list[ClipWindow | TransitionClip] = list(resolved)
+    refusals: list[str] = []
+    for index, before in enumerate(ordered[:-1]):
+        choice = transitions.get(before.shot_id)
+        if choice is None:
+            continue
+        after = ordered[index + 1]
+        overlap_start, overlap_end = after.start, before.end
+        if after.end - overlap_end <= BOUNDARY_TOLERANCE_SECONDS < (
+            overlap_end - overlap_start
+        ):
+            # The incoming Shot swallowed whole. Checked **before** the no-overlap branch below
+            # and before the crowding count, because neither sees it: two clips is exactly two
+            # clips however they are nested, and the arithmetic that follows would produce a third
+            # entry running from the Overlap's end back to the incoming Shot's earlier end — a
+            # window of negative length, whose frame count reaches `sum(plan.frames)` as a
+            # negative number and breaks FX-NFR-1 in the one direction nothing else here can.
+            refusals.append(
+                TRANSITION_NESTED_REFUSAL.format(
+                    before=before.label,
+                    after=after.label,
+                    start=before.start,
+                    end=before.end,
+                    inner_start=after.start,
+                    inner_end=after.end,
+                )
+            )
+            continue
+        if overlap_end - overlap_start <= BOUNDARY_TOLERANCE_SECONDS:
+            # No Overlap, so no paired transition. A stored type on a boundary with no Overlap is
+            # a **one-sided** treatment of this clip's own frames (AD-19, FX-16) -- story 11.4 --
+            # and it is not this slice's, so nothing is composed and nothing is refused either:
+            # a sentence here would report a defect where a Director has simply not dragged yet.
+            continue
+        # Every input window that covers any of the Overlap's interior. The two legs are two of
+        # them by construction, so anything past two is the third picture R-37 is about. The
+        # tolerance is applied inwards on both ends for `tiling_refusals`' reason: a boundary
+        # written twice within half a frame is one boundary, not an overlap.
+        covering = [
+            clip
+            for clip in ordered
+            if clip.start < overlap_end - BOUNDARY_TOLERANCE_SECONDS
+            and clip.end > overlap_start + BOUNDARY_TOLERANCE_SECONDS
+        ]
+        if len(covering) != 2:
+            refusals.append(
+                TRANSITION_CROWDED_REFUSAL.format(
+                    before=before.label,
+                    after=after.label,
+                    start=overlap_start,
+                    end=overlap_end,
+                    count=len(covering),
+                )
+            )
+            continue
+        # The later Shot's resolved range that begins at the Overlap. It is the only entry the
+        # split touches, and it must still be the whole of that Shot's head -- a `position` that
+        # finds nothing means the resolution loop cut this boundary some other way, which the
+        # count above should have caught, and refusing to guess is cheaper than assuming.
+        position = next(
+            (
+                spot
+                for spot, entry in enumerate(entries)
+                if isinstance(entry, ClipWindow)
+                and entry.shot_id == after.shot_id
+                and abs(entry.start - overlap_start) <= BOUNDARY_TOLERANCE_SECONDS
+            ),
+            None,
+        )
+        if position is None:
+            continue
+        head = entries[position]
+        assert isinstance(head, ClipWindow)
+        entries[position : position + 1] = [
+            TransitionClip(
+                # The earlier Shot's tail, from its **own** window rather than from its truncated
+                # segment: the segment stops at `overlap_start`, and these are the frames beyond
+                # it. `offset` advances by exactly the seconds skipped, which is the rule the
+                # resolution loop applies to every split it makes.
+                before=replace(
+                    before,
+                    start=overlap_start,
+                    duration=overlap_end - overlap_start,
+                    offset=before.offset + (overlap_start - before.start),
+                ),
+                after=replace(
+                    head, start=overlap_start, duration=overlap_end - overlap_start
+                ),
+                choice=choice,
+            ),
+            replace(
+                head,
+                start=overlap_end,
+                duration=head.end - overlap_end,
+                offset=head.offset + (overlap_end - overlap_start),
+            ),
+        ]
+    return entries, refusals
+
+
 def assembly_plan(
-    clips: list[ClipWindow], song_seconds: float, dimensions: dict[str, tuple[int, int]]
+    clips: list[ClipWindow],
+    song_seconds: float,
+    dimensions: dict[str, tuple[int, int]],
+    transitions: Mapping[str, TransitionChoice] | None = None,
 ) -> AssemblyPlan:
     """The plan for a set of clips that passed `assembly_refusals`.
 
@@ -394,14 +662,27 @@ def assembly_plan(
                     )
                 )
     resolved.sort(key=lambda clip: clip.start)
-    ordered = resolved
-    frames = [clip_frames_on_grid(clip.start, clip.end) for clip in ordered]
+    # The Overlaps the Director authored a blend for, turned into entries. `entries` is the same
+    # boundaries as `resolved` in the same order -- one of them split in two -- so the frame sum
+    # below is computed from the same telescoping sequence either way. See `_paired_transitions`.
+    entries, transition_refusals = _paired_transitions(
+        ordered, resolved, transitions or {}
+    )
+    frames = [clip_frames_on_grid(clip.start, clip.end) for clip in entries]
+    # A transition contributes both legs' Shots, and the normalization target is still the
+    # largest-area take present: the segment is rendered at the export's grid like every other
+    # intermediate, and a leg is one of the takes this already considered.
     width, height = max(
-        (dimensions[clip.shot_id] for clip in ordered),
+        (dimensions[clip.shot_id] for clip in resolved),
         key=lambda size: size[0] * size[1],
     )
     return AssemblyPlan(
-        clips=ordered, frames=frames, width=width, height=height, song_seconds=song_seconds
+        clips=entries,
+        frames=frames,
+        width=width,
+        height=height,
+        song_seconds=song_seconds,
+        transition_refusals=transition_refusals,
     )
 
 
@@ -495,6 +776,46 @@ DEFAULT_EXPORT_PRESET = DRAFT_PRESET.name
 # ------------------------------------------------------------------------------------------
 
 
+def normalized_stages(
+    *,
+    head: Sequence[str],
+    width: int,
+    height: int,
+    geometry_stages: Sequence[str] = (),
+    treatment_stages: Sequence[str] = (),
+) -> list[str]:
+    """One clip's whole filter chain: whatever cuts it, its look, and the normalization.
+
+    **Extracted so `trim_args` and `transition_segment_args` cannot drift**, which is not a tidying
+    argument. R-38 requires the transition segment be concat-identical to every other intermediate
+    -- same geometry, same rate, same SAR, same pixel format -- because the join is `-c:v copy`
+    (FX-NFR-2) and a segment that differed in any of the four would either fail the copy or ride
+    into the stream as a second encoding of the same timeline. Two functions writing that tail
+    separately is exactly how one of them would later gain a stage the other did not.
+
+    `head` is the only thing that differs between the two callers, and the difference is real:
+    `trim_args` opens the cut with `trim=start_frame=` and closes it with `-frames:v`, which caps
+    the process's single output. A segment has **two** legs inside one `-filter_complex` and
+    `-frames:v` can only cap what comes out of the graph, so each leg has to close itself with an
+    `end_frame`. See `transition_segment_args` for the measurement that makes that mandatory
+    rather than careful.
+
+    The two insertion points are AD-17's and are unchanged: `geometry_stages` before `scale` so a
+    punch-in samples the take's own pixels, `treatment_stages` after `scale` and before `pad` so
+    grain and a vignette leave the letterbox bars at pure black.
+    """
+    return [
+        *head,
+        *geometry_stages,
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease",
+        *treatment_stages,
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2",
+        f"fps={ASSEMBLY_FPS}",
+        "setsar=1",
+        "format=yuv420p",
+    ]
+
+
 def trim_args(
     source: Path,
     dest: Path,
@@ -537,19 +858,17 @@ def trim_args(
     an effect at all.
     """
     skip = round(offset * ASSEMBLY_FPS)
-    stages = (
-        ([f"trim=start_frame={skip}", "setpts=PTS-STARTPTS"] if skip > 0 else [])
-        + list(geometry_stages)
-        + [f"scale={width}:{height}:force_original_aspect_ratio=decrease"]
-        + list(treatment_stages)
-        + [
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2",
-            f"fps={ASSEMBLY_FPS}",
-            "setsar=1",
-            "format=yuv420p",
-        ]
+    filters = ",".join(
+        normalized_stages(
+            head=[f"trim=start_frame={skip}", "setpts=PTS-STARTPTS"]
+            if skip > 0
+            else [],
+            width=width,
+            height=height,
+            geometry_stages=geometry_stages,
+            treatment_stages=treatment_stages,
+        )
     )
-    filters = ",".join(stages)
     return [
         "ffmpeg",
         "-y",
@@ -559,6 +878,133 @@ def trim_args(
         source.as_posix(),
         "-vf",
         filters,
+        "-frames:v",
+        str(frames),
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        preset.x264_preset,
+        "-crf",
+        preset.crf,
+        dest.as_posix(),
+    ]
+
+
+#: The two link labels a transition segment's legs come out on. Deliberately not `fx`-prefixed:
+#: `effects._branch_stage` owns every label beginning `fx`, and a segment carries two of its
+#: chains at once (R-41).
+TRANSITION_LEG_LABELS = ("xfa", "xfb")
+
+#: What closes a transition segment, after the `xfade`, and it is **not** optional.
+#:
+#: Measured 2026-08-28 on this machine's ffmpeg 7.0: two legs each ending `format=yuv420p`, joined
+#: by `xfade` with nothing after it, encode as **`yuv444p`, profile High 4:4:4 Predictive** -- rc
+#: 0, nothing at `-v warning`, correct frame count, correct size, correct rate. Every other
+#: intermediate is `yuv420p` / High, and the join is `-c:v copy`, so that segment goes into the
+#: export as a mid-stream chroma-format switch inside one copied track. `ffmpeg -f concat` accepts
+#: it, reports rc 0, and writes a file whose container declares the *first* stream's `yuv420p`.
+#: The `xfade`'s own output format has to be pinned back, and this is the pin.
+#:
+#: **`fps` is deliberately absent from it.** Both legs already close on `fps={ASSEMBLY_FPS}` and
+#: the measured output rate is 24/1; a rate filter placed *downstream of a framesync filter* is
+#: the exact shape `effects.BRANCH_FRAME_GUARD` exists to compensate for, and there is no reason
+#: to introduce one where nothing needs it.
+TRANSITION_SEGMENT_TAIL = ("setsar=1", "format=yuv420p")
+
+
+def transition_segment_args(
+    before: Path,
+    after: Path,
+    dest: Path,
+    frames: int,
+    width: int,
+    height: int,
+    xfade: str,
+    *,
+    before_offset: float = 0.0,
+    after_offset: float = 0.0,
+    preset: ExportPreset = DRAFT_PRESET,
+    before_geometry: Sequence[str] = (),
+    before_treatment: Sequence[str] = (),
+    after_geometry: Sequence[str] = (),
+    after_treatment: Sequence[str] = (),
+) -> list[str]:
+    """Two takes -> one blended intermediate: the Overlap's frames, from both Shots, in one run.
+
+    AD-18's segment and R-38's shape. Each leg is read from its **own** take, put through its
+    **own** full effect chain (R-41), normalized by the same `normalized_stages` every other
+    intermediate is built from, and the two are joined by one `xfade`. The result is
+    concat-identical to a `trim_args` output, so the join keeps `-c:v copy` and the export gains
+    no second generation of loss (FX-NFR-2).
+
+    **Both legs close themselves with `end_frame`, and that is the whole safety of this function.**
+
+    Measured 2026-08-28 on ffmpeg 7.0, and reproduced independently before the slice was written:
+    `xfade` with legs of **unequal length silently truncates to the shorter one**. Thirteen-frame
+    and twelve-frame legs give **twelve frames out, rc 0, nothing at `-v warning`** -- and
+    `-frames:v 13` does **not** catch it, because a frame cap caps from above only. There is no
+    `T` flag on any `xfade` option, so R-29's crash class does not reach here; the silent-short
+    class does, and it lands on the one rule this project may never break.
+
+    Three things follow, and all three are in the argv below rather than in a comment:
+
+    * each leg carries `trim=start_frame=S:end_frame=S+frames`, so the two legs are the same
+      length by construction rather than by the sources happening to agree;
+    * `-frames:v frames` stays, as the cap from above it has always been;
+    * and **the caller asserts the rendered frame count**, because neither of the two above can
+      see a leg that came up short. `tests/test_assembly_route.py` renders a segment and counts
+      its frames against `clip_frames_on_grid`; a pinned argv is necessary here and is not
+      sufficient.
+
+    A leg whose effect chain branches loses a frame at its own `fps` stage and gets
+    `effects.BRANCH_FRAME_GUARD` from `build_effect_stages` exactly as an ordinary clip does --
+    **and an `xfade` graph is two branched legs.** Measured the same day with the guard suppressed
+    on both legs: thirteen frames asked for, **twelve** written, rc 0.
+
+    `duration` is the segment's own length on the assembly grid -- `frames / ASSEMBLY_FPS`, six
+    decimals, the formatter every generated render input in this project already uses -- and
+    `offset=0`, because the blend *is* the whole segment (AD-19: a paired transition's duration is
+    the Overlap's duration, and there is no second source for that number).
+    """
+    lead, follow = TRANSITION_LEG_LABELS
+    skips = (round(before_offset * ASSEMBLY_FPS), round(after_offset * ASSEMBLY_FPS))
+    legs = [
+        ",".join(
+            normalized_stages(
+                head=[
+                    f"trim=start_frame={skip}:end_frame={skip + frames}",
+                    "setpts=PTS-STARTPTS",
+                ],
+                width=width,
+                height=height,
+                geometry_stages=geometry,
+                treatment_stages=treatment,
+            )
+        )
+        for skip, geometry, treatment in (
+            (skips[0], before_geometry, before_treatment),
+            (skips[1], after_geometry, after_treatment),
+        )
+    ]
+    graph = (
+        f"[0:v]{legs[0]}[{lead}];"
+        f"[1:v]{legs[1]}[{follow}];"
+        f"[{lead}][{follow}]xfade=transition={xfade}"
+        f":duration={frames / ASSEMBLY_FPS:.6f}:offset=0,"
+        + ",".join(TRANSITION_SEGMENT_TAIL)
+    )
+    return [
+        "ffmpeg",
+        "-y",
+        "-v",
+        "error",
+        "-i",
+        before.as_posix(),
+        "-i",
+        after.as_posix(),
+        "-filter_complex",
+        graph,
         "-frames:v",
         str(frames),
         "-an",

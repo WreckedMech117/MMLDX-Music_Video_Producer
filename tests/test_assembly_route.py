@@ -44,7 +44,15 @@ from music_video_producer.assembly import (
 from music_video_producer.batch import render_timing_summary
 from music_video_producer.comfy import ComfyError
 from music_video_producer.config import Settings
-from music_video_producer.models import EffectSpec, Project, RenderJob, Shot, shot_label
+from music_video_producer.effects import BRANCH_FRAME_GUARD
+from music_video_producer.models import (
+    EffectSpec,
+    Project,
+    RenderJob,
+    Shot,
+    TransitionSpec,
+    shot_label,
+)
 from music_video_producer.store import ProjectStore
 
 
@@ -2927,3 +2935,544 @@ def test_a_sidecar_element_that_is_not_a_number_refuses_the_export_by_name(tmp_p
         assert refused.json()["detail"].endswith(refusal), (repr(poison), refused.text)
         # Nothing half-started: the refusal happens before the job record is written.
         assert store.get(project_id).jobs == [], repr(poison)
+
+
+# ------------------------------------------------------------------------------------------
+# Transitions, through real ffmpeg (story 11.1). **This is the half a pinned argv cannot do.**
+#
+# The failure this slice is built around is a *short render at rc 0*: `xfade` with legs of
+# unequal length silently truncates to the shorter one, and `-frames:v` caps from above only. No
+# argv assertion can see it, and neither can an exit code. So the frame count is counted on the
+# written file, against `clip_frames_on_grid` — which is exactly what
+# `effects.BRANCH_FRAME_GUARD`'s own docstring says has to be done for a branched graph, and an
+# `xfade` graph is two branched legs.
+# ------------------------------------------------------------------------------------------
+
+
+def rendered_frames(path: Path) -> int:
+    """The frames the file actually holds, counted rather than read off a header.
+
+    `nb_read_frames` decodes; `nb_frames` is a container field a muxer may write from an
+    intention. The whole point here is to disbelieve the intention.
+    """
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+            "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", path.as_posix(),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return int(result.stdout.strip())
+
+
+def kept_intermediates(monkeypatch, keep_root: Path) -> list[Path]:
+    """Every intermediate the export wrote, copied out before the route deletes its workdir.
+
+    The route builds its clips inside `exports/.work-<job id>/` and `shutil.rmtree`s it in a
+    `finally`, so an intermediate cannot be looked for after the request. `run_tool` is a closure
+    inside `create_app` and is not patchable by name, so the interception is at the deletion:
+    the tree is copied, then removed exactly as it would have been.
+
+    Returns the list the copies land in — `clip_000.mp4`, `clip_001.mp4`, … in plan order, which
+    is the order `plan.clips` is in, so the transition segment is at its own plan index.
+    """
+    import shutil as shutil_module
+
+    copies: list[Path] = []
+    real_rmtree = shutil_module.rmtree
+
+    def keep(path, *args, **kwargs):
+        source = Path(path)
+        if source.is_dir():
+            for item in sorted(source.glob("clip_*.mp4")):
+                copy = keep_root / f"kept-{item.name}"
+                copy.write_bytes(item.read_bytes())
+                copies.append(copy)
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil_module, "rmtree", keep)
+    return copies
+
+
+def set_transition(client, project_id: str, shot_id: str, type_: str | None):
+    return client.put(
+        f"/api/projects/{project_id}/shots/{shot_id}/transitions",
+        json={"transition_out": None if type_ is None else {"type": type_}},
+    )
+
+
+def overlap_the_two_shots(client, store, tmp_path: Path, project_id: str, overlap: float = 0.5):
+    """Drag the second Shot back over the first by `overlap` seconds, and re-approve both.
+
+    Re-approved because AD-13's snapshot is what `assembly_refusals` compares the live window
+    against, and moving a window after approval is a refusal by design. The plan still tiles the
+    8 s song: the first Shot keeps its window and the second grows by the overlap.
+
+    **The second take is re-synthesized longer, and that is not fixture housekeeping.** Widening
+    a window past what its take holds is refused by name — `ASSEMBLY_OFFSET_OVERRUN_REFUSAL`,
+    which is what the first run of these tests got — and a Director who drags a clip across its
+    neighbour genuinely does widen its window. The take grows with it by the same margin the
+    fixture's takes already carry (0.458 s of over-render), so this stays a fixture describing a
+    plan that could exist rather than one whose only fault has been hidden.
+    """
+    shots_dir = (
+        tmp_path / "comfy" / "output" / "music-video-producer" / project_id / "shots"
+    )
+    synthesize_take(
+        shots_dir / "shot_b-h3_00001-audio.mp4",
+        4.458 + overlap,
+        size="192x108",
+        colour="blue",
+    )
+    project = store.get(project_id)
+    shots = [shot.model_dump(mode="json") for shot in project.shots]
+    shots[1]["start"] = round(4.0 - overlap, 6)
+    shots[1]["duration"] = round(4.0 + overlap, 6)
+    saved = client.put(f"/api/projects/{project_id}/shots", json={"shots": shots})
+    assert saved.status_code == 200, saved.text
+    for shot_id in ("shot_a", "shot_b"):
+        client.post(f"/api/projects/{project_id}/shots/{shot_id}/unapprove")
+        approved = client.post(f"/api/projects/{project_id}/shots/{shot_id}/approve")
+        assert approved.status_code == 200, approved.text
+
+
+def test_the_rendered_transition_segment_holds_exactly_the_overlaps_frames(
+    tmp_path: Path, monkeypatch
+):
+    """**The acceptance this slice exists for, and the only form of it that is worth anything.**
+
+    Given two Shots whose windows overlap and a transition set on the pair, the middle entry of
+    the plan is `clip_frames_on_grid(overlap_start, overlap_end)` frames — and the *written file*
+    holds that many. The second claim is not implied by the first: `xfade` with legs of unequal
+    length silently truncates to the shorter one at rc 0, and `-frames:v` caps from above only, so
+    both the argv and the exit code agree with a segment that is a frame short.
+
+    And the segment is a blend rather than either leg: its frames differ, frame by frame, from a
+    control render of the outgoing leg alone and from one of the incoming leg alone. A segment
+    that had silently rendered one input would have the right count and the wrong picture.
+
+    The segment is also concat-identical to an ordinary intermediate — same codec, profile, pixel
+    format, geometry, rate and SAR — which is what keeps the join at `-c:v copy` (FX-NFR-2).
+    **Measured, because it is not free:** with no `format` pinned after the `xfade`, this file
+    comes out `yuv444p` / High 4:4:4 Predictive while every other intermediate is `yuv420p` /
+    High, at rc 0 and with the right frame count, and `ffmpeg -f concat -c copy` accepts the
+    mismatch and writes a container declaring the first stream's format.
+    """
+    import music_video_producer.app as app_module
+    from music_video_producer.assembly import (
+        clip_frames_on_grid,
+        transition_segment_args,
+        trim_args,
+    )
+
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    overlap_the_two_shots(client, store, tmp_path, project_id, overlap=0.5)
+    assert set_transition(client, project_id, "shot_a", "dissolve").status_code == 200
+
+    segments: list[list[str]] = []
+    trims: list[list[str]] = []
+    real_segment = app_module.transition_segment_args
+    real_trim = app_module.trim_args
+
+    def record_segment(*args, **kwargs):
+        segments.append(real_segment(*args, **kwargs))
+        return segments[-1]
+
+    def record_trim(*args, **kwargs):
+        trims.append(real_trim(*args, **kwargs))
+        return trims[-1]
+
+    monkeypatch.setattr(app_module, "transition_segment_args", record_segment)
+    monkeypatch.setattr(app_module, "trim_args", record_trim)
+    survivors = kept_intermediates(monkeypatch, tmp_path)
+
+    response = client.post(f"/api/projects/{project_id}/assemble")
+    assert response.status_code == 200, response.text
+
+    # Three entries across the boundary, and the middle one is the Overlap's frames on the grid.
+    assert response.json()["clip_count"] == 3
+    expected = clip_frames_on_grid(3.5, 4.0)
+    assert expected == 12
+    assert len(segments) == 1 and len(survivors) == 3
+    # Plan order, so the blend is the middle entry: A truncated, the segment, B from the
+    # Overlap's end. That is AD-18's three, on disk.
+    segment = survivors[1]
+
+    # **The rendered count.** Not the argv's cap, not the plan's arithmetic: the frames the file
+    # decodes to.
+    assert rendered_frames(segment) == expected
+
+    # Concat-identical to every other intermediate, which is what `-c:v copy` needs. Compared
+    # against an ordinary `trim_args` output built from the same take at the same geometry, so
+    # this is the real neighbour's shape rather than a list of values written down here.
+    shape = "stream=codec_name,profile,pix_fmt,width,height,r_frame_rate,sample_aspect_ratio"
+    neighbour = tmp_path / "neighbour.mp4"
+    subprocess.run(
+        trim_args(
+            Path(trims[1][trims[1].index("-i") + 1]), neighbour, expected, 192, 108
+        ),
+        check=True,
+        capture_output=True,
+    )
+    assert probe(segment, shape) == probe(neighbour, shape)
+    assert "yuv420p" in probe(segment, shape)
+
+    # And it is a blend: neither leg alone, frame for frame.
+    legs = []
+    for source, offset in (
+        (Path(trims[0][trims[0].index("-i") + 1]), 3.5),
+        (Path(trims[1][trims[1].index("-i") + 1]), 0.0),
+    ):
+        control = tmp_path / f"control-{len(legs)}.mp4"
+        subprocess.run(
+            transition_segment_args(
+                source, source, control, expected, 192, 108, "fade",
+                before_offset=offset, after_offset=offset,
+            ),
+            check=True,
+            capture_output=True,
+        )
+        legs.append(frame_checksums(control))
+    blend = frame_checksums(segment)
+    assert len(blend) == expected
+    for index, control in enumerate(legs):
+        assert blend != control, f"the segment rendered leg {index} rather than a blend"
+    assert comfy.prompts == []
+
+
+def test_a_transition_between_two_branched_looks_still_renders_every_frame(
+    tmp_path: Path, monkeypatch
+):
+    """**An `xfade` graph is two branched legs**, and a branched chain loses a frame at rc 0.
+
+    `effects.BRANCH_FRAME_GUARD` exists for exactly that — `tpad=stop=1:stop_mode=clone` at the
+    head of a chain whose `fps` stage would otherwise emit one fewer than it received — and
+    `build_effect_stages` prepends it per chain. Composing each leg through that builder is what
+    makes the guard ride along on both.
+
+    Measured 2026-08-28 with the guard suppressed on both legs of this very shape: thirteen frames
+    asked for, **twelve written**, rc 0, nothing at `-v warning`, and `-frames:v` blind to it. So
+    this is the count on the file and not the count in the argv.
+
+    It also exercises R-41's leg namespace end to end: both Shots carry a branching effect, both
+    legs start at chain slot 0, and two branches named alike in one `-filter_complex` is an ffmpeg
+    error. A 200 here is the label prefix working.
+    """
+    import music_video_producer.app as app_module
+    from music_video_producer.assembly import clip_frames_on_grid
+
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    overlap_the_two_shots(client, store, tmp_path, project_id, overlap=0.5)
+    for shot_id in ("shot_a", "shot_b"):
+        write_stack(
+            client, project_id, shot_id,
+            [{"effect": "bloom", "enabled": True, "parameters": {"intensity": 0.5}}],
+        )
+    assert set_transition(client, project_id, "shot_a", "dissolve").status_code == 200
+
+    graphs: list[str] = []
+    real_segment = app_module.transition_segment_args
+
+    def record_segment(*args, **kwargs):
+        built = real_segment(*args, **kwargs)
+        graphs.append(built[built.index("-filter_complex") + 1])
+        return built
+
+    monkeypatch.setattr(app_module, "transition_segment_args", record_segment)
+    survivors = kept_intermediates(monkeypatch, tmp_path)
+
+    response = client.post(f"/api/projects/{project_id}/assemble")
+    assert response.status_code == 200, response.text
+    assert len(graphs) == 1
+
+    # R-41: each leg's branch labels carry its own leg, so one graph holds two namespaces.
+    assert "[fxA0a]" in graphs[0] and "[fxB0a]" in graphs[0]
+    assert "[fx0a]" not in graphs[0], "both legs would claim one label"
+    # And the guard is on both legs, which is what the count below depends on.
+    assert graphs[0].count(BRANCH_FRAME_GUARD) == 2
+
+    assert rendered_frames(survivors[1]) == clip_frames_on_grid(3.5, 4.0)
+    assert comfy.prompts == []
+
+
+def test_the_export_with_a_transition_matches_the_song_and_records_what_it_blended(
+    tmp_path: Path
+):
+    """FX-NFR-1 on the written file, and FX-25's third slot filled by the epic that reserved it.
+
+    The whole export, verified the way `verification_problems` verifies it: duration within one
+    frame of the song. Three entries, one of them a blend, and the frame total is the song's — the
+    third entry costs the plan nothing, which is the structural rather than arithmetic argument
+    AD-19 makes.
+
+    `ExportLook.transitions` was declared empty before this epic and `test_stated_constraints.py`
+    predicted the day it stopped being: *"the day Epic 11 fills it, this comment goes false with
+    nothing to say so."* It reads like its two siblings — one `"<shot_id>=<value>"` line — and the
+    shot id is the **outgoing** Shot's, because AD-30 makes `transition_out` authoritative.
+    """
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    overlap_the_two_shots(client, store, tmp_path, project_id, overlap=0.5)
+    assert set_transition(client, project_id, "shot_a", "blur_wipe").status_code == 200
+
+    response = client.post(f"/api/projects/{project_id}/assemble")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    export = tmp_path / "projects" / project_id / "media" / body["export"]
+
+    assert body["clip_count"] == 3
+    assert body["total_frames"] == 192
+    assert abs(float(probe(export, "format=duration")) - 8.0) <= 1 / 24
+    assert probe(export, "stream=codec_type").splitlines() == ["video", "audio"]
+    assert body["job"]["look"]["transitions"] == ["shot_a=blur_wipe"]
+    # Both takes went into the segment, so both are named among the inputs it consumed.
+    assert body["job"]["inputs"].count(
+        f"shot_a=music-video-producer/{project_id}/shots/shot_a-h3_00001-audio.mp4"
+    ) == 2
+    assert comfy.prompts == []
+
+
+def test_a_shot_with_no_transition_exports_exactly_what_it_exported_before(
+    tmp_path: Path, monkeypatch
+):
+    """Constraint 5, asserted on the argv and the composed chain and **never on the mp4**.
+
+    R-20: multi-threaded libx264 is not bit-exact on high-entropy input, so a determinism claim
+    belongs on the filter graph and the command line rather than on the encoded file. What is
+    claimed here is that a project with no transition anywhere runs the same two `trim_args` it
+    always ran, builds no segment, joins with the same `concat_args`, and records an empty
+    `transitions` slot — the state every export in this application's history was in.
+    """
+    import music_video_producer.app as app_module
+    from music_video_producer.assembly import concat_args, trim_args
+
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    assert all(shot.transition_out is None for shot in store.get(project_id).shots)
+
+    segments: list[list[str]] = []
+    joins: list[tuple] = []
+    real_segment = app_module.transition_segment_args
+    real_concat = app_module.concat_args
+
+    def record_segment(*args, **kwargs):
+        segments.append(real_segment(*args, **kwargs))
+        return segments[-1]
+
+    def record_concat(list_file, song, dest, overlays=None, **kwargs):
+        joins.append((list_file, song, dest, list(overlays or []), kwargs))
+        return real_concat(list_file, song, dest, overlays, **kwargs)
+
+    monkeypatch.setattr(app_module, "transition_segment_args", record_segment)
+    monkeypatch.setattr(app_module, "concat_args", record_concat)
+    commands, response = recorded_trims(client, monkeypatch, project_id)
+
+    assert response.status_code == 200, response.text
+    assert segments == [], "a project with no transition must build no segment"
+    assert len(commands) == 2
+    for command in commands:
+        source = Path(command[command.index("-i") + 1])
+        assert command == trim_args(source, Path(command[-1]), 96, 192, 108)
+    # The join is the song-only argv this route has always built: no overlays, default preset,
+    # and the argv rebuilt from the very arguments the route passed rather than from a
+    # reconstruction of them.
+    assert len(joins) == 1
+    list_file, song, dest, overlays, extra = joins[0]
+    assert overlays == []
+    assert concat_args(list_file, song, dest, overlays, **extra) == concat_args(
+        list_file, song, dest
+    )
+    assert response.json()["job"]["look"]["transitions"] == []
+    assert comfy.prompts == []
+
+
+def test_accepted_take_audio_under_a_transition_is_the_mix_it_always_was(
+    tmp_path: Path, monkeypatch
+):
+    """**Constraint 6, stated and executed: the mix does not move.**
+
+    `AudioOverlay` stops the outgoing take's audio at the incoming Shot's start, because
+    `assembly_plan` truncates the outgoing clip there. The Overlap's seconds are seconds the
+    incoming Shot has already begun, so they were its audio before this epic and they stay its
+    audio now: **a transition entry contributes the incoming leg's overlay and only it.**
+
+    Had it contributed none, the incoming Shot's accepted audio would have lost exactly the head
+    of itself the day a Director set a dissolve — silently, at 200, in a mix nobody was watching.
+
+    What changes is the shape and not the content, and this is the assertion that says which:
+    the same source, the same take seconds, at the same timeline positions, in two contiguous
+    pieces instead of one. The outgoing Shot's audio does **not** come in under the blend, which
+    is the same rule read consistently — it stopped at the incoming Shot's start before, and this
+    epic moved no clip's start.
+    """
+    import music_video_producer.app as app_module
+    from music_video_producer.assembly import ASSEMBLY_FPS
+
+    def overlays_for(root: Path, transition: str | None):
+        client, store, _comfy, _app = make_client(root)
+        project_id, shots_dir = project_with_two_approved_takes(client, store, root)
+        overlap_the_two_shots(client, store, root, project_id, overlap=0.5)
+        # An acceptance needs something to accept: `ASSEMBLY_NO_AUDIO_TO_MIX_REFUSAL` refuses a
+        # take with no audio stream, and the fixture's colour sources carry none.
+        synthesize_toned_take(shots_dir / "shot_a-h3_00001-audio.mp4", 4.458)
+        synthesize_toned_take(
+            shots_dir / "shot_b-h3_00001-audio.mp4", 4.958, size="192x108"
+        )
+        project = store.get(project_id)
+        for shot in project.shots:
+            shot.mix_take_audio = True
+        store.save(project)
+        for shot_id in ("shot_a", "shot_b"):
+            client.post(f"/api/projects/{project_id}/shots/{shot_id}/unapprove")
+            client.post(f"/api/projects/{project_id}/shots/{shot_id}/approve")
+        if transition:
+            assert set_transition(client, project_id, "shot_a", transition).status_code == 200
+        seen: list[list] = []
+        real_concat = app_module.concat_args
+
+        def record(list_file, song, dest, overlays=None, **kwargs):
+            seen.append(list(overlays or []))
+            return real_concat(list_file, song, dest, overlays, **kwargs)
+
+        monkeypatch.setattr(app_module, "concat_args", record)
+        response = client.post(f"/api/projects/{project_id}/assemble")
+        assert response.status_code == 200, response.text
+        monkeypatch.undo()
+        return seen[0]
+
+    def covered(overlays):
+        """Which source seconds land at which timeline seconds, as one flat span list."""
+        return [
+            (
+                Path(overlay.source).name,
+                round(overlay.offset_seconds, 6),
+                round(overlay.offset_seconds + overlay.window_seconds, 6),
+                round(overlay.delay_seconds, 6),
+            )
+            for overlay in overlays
+        ]
+
+    without = overlays_for(tmp_path / "plain", None)
+    with_blend = overlays_for(tmp_path / "blended", "dissolve")
+
+    # Two clips become three, so the second Shot's one overlay becomes two.
+    assert len(without) == 2 and len(with_blend) == 3
+
+    # The outgoing Shot's contribution is untouched — same file, same take seconds, same delay.
+    assert covered(without)[0] == covered(with_blend)[0]
+
+    # And the incoming Shot's is the same span in two pieces: the second piece starts where the
+    # first ends, on the timeline and in the take, and the pair covers what the single one did.
+    first, second = with_blend[1], with_blend[2]
+    whole = without[1]
+    assert Path(first.source).name == Path(second.source).name == Path(whole.source).name
+    assert first.offset_seconds == whole.offset_seconds
+    assert first.delay_seconds == whole.delay_seconds
+    assert round(first.delay_seconds + first.window_seconds, 9) == round(
+        second.delay_seconds, 9
+    )
+    assert round(first.window_seconds + second.window_seconds, 9) == round(
+        whole.window_seconds, 9
+    )
+    # The take offset of the second piece is where the first stopped, to within the half frame
+    # `assembly_plan`'s own `replace(clip, offset=...)` has produced for every nested overlay
+    # since the layers ruling — real seconds against grid seconds, and the established convention.
+    assert abs(
+        (first.offset_seconds + first.window_seconds) - second.offset_seconds
+    ) <= 1 / (2 * ASSEMBLY_FPS)
+
+
+def test_more_than_two_clips_over_one_instant_still_exports_and_says_what_it_refused(
+    tmp_path: Path
+):
+    """R-37 at the route: the **transition** is refused, never the export.
+
+    A third Shot dragged across the Overlap makes three clips cover one instant. There is no pair
+    of legs to blend, so the boundary stays the hard cut it already is — and the export runs,
+    because refusing it would be stricter than `assembly_plan` itself and would cost a Director a
+    render over one geometry.
+
+    The sentence is not lost. `ExportLook.transitions` carries it whole, prefixed `refused:`,
+    which is the only place saying a transition the manifest holds did not run: a record listing
+    only the successes would make a refused transition indistinguishable from one nobody set.
+    """
+    from music_video_producer.assembly import TRANSITION_CROWDED_REFUSAL
+
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    # Three shots tiling the song, the middle one overlapping both of its neighbours.
+    synthesize_take(shots_dir / "shot_c-h3_00001-audio.mp4", 5.208, colour="green")
+    prefix = f"music-video-producer/{project_id}/shots"
+    shots = [
+        {"id": "shot_a", "start": 0.0, "duration": 3.5, "status": "complete",
+         "latest_output": f"{prefix}/shot_a-h3_00001-audio.mp4"},
+        {"id": "shot_b", "start": 3.0, "duration": 1.0, "status": "complete",
+         "latest_output": f"{prefix}/shot_b-h3_00001-audio.mp4"},
+        {"id": "shot_c", "start": 3.25, "duration": 4.75, "status": "complete",
+         "latest_output": f"{prefix}/shot_c-h3_00001-audio.mp4"},
+    ]
+    # Un-approved first: `_require_approval_unchanged` refuses a whole-shot write that moves an
+    # approved Shot, which is the guard doing its job rather than a fixture inconvenience.
+    for shot_id in ("shot_a", "shot_b"):
+        client.post(f"/api/projects/{project_id}/shots/{shot_id}/unapprove")
+    assert client.put(
+        f"/api/projects/{project_id}/shots", json={"shots": shots}
+    ).status_code == 200
+    for shot_id in ("shot_a", "shot_b", "shot_c"):
+        assert client.post(
+            f"/api/projects/{project_id}/shots/{shot_id}/approve"
+        ).status_code == 200
+    assert set_transition(client, project_id, "shot_a", "dissolve").status_code == 200
+
+    response = client.post(f"/api/projects/{project_id}/assemble")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    recorded = body["job"]["look"]["transitions"]
+    assert len(recorded) == 1 and recorded[0].startswith("refused: ")
+    assert recorded[0].removeprefix("refused: ") == TRANSITION_CROWDED_REFUSAL.format(
+        before=shot_label(store.get(project_id), store.get(project_id).shots[0]),
+        after=shot_label(store.get(project_id), store.get(project_id).shots[1]),
+        start=3.0,
+        end=3.5,
+        count=3,
+    )
+    export = tmp_path / "projects" / project_id / "media" / body["export"]
+    assert abs(float(probe(export, "format=duration")) - 8.0) <= 1 / 24
+    assert comfy.prompts == []
+
+
+def test_a_stored_transition_the_catalogue_does_not_know_refuses_the_export_by_name(
+    tmp_path: Path
+):
+    """AD-21 applied to the other catalogue: nothing stored says a transition is valid.
+
+    The route validated at the time; a manifest is hand-editable and the catalogue is not stored
+    beside it, so the export asks again. **This one does refuse the export**, unlike R-37's
+    geometry refusal, and the difference is that there is no picture to render from an unknown
+    type at all — `transition_definition` is the only thing that turns a type into an `xfade`
+    name. That is `_effect_stack_refusals`' rule, one catalogue over.
+    """
+    from music_video_producer.app import ASSEMBLY_TRANSITION_REFUSAL
+    from music_video_producer.effects import TRANSITION_CATALOGUE, TRANSITION_UNKNOWN_REFUSAL
+
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    overlap_the_two_shots(client, store, tmp_path, project_id, overlap=0.5)
+    project = store.get(project_id)
+    project.shots[0].transition_out = TransitionSpec(type="crossfade")
+    store.save(project)
+
+    response = client.post(f"/api/projects/{project_id}/assemble")
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"] == ASSEMBLY_TRANSITION_REFUSAL.format(
+        shot=shot_label(project, project.shots[0]),
+        detail=TRANSITION_UNKNOWN_REFUSAL.format(
+            transition="crossfade", known=", ".join(sorted(TRANSITION_CATALOGUE))
+        ),
+    )
+    assert store.get(project_id).jobs == []
+    assert comfy.prompts == []

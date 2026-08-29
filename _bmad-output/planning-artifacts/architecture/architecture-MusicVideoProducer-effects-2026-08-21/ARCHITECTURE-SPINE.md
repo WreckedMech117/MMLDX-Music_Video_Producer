@@ -98,7 +98,9 @@ Binding, read-only. Not re-derived here.
 - **Prevents:** a whole-manifest save silently clearing every Effect Stack in the project
 - **Rule:** `Shot` gains `effects: list[EffectSpec]`, `transition_in: TransitionSpec | None`, `transition_out: TransitionSpec | None`, all defaulted so every existing manifest loads unchanged. They are written **only** by dedicated routes under `/api/projects/{id}/shots/{shot_id}/effects` and `.../transitions`. `replace_project` (the generic `PUT /api/projects/{project_id}`) **adopts them from the stored Shot**, via the established `_adopt_*` idiom already used for the Song's recovery slots and vocal type — a body that omits them, or invents them, does not change them. A test asserts a full-project PUT that omits `effects` leaves every stack intact.
 
-> That route's own comments record this hole being found ~~**six times**~~ ~~**thirteen times**~~ **fourteen times**. This AD exists so it is not found a fifteenth.
+> That route's own comments record this hole being found ~~**six times**~~ ~~**thirteen times**~~ ~~**fourteen times**~~ **fifteen times**. This AD exists so it is not found a ~~fifteenth~~ **sixteenth**.
+>
+> **Amended 2026-08-28 by story 11.1, the commit that made it fifteen.** `Shot.transition_in` and `Shot.transition_out` are the fifteenth instance, guarded by `app._adopt_shot_transitions` on both generic writes *in the same commit as the fields*, which is what this Rule asks for — so the number moved because the pattern recurred, not because a hole shipped. The count is amended here rather than left for a retrospective because this spine's own AD-25 amendment records the single failure this feature repeated most: **a commit that changes what a document describes must correct that document in the same commit.** `docs/BUILD-HANDOFF.md` §4 still reads fourteen and is the same correction.
 >
 > **Amended 2026-08-27.** The figure was six when this spine was written and is fourteen by the route's own count today, read out of `src/music_video_producer/routes/project.py`. **The Effect Stack this AD is about became the thirteenth**, guarded by `_adopt_shot_effects` in the same commit as the field exactly as the Rule requires; the record of what an export looked like became the fourteenth. **Re-counted 2026-08-27 and it is fourteen, not thirteen:** the envelope-pointer guard (`_adopt_song_analysis`, 2026-08-24) had been numbered *seventh*, a number `character_slot` already held since 2026-08-21, so one instance was invisible in the route's own ledger. Dated from `git log -S` on each comment, it falls twelfth; the Effect Stack is the thirteenth and the export-look record the fourteenth. A count that is stale by half reads as a rule that has stopped happening, which is the opposite of what it is for. Note also that the ordinals *inside* that route are instance numbers rather than a running total — `routes/song.py`'s "sixth time" is `Song.vocal_type`, instance six, and is correct unchanged.
 
@@ -148,6 +150,17 @@ Binding, read-only. Not re-derived here.
 - **Prevents:** an `xfade` chain re-encoding the whole timeline and adding a generation of loss to effect-free clips
 - **Rule:** For an Overlap between clips A and B, `assembly_plan` emits **three** entries — A truncated to the Overlap's start, a transition segment, B from the Overlap's end — and the concat list joins them with `-c:v copy` unchanged. The transition segment is rendered by its own pinned argv from A's and B's overlapping frames through `xfade`, at the same normalized geometry, rate, SAR and pixel format as every other intermediate, which is what makes `xfade`'s equal-input precondition hold by construction. **The transition segment's frame count is exactly the Overlap's frames on the existing cumulative grid** — `clip_frames_on_grid` is not modified and the telescoping is unchanged.
 
+> **Amended 2026-08-29 — a third refusable geometry, unstated here, caught by a test rather than
+> by review.** An incoming Shot nested **wholly inside** the outgoing one is caught by neither a
+> crowding count (it is exactly two clips) nor a no-overlap check. The first implementation of the
+> three-entry split produced `frames = [48, 144, -96, 96]` — a plan that **added up to the song by
+> cancelling a window against itself**, which is the one way the frame rule can be satisfied and
+> wrong at once. `all(count > 0 for count in plan.frames)` is asserted at the split now.
+>
+> A related boundary, also measured: below `BOUNDARY_TOLERANCE_SECONDS` (half a frame) an "overlap"
+> is the same boundary written twice rather than an overlap — `_seam_overlaps` and `tiling_refusals`
+> already agree on that, and a transition sweep must start above it.
+
 ### AD-19 — The Overlap is the only transition geometry
 
 - **Binds:** FX-16, FX-17, FX-18, FX-NFR-1
@@ -191,7 +204,7 @@ Binding, read-only. Not re-derived here.
 
 - **Binds:** all of FX-1..FX-25
 - **Prevents:** effect and analysis logic accreting into `app.py` where it cannot be tested by comparison
-- **Rule:** `audio.py` — envelope extraction; its only I/O is an ffmpeg decode to `s16le` on **stdout** (this sentence said stdin and was wrong); **amended 2026-08-24 by Director ruling R-8** — `numpy` is a declared dependency. The evidence that made it acceptable: `git show cab8038 -- uv.lock` adds no new `[[package]]` block, because numpy was already locked transitively through `faster-whisper`. Nothing new installs; a declaration made an existing fact honest. FX-NFR-4's literal reading no longer holds. `effects.py` — filter-stage construction, `sendcmd` generation, and transition-segment argv. Both follow the standing naming convention (one lowercase noun) and neither imports `app.py`, `batch.py`, or `assembly.py`. Routes stay thin delegators.
+- **Rule:** `audio.py` — envelope extraction; its only I/O is an ffmpeg decode to `s16le` on **stdout** (this sentence said stdin and was wrong); **amended 2026-08-24 by Director ruling R-8** — `numpy` is a declared dependency. The evidence that made it acceptable: `git show cab8038 -- uv.lock` adds no new `[[package]]` block, because numpy was already locked transitively through `faster-whisper`. Nothing new installs; a declaration made an existing fact honest. FX-NFR-4's literal reading no longer holds. `effects.py` — filter-stage construction, `sendcmd` generation, and ~~transition-segment argv~~ *(corrected 2026-08-29: the transition argv is in `assembly.py`; see the table below. This is the plain sentence beside an amendment that the amendment itself warned would be read as as-built.)*. Both follow the standing naming convention (one lowercase noun) and neither imports `app.py`, `batch.py`, or `assembly.py`. Routes stay thin delegators.
 
 > **Amended 2026-08-27 — this Rule names three jobs for `effects.py` in the present tense and the
 > module does one of them.** The clause read *"`effects.py` — filter-stage construction, `sendcmd`
@@ -203,7 +216,7 @@ Binding, read-only. Not re-derived here.
 > |---|---|
 > | **filter-stage construction** | **As-built.** `build_effect_stages`, twenty-five composers, the catalogue, `validate_stack`, `preview_fingerprint`, the LUT discovery and quoting. |
 > | ~~`sendcmd` generation~~ | ~~**Planned — Epic 10 (Slice E).** Grep the module for `sendcmd` and you get two lines of *prose*, in the module docstring and in `lut_file_argument`, both saying that `lut3d`'s quoted form is more robust than the cwd-relative remedy `sendcmd` needs. There is no generator, no script text, and no caller.~~ **Shipped 2026-08-27 in `ad67a14`, and this row was left standing by that very commit — corrected 2026-08-28 by Epic 10's retrospective.** `effects.py` now holds `drive_samples`, `sendcmd_script`, `DriveScript` and `drive_readout`; `app.py` and `routes/shots.py` call them. The sentence above was true when written and false in the commit that published it, which is the single failure this epic repeated most: **a commit that changes what a document describes must correct that document in the same commit.** |
-> | ~~transition-segment argv~~ | **Planned — Epic 11 (Slice F).** No `xfade` anywhere in the module. The only occurrences of the word are `preview_fingerprint`'s seventh input slot, deliberately hashed empty so Epic 11 moves only the Shots that acquire a transition. |
+> | ~~transition-segment argv~~ | ~~**Planned — Epic 11 (Slice F).** No `xfade` anywhere in the module. The only occurrences of the word are `preview_fingerprint`'s seventh input slot, deliberately hashed empty so Epic 11 moves only the Shots that acquire a transition.~~ **Shipped 2026-08-29 — and in `assembly.py`, not here.** Two reasons, the second stronger. `assembly.py` is a leaf and may not import `effects`; and R-38 requires the segment be concat-identical to `trim_args`' output, for which the only *structural* guarantee is one shared stage builder — `assembly.normalized_stages`, with `trim_args` byte-identical to before. The **catalogue** is in `effects.py`, and `assembly.py` receives a resolved `xfade` name the way it already receives finished stage strings. AD-25's Rule sentence above still names this module and is wrong about it. |
 >
 > Both remain the right home for the work and AD-25's placement decision is unchanged — what is
 > corrected is the tense. **The idiom to keep:** an amendment block in this spine describes what

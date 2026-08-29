@@ -8768,6 +8768,12 @@ RENDERED_SHOT = {
     "mix_take_audio": True,
     "flagged": True,
     "locked": True,
+    # Neither plan content nor take provenance: a transition is a fact about the **boundary
+    # between two named Shots**, and a copy is on no such boundary. Set to a real catalogue type
+    # on both sides so "the copy holds the model's default" is a claim about a value that
+    # genuinely differs — a `None` here would let a copy that inherited the transition pass.
+    "transition_in": {"type": "dissolve"},
+    "transition_out": {"type": "wipe_left"},
 }
 
 

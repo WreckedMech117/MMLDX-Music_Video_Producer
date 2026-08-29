@@ -35,6 +35,8 @@ from .assembly import (
     AudioOverlay,
     ClipWindow,
     ExportProgress,
+    TransitionChoice,
+    TransitionClip,
     assembly_plan,
     assembly_refusals,
     clip_frames_on_grid,
@@ -45,6 +47,7 @@ from .assembly import (
     probe_streams_args,
     probe_take_args,
     take_cut_refusal,
+    transition_segment_args,
     trim_args,
     verification_problems,
     with_progress,
@@ -104,6 +107,7 @@ from .effects import (
     preview_fingerprint,
     song_fingerprint,
     song_fingerprints_match,
+    transition_definition,
     validate_stack,
 )
 from .h3_expansion_prompt import system_prompt as h3_system_prompt
@@ -130,6 +134,7 @@ from .models import (
     Song,
     SongAnalysis,
     SongSection,
+    TransitionSpec,
     TreatmentMessage,
     VocalType,
     assets_for_proposal,
@@ -608,6 +613,21 @@ SHOT_DIRECTOR_WITHHELD: frozenset[str] = frozenset(
         # it against the catalogue before storing a byte. A look is the Director's eye on a take,
         # made in the Effects tab against a preview; a chat turn has no way to see what it did.
         "effects",
+        # The Transition pair, withheld on the never-been-in grounds this set was opened with,
+        # plus `effects`' own: a transition is *filter configuration* -- one catalogue id that
+        # resolves to an `xfade` name -- and the Director's chat is about story. It is also
+        # unreachable by the model in either direction, which is what makes withholding it cost
+        # nothing: no tool schema declares either field, neither automated writer touches them,
+        # and the one route that writes them validates against the catalogue first.
+        #
+        # There is a second reason particular to these two, and it is the stronger one. A
+        # transition is a fact about the **boundary between two Shots**, and the Director's dump
+        # hands the model one Shot at a time. `"transition_out": {"type": "wipe_left"}` inside a
+        # shot object says nothing about which shot it wipes into, so the only thing a model
+        # could learn from it is that a key exists -- and the recorded degradation mode of this
+        # model family is JSON in the context begetting JSON in the reply.
+        "transition_in",
+        "transition_out",
     }
 )
 
@@ -2389,6 +2409,48 @@ def _adopt_shot_effects(
                 ),
             )
         shot.effects = adoption.stack
+
+
+def _adopt_shot_transitions(project: Project, stored: dict[str, Shot]) -> None:
+    """Server-own `Shot.transition_in`/`transition_out` across the two generic whole-shot writes.
+
+    **Written in the same commit as the fields** (AD-16), because this repository's own history
+    says the alternative does not work: `routes/project.py`'s comments count fourteen findings of
+    this exact hole, and the rule exists precisely because "add the adopt guard afterwards" never
+    arrived. `_adopt_shot_effects` is the sibling this matches, and the failure is identical.
+
+    It fails the two ways every one of its siblings does. Both fields default to `None`, so a
+    client written before they existed -- which is every client until story 11.3, and every
+    hand-rolled API call forever -- simply omits them, they arrive as `None`, and **one ordinary
+    save would clear every transition in the project at once**. `PUT .../shots` makes that the
+    likely path rather than the exotic one: **dragging a clip writes the whole shot list back**,
+    and dragging is exactly the gesture that *authors* an Overlap, so a Director would set a
+    dissolve, drag the clip to size it, and be told 200 while the type they had just chosen was
+    thrown away. And a body that *invented* a transition would be writing a catalogue id through a
+    route that never asks the catalogue whether it knows one, past `transition_definition` -- the
+    one thing standing between a client's string and an `xfade` argument.
+
+    **The stored pair is adopted whatever the body says, in both directions, for every Shot the
+    store holds.** A Shot the store does **not** hold gets `None` for both, and that is the
+    opposite of `_adopt_shot_effects`' decision about a new Shot -- deliberately, and it follows
+    from `models.SHOT_UNINHERITED_DECISION_FIELDS`. A look describes the Shot's own frames and
+    travels with them, which is why a Split's two halves must both keep it. A transition describes
+    a **boundary between two named Shots**, and a Shot that did not exist a moment ago is on no
+    such boundary: a Duplicate carrying `transition_out` would author a blend nobody dragged, and
+    a Split's left half would claim one at the interior seam it makes with its own other half. So
+    the answer for a new Shot is the anchor adoption's `""`-reading rather than the stack's, and
+    for the same reason the anchor gives: a value that arrived on this route was not set by the
+    Director on the route that sets them.
+
+    No catalogue read and no validation on any path, which is what makes this free enough to run
+    on every ordinary save: nothing client-supplied survives it, so there is nothing to validate.
+    """
+    for shot in project.shots:
+        was = stored.get(shot.id)
+        shot.transition_in = was.transition_in.model_copy() if was and was.transition_in else None
+        shot.transition_out = (
+            was.transition_out.model_copy() if was and was.transition_out else None
+        )
 
 
 #: Everything about a job that this application **recorded** rather than a client supplied. Named
@@ -7116,6 +7178,102 @@ class ShotEffectsResponse(BaseModel):
     effects: list[EffectSpec] = Field(default_factory=list)
 
 
+#: The "this body said nothing about this side" sentinel for `ShotTransitionsRequest`.
+#:
+#: An object identity rather than a string or `None`, because both of those are values a client
+#: could send: `None` is how a transition is **cleared**, and any string would be a type. The one
+#: shape that cannot arrive over JSON is a Python object nobody can spell.
+SHOT_TRANSITION_UNSAID: Any = object()
+
+#: The refusal for a body that names neither side. `ShotEffectsRequest`'s lesson, applied before
+#: it can be learned a second time: a misspelled key must not read as the value that destroys
+#: something and answer 200.
+SHOT_TRANSITION_ABSENT_REFUSAL = (
+    "This request named no transition for {shot}. Send `transition_out` (or `transition_in`) with "
+    "a type to set one, or with `null` to clear it — a body that names neither is not a way to "
+    "clear both."
+)
+#: A Shot the Director has put a hands-off on. `SHOT_EFFECTS_LOCKED_REFUSAL`'s wording and its
+#: 422, on the ruling of 2026-08-18 that puts `locked` on the unprocessable side rather than the
+#: conflict side: a lock clears by a deliberate act, never by patience.
+SHOT_TRANSITION_LOCKED_REFUSAL = (
+    "{shot} is locked, so its transition was not changed. Unlock the shot to change it."
+)
+
+class ShotTransitionsRequest(BaseModel):
+    """The body of a Transition write: which type, on which side, or `null` to clear it.
+
+    **Both fields default to a sentinel rather than to `None`**, and that is the whole of the
+    difference between "clear this transition" and "say nothing about it". `None` is the value
+    that *clears*, so it cannot also be the value that means absent — the shape
+    `ShotEffectsRequest.effects` learned the expensive way, where a misspelled key bound to the
+    clearing value and answered 200 over a destroyed grade. Here `{"transiton_out": {...}}` reaches
+    the route as "neither side named", which is refused by name
+    (`SHOT_TRANSITION_ABSENT_REFUSAL`), rather than as "clear both sides" reported as success.
+
+    `type` arrives inside a `TransitionSpec` and is a free string on that model, so the catalogue
+    answers first and answers in a sentence written for a Director — `EffectSpec.effect`'s design,
+    for its reason (AD-27). A `Literal` here would put the catalogue in a second place.
+
+    **This route writes the pair together and keeps the mirror in step** (AD-30). Writing
+    `transition_out` on a Shot also writes `transition_in` on the Shot that follows it in song
+    order, so the later Shot's own panel can draw its half of one blend; the outgoing field stays
+    the authoritative one and is the only side the export reads.
+    """
+
+    #: The sentinel: a value no client can send, because JSON has no way to spell it. `Any` rather
+    #: than a union with the sentinel's type, because pydantic would otherwise coerce.
+    #: `default_factory` rather than a bare default, and it is not a style choice: pydantic tries
+    #: to serialise a plain default into the JSON schema and warns
+    #: (`PydanticJsonSchemaWarning`) on every `openapi()` call for one it cannot. A factory is
+    #: never inlined into the schema, so `/openapi.json` is clean and the field still reads as
+    #: optional — which is what a client discovering this route has to see.
+    transition_out: TransitionSpec | None | Any = Field(
+        default_factory=lambda: SHOT_TRANSITION_UNSAID
+    )
+    transition_in: TransitionSpec | None | Any = Field(
+        default_factory=lambda: SHOT_TRANSITION_UNSAID
+    )
+
+
+class TransitionCatalogueEntry(BaseModel):
+    """One transition the application offers, as a client with no interface can discover it.
+
+    `pair_only` is FX-19's requirement on the wire: a pair-only entry is **present in the list**
+    and refuses one-sided use with its reason, rather than being silently absent from a list a
+    Director is trying to learn.
+
+    `xfade` is carried because it is not a secret and because it is the one field that makes the
+    catalogue checkable against ffmpeg by a reader who has neither this source nor a browser —
+    R-34's `hblur`-is-"Blur wipe" ruling is exactly the kind of claim that has to be readable.
+    """
+
+    transition_id: str
+    label: str
+    xfade: str
+    pair_only: bool
+
+
+class ShotTransitionsResponse(BaseModel):
+    """One Shot's Transition pair, read back, with the catalogue beside it.
+
+    `shot_id` is carried so a reply cannot be misfiled, exactly as `ShotEffectsResponse` carries
+    it. A `response_model` for that model's reason too: a route whose shape is a bare dict appears
+    in no `/openapi.json` and no client can discover it.
+
+    **The catalogue rides on the read**, which is what makes story 11.1's own final acceptance
+    criterion true — *"the route is sufficient to set and clear a Transition without any
+    interface"*. A headless client that could set a transition but could not find out which twelve
+    exist would have to read this source to use the route. It is a constant, computed from
+    `effects.TRANSITION_CATALOGUE`, and costs no disk read on any path.
+    """
+
+    shot_id: str
+    transition_out: TransitionSpec | None = None
+    transition_in: TransitionSpec | None = None
+    catalogue: list[TransitionCatalogueEntry] = Field(default_factory=list)
+
+
 class ShotDriveBinding(BaseModel):
     """One Parameter Binding's compiled drive over one Shot's window — the Drive readout's whole
     subject, and R-27's ruling as a wire shape.
@@ -8211,6 +8369,21 @@ def _names_an_undiscovered_look(refusal: EffectRefusal) -> bool:
 #: written to be read by a Director and are asserted verbatim in slice B's tests.
 ASSEMBLY_EFFECTS_REFUSAL = "{shot}: {detail}"
 
+#: Why an export refused a Shot's stored Transition, in `ASSEMBLY_EFFECTS_REFUSAL`'s own two-layer
+#: shape and for its reason: `effects.transition_definition` says what is wrong with the type and
+#: has no idea which Shot carries it. Kept as a second constant rather than reusing that one,
+#: because the two name different things about a Shot and a Director reading a report needs to
+#: know whether the look or the blend is the problem.
+ASSEMBLY_TRANSITION_REFUSAL = "{shot}'s transition: {detail}"
+
+#: How a Transition the plan **refused** is written into `ExportLook.transitions` (R-37, FX-25).
+#:
+#: The refusal sentence already names both Shots, so this prefixes rather than re-labels: the slot
+#: is read as `"<shot_id>=<value>"` and a reader must be able to tell a blend that ran from one
+#: that did not. The alternative -- listing only what composed -- makes a refused transition
+#: indistinguishable from one nobody ever set, which is the silence R-37 exists against.
+TRANSITION_REFUSED_RECORD = "refused: {shot}"
+
 
 #: Why a render — an export or a preview — refused a Shot whose look is driven by a measurement
 #: that is not there any more. Story 10.4's third acceptance criterion, and the *only* half of
@@ -8330,6 +8503,18 @@ class ExportSubject:
     #: subject without one (every existing test) reads "no analysis" instead of an attribute that
     #: has to be tested for before it can be asked.
     measurement: Callable[[], SongMeasurement] = _unmeasured_song
+    #: Shot id -> the **stored** `transition_out.type` of the Shots that carry one, unresolved.
+    #:
+    #: The *outgoing* Shot's field and only it, which is AD-30: `transition_out` is authoritative
+    #: for a paired transition and the later Shot's `transition_in` is a mirror the write path
+    #: keeps in step. A manifest whose pair disagrees -- hand-edited, or a write that landed
+    #: halfway -- therefore has a decidable export rather than an undefined one.
+    #:
+    #: Raw strings, not `TransitionDefinition`s, for `stacks`' reason: the plan-stage check below
+    #: is what asks the catalogue, and a subject that had already resolved them could not report a
+    #: type the catalogue refuses. A Shot with no transition is absent, so `if not
+    #: subject.transitions` is "this project blends nothing".
+    transitions: Mapping[str, str] = dataclass_field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -8356,6 +8541,19 @@ class ExportComposition:
     #: same noise twice. The refusals and the provenance below are still judged once per Shot —
     #: they are facts about the stack, and a Director told the same sentence twice is worse off.
     effect_stages: dict[int, EffectStages] = dataclass_field(default_factory=dict)
+    #: **The transition entry's index in `plan.clips`** -> its two legs' composed chains, in the
+    #: order they play: the outgoing Shot's, then the incoming one's. Epic 11's slot, and the one
+    #: this class's docstring reserved.
+    #:
+    #: Two entries and not one, because a transition segment is two full effect chains inside one
+    #: `-filter_complex` and each is composed against its **own** Shot's stack -- FX-NFR-3 says the
+    #: preview is the export's own chain, and a blend of two *ungraded* takes would not match the
+    #: clips on either side of it (R-41). They are composed with a leg prefix for the same ruling:
+    #: both legs start at chain slot 0, so two graded Shots would emit duplicate filtergraph labels
+    #: and two *bound* Shots would emit one `sendcmd` target driving both legs, at rc 0.
+    transition_stages: dict[int, tuple[EffectStages, EffectStages]] = dataclass_field(
+        default_factory=dict
+    )
     #: The provenance record of the same composition — what goes onto `RenderJob.look` (FX-25).
     #: Built here rather than at the job write so it cannot describe a different composition from
     #: the one the export is about to run.
@@ -8454,6 +8652,12 @@ def _compose_effect_chains(
     reported: set[str] = set()
     recorded: set[str] = set()
     for index, clip in enumerate(plan.clips):
+        # A transition entry is not one clip's chain and is composed by `_compose_transitions`,
+        # which needs a leg prefix this call has no notion of (R-41). Skipped here rather than
+        # handled here, so that the two composers cannot come to different answers about one
+        # segment — and so that this function goes on being about "one clip, one chain".
+        if isinstance(clip, TransitionClip):
+            continue
         stack = subject.stacks.get(clip.shot_id)
         if not stack:
             continue
@@ -8650,6 +8854,130 @@ def _binding_envelope_refusals(subject: ExportSubject) -> list[str]:
     return refusals
 
 
+def _transition_catalogue_refusals(subject: ExportSubject) -> list[str]:
+    """Every Shot whose stored Transition the catalogue will not agree to, named by its label.
+
+    `_effect_stack_refusals`' rule applied to the other catalogue, and registered beside it for
+    the same reason: the verdict needs no geometry, so it joins the one answer everything else
+    joins -- a Director with an unapproved shot *and* a transition type this build no longer
+    ships is told both at once.
+
+    **AD-21:** nothing stored says a transition is valid. The route said so at the time; this asks
+    again, because a manifest is hand-editable and the catalogue is not stored beside it.
+
+    **This one does refuse the export, and R-37's geometry refusal does not.** The two are not the
+    same question read two ways. An unknown type is a stored *value* the catalogue rejects -- the
+    same class as an unknown effect id, which has refused the export since Epic 9 -- and there is
+    no picture that could be rendered from it: `transition_definition` is the only thing that
+    turns a type into an `xfade` name, so a plan holding one cannot be built at all. R-37 is about
+    *geometry*, where a perfectly good hard cut is already available and refusing the whole export
+    would be stricter than `assembly_plan` itself. See `assembly.TRANSITION_CROWDED_REFUSAL`.
+    """
+    if not subject.transitions:
+        return []
+    refusals: list[str] = []
+    seen: set[str] = set()
+    for clip in sorted(subject.clips, key=lambda item: item.start):
+        stored = subject.transitions.get(clip.shot_id)
+        if stored is None or clip.shot_id in seen:
+            continue
+        seen.add(clip.shot_id)
+        try:
+            transition_definition(stored)
+        except EffectRefusal as refusal:
+            refusals.append(
+                ASSEMBLY_TRANSITION_REFUSAL.format(shot=clip.label, detail=refusal)
+            )
+    return refusals
+
+
+def _compose_transitions(
+    subject: ExportSubject, composition: ExportComposition
+) -> list[str]:
+    """Compose both legs of every transition segment, and record what the export blended.
+
+    Registered in `EXPORT_COMPOSITION_CHECKS` because it needs the plan: which boundaries actually
+    became `TransitionClip`s is `assembly_plan`'s answer, and the delivery geometry a leg is
+    composed against is the plan's too.
+
+    **Each leg gets a leg prefix** (R-41). `effects.build_effect_stages` names a branch's links
+    `fx{slot}a` and a bound filter's instance `b{slot}`, where `slot` is the position in *that
+    Shot's own* chain -- and both legs of a segment start at slot 0. Without the prefix two graded
+    Shots emit `[fx0a]` twice in one `-filter_complex`, which is at least loud, and two *bound*
+    Shots emit one `sendcmd` target addressing the filters of both legs, which is silent at rc 0
+    and is the class `DriveScript.target`'s docstring says nothing else can catch.
+
+    **A leg is composed against its own Shot's whole window, never the Overlap's slice**, and the
+    two numbers say so: `clip_offset` is the seconds from the Shot's first frame to this leg's
+    first frame -- the Overlap's start minus the Shot's own start -- and `shot_seconds` is the
+    Shot's whole window. That is `_compose_effect_chains`' rule exactly, and it is what keeps a
+    time-dependent stage carrying on across the seam instead of restarting inside the blend: the
+    outgoing Shot's grain does not re-seed at the dissolve, and its ramp does not jump back.
+
+    **The look record is written here and nowhere else for a transition** (FX-25). Every entry is
+    `"<outgoing shot id>=<value>"`, the shape `effects` and `bindings` already use, so all three
+    slots of `ExportLook` read alike. A transition the plan **refused** is listed too, carrying
+    `assembly.TRANSITION_CROWDED_REFUSAL` whole -- that is the only place saying a boundary the
+    manifest asked to blend stayed a hard cut (R-37), and a record that listed only the successes
+    would make a refused transition indistinguishable from one nobody set.
+
+    Refusals from *this* function are the catalogue's, accumulated rather than raised on the first
+    fault, for `_compose_effect_chains`' reason -- and a Shot whose stack has already been refused
+    there is refused there, once, in the catalogue's own words.
+    """
+    plan = subject.plan
+    if plan is None:
+        return []
+    composition.look.transitions.extend(
+        TRANSITION_REFUSED_RECORD.format(shot=line) for line in plan.transition_refusals
+    )
+    refusals: list[str] = []
+    luts_read: list[Sequence[LutEntry]] = []
+
+    def luts() -> Sequence[LutEntry]:
+        """The looks folder, read at most once and only if a leg actually names one."""
+        if not luts_read:
+            luts_read.append(subject.looks())
+        return luts_read[0]
+
+    envelope = subject.measurement().envelope if _bound_shot_ids(subject) else None
+    for index, entry in enumerate(plan.clips):
+        if not isinstance(entry, TransitionClip):
+            continue
+        composed: list[EffectStages] = []
+        for leg, clip in (("A", entry.before), ("B", entry.after)):
+            stack = subject.stacks.get(clip.shot_id)
+            if not stack:
+                composed.append(EffectStages())
+                continue
+            try:
+                composed.append(
+                    build_effect_stages(
+                        stack,
+                        width=plan.width,
+                        height=plan.height,
+                        luts=luts(),
+                        clip_offset=clip.start - clip.approved_start,
+                        shot_seconds=clip.approved_duration,
+                        envelope=envelope,
+                        shot_start=clip.approved_start,
+                        clip_seconds=plan.frames[index] / ASSEMBLY_FPS,
+                        leg=leg,
+                    )
+                )
+            except EffectRefusal as refusal:
+                refusals.append(
+                    ASSEMBLY_EFFECTS_REFUSAL.format(shot=clip.label, detail=refusal)
+                )
+                composed.append(EffectStages())
+        if len(composed) == 2:
+            composition.transition_stages[index] = (composed[0], composed[1])
+        composition.look.transitions.append(
+            f"{entry.before.shot_id}={entry.choice.transition_id}"
+        )
+    return refusals
+
+
 #: **This is the list Epic 10 appends to.** A binding refusal — an envelope that was never
 #: measured, a parameter no effect declares — is a fact about the stack and the song, needs no
 #: geometry, and belongs here as a third entry with nothing else edited.
@@ -8660,11 +8988,16 @@ def _binding_envelope_refusals(subject: ExportSubject) -> list[str]:
 #: in the catalogue's own words with nothing new registered. What needed a fourth entry is the
 #: half `validate_stack` cannot see, because it is a fact about the *song* and not about the
 #: stack: an envelope that was never taken, or was taken from a track this project no longer has.
+#:
+#: *Appended to on 2026-08-28 by story 11.1, as a fifth entry with nothing else edited.* A stored
+#: transition type the catalogue does not know is a fact about the stack's sibling and the song's
+#: neither -- it needs no geometry at all -- so it belongs here beside the stack's own verdict.
 EXPORT_PLAN_CHECKS: tuple[Callable[[ExportSubject], list[str]], ...] = (
     _window_refusals,
     _oversized_stack_refusals,
     _effect_stack_refusals,
     _binding_envelope_refusals,
+    _transition_catalogue_refusals,
 )
 
 #: Every check that needs the export's own geometry, and may build what the export then runs.
@@ -8672,9 +9005,12 @@ EXPORT_PLAN_CHECKS: tuple[Callable[[ExportSubject], list[str]], ...] = (
 #: **This is the list Epic 11 appends to.** A transition is composed against the plan — it needs
 #: both neighbours' frame counts and the delivery size — so it registers here, fills its own slot
 #: on `ExportComposition`, and reports into the same one answer.
+#:
+#: *Appended to on 2026-08-28, as that comment said it would be.* `_compose_transitions` composes
+#: both legs of every transition segment and writes `ExportLook.transitions`.
 EXPORT_COMPOSITION_CHECKS: tuple[
     Callable[[ExportSubject, ExportComposition], list[str]], ...
-] = (_compose_effect_chains,)
+] = (_compose_effect_chains, _compose_transitions)
 
 
 def export_plan_refusals(subject: ExportSubject) -> list[str]:
@@ -9478,6 +9814,11 @@ MANIFEST_WRITE_GUARDS: dict[str, str] = {
     # ones that had to be gated, and both of them are.
     "replace_shot_bindings": WRITE_GUARD_LAST_WRITER_WINS,
     "replace_shot_effects": WRITE_GUARD_LAST_WRITER_WINS,
+    # The third of the narrow look writers, classified with the two above and by their argument:
+    # one Director, one panel, one boundary. What a second writer could take is one transition
+    # type, and the Director is looking at the control that lost it. The *generic* routes are the
+    # ones that had to be gated, and `_adopt_shot_transitions` is what gates them.
+    "replace_shot_transitions": WRITE_GUARD_LAST_WRITER_WINS,
     "replace_song_vocal_type": WRITE_GUARD_LAST_WRITER_WINS,
     "select_shot_take": WRITE_GUARD_LAST_WRITER_WINS,
     "snap_timeline_cuts": WRITE_GUARD_LAST_WRITER_WINS,
@@ -11949,11 +12290,34 @@ def create_app(
             },
             looks=discovered_looks,
             measurement=song_measurement,
+            # Only the **outgoing** Shot's field, which is AD-30: `transition_out` is
+            # authoritative for a paired transition, `transition_in` is the mirror the write path
+            # keeps in step, and at export only one of the two is read — so a manifest whose pair
+            # disagrees produces a decidable export rather than an undecidable one.
+            transitions={
+                shot.id: shot.transition_out.type
+                for shot in project.shots
+                if shot.transition_out
+            },
         )
         refusals = export_plan_refusals(subject)
         if refusals:
             raise HTTPException(status_code=422, detail="\n".join(refusals))
-        plan = assembly_plan(clips, song_seconds, dimensions)
+        # The catalogue resolved once, after the plan check above has agreed to every stored type,
+        # so `transition_definition` cannot raise here. `assembly.py` is handed the `xfade` name
+        # the way `trim_args` is handed finished stage strings: it goes on importing nothing from
+        # `effects.py`, and the frame arithmetic cannot be reached by a catalogue at all.
+        plan = assembly_plan(
+            clips,
+            song_seconds,
+            dimensions,
+            {
+                shot_id: TransitionChoice(
+                    stored, transition_definition(stored).xfade
+                )
+                for shot_id, stored in subject.transitions.items()
+            },
+        )
         # The composition stage: the checks that need the export's own delivery geometry, which
         # is why they could not run above. They build what the export is driven with as well as
         # reporting on it — `build_effect_stages` is the only thing that can see a look whose
@@ -11989,7 +12353,19 @@ def create_app(
             kind="post",
             status="running",
             target_id="assembly",
-            inputs=[f"{clip.shot_id}={clip.approved_output}" for clip in plan.clips],
+            # FR-24 adapted: the exact takes this export was built from, by shot. A transition
+            # entry consumed **two** takes in one segment and contributes both, in the order they
+            # play — the record answers "which takes went in", and a segment that listed one of
+            # its two legs would understate the export by the frames of the other.
+            inputs=[
+                f"{clip.shot_id}={clip.approved_output}"
+                for entry in plan.clips
+                for clip in (
+                    (entry.before, entry.after)
+                    if isinstance(entry, TransitionClip)
+                    else (entry,)
+                )
+            ],
             look=composition.look,
         )
         # Appended to a **fresh** read, never to `project`. That object was read before the
@@ -12086,6 +12462,57 @@ def create_app(
                 # Keyed by the clip's own index, not by its Shot's id: a Shot that another nests
                 # inside is two clips here, and story 9.7 composed them apart on purpose so the
                 # second carries on where the first stopped rather than replaying it.
+                if isinstance(clip, TransitionClip):
+                    # AD-18's third entry, rendered by its own pinned argv from **both** takes in
+                    # one invocation (R-38). Re-cutting it from the finished intermediates is not
+                    # merely costlier, it is impossible: `assembly_plan` truncates the earlier clip
+                    # at the later one's start, so the outgoing Shot's overlap frames are in no
+                    # intermediate at all.
+                    #
+                    # `-c:v copy` on the join is unchanged (FX-NFR-2), which is what
+                    # `assembly.normalized_stages` guarantees structurally: this segment's legs are
+                    # built from the same chain builder `trim_args` uses, and the `xfade`'s own
+                    # output is pinned back to `yuv420p` — measured, because it is `yuv444p`
+                    # otherwise, at rc 0.
+                    legs = composition.transition_stages.get(
+                        index, (EffectStages(), EffectStages())
+                    )
+                    for leg in legs:
+                        for script in leg.scripts:
+                            (workdir / script.filename).write_text(
+                                script.text, encoding="utf-8"
+                            )
+                    rc, _out, err = await run_tool(
+                        with_progress(
+                            transition_segment_args(
+                                clip.before.source,
+                                clip.after.source,
+                                dest,
+                                frames,
+                                plan.width,
+                                plan.height,
+                                clip.choice.xfade,
+                                before_offset=clip.before.offset,
+                                after_offset=clip.after.offset,
+                                preset=preset,
+                                before_geometry=legs[0].geometry,
+                                before_treatment=legs[0].treatment,
+                                after_geometry=legs[1].geometry,
+                                after_treatment=legs[1].treatment,
+                            )
+                        ),
+                        on_progress=lambda microseconds, at=trimmed_seconds: report(
+                            progress.trim(at, microseconds)
+                        ),
+                        cwd=workdir
+                        if any(leg.scripts for leg in legs)
+                        else None,
+                    )
+                    if rc != 0 or not dest.is_file():
+                        raise failed(f"transition ({clip.label})", err)
+                    intermediates.append(dest)
+                    trimmed_seconds += frames / ASSEMBLY_FPS
+                    continue
                 composed = effect_stages.get(index, EffectStages())
                 # This clip's compiled drive scripts, written beside `clips.txt` and the
                 # intermediates in the export's own `workdir`, which is then ffmpeg's working
@@ -12136,7 +12563,31 @@ def create_app(
             # song-only ruling's.
             overlays: list[AudioOverlay] = []
             elapsed_frames = 0
-            for clip, frames in zip(plan.clips, plan.frames, strict=True):
+            for entry, frames in zip(plan.clips, plan.frames, strict=True):
+                # **A transition contributes the incoming Shot's leg, and only it — so the mix
+                # does not move.** This is the decision constraint 6 asked to be stated.
+                #
+                # `AudioOverlay` has always stopped the earlier take's audio at the later one's
+                # start, because `assembly_plan` truncates the earlier clip there. The Overlap's
+                # seconds are seconds the later Shot has already begun, so they were the later
+                # Shot's before this epic and they stay the later Shot's now. Take the segment's
+                # frames out of the accumulator and the incoming Shot's accepted audio would lose
+                # exactly the head of itself, silently, on the day a Director sets a dissolve.
+                #
+                # What changes is the *shape* and not the content: a Shot whose take audio is
+                # accepted and which is preceded by a transition contributes **two** overlays
+                # where it contributed one — the Overlap's frames at its own take offset and its
+                # own delay, then the remainder at the offset the split advanced. Same source,
+                # same take seconds, same timeline positions, in two pieces. The sub-frame
+                # discrepancy between the second piece's take offset and the first piece's end is
+                # the one `assembly_plan`'s own `replace(clip, offset=clip.offset + ...)` has
+                # produced for every nested overlay since the layers ruling; it is bounded by half
+                # a frame and it is the established convention rather than something new here.
+                #
+                # The outgoing Shot's take audio does **not** come in under the blend, and that is
+                # the same rule read consistently: it stopped at the later Shot's start before,
+                # and this epic moved no clip's start.
+                clip = entry.after if isinstance(entry, TransitionClip) else entry
                 if clip.mix_audio:
                     overlays.append(
                         AudioOverlay(

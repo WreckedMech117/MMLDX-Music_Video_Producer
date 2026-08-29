@@ -176,6 +176,49 @@ and then left in a commit subject is a number nobody will find.**
   node module and called with a Proxy that appends every method call and property write to a log. It
   **records and simulates nothing** — no paths, no state machine, no pixels — and it is fed
   `api.js`'s own plan, so the geometry under test is the geometry that ships.
+- **`xfade` emits `yuv444p`, and `concat -c copy` joins it to `yuv420p` without a word.** Measured
+  2026-08-29 and reproduced independently. Two legs each ending `format=yuv420p`, blended by
+  `xfade` with nothing after it, encode as **`yuv444p` / High 4:4:4 Predictive** — rc 0, correct
+  frame count, correct geometry, and a pixel format no other intermediate in the export uses. Then
+  `ffmpeg -f concat -c copy` **accepts the mismatch at rc 0 with no warning at `-v warning`** and
+  writes a container **declaring `yuv420p` / High** over frames that are not. The header lies about
+  a third of the file.
+
+  The fix is one stage: a transition segment closes with `setsar=1,format=yuv420p`. It deliberately
+  carries **no `fps`** — a rate filter downstream of a framesync filter is the exact shape
+  `BRANCH_FRAME_GUARD` exists to compensate for.
+
+  **This is the fourth distinct wrong-output-at-exit-code-0 this project has met**, after a branched
+  chain losing one frame (Epic 9), a `sendcmd` at a missing label changing nothing (Epic 10), and
+  `xfade` truncating to its shorter leg (Epic 11). The pattern is now established well enough to
+  state as a rule: **in this pipeline, ffmpeg's exit code is evidence of nothing.** Assert the
+  rendered artefact — frame count, pixel format, checksum against a control — never the return code.
+- **A transition segment costs ~40 ms per overlap, and almost nothing per second of dissolve.**
+  The debt the spine's *Deferred* section and §6 both recorded — *"full-resolution export cost of a
+  reactive binding and of transition segments, measure before E and F merge"* — is now discharged on
+  both halves. Epic 10 measured the binding half (+1.1 ms, +0.4 %). This is the transition half,
+  measured 2026-08-28 on **real H3 takes** (1056×608, 24 fps, yuv420p) at the export's own draft
+  encoder (`libx264 veryfast crf18`), arms **alternated within each pair** and pooled, n=30 per arm
+  per length:
+
+  | segment | plain trim | `xfade` segment | delta |
+  |---|---|---|---|
+  | 12 frames (0.5 s) | 77.6 ms | 120.6 ms | **+43.0 ms** (+55.4 %) |
+  | 48 frames (2.0 s) | 114.0 ms | 167.6 ms | **+53.6 ms** (+47.0 %) |
+
+  Fitted across the two: **+39.4 ms fixed per segment, +0.30 ms per extra frame.** Within-arm spread
+  was 8.4/21.1 ms at 12 frames and 14.2/37.7 ms at 48, so the delta clears the noise at both lengths
+  — but only just at 48, which is why the fit uses both rather than either alone.
+
+  **Two consequences for Slice F.** The cost is the *second input's open and decode*, not the blend:
+  quadrupling a dissolve's length costs ten more milliseconds, so **transition length needs no
+  ceiling on cost grounds** and a Director can use long dissolves freely. And the per-export figure
+  is per *overlap*, not per second — twenty overlaps is under a second added to a whole assemble.
+
+  **Do not quote the percentage on its own.** It is 55 % of a 77 ms segment, not of an export, and
+  this repository has already had one export measurement lie in the other direction: a single 25-run
+  round manufactured a 30 % regression out of nothing. Both numbers here come from alternated,
+  pooled rounds for that reason.
 - **The browser harnesses are not in `pytest`, and one of them was broken for four slices before
   anyone noticed.** `pyproject.toml` sets `testpaths = ["tests"]` and pytest's default
   `python_files = test_*.py`, so every `tests/e2e_*.py` harness is **outside the suite** — a green
@@ -322,4 +365,4 @@ Violating one of these is a defect even when the code works.
 
 ## 8. If you only read one thing
 
-Start on **effects Epic 10 — Slice E of the effects `BUILD-ORDER.md`** *(corrected 2026-08-27; this said ~~Start on **effects Story 8.1**~~, which shipped on 2026-08-24 along with the rest of Epics 8 and 9)*. Put a new route in `src/music_video_producer/routes/`, not in `app.py`. Before writing any LLM-facing schema, read §3's model envelope and use `_promoted()`. Before adding any field to `Project` or `Shot`, write its `_adopt_*` guard and its test in the same commit — that hole has now been found fourteen times in one route. Before planning around any constraint written more than a few days ago, re-run it.
+Start on **effects Epic 10 — Slice E of the effects `BUILD-ORDER.md`** *(corrected 2026-08-27; this said ~~Start on **effects Story 8.1**~~, which shipped on 2026-08-24 along with the rest of Epics 8 and 9)*. Put a new route in `src/music_video_producer/routes/`, not in `app.py`. Before writing any LLM-facing schema, read §3's model envelope and use `_promoted()`. Before adding any field to `Project` or `Shot`, write its `_adopt_*` guard and its test in the same commit — that hole has now been found ~~fourteen~~ **fifteen** times in one route *(the transition pair, 2026-08-29 — guarded in the same commit as the field, as the Rule asks, and still counted)*. Before planning around any constraint written more than a few days ago, re-run it.

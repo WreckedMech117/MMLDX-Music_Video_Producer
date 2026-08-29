@@ -11258,6 +11258,8 @@ def test_a_new_shot_field_cannot_be_added_without_deciding_what_the_director_see
         "mix_take_audio",
         "flagged",
         "effects",
+        "transition_in",
+        "transition_out",
     }
     assert not SHOT_DIRECTOR_VISIBLE & SHOT_DIRECTOR_WITHHELD
     assert {"mode", "citations", "singing", "prompt"} <= SHOT_DIRECTOR_VISIBLE
@@ -11278,6 +11280,8 @@ def test_a_new_shot_field_cannot_be_added_without_deciding_what_the_director_see
         "mix_take_audio",
         "flagged",
         "effects",
+        "transition_in",
+        "transition_out",
     }
     assert DIRECTOR_CONTEXT_EXCLUDE["shots"] == {
         "__all__": {
@@ -11292,6 +11296,8 @@ def test_a_new_shot_field_cannot_be_added_without_deciding_what_the_director_see
             "mix_take_audio",
             "flagged",
             "effects",
+            "transition_in",
+            "transition_out",
         }
     }
 
@@ -26039,3 +26045,332 @@ def test_a_copied_stack_carries_its_bindings_with_no_new_code(tmp_path: Path):
         "a copied stack put one card id on two Shots"
     )
     assert target.effects[0].id.startswith("fx_")
+
+
+# ------------------------------------------------------------------------------------------
+# Transitions: the route, and the guard that keeps every other route out of it (story 11.1).
+# ------------------------------------------------------------------------------------------
+
+
+def transitions_url(project_id: str, shot_id: str = "shot_one") -> str:
+    return f"/api/projects/{project_id}/shots/{shot_id}/transitions"
+
+
+def overlapping_project(client, name: str = "Transitions") -> str:
+    """Two shots the Director has dragged across each other — the geometry a paired transition
+    needs, and the geometry a wipe refuses to exist without."""
+    project_id = client.post("/api/projects", json={"name": name}).json()["id"]
+    saved = client.put(
+        f"/api/projects/{project_id}/shots",
+        json={
+            "shots": [
+                {"id": "shot_one", "start": 0, "duration": 4, "prompt": "A corridor"},
+                {"id": "shot_two", "start": 3.5, "duration": 4.5, "prompt": "A threshold"},
+            ]
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    return project_id
+
+
+def test_the_route_alone_sets_and_clears_a_transition_and_keeps_the_pair_in_step(
+    tmp_path: Path,
+):
+    """Story 11.1's own final acceptance criterion, executed: *"the route is sufficient to set
+    and clear a Transition without any interface, so this story is completable and testable
+    before Story 11.3 exists."*
+
+    Set, read back, clear, read back — through HTTP and through the manifest, never through the
+    handler's own object.
+
+    **And the mirror** (AD-30): writing `transition_out` on the earlier Shot writes
+    `transition_in` on the one that follows it in song order, so a panel drawn on either Shot
+    shows one blend rather than two halves that can disagree. The outgoing field stays the
+    authoritative one — it is the only side the export reads — and clearing one clears both.
+    """
+    client, _store, _ = make_client(tmp_path)
+    project_id = overlapping_project(client)
+
+    written = client.put(transitions_url(project_id), json={"transition_out": {"type": "dissolve"}})
+    assert written.status_code == 200, written.text
+
+    stored = ProjectStore(tmp_path).get(project_id)
+    assert stored.shots[0].transition_out.type == "dissolve"
+    assert stored.shots[0].transition_in is None
+    assert stored.shots[1].transition_in.type == "dissolve"
+    assert stored.shots[1].transition_out is None
+
+    read = client.get(transitions_url(project_id)).json()
+    assert read["shot_id"] == "shot_one"
+    assert read["transition_out"] == {"type": "dissolve"}
+    assert read["transition_in"] is None
+    # The catalogue rides on the read, which is what makes "without any interface" true: a client
+    # that could set a transition but not discover the vocabulary would have to read the source.
+    assert len(read["catalogue"]) == 12
+    assert {"transition_id": "blur_wipe", "label": "Blur wipe", "xfade": "hblur",
+            "pair_only": False} in read["catalogue"]
+    assert sum(1 for entry in read["catalogue"] if entry["pair_only"]) == 8
+
+    cleared = client.put(transitions_url(project_id), json={"transition_out": None})
+    assert cleared.status_code == 200, cleared.text
+    stored = ProjectStore(tmp_path).get(project_id)
+    assert stored.shots[0].transition_out is None
+    assert stored.shots[1].transition_in is None, "clearing one end left the mirror standing"
+
+    # Written from the incoming Shot's own end, the mirror goes backwards by the same rule.
+    back = client.put(
+        transitions_url(project_id, "shot_two"), json={"transition_in": {"type": "fade_black"}}
+    )
+    assert back.status_code == 200, back.text
+    stored = ProjectStore(tmp_path).get(project_id)
+    assert stored.shots[0].transition_out.type == "fade_black"
+    assert stored.shots[1].transition_in.type == "fade_black"
+
+
+def test_the_generic_writes_can_neither_clear_nor_forge_a_transition(tmp_path: Path):
+    """**The guard**, in the same commit as the fields (AD-16), on both whole-shot write paths
+    and in both directions.
+
+    `replace_project`'s own ledger reads fourteen findings of this hole before these fields
+    arrived to make it fifteen, and BUILD-ORDER names it the pattern most likely to be skipped
+    and most expensive to skip. Four bodies, every one of them a body a real client sends:
+
+    * a full-project `PUT` that simply **omits** the fields — what every client written before
+      they existed sends, and what any hand-rolled API call sends forever;
+    * the same `PUT` **inventing** one, which would write a catalogue id straight past
+      `transition_definition`, the only thing between a client's string and an `xfade` argument;
+    * `PUT .../shots` omitting them — **the one that matters most, and more so than it did for
+      `effects`**: dragging a clip writes the whole shot list back through this route, and
+      dragging is the gesture that *authors the Overlap a transition needs*. Without the guard,
+      the single act of sizing a dissolve would destroy the dissolve, at 200;
+    * `PUT .../shots` inventing one.
+
+    A Shot the stored project does **not** hold gets `None`, which is the opposite of
+    `_adopt_shot_effects`' answer and follows from `SHOT_UNINHERITED_DECISION_FIELDS`: a look
+    describes a Shot's own frames and travels with them, a transition describes a boundary
+    between two named Shots and a new Shot is on no such boundary.
+    """
+    client, _store, _ = make_client(tmp_path)
+    project_id = overlapping_project(client)
+    assert client.put(
+        transitions_url(project_id), json={"transition_out": {"type": "dissolve"}}
+    ).status_code == 200
+
+    def pair() -> list[tuple[str | None, str | None]]:
+        return [
+            (
+                shot.transition_out.type if shot.transition_out else None,
+                shot.transition_in.type if shot.transition_in else None,
+            )
+            for shot in ProjectStore(tmp_path).get(project_id).shots
+        ]
+
+    intact = [("dissolve", None), (None, "dissolve")]
+    assert pair() == intact
+
+    # 1. The whole-project PUT, omitting the fields entirely.
+    body = client.get(f"/api/projects/{project_id}").json()
+    for shot in body["shots"]:
+        shot.pop("transition_out", None)
+        shot.pop("transition_in", None)
+    body["name"] = "Renamed by an ordinary save"
+    omitted = client.put(f"/api/projects/{project_id}", json=body)
+    assert omitted.status_code == 200, omitted.text
+    assert ProjectStore(tmp_path).get(project_id).name == "Renamed by an ordinary save"
+    assert pair() == intact, "an ordinary whole-project save erased every transition"
+
+    # 2. The whole-project PUT, inventing one — including onto a Shot that has never existed.
+    body = client.get(f"/api/projects/{project_id}").json()
+    body["shots"][0]["transition_out"] = {"type": "wipe_left"}
+    body["shots"][1]["transition_in"] = None
+    body["shots"].append(
+        {
+            "id": "shot_smuggled",
+            "start": 8,
+            "duration": 4,
+            "prompt": "Invented",
+            "transition_out": {"type": "slide_up"},
+        }
+    )
+    forged = client.put(f"/api/projects/{project_id}", json=body)
+    assert forged.status_code == 200, forged.text
+    stored = ProjectStore(tmp_path).get(project_id)
+    assert [
+        (
+            shot.transition_out.type if shot.transition_out else None,
+            shot.transition_in.type if shot.transition_in else None,
+        )
+        for shot in stored.shots
+    ] == [*intact, (None, None)], "a body wrote a transition through the generic route"
+
+    # 3. `PUT .../shots` omitting them — the drag, which is how the Overlap is authored.
+    shots = [shot.model_dump(mode="json") for shot in ProjectStore(tmp_path).get(project_id).shots]
+    for shot in shots:
+        shot.pop("transition_out", None)
+        shot.pop("transition_in", None)
+    shots[1]["start"] = 3.25
+    shots[1]["duration"] = 4.75
+    dragged = client.put(f"/api/projects/{project_id}/shots", json={"shots": shots})
+    assert dragged.status_code == 200, dragged.text
+    moved = ProjectStore(tmp_path).get(project_id)
+    assert moved.shots[1].start == 3.25, "the drag itself did not land"
+    assert [
+        (
+            shot.transition_out.type if shot.transition_out else None,
+            shot.transition_in.type if shot.transition_in else None,
+        )
+        for shot in moved.shots
+    ][:2] == intact, "sizing the overlap destroyed the transition it was sizing"
+
+    # 4. `PUT .../shots` inventing one.
+    shots = [shot.model_dump(mode="json") for shot in ProjectStore(tmp_path).get(project_id).shots]
+    shots[0]["transition_out"] = {"type": "slide_down"}
+    shots[1]["transition_in"] = {"type": "slide_down"}
+    invented = client.put(f"/api/projects/{project_id}/shots", json={"shots": shots})
+    assert invented.status_code == 200, invented.text
+    assert [
+        (
+            shot.transition_out.type if shot.transition_out else None,
+            shot.transition_in.type if shot.transition_in else None,
+        )
+        for shot in ProjectStore(tmp_path).get(project_id).shots
+    ][:2] == intact
+
+
+def test_a_client_that_has_never_heard_of_transitions_changes_none_of_them(tmp_path: Path):
+    """Story 11.1's last acceptance criterion, stated as the client that actually exists.
+
+    A whole-project `PUT` and a whole-shots `PUT` built by stripping **every** transition key from
+    the body — not by omitting one field on one Shot — which is what a client written before this
+    field existed genuinely sends. Nothing is created, altered or cleared, on any Shot, on either
+    route, and the rest of the body still lands.
+    """
+    client, _store, _ = make_client(tmp_path)
+    project_id = overlapping_project(client)
+    assert client.put(
+        transitions_url(project_id), json={"transition_out": {"type": "blur_wipe"}}
+    ).status_code == 200
+
+    def strip(payload: dict) -> dict:
+        for shot in payload.get("shots", []):
+            shot.pop("transition_out", None)
+            shot.pop("transition_in", None)
+        return payload
+
+    whole = strip(client.get(f"/api/projects/{project_id}").json())
+    whole["shots"][0]["prompt"] = "A corridor, repainted"
+    assert client.put(f"/api/projects/{project_id}", json=whole).status_code == 200
+
+    listed = strip({"shots": [
+        shot.model_dump(mode="json") for shot in ProjectStore(tmp_path).get(project_id).shots
+    ]})
+    listed["shots"][1]["prompt"] = "A threshold, repainted"
+    assert client.put(f"/api/projects/{project_id}/shots", json=listed).status_code == 200
+
+    stored = ProjectStore(tmp_path).get(project_id)
+    assert stored.shots[0].prompt == "A corridor, repainted"
+    assert stored.shots[1].prompt == "A threshold, repainted"
+    assert stored.shots[0].transition_out.type == "blur_wipe"
+    assert stored.shots[1].transition_in.type == "blur_wipe"
+
+
+def test_the_transition_route_refuses_by_name_and_stores_nothing_when_it_does(tmp_path: Path):
+    """Every refusal this route makes, shown whole and asserted verbatim, and each one leaves the
+    manifest exactly as it found it.
+
+    * **An unknown type** — the catalogue's own sentence, which prints the whole vocabulary,
+      because a Director who misspelled one needs the spelling.
+    * **A pair-only type with no Overlap** (FX-19, R-34) — the reason a wipe is *in* the list
+      rather than absent from it. Said at the write, which is when the Director is choosing.
+    * **A body naming neither side** — `ShotEffectsRequest.effects`' lesson applied before it can
+      be learned twice: `{"transiton_out": ...}` must not read as "clear both" and answer 200.
+    * **A locked Shot** — 422 and not 409, on the ruling of 2026-08-18 that puts `locked` on the
+      unprocessable side: a lock clears by a deliberate act, never by patience.
+    """
+    from music_video_producer.app import (
+        SHOT_TRANSITION_ABSENT_REFUSAL,
+        SHOT_TRANSITION_LOCKED_REFUSAL,
+    )
+    from music_video_producer.effects import (
+        TRANSITION_CATALOGUE,
+        TRANSITION_PAIR_ONLY_REFUSAL,
+        TRANSITION_UNKNOWN_REFUSAL,
+    )
+
+    client, _store, _ = make_client(tmp_path)
+    project_id = overlapping_project(client)
+    before = ProjectStore(tmp_path).get(project_id).model_dump(mode="json")
+
+    unknown = client.put(transitions_url(project_id), json={"transition_out": {"type": "crossfade"}})
+    assert unknown.status_code == 422
+    assert unknown.json()["detail"] == TRANSITION_UNKNOWN_REFUSAL.format(
+        transition="crossfade", known=", ".join(sorted(TRANSITION_CATALOGUE))
+    )
+
+    absent = client.put(transitions_url(project_id), json={"nothing": 1})
+    assert absent.status_code == 422
+    assert absent.json()["detail"] == SHOT_TRANSITION_ABSENT_REFUSAL.format(shot="SHOT 01 (shot_one)")
+
+    # Nothing above touched the manifest.
+    assert ProjectStore(tmp_path).get(project_id).model_dump(mode="json") == before
+
+    # A pair-only type where the two shots merely touch, which is the geometry a wipe cannot exist
+    # on. The project is rebuilt without the overlap so the refusal is about the boundary.
+    plain = project_with_two_shots(client, name="No overlap")
+    refused = client.put(transitions_url(plain), json={"transition_out": {"type": "wipe_left"}})
+    assert refused.status_code == 422
+    assert refused.json()["detail"] == TRANSITION_PAIR_ONLY_REFUSAL.format(
+        label="Wipe left",
+        shot="SHOT 01 (shot_one)",
+        alternatives="Blur wipe, Dissolve, Fade through black, Fade through white",
+    )
+    assert ProjectStore(tmp_path).get(plain).shots[0].transition_out is None
+    # And the four that are not pair-only are accepted on that very boundary, which is what makes
+    # the refusal a statement about wipes rather than about the geometry.
+    for transition_id in ("dissolve", "fade_black", "fade_white", "blur_wipe"):
+        allowed = client.put(
+            transitions_url(plain), json={"transition_out": {"type": transition_id}}
+        )
+        assert allowed.status_code == 200, (transition_id, allowed.text)
+
+    locked = ProjectStore(tmp_path).get(project_id)
+    locked.shots[0].locked = True
+    ProjectStore(tmp_path).save(locked)
+    held = client.put(transitions_url(project_id), json={"transition_out": {"type": "dissolve"}})
+    assert held.status_code == 422
+    assert held.json()["detail"] == SHOT_TRANSITION_LOCKED_REFUSAL.format(
+        shot="SHOT 01 (shot_one)"
+    )
+    assert ProjectStore(tmp_path).get(project_id).shots[0].transition_out is None
+
+
+def test_a_new_shot_never_inherits_a_transition_from_the_one_it_was_made_from(tmp_path: Path):
+    """`SHOT_UNINHERITED_DECISION_FIELDS`, executed at the door a copy actually arrives through.
+
+    Split and Duplicate both save the whole shot list through `PUT .../shots` carrying a new id,
+    which is `_adopt_shot_effects`' keep-the-stack branch — and the opposite answer here. A
+    Duplicate landing in front of another Shot would author a blend nobody dragged (AD-30 makes
+    `transition_out` authoritative), and a Split's left half would claim one at the interior seam
+    it makes with its own other half.
+
+    The original keeps its own, which is the other half of the claim: this is a rule about the
+    copy, not a rule that a whole-shots write clears transitions.
+    """
+    client, _store, _ = make_client(tmp_path)
+    project_id = overlapping_project(client)
+    assert client.put(
+        transitions_url(project_id), json={"transition_out": {"type": "dissolve"}}
+    ).status_code == 200
+
+    shots = [shot.model_dump(mode="json") for shot in ProjectStore(tmp_path).get(project_id).shots]
+    copy = dict(shots[0])
+    copy["id"] = "shot_copy"
+    copy["start"] = 8.0
+    shots.append(copy)
+    saved = client.put(f"/api/projects/{project_id}/shots", json={"shots": shots})
+    assert saved.status_code == 200, saved.text
+
+    stored = {shot.id: shot for shot in ProjectStore(tmp_path).get(project_id).shots}
+    assert stored["shot_copy"].transition_out is None
+    assert stored["shot_copy"].transition_in is None
+    assert stored["shot_one"].transition_out.type == "dissolve"

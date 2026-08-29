@@ -399,11 +399,21 @@ def populate(client: TestClient, project_id: str, **body) -> dict:
 #:
 #:   marked   e84a8587382283b70dbaa0399a744f8def29a36fcacfb9a4ca288492e895006e
 #:   unmarked 1607b49e3f452dc39aa15138137ebfad2b23021bf1744d5dac8051b3c41114d0
+#:
+#: **Re-pinned again on 2026-08-28** when `Shot.transition_in`/`transition_out` were declared, by
+#: the same argument in the same shape: `plan_digest` hashes every field of every shot, so two new
+#: fields move it whatever their value. Proved rather than assumed, exactly as the paragraph above
+#: was: with the two keys stripped from each shot the digests below reproduce the values they
+#: replace, and every shot a populate writes carries `null` on both — populate writes no
+#: transition, and no window, prompt, seed or citation moved. The values they replace:
+#:
+#:   marked   285cf7a5c8a11ceb4f79eceb873953758385b61e36909fd674414fa4983a2386
+#:   unmarked 744c2f277f7568815e59b1bf56f5c686e6733a24f324dc682f354e43732b3498
 CHAINED_DIGEST_SECTIONS_MARKED = (
-    "285cf7a5c8a11ceb4f79eceb873953758385b61e36909fd674414fa4983a2386"
+    "9383d8a8b3f21b2ad98f25457626412f03619fa3809a038f942a34cab0a761e9"
 )
 CHAINED_DIGEST_NO_SECTIONS = (
-    "744c2f277f7568815e59b1bf56f5c686e6733a24f324dc682f354e43732b3498"
+    "37d6b29191383f4160a7d959d6b180ec2d3ea616232a91aff92d958bd26441f5"
 )
 
 
@@ -2859,11 +2869,21 @@ def test_a_line_up_report_carries_the_content_half_and_not_the_manifest(tmp_path
 #:
 #:   marked   aae1a1e69d406723ccbb4d2ae8bb0882eebc4a79ed06b539dfe92f36d9e8cea4
 #:   unmarked f3eb2656353ea017029b75b6e7664e4641f19118d4ac14511d26c7551391e3d1
+#:
+#: **Re-pinned again on 2026-08-28** when `Shot.transition_in`/`transition_out` were declared, by
+#: the same argument in the same shape: `plan_digest` hashes every field of every shot, so two new
+#: fields move it whatever their value. Proved rather than assumed, exactly as the paragraph above
+#: was: with the two keys stripped from each shot the digests below reproduce the values they
+#: replace, and every shot a populate writes carries `null` on both — populate writes no
+#: transition, and no window, prompt, seed or citation moved. The values they replace:
+#:
+#:   marked   ea2e9e81d7149ac762cea77f634b564693d62cba15032a416448cb6e57965184
+#:   unmarked 05eef24988b505e956e087c3eab7d9c7e447dd5de1eec6df73785bc9d33c4440
 VARIED_DIGEST_SECTIONS_MARKED = (
-    "ea2e9e81d7149ac762cea77f634b564693d62cba15032a416448cb6e57965184"
+    "3c7338cb32b5107dee1870d4630aa6a94a4fe94c70d34af2d40b5e2faf02c18e"
 )
 VARIED_DIGEST_NO_SECTIONS = (
-    "05eef24988b505e956e087c3eab7d9c7e447dd5de1eec6df73785bc9d33c4440"
+    "4e7084ff586d28044f9c1b2a6a4d57a9878df97fcaf292d53d8dcfcd1180ee45"
 )
 
 

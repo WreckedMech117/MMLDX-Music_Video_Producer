@@ -680,6 +680,32 @@ class EffectSpec(BaseModel):
     bindings: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class TransitionSpec(BaseModel):
+    """One Transition, as a Shot stores it: which of the catalogue's twelve, and nothing else.
+
+    **There is no duration field and there will not be one** (AD-19). A paired transition's
+    length *is* the Overlap's length — the seconds the Director dragged one clip across the other
+    — so a stored duration would be a second, invisible source of the same number, and the two
+    could disagree. A one-sided transition treats its own clip's frames and changes no frame
+    count at all. Either way the geometry is already on the timeline, and this model's whole job
+    is to say *what kind* of blend it is.
+
+    `type` is a free string on the model for `EffectSpec.effect`'s reason, and it is the same
+    reason: the catalogue lives in `effects.py` (`TRANSITION_CATALOGUE`) and is the only thing
+    entitled to say which types exist, which are pair-only, and which `xfade` name each resolves
+    to. A `Literal` here would answer that question in a second place and would make every
+    manifest holding a type this build no longer ships unloadable. The route validates against
+    the catalogue before a byte is stored, and the export asks again at the moment it composes —
+    AD-21's rule, applied to a transition exactly as it is applied to a stack.
+
+    No `id`. `EffectSpec` needed one because a Shot holds a *list* of cards and two cards of one
+    effect are otherwise indistinguishable (R-33); a Shot holds at most one `transition_in` and
+    one `transition_out`, and the field name is the address.
+    """
+
+    type: str
+
+
 class Shot(BaseModel):
     """One window of the song, and what it is meant to be built from.
 
@@ -837,6 +863,21 @@ class Shot(BaseModel):
     # `PUT .../shots/{id}/effects`, which revalidates the whole stack against the folder as
     # discovered at that moment. The id is checked at the instant it can first matter.
     effects: list[EffectSpec] = Field(default_factory=list)
+    # The Transition pair (FX-16..FX-19, AD-16, AD-30). `None` — the default, and what every
+    # manifest written before these fields existed loads as — means this boundary is a hard cut,
+    # and `assembly_plan` then resolves it exactly as it always has: the later Shot on top.
+    #
+    # **`transition_out` on the earlier Shot is authoritative** (AD-30). `transition_in` is the
+    # mirror the write path keeps in step so the later Shot can draw its own half of the blend;
+    # at export only the outgoing Shot's field is read, so a manifest whose pair disagrees —
+    # hand-edited, or a write that landed halfway — has a decidable answer rather than an
+    # undefined one.
+    #
+    # Written **only** by `PUT .../shots/{shot_id}/transitions` (AD-16). The two generic
+    # whole-shot writes re-adopt the stored pair through `app._adopt_shot_transitions`, so a body
+    # that omits them cannot clear a transition and a body that invents one cannot plant it.
+    transition_in: TransitionSpec | None = None
+    transition_out: TransitionSpec | None = None
 
     @field_validator("mode", mode="before")
     @classmethod
@@ -959,7 +1000,29 @@ SHOT_TAKE_PROVENANCE_FIELDS = frozenset(
 #: on, and one that arrived locked would be refused by the sweeps, fills and re-renders the
 #: Director reaches for next, giving a reason they never set on it. Unlocked is the cheap,
 #: visible state; an inherited lock is invisible protection nobody asked for.
-SHOT_UNINHERITED_DECISION_FIELDS = frozenset({"locked"})
+SHOT_UNINHERITED_DECISION_FIELDS = frozenset(
+    {
+        "locked",
+        # The Transition pair, and they are here rather than in `SHOT_PLAN_CONTENT_FIELDS`
+        # because a transition is not a fact about *this* Shot at all — it is a fact about the
+        # **boundary between two named Shots**, and a copy has no such boundary.
+        #
+        # Both directions are defects rather than losses. Duplicate: the copy lands somewhere in
+        # the plan carrying `transition_out`, and AD-30 makes that field authoritative, so a copy
+        # dropped in front of another Shot would author a blend the Director never dragged.
+        # Split is sharper: the two halves of one Shot share one window, and a `transition_out`
+        # inherited by the *left* half sits at an interior boundary the two halves make between
+        # themselves — a blend of a Shot with itself, on frames that were one continuous clip a
+        # moment ago. `effects` is the opposite case and is classified the opposite way for the
+        # same reason: a look describes the Shot's own frames and travels with them.
+        #
+        # The Director re-authors a transition by dragging the new clip across its neighbour,
+        # which is the gesture that makes the geometry the transition *is* (AD-19). Nothing is
+        # lost that the geometry does not already have to be re-made for.
+        "transition_in",
+        "transition_out",
+    }
+)
 
 
 def citations_in_role(shot: Shot, role: AssetRole) -> list[AssetCitation]:
@@ -1790,8 +1853,20 @@ class ExportLook(BaseModel):
     #: `"<shot_id>=<value>"` shape as `effects` above (FX-25). *Corrected 2026-08-28: this said
     #: ~~"Present and empty"~~, which stopped being true when Epic 10 filled it.*
     bindings: list[str] = Field(default_factory=list)
-    #: Epic 11's transitions. Present and empty — genuinely, on every record this build writes.
-    #: See the class docstring.
+    #: One entry per Transition that composed a segment, in plan order, in the same
+    #: `"<shot_id>=<value>"` shape as the two slots above (FX-25). The shot id is the **outgoing**
+    #: Shot's, because AD-30 makes `transition_out` the authoritative half of a pair.
+    #:
+    #: *Corrected 2026-08-28 by Story 11.1, the story that falsified it.* This said ~~"Present and
+    #: empty — genuinely, on every record this build writes"~~, and `test_stated_constraints.py`'s
+    #: row for it predicted exactly this: *"the day Epic 11 fills it, this comment goes false with
+    #: nothing to say so."* Its row is amended in the same commit.
+    #:
+    #: **A refused transition is listed too, and that is the point of listing anything.** Where
+    #: more than two clips cover one instant the blend is not composed and the boundary stays the
+    #: hard cut it is today (R-37) — the export is not refused over one geometry — so this record
+    #: is the only place that says a transition the manifest holds did not run. It reads
+    #: `"<shot_id>=refused: <sentence>"`, carrying `assembly.TRANSITION_CROWDED_REFUSAL` whole.
     transitions: list[str] = Field(default_factory=list)
 
 

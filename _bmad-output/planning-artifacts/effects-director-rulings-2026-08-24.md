@@ -796,9 +796,25 @@ time, never a flag that can outlive its condition.
 
 ## R-37 — A three-way overlap refuses the transition, not the export
 
-Where more than two clips cover one instant, the **transition** is refused by name — reusing
-`timeline.SNAP_NESTED`'s existing wording and remedy — and the plan still assembles. One check
-registered into `EXPORT_PLAN_CHECKS`.
+Where more than two clips cover one instant, the **transition** is refused by name and the plan
+still assembles.
+
+> **Amended 2026-08-29 by the implementer, on two counts, and both were mine.**
+> **The mechanism contradicted the ruling's own point.** `export_plan_refusals` is consumed as
+> `if refusals: raise HTTPException(422)` — a check registered there that returns a sentence
+> **refuses the export**, which is exactly the outcome the paragraph above spends its length
+> rejecting. The decision is made in `assembly_plan` instead (`AssemblyPlan.transition_refusals`)
+> and recorded on `ExportLook.transitions` as `refused: <sentence>`. A fifth `EXPORT_PLAN_CHECKS`
+> entry *was* added, for a different condition that genuinely must refuse: an unknown stored
+> type, from which there is no picture to render at all.
+> **And "reuse `SNAP_NESTED`'s wording" cannot be done literally, twice over.** `assembly.py` is
+> an AD-25 leaf and `tests/test_module_boundaries.py` now *enforces* that it imports nothing from
+> this package — so it may not reach `timeline`. And the sentence does not fit the general case:
+> three consecutive Shots each dragged over the next until the overlaps touch is the ordinary way
+> to reach this condition, and **nothing is nested in it**, so `SNAP_NESTED`'s *"sits entirely
+> inside"* would state a falsehood. Two sentences ship: a general one, and a nested one whose
+> opening and remedy are `SNAP_NESTED`'s **character for character**, held identical by a test
+> across the boundary the import cannot cross.
 
 Not hypothetical: `assembly_plan` already resolves a nested overlay into two `ClipWindow`s for one
 Shot, and Story 9.7 shipped composing them apart on purpose. Refusing the whole export would be
