@@ -732,6 +732,148 @@ the moment a Director saves a stack.
 
 ---
 
+## Rulings of 2026-08-28 — Epic 11's shape, settled before it starts
+
+Eight decisions, taken after a scoping pass that measured `xfade` on this machine rather than
+reasoning about it. **The measurement that shapes the whole epic:** `xfade` with legs of unequal
+length **silently truncates to the shorter one** — rc 0, no warning at `-v warning`, and `-frames:v`
+does not detect it because it caps from above only. Reproduced independently: 13-frame and 12-frame
+legs give 12 frames out, with and without the cap. That is Epic 10's mistargeted-`sendcmd` failure
+in a new place, and it lands on the one rule this project may never break — the assembled video
+matching the song within a frame.
+
+`xfade` carries **no `T` flag** on any option, so R-29's crash class does not reach Epic 11. The
+silent-short-output class does.
+
+## R-34 — Twelve transitions, and `hblur` is catalogued as "Blur wipe"
+
+FX-19 sets a minimum and the PRD deferred the concrete list to the Director as the last open UX
+question. **Twelve:** dissolve, fade through black, fade through white, blur wipe, and wipe and
+slide in all four directions. Twelve is the smallest set in which *directional* means a direction
+the Director picks rather than two of four.
+
+**Measured: ffmpeg offers 58 `xfade` transitions and there is no isotropic blur — only `hblur`,
+which is horizontal.** So it is catalogued as **"Blur wipe"**. FX-18 says a named type is never
+quietly substituted, and calling a horizontal-only effect "Blur" is precisely that substitution,
+made by the catalogue rather than by the renderer.
+
+Wipes and slides have **no meaningful one-sided form** and are therefore the *pair-only* entries
+FX-19 requires — present in the list and refusing one-sided use **with their reason**, rather than
+silently absent from a list a Director is trying to learn. The one-sided forms are a separate
+composition: `fade` for black and white, and a `sendcmd`-driven `gblur.sigma` ramp for the blur —
+measured working, frames bit-identical outside the ramp.
+
+## R-35 — A boundary preview is a second route and a second fingerprint
+
+Story 11.5 needs a window spanning a cut with two takes in it. `preview_fingerprint` takes **one**
+`take` and one window, and its own docstring asserts as an invariant that a preview is *"never one
+half of a resolved overlap"* — which Story 11.5 contradicts directly. That is a live conflict inside
+the code, not a stale artifact.
+
+**A boundary is a different subject, so it gets its own route and its own key.** The reserved
+seventh fingerprint slot stays exactly what it was reserved for — a transition on a *Shot's own*
+preview, which is what a one-sided transition needs.
+
+**Widening `preview_fingerprint` was rejected for a measured reason:** added inputs that do not
+canonicalise to nothing when absent rename every Shot preview in every project on merge day. That is
+the mistake AD-28's 2026-08-26 amendment was written to stop happening twice, and Epic 10 already
+paid for the version of it where the client's key and the server's fingerprint disagreed.
+
+## R-36 — Removing an Overlap activates the stored transitions, and says so
+
+FX-16 retains the stored types and turns them into one-sided transitions. The consequence no
+artifact stated: **dragging a clip 200 ms silently converts a dissolve into two one-sided treatments
+that both change the rendered picture** — A's tail fades, B's head fades — with no gesture, no
+announcement, and a timeline that now shows nothing at all.
+
+**It is announced**, in the past-tense toast idiom Story 11.3's pair mirror is already building
+(UX-DR12): *"Shot 04 and Shot 05 no longer overlap — both transitions now treat their own frames."*
+One sentence, machinery already in the slice.
+
+*Rejected:* holding the transitions inert until confirmed. It is safer for the Director and it
+requires a stored applied/unapplied flag, which AD-21 and standing law 5 both bar — derived at read
+time, never a flag that can outlive its condition.
+
+## R-37 — A three-way overlap refuses the transition, not the export
+
+Where more than two clips cover one instant, the **transition** is refused by name — reusing
+`timeline.SNAP_NESTED`'s existing wording and remedy — and the plan still assembles. One check
+registered into `EXPORT_PLAN_CHECKS`.
+
+Not hypothetical: `assembly_plan` already resolves a nested overlay into two `ClipWindow`s for one
+Shot, and Story 9.7 shipped composing them apart on purpose. Refusing the whole export would be
+**stricter than `assembly_plan` itself**, and would cost a Director a render over one geometry.
+
+## R-38 — The transition segment reads the two takes, in one invocation
+
+Each leg through its own full effect chain and `trim`, joined by `xfade`, at the same normalised
+geometry, rate, SAR and pixel format as every other intermediate — measured concat-identical to
+`trim_args`' output. `-c:v copy` on the join is unchanged, so FX-NFR-2 is intact.
+
+**Re-cutting from the finished intermediates is not merely more expensive, it is impossible:**
+`assembly_plan` truncates the earlier clip at the later one's start, so **A's overlap frames are in
+no intermediate at all.** That option would require emitting a fourth clip nobody joins.
+
+The frames are provably available: `_window_refusals` runs `assembly_refusals` over
+`subject.clips` — the full Shot windows, *before* overlap resolution — so each take already holds
+its whole window and **no over-render margin is borrowed**, which is what AD-19 requires and what
+R-3's older "taking advantage of the margins" wording got wrong.
+
+## R-39 — A transition is an entry in `plan.clips`, not a sibling list
+
+`AssemblyPlan.clips` is zipped 1:1 with `plan.frames` in three places, and `ExportComposition`'s
+stages are keyed by that index. A transition rides as a **union entry in that one ordered list**.
+
+**The frame grid's whole guarantee is that `sum(plan.frames)` telescopes over one ordered list of
+boundaries.** Two lists means the audio-overlay accumulator and the grid sum are computed from
+sources that can disagree, and FX-NFR-1 is the one thing this epic may not get wrong. The cost —
+every `zip(plan.clips, plan.frames)` site must decide what a transition entry means to it — is a
+**visible** cost rather than an invisible one, which is the trade being made deliberately.
+
+**And a correction to AD-18's reading:** `assembly_plan` today emits **two** entries at an overlap,
+not three, because its resolution loop subtracts each later clip's window from the earlier one. The
+third entry is therefore a change to *what `assembly_plan` emits*, not merely a new argv. The
+**grid** is untouched — every boundary is still some clip's own start or end, so
+`clip_frames_on_grid` telescopes identically. That is what "no new geometry" means, and what it does
+not.
+
+## R-40 — The Overlap band is drawn above the clips, with `pointer-events: none`
+
+`DESIGN.md` says to draw the band **behind** the clip content so borders and chips stay legible.
+**That is unbuildable at HEAD:** `.shot-clip` is `background: #232919` — opaque, with
+`overflow: hidden` — so two clips cover the overlap region completely and a band behind them paints
+nothing.
+
+The band is drawn **above** at 22% alpha with `pointer-events: none`, which preserves both
+properties the design was protecting — not a drag target, and everything underneath still readable —
+and is the technique `#beat-band` and `#vocal-band` already use. `DESIGN.md` §3 and §5 are amended
+in place with the measurement.
+
+Standing hazard the browser gate exists for: a later clip already covers the earlier one's right
+resize handle, and a new overlay **must not make that worse**.
+`tests/e2e_clip_overlap_and_split.py` is that gate.
+
+## R-41 — Both legs compose their Shot's effects, in a per-leg slot namespace
+
+Two graded Shots meeting at a transition should blend their **graded** pictures — FX-NFR-3 says the
+preview is the export's own chain, and a segment that blended ungraded takes would not match the
+clips on either side of it.
+
+**The blocker, found in code and settled here:** `effects.py` labels a branched stage
+`[fx{slot}a]` and a bound filter `class@b{slot}`, where `slot` is the position in *that Shot's own*
+chain — and **both legs of an `xfade` graph start at slot 0.** Two graded Shots would emit duplicate
+filtergraph link labels, which is at least loud; two *bound* Shots would emit **one `sendcmd` target
+driving both legs**, which is silent at rc 0 and is exactly the class `DriveScript.target`'s
+docstring says nothing else can catch.
+
+So the slot namespace gains a **leg prefix** — `fxA0`/`fxB0`, `@a0`/`@b0` — and the existing test
+that *every `sendcmd` target appears as an `@label` in the chain produced by the same call* is
+extended to a two-leg composition. If the label work proves larger than it looks, the honest
+fallback is to refuse a transition where either Shot carries a binding — **as a recorded ruling with
+its reason, never as a silence.**
+
+---
+
 ## Delegated decisions
 
 Not the Director's calls. Recorded here because they were made *for* the Director on 2026-08-27,

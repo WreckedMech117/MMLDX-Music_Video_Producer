@@ -292,13 +292,31 @@ def test_a_range_cited_beside_its_own_document_ends_at_that_documents_last_id():
     assert not stale, "\n".join(stale)
 
 
+#: The rulings file's own last id, derived rather than written down.
+#:
+#: **The negative controls below used to hard-code it, and that went stale the first time the file
+#: grew** -- on 2026-08-28, when R-34..R-41 landed and three tests in this module failed for the
+#: reason the module exists to catch. A guard whose fixture carries the very number the guard
+#: watches is a guard that bills its own maintenance to whoever adds a ruling, which is how a check
+#: earns a reputation for noise and then gets deleted. It is read from the file.
+RULINGS_LAST = max(
+    int(found)
+    for found in re.findall(
+        r"^## R-(\d+)",
+        (REPO / "_bmad-output/planning-artifacts/effects-director-rulings-2026-08-24.md")
+        .read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+)
+
+
 @pytest.mark.parametrize(
     ("text", "fires"),
     [
         ("`effects-director-rulings-2026-08-24.md` (R-8…R-28)", True),
-        ("`effects-director-rulings-2026-08-24.md` (R-8…R-33)", False),
+        (f"`effects-director-rulings-2026-08-24.md` (R-8…R-{RULINGS_LAST})", False),
         ("`effects-director-rulings-2026-08-24.md` (R-25 to R-28)", False),
-        ("`effects-director-rulings-2026-08-24.md` (~~R-8…R-28~~ R-8…R-33)", False),
+        (f"`effects-director-rulings-2026-08-24.md` (~~R-8…R-28~~ R-8…R-{RULINGS_LAST})", False),
         ("the rulings, R-8…R-28", False),
     ],
 )
