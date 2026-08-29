@@ -88,7 +88,7 @@ FX-NFR-6: Preview stays inside a measured budget — under one second from chang
 
 ### UX Design Requirements
 
-UX-DR1: Add `--blue #5b9bd5` as the sixth and final accent token, reserved permanently to transitions and reactive bindings; amend DESIGN.md's "no new accent colors" anti-goal in place with the argument for the exception
+UX-DR1: Add `--blue #5b9bd5` as the ~~sixth~~ **seventh** and final accent token *(count corrected 2026-08-29 by story 11.2: story 11.2 corrected its own copy of this count on 2026-08-28 and this line, in the same file, was left saying six. `styles.css` defines six accents before it.)*, reserved permanently to transitions and reactive bindings; amend DESIGN.md's "no new accent colors" anti-goal in place with the argument for the exception
 UX-DR2: Inspector tab strip built from a data array in the existing `ASSET_TABS` idiom, implemented as a real tablist — `role="tablist"`, arrow-key movement, `aria-selected`, panels bound by `aria-controls`
 UX-DR3: Effect card component — drag handle, Consolas family micro-label, effect name, enable toggle, remove; disabled cards at 45% opacity with controls still readable
 UX-DR4: Parameter row component — label, slider on `--line` track with `--acid` fill, Consolas numeric readout, and the `〜` bind glyph at the right edge

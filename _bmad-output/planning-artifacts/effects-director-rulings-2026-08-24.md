@@ -846,8 +846,46 @@ that both change the rendered picture** — A's tail fades, B's head fades — w
 announcement, and a timeline that now shows nothing at all.
 
 **It is announced**, in the past-tense toast idiom Story 11.3's pair mirror is already building
-(UX-DR12): *"Shot 04 and Shot 05 no longer overlap — both transitions now treat their own frames."*
-One sentence, machinery already in the slice.
+(UX-DR12): ~~*"Shot 04 and Shot 05 no longer overlap — both transitions now treat their own
+frames."*~~ One sentence, machinery already in the slice.
+
+> **Amended 2026-08-29 by the implementer of story 11.2, on the sentence rather than on the
+> ruling.** Announcing the change is right and is unchanged. **What the sentence says is not what
+> the epic built.**
+>
+> This ruling's premise is that removing the Overlap makes *"two one-sided treatments that both
+> change the rendered picture — A's tail fades, B's head fades"*. **Only A's tail fades.** The
+> export reads `transition_out` and no other field: `assembly._paired_transitions` resolves a
+> blend from it, `app._compose_one_sided_transitions` composes a one-sided treatment from it, and
+> that second function's own docstring names the gap — *"`transition_in` is not read at all:
+> AD-30 makes it the mirror… a one-sided fade in on the very first Shot — the one boundary where
+> an incoming field has no pair to mirror — is described by no acceptance criterion in Epic 11 and
+> would need that mapping widened."* B's `transition_in` renders nothing. So *"both transitions
+> now treat their own frames"* would be this application announcing a treatment that does not
+> happen, in the one voice rule it has about never implying what it cannot verify.
+>
+> **Measured rather than read**, through the shipped routes on 2026-08-29. Two Shots, no Overlap.
+> Writing `transition_in: fade_black` on the **first** Shot — the one boundary where the incoming
+> half can exist without the write route mirroring it onto an earlier Shot — answers 200, stores
+> the field, mirrors nothing, and exports with `ExportLook.transitions == []`. Writing the **same
+> type** as `transition_out` on the **same** Shot exports
+> `['shot_a=fade_black one-sided over 12 frames']`. One half composes; the other is stored and
+> never read.
+>
+> **The sentence that ships**, same idiom, same tense, both Shots named:
+>
+> > `Shot 04 and Shot 05 no longer overlap — Shot 04's transition now treats its own last frames,
+> > then cuts.`
+>
+> `api.TRANSITION_OVERLAP_REMOVED_TOAST` carries it, one per pair, and only where the outgoing
+> Shot really holds a stored type — a pair with nothing stored has nothing to convert and nothing
+> to announce.
+>
+> **The alternative, recorded because it is the better product and was not this slice's to
+> take:** make the incoming half render too, so the ruling's premise becomes true. That is a
+> change to what the export composes, on a boundary Epic 11 has no acceptance criterion for, and
+> `_compose_one_sided_transitions` already names it as a later story's. If it is ever taken, this
+> sentence goes back to naming two treatments and the change is one line here and one test.
 
 *Rejected:* holding the transitions inert until confirmed. It is safer for the Director and it
 requires a stored applied/unapplied flag, which AD-21 and standing law 5 both bar — derived at read

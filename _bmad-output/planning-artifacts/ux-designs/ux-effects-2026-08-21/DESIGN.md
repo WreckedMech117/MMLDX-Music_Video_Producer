@@ -42,9 +42,25 @@ The MVP contract's rule stands: **one state, one colour, everywhere it appears.*
 | State | Treatment |
 |---|---|
 | Clip carries Effects | Consolas `ƒ` corner chip, `--muted` on `--surface-2`, 14 px, `--radius` 3px |
-| Overlap with a Transition set | `--blue` band at 22 % over the clip run, `--blue` 1px top and bottom edge, Consolas type label centred |
+| Overlap with a Transition set | `--blue` band at 22 % ~~behind~~ **above** the clip run, `--blue` 1px top and bottom edge, Consolas type label ~~centred~~ along the band's bottom edge, where it fits |
 | Overlap with no Transition set | `--line-strong` hatch, no `--blue`, Consolas `CUT` label — an overlap is a hard cut until a type is chosen, and it must look like one |
 | Parameter bound to a Band | `〜` glyph on the parameter row, `--dim` when inert, `--blue` when bound |
+
+**Amended 2026-08-29 by story 11.2, on R-40, with the measurement.** Both rows above said the band draws *behind* the clip content (see also §5), so state borders and the corner chips would stay legible on top of it. **That is unbuildable at HEAD:** `.shot-clip` is `background: #232919` — opaque — with `overflow: hidden`, so two clips cover the overlap region completely and a band behind them paints nothing at all. It is drawn **above** at 22 % alpha with `pointer-events: none`, which preserves both properties the rule was protecting — everything underneath is still readable through the fill, and nothing new is a drag target — and is the technique `#beat-band` and `#vocal-band` already use one track down.
+
+The layer sits at `z-index: 1`: above every clip body (`.shot-clip` carries no z-index) and **below every resize handle** (`.resize-handle` carries `z-index: 2`). That is load-bearing rather than tidy — a later clip already paints over the earlier one's right handle, and an overlay at 2 or above would take back the 2026-08-21 fix on all eighteen of the Director's overlapping pairs. `tests/e2e_overlap_band.py` hit-tests every handle lying under a band.
+
+**And the label is not always drawn, which nothing here said.** Measured 2026-08-29: at the default 16.6 px/s a **0.50 s Overlap is 8.3 px wide**, and `DISSOLVE` needs about 3.1 s of Overlap before it letters at that zoom. Below its own label's measured width the band draws **no label**, because a clipped fragment of a word says something false where nothing says only that there is not room — and the whole sentence (`DISSOLVE across a 0.50s overlap between shot 01 and shot 02.`) stays on the band's `title` and its accessible name at **every** width, which is what keeps the type off the fill alone (UX-DR15). At a working zoom the label is there; at a whole-song zoom what carries the state is the treatment, and a `--blue` fill against a `--line-strong` hatch differ in texture and not only in hue.
+
+One real consequence, recorded rather than implied: `BOUNDARY_TOLERANCE_SECONDS` (1/48 s) is what makes an overlap an overlap, and that is **0.35 px** at the default zoom. The band is floored at 2 px so a blend the assembler will really perform is never drawn as nothing.
+
+**And the label is not centred vertically, which was found by looking at it.** *(Added 2026-08-29, same story, second pass.)* The first build centred it, as this section said. The screenshot showed `CUT` drawn straight through the word "dark." in the clip beneath — **both** words illegible — and every automated gate was green over it. The cause is structural rather than a near miss: a band spans a *boundary*, so the region under it is the later clip's own left edge, which is exactly where `.clip-id` and `.clip-prompt` are drawn. This is `#beat-band`'s lesson in the other direction, and its own comment already states the rule: a mark that buries what it annotates fails, however correctly it is placed.
+
+So the label sits along the band's **bottom** edge, on a translucent `--bg` ground. A clip is 82 px and its prompt stops painting at 47.8 px (59.8 px with a RENDERING line), so the bottom of the band is the one strip where the clip draws nothing at all. The ground is not a shadow and not chrome (§5 bars both); it is the same device the existing `.job-status` and `.source-badge` chips already use.
+
+**And then the chip column, which the same measurement caught on the next run.** `.clip-chips` is anchored `bottom: 4px` at the clip's **right** edge — and a band's right edge *is* the earlier clip's right edge, so a bottom-aligned label lands on the `ƒ` chip of every graded Shot with an Overlap after it. The ground made the label readable and hid the chip, which is one state signal drawn over another. The label gives that column its **33 px** back — `.clip-prompt`'s own inset around the same chips, the same number for the same reason — and `overlapBands` adds it to the width a band needs *before it letters at all*, so the inset can never squeeze a word into the column instead of withholding it.
+
+The cost is stated rather than hidden: under an overlap the earlier clip's chip is usually already covered by the later clip's opaque body, so the inset often protects a chip nobody can see, and it costs 33 px of band before a graded Shot's label appears. `renderTimeline` draws clips in **manifest** order rather than song order, though, so which clip is on top is not a property of the plan — a Split appends the new half to the end of the manifest — and in that case the chip really is on top. `tests/e2e_overlap_band.py` measures the label against the **painted glyph rectangles** of every clip's text and chips — element boxes lie here, exactly as they did for the chip inset above — and fails on any intersection; its fixture carries a real effect stack, because one with no chip on it would make half that check impossible to fail.
 
 Chips **stack in a column up the clip's right edge**, newest concern nearest the bottom, and are ordered only when there is more than one. The reading order when they coexist is `✓ ƒ ⚑`.
 
@@ -82,7 +98,7 @@ All composed from the tokens above.
 
 **Do**
 
-- Draw the Overlap band *behind* the clip content, so clip state borders and chips stay fully legible on top of it.
+- ~~Draw the Overlap band *behind* the clip content, so clip state borders and chips stay fully legible on top of it.~~ **Amended 2026-08-29 by story 11.2, on R-40 — see §3.** Draw it **above** the clip content at 22 % alpha with `pointer-events: none`, at a `z-index` below the resize handles. Behind is unbuildable: `.shot-clip` is opaque with `overflow: hidden`, so a band behind two clips paints nothing. Legibility and "not a drag target" both survive the move; drawing it behind did not survive contact with the stylesheet.
 - Keep every Consolas micro-label uppercase and letter-spaced, including the new transition and band names.
 - Let `--blue` mean transition or reactive-binding and nothing else, anywhere.
 

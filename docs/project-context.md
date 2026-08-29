@@ -36,9 +36,11 @@ Each of these points at the document that owns it. None of them is restated here
 
 ## Standing practices with no mechanism
 
-Recorded 2026-08-28, closing Epic 9's action items 40 and 42. Four guards now cover what a machine
-can hold — `tests/test_stale_claims.py`, `test_spec_frontmatter.py`, `test_sprint_tracker.py`,
-`test_line_citations.py`, `test_enumeration_claims.py`. **These two cannot be mechanised, and are
+Recorded 2026-08-28, closing Epic 9's action items 40 and 42. ~~Four~~ **Five** guards now cover
+what a machine can hold — `tests/test_stale_claims.py`, `test_spec_frontmatter.py`,
+`test_sprint_tracker.py`, `test_line_citations.py`, `test_enumeration_claims.py`. *(Count corrected
+2026-08-29 by story 11.2: the sentence said four and named five, and the epic specs commissioned
+since have been quoting "the five guards" from the list rather than from the number.)* **These two cannot be mechanised, and are
 written down as practice rather than carried as open tasks**, because an item that is carried
 forever stops being read. That is the failure they are about.
 

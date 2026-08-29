@@ -104,9 +104,9 @@ development_status:
 
   epic-11: in-progress
   11-1-an-overlap-becomes-a-transition: in-progress
-  11-2-the-overlap-on-the-timeline: backlog
-  11-3-the-transition-pair: backlog
-  11-4-one-sided-transitions: backlog
+  11-2-the-overlap-on-the-timeline: review
+  11-3-the-transition-pair: review
+  11-4-one-sided-transitions: review
   11-5-preview-a-transition: backlog
   epic-11-retrospective: optional
 

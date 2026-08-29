@@ -18,6 +18,12 @@ import { TIMELINE_LABEL_WIDTH, TIMELINE_WHEEL_ACTIONS, TIMELINE_ZOOM_STEP, clamp
 // reads the measurement once on the load path -- in the same reply that carries the drag's own
 // targets -- positions what the plan returns, and writes nothing.
 import { BEAT_MARKERS_BAND, BEAT_MARKERS_CONTROL, beatMarkerPlan } from "./api.js";
+// The Overlap band on the SHOTS track and the two transition rows in the Effects tab (stories
+// 11.2, 11.3, 11.4). Every decision is in api.js: which pixels a band spans, which label it
+// carries, whether a row is paired, one-sided or inert, what each state says, what a write sends
+// and what the mirror announces. This module positions, binds and writes, and re-derives none of
+// it -- the division `beatMarkerPlan` above is held to, and for its reason.
+import { overlapBands, overlapRemovalToasts, transitionMirrorToast, transitionRows, transitionWriteBody } from "./api.js";
 // Direct manipulation on the SHOTS track: the undo/redo stacks, the gap-fill gesture and the
 // playhead magnet. Every decision they make is pure and lives in api.js; this module holds the
 // two stacks, binds the gestures and does the writing.
@@ -406,6 +412,10 @@ async function loadProject(id) {
   const previousProject = state.project?.id;
   const previousSelection = state.selectedShotId;
   state.project = await api.project(id);
+  // The plan as it now stands, for R-36's announcement. Taken on every load, refresh included: a
+  // refresh means some other writer moved the project, and comparing the next save against a
+  // snapshot taken before that would announce a change this Director never made.
+  overlapWatch = overlapGeometry(state.project.shots);
   state.audioBuffer = null;
   // A measurement describes one project's song, so it is dropped on a real project change and
   // kept across a refresh of the project already on screen -- which is what loadProject mostly
@@ -1676,6 +1686,37 @@ function takeProvenance(row) {
   return parts.join(" · ");
 }
 
+// The Overlap bands, drawn into the SHOTS track with the clips (stories 11.2, FX-16).
+//
+// **Above the clips, not behind them** (R-40). `DESIGN.md` said behind, so state borders and the
+// corner chips would stay legible on top; that is unbuildable here, because `.shot-clip` is
+// `background: #232919` with `overflow: hidden`, so two clips cover the overlap region completely
+// and a band behind them paints nothing at all. Drawn above at 22% alpha with
+// `pointer-events: none`, both of the properties the design was protecting survive -- everything
+// underneath stays readable and nothing new is a drag target -- and it is `#beat-band`'s and
+// `#vocal-band`'s own technique. `DESIGN.md` sections 3 and 5 carry the measurement.
+//
+// **The z-index is what keeps the standing hazard from getting worse.** A later clip already
+// covers the earlier one's right resize handle, which is why `.resize-handle` carries `z-index: 2`
+// against clip bodies at `auto`. These bands sit at `z-index: 1` (`styles.css`), so they are above
+// every clip body and below every handle: an overlay that painted over the handles would take back
+// the fix `e2e_clip_overlap_and_split.py` gates, and it does not.
+//
+// Positions what `overlapBands` decided and re-derives none of it: the left, the width, whether
+// the label fits, and the sentence are all its answers, so no `pixelsPerSecond` arithmetic appears
+// below. The sentence is on `title` **and** `aria-label` at every width -- a band too narrow to
+// letter still says what it is, which is what stops the type being colour-alone (UX-DR15).
+function overlapBandsHtml() {
+  const bands = overlapBands(state.project?.shots, {
+    pixelsPerSecond: state.pixelsPerSecond,
+    catalogue: transitionCatalogue,
+  });
+  if (!bands.length) return "";
+  return `<div class="overlap-bands">${bands.map((band) =>
+    `<div class="${band.className}" data-before="${escapeHtml(band.before)}" data-after="${escapeHtml(band.after)}"${band.chips ? ` data-chips="${band.chips}"` : ""} role="img" title="${escapeHtml(band.note)}" aria-label="${escapeHtml(band.note)}" style="left:${band.left}px;width:${band.width}px">${band.labelled ? `<span class="overlap-label">${escapeHtml(band.label)}</span>` : ""}</div>`
+  ).join("")}</div>`;
+}
+
 function renderTimeline() {
   const duration = projectDuration();
   const trackWidth = Math.max(900, duration * state.pixelsPerSecond);
@@ -1711,6 +1752,13 @@ function renderTimeline() {
   // `shotLabel` counted manifest positions, so `Delete SHOT 03?` was drawn over a clip reading
   // SHOT 05. One function ranks the shots now, and the dialog and the clip read it.
   const timeOrder = songOrderRanks(state.project?.shots);
+  // The plan as it stands, if nothing has taken it yet. `loadProject` is where it is normally
+  // taken and every workspace reaches this function on the way to a first paint, so this is the
+  // floor rather than the mechanism: seeding it here is what makes "which Overlaps went away" a
+  // question about a plan someone has actually seen, on every entry point into the timeline.
+  // Seeding can never announce anything, because a snapshot of the present differs from the
+  // present in nothing.
+  if (overlapWatch === null && state.project) overlapWatch = overlapGeometry(state.project.shots);
   // The server's verdict on each shot's window length, never this client's own arithmetic. The
   // band's constants live in `timeline.py` and the short end's floor fires well below its
   // nominal minimum, so a check re-derived here would drift and paint the wrong clips. Only the
@@ -1772,7 +1820,7 @@ function renderTimeline() {
       band.className,
     ].filter(Boolean).join(" ");
     return `<div class="shot-clip ${cell.className} ${marks} ${shot.id === state.selectedShotId ? "selected" : ""}" data-shot-id="${shot.id}"${chips.length ? ` data-chips="${chips.length}"` : ""} title="${escapeHtml(band.label)}" aria-label="${escapeHtml(band.label)}" style="left:${shot.start * state.pixelsPerSecond}px;width:${Math.max(40, shot.duration * state.pixelsPerSecond)}px"><span class="resize-handle left"></span><span class="clip-id">SHOT ${String(timeOrder.get(shot.id)).padStart(2, "0")} · ${shot.duration.toFixed(1)}s</span>${render.flag ? `<span class="clip-state">${escapeHtml(phase.flag || renderingFlag(percent))}</span>` : ""}<span class="clip-prompt">${escapeHtml(cell.text)}</span>${fxHtml}<span class="resize-handle right"></span></div>`;
-  }).join("");
+  }).join("") + overlapBandsHtml();
   $$(".shot-clip", track).forEach(bindClip);
   renderReferences();
   // The SECTIONS track, drawn at last: the Director's own marks, each with its window
@@ -2518,9 +2566,40 @@ let effectCatalogue = null;
 //: catalogue on purpose -- a served catalogue with no effects would be a different, and much
 //: stranger, thing to report.
 let effectCatalogueError = "";
-//: The last refusal a stack write was given, and the Shot it was about. Kept rather than left to
-//: the toast, because a toast is gone in four seconds and the sentence a Director has to act on
-//: names an effect, a parameter and a bound. Cleared by the next write that lands.
+
+//: The twelve transitions this application offers, read **once per process** and then held.
+//:
+//: Not beside `effectCatalogue` at boot, and the reason is the route rather than a preference:
+//: there is no unscoped transitions route to ask. The catalogue rides on
+//: `GET .../shots/{shot_id}/transitions` because story 11.1's own last acceptance criterion is
+//: that the route be sufficient with no interface at all, so a shot id is needed to ask for a
+//: constant. `renderTimeline` asks the first time it has a project with any Shot in it, which is
+//: also the first moment anything could want it -- see `loadTransitionCatalogue`.
+let transitionCatalogue = null;
+//: Why the catalogue is missing, when it is. `effectCatalogueError`'s shape and its meaning:
+//: empty is "read, and here it is", anything else is what the two rows say instead of offering
+//: twelve unlabelled ids. A band still draws without it, spelling the stored type out of the id.
+let transitionCatalogueError = "";
+//: Whether the one read has been started. Set **synchronously**, before the await, because
+//: `renderTimeline` runs on every `pointermove` of a clip drag and a flag set after the reply
+//: would send sixty requests during one gesture.
+let transitionCatalogueAsked = false;
+
+//: The plan as this browser last saw it at rest: `{id, start, duration, transition_out}` per Shot,
+//: and nothing else. It exists for one question -- which Overlaps have gone away since -- which is
+//: R-36's announcement, and it is a snapshot rather than a hook inside the drag so that
+//: `overlapRemovalToasts` stays a pure comparison of two plans.
+//:
+//: Refreshed where a plan lands (`loadProject`) and where one is sent (`saveShotsSilently`, after
+//: the comparison). `null` compares as "nothing was overlapping", which is the safe direction: a
+//: missing snapshot says nothing rather than announcing a change that did not happen.
+let overlapWatch = null;
+
+//: The last refusal a write from this panel was given, and the Shot it was about. Kept rather than
+//: left to the toast, because a toast is gone in four seconds and the sentence a Director has to
+//: act on names an effect, a parameter and a bound -- or, since Epic 11, names a transition, the
+//: Shot and why a wipe cannot run on a boundary with no Overlap. Cleared by the next write that
+//: lands, from either control.
 let lastEffectsRefusal = null;
 //: A reorder drag in flight, or `null`. `{ shotId, from, candidates, target }`: the Shot it
 //: belongs to, the storage index of the card being carried, the measured boxes it may be dropped
@@ -2599,12 +2678,66 @@ async function loadEffectCatalogue() {
   }
 }
 
+// The transition catalogue, asked once and never again. It is a constant -- twelve entries built
+// from `effects.TRANSITION_CATALOGUE` -- and it rides on a per-Shot read because that is the route
+// story 11.1 shipped; any Shot answers with the same twelve, so the first one this project holds
+// is the one asked.
+//
+// `loadEffectCatalogue`'s posture exactly: a failure is remembered rather than retried, because
+// the two rows need it to say what any transition is and there is nothing useful to draw in the
+// meantime. The band is the one thing that survives without it, spelling a stored type out of its
+// own id rather than falling back to `CUT` -- which would say a hard cut is what the export will
+// do, and it is not.
+//
+// The redraw at the end is the point: everything drawn from the catalogue was drawn before it
+// arrived, so nothing would show the twelve until the next unrelated render.
+async function loadTransitionCatalogue() {
+  const projectId = state.project?.id;
+  const shotId = state.project?.shots?.[0]?.id;
+  if (!projectId || !shotId) return;
+  transitionCatalogueAsked = true;
+  try {
+    const read = await api.shotTransitions(projectId, shotId);
+    transitionCatalogue = read?.catalogue || [];
+    transitionCatalogueError = "";
+  } catch (error) {
+    transitionCatalogue = null;
+    transitionCatalogueError = error.message || "unreadable";
+  }
+  renderTimeline();
+}
+
+// The plan's geometry and its stored outgoing transitions, and nothing else -- what `overlapWatch`
+// holds. A shallow copy per Shot rather than a `structuredClone` of the list: this is compared,
+// never drawn from, and cloning a manifest sixty times a second is the cost the beat band's own
+// guard exists to avoid.
+function overlapGeometry(shots) {
+  return (shots || []).filter(Boolean).map((shot) => ({
+    id: shot.id, start: shot.start, duration: shot.duration, transition_out: shot.transition_out,
+  }));
+}
+
+// R-36's announcement: an Overlap dragged away converts a stored pair into a one-sided treatment
+// that changes the rendered picture, with no gesture and nothing left on the timeline to show it.
+//
+// Said **once per pair**, from a pure comparison of the plan as it was against the plan being
+// stored, and only where the outgoing Shot really carries a type. The snapshot is advanced here
+// whether or not anything was said, so a second save cannot re-announce the first one's change.
+function announceOverlapRemovals(shots) {
+  for (const line of overlapRemovalToasts(overlapWatch, shots)) toast(line);
+  overlapWatch = overlapGeometry(shots);
+}
+
 // The strip. A real tablist: `role="tablist"`, `role="tab"`, `aria-selected`, `aria-controls`
 // naming the panel each tab owns, and a roving `tabindex` so the pair is one tab stop with the
 // arrow keys moving inside it. Every one of those values comes out of `shotTabStrip`.
 function shotTabStripHtml(shot, activeTab) {
   const tabs = shotTabStrip(shot, activeTab).map((tab) =>
-    `<button type="button" class="shot-tab${tab.active ? " active" : ""}" id="${tab.control}" role="tab" aria-selected="${tab.active}" aria-controls="${tab.panel}" tabindex="${tab.tabIndex}">${escapeHtml(tab.label)}${tab.countLabel ? `<span class="shot-tab-count">${escapeHtml(tab.countLabel)}</span>` : ""}</button>`
+    // The count's own sentence rides on the chip, so the number is never a bare digit whose unit
+    // has to be guessed at. It counts effects **and** transitions since Epic 11 (see
+    // `shotTabStrip`), and the clip chip on the timeline counts effects alone and says so in
+    // words -- so the two can differ, and each says what it is.
+    `<button type="button" class="shot-tab${tab.active ? " active" : ""}" id="${tab.control}" role="tab" aria-selected="${tab.active}" aria-controls="${tab.panel}" tabindex="${tab.tabIndex}">${escapeHtml(tab.label)}${tab.countLabel ? `<span class="shot-tab-count" title="${escapeHtml(tab.countTitle)}" aria-label="${escapeHtml(tab.countTitle)}">${escapeHtml(tab.countLabel)}</span>` : ""}</button>`
   ).join("");
   return `<div class="shot-tabs" role="tablist" aria-label="Shot inspector">${tabs}</div>`;
 }
@@ -2881,6 +3014,14 @@ function effectCopySectionHtml(section) {
 // box: a placeholder shaped like a card is a thing pretending to be a stack.
 function effectsPanel(shot) {
   const model = currentEffectsModel(shot);
+  // The two transition rows, from their own catalogue. **Independent of the effect catalogue**,
+  // and drawn even when that one never arrived: they are two different reads of two different
+  // constants, and a Shot whose stack cannot be labelled still has boundaries a Director can
+  // author. Folding them into `model.problem` would hide a working control for an unrelated
+  // failure.
+  const transitions = transitionRows(state.project, shot, transitionCatalogue, {
+    error: transitionCatalogueError,
+  });
   const refusal = effectsRefusalNotice(shot.id, lastEffectsRefusal);
   // The last copy's report, in the readiness idiom the refusal above already uses. Counts for
   // what landed and every refused Shot's own sentence, whole -- `effectCopyReport`'s division,
@@ -2896,7 +3037,11 @@ function effectsPanel(shot) {
     ? `<div class="shot-readiness blocked" id="effects-refusal"><strong>${escapeHtml(refusal.flag)}</strong><p>${escapeHtml(refusal.message)}</p></div>`
     : "";
   if (model.problem) {
-    return { model, html: `${refusalHtml}<p class="effects-problem" id="effects-problem">${escapeHtml(model.problem)}</p>` };
+    return {
+      model,
+      transitions,
+      html: `${refusalHtml}<p class="effects-problem" id="effects-problem">${escapeHtml(model.problem)}</p>${transitionRowsHtml(transitions)}`,
+    };
   }
   const lockHtml = model.lockNote
     ? `<p class="control-reason" id="effects-locked">${escapeHtml(model.lockNote)}</p>`
@@ -2919,8 +3064,53 @@ function effectsPanel(shot) {
     : "";
   return {
     model,
-    html: `${refusalHtml}${copiedHtml}${lockHtml}${stackNoteHtml}<div class="effect-stack" id="effect-stack">${model.runs.map(effectRunHtml).join("")}</div>${picker}${effectCopyHtml(model.copy)}`,
+    transitions,
+    html: `${refusalHtml}${copiedHtml}${lockHtml}${stackNoteHtml}<div class="effect-stack" id="effect-stack">${model.runs.map(effectRunHtml).join("")}</div>${picker}${effectCopyHtml(model.copy)}${transitionRowsHtml(transitions)}`,
   };
+}
+
+// The transition pair: `Transition in` and `Transition out`, each selecting from the catalogue
+// (FX-16, FX-17, FX-18, FX-19, DESIGN section 4.8).
+//
+// **Every state a row can be in is `transitionRows`' answer**, including which edge token it takes
+// and what its sentence says. Nothing here asks whether an Overlap exists, and that is the whole
+// point of the division: `--blue` on a row with nothing to blend across would be the palette's
+// last accent saying something untrue, and a template that decided it would be checkable only by
+// looking at it.
+//
+// **The state is a sentence, never the edge colour alone** (UX-DR15). A paired row states the
+// Overlap's length in Consolas; a one-sided one states whose frames get treated and that it then
+// cuts; the first Shot's `Transition in` states that nothing renders from it at all. The edge is a
+// second signal, and the `.control-reason` under the select is the first.
+//
+// **Nothing is drawn disabled for want of an Overlap.** A one-sided transition is a real editorial
+// choice (FX-18) and a greyed control would state that it is impossible without saying why. The
+// Shot's own lock is the one thing that does disable these, and it says so in the note the panel
+// already carries above them.
+function transitionRowsHtml(transitions) {
+  if (!transitions) return "";
+  if (transitions.problem) {
+    return `<div class="transition-pair"><span class="effect-family">TRANSITIONS</span><p class="effects-problem" id="transitions-problem">${escapeHtml(transitions.problem)}</p></div>`;
+  }
+  const rows = transitions.rows.map((row) => {
+    const options = row.options.map((option) =>
+      `<option value="${escapeHtml(option.value)}"${option.value === row.value ? " selected" : ""}>${escapeHtml(option.label)}</option>`).join("");
+    // A stored type this build's catalogue does not know is offered back as itself, so the select
+    // draws what the manifest holds instead of silently showing "No transition" over it. The row's
+    // sentence beside it is the export's own refusal waiting to happen, and `EFFECT_UNKNOWN_NOTE`
+    // is the precedent one card up.
+    const unknown = row.unknown
+      ? `<option value="${escapeHtml(row.value)}" selected>${escapeHtml(row.value)}</option>`
+      : "";
+    const length = row.length
+      ? `<span class="transition-length" id="${row.control}-length">${escapeHtml(row.length)}</span>`
+      : "";
+    const note = row.note
+      ? `<p class="control-reason" id="${row.control}-note">${escapeHtml(row.note)}</p>`
+      : "";
+    return `<div class="transition-row" data-edge="${row.edge}" data-state="${row.state}"><div class="transition-head"><label for="${row.control}">${escapeHtml(row.label)}</label>${length}</div><select id="${row.control}" data-side="${row.side}" ${row.disabled ? "disabled" : ""}>${unknown}${options}</select>${note}</div>`;
+  }).join("");
+  return `<div class="transition-pair"><span class="effect-family">TRANSITIONS</span>${rows}</div>`;
 }
 
 // The one place a stack is written, and the one place a refusal is kept.
@@ -2959,6 +3149,54 @@ async function writeEffectStack(shotId, next) {
     toast(error.message, "error");
   }
   // Either way: the clip's chip, the tab's count and every card redraw from what is stored.
+  renderTimeline();
+  return landed;
+}
+
+// One side of a Transition Pair written, through the one route that writes either field (AD-16).
+//
+// **The mirror is the server's** (AD-30): writing `transition_out` on a Shot also writes
+// `transition_in` on the Shot that follows it in song order, and the reply is the whole Project
+// because two Shots moved and only one of them was named. So nothing here writes a neighbour, and
+// the panel redraws from what was stored rather than from what it hoped it sent.
+//
+// **The announcement is the half the Director did not touch** (FX-17, UX-DR12) -- past tense, at
+// the moment it happens, naming both Shots. Said only when a mirror really fired:
+// `transitionMirrorToast` answers `""` on a boundary with nothing on the other side of it, and
+// announcing a change that did not happen is what the past-tense idiom exists to prevent.
+//
+// **A refusal is kept, not toasted away.** A pair-only type on a boundary with no Overlap is
+// offered in the list and refused by the route with its reason (FX-19, R-34) -- the route's own
+// sentence, which names the type, the Shot and the alternatives -- and a sentence a Director has
+// to act on outlives four seconds. It goes where every other refusal in this panel goes.
+async function writeShotTransition(shotId, side, transitionId) {
+  if (!requireProject()) return false;
+  const projectId = state.project.id;
+  const shot = state.project.shots.find((item) => item.id === shotId);
+  if (!shot) return false;
+  // Read before the write, off the plan the Director is looking at: the reply renumbers nothing,
+  // but it does move the neighbour, and the sentence is about the gesture that was just made.
+  const announcement = transitionMirrorToast(
+    state.project, shot, side, transitionId, transitionCatalogue);
+  let landed = false;
+  try {
+    const project = await api.saveShotTransitions(
+      projectId, shotId, transitionWriteBody(side, transitionId));
+    // The Director moved to another project while this was in flight. The write landed on the
+    // server; applying its reply here would show one project's work under another's name.
+    if (state.project?.id !== projectId) return false;
+    state.project = project;
+    lastEffectsRefusal = null;
+    landed = true;
+    if (announcement) toast(announcement);
+  } catch (error) {
+    if (state.project?.id !== projectId) return false;
+    lastEffectsRefusal = { shotId, message: error.message };
+    toast(error.message, "error");
+  }
+  // Either way: the band on the timeline, the tab's count and both rows redraw from what is
+  // stored. The band is the reason this is `renderTimeline` and not a panel repaint -- the
+  // boundary that just changed is two clips wide and lives on the other side of the workspace.
   renderTimeline();
   return landed;
 }
@@ -3228,8 +3466,16 @@ function paintEffectSlider(inspector, target, input) {
 // time: a disabled control dispatches no click and no change, which is what keeps `card.toggle
 // .disabled` the single place that decides whether a stack can be written from this panel. The
 // route refuses regardless, which is the half that is actually a guard.
-function bindEffectsPanel(inspector, shot, model) {
+function bindEffectsPanel(inspector, shot, model, transitions) {
   const shotId = shot.id;
+  // The transition pair. `change` and not `input`, which is the same moment for a select and is
+  // the rule every other control on this tab is bound by. The side travels on the element, so a
+  // handler cannot write the row it was not drawn for.
+  for (const row of transitions?.rows || []) {
+    $("#" + row.control, inspector)?.addEventListener("change", (event) => {
+      writeShotTransition(shotId, row.side, event.target.value);
+    });
+  }
   // Whatever the last render left the strip holding is gone: this render decides again whether
   // there is a strip at all, and a view left over from another Shot's panel would repaint one
   // Shot's band onto another's canvas the next time a tab switch asked for a repaint.
@@ -3776,6 +4022,18 @@ function randomizeSeedFor(shotId) {
 export function renderShotInspector() {
   const shot = selectedShot();
   const inspector = $("#shot-inspector");
+  // The twelve transitions, asked the first time this workspace has a Shot to ask through -- which
+  // is also the first moment anything is drawn from them, since the two rows below are the only
+  // control that needs a label for a type. Here rather than beside `loadEffectCatalogue` at boot
+  // because the route is Shot-scoped: the catalogue rides on `GET .../shots/{id}/transitions`, so
+  // there is nothing to ask before a plan exists (see `loadTransitionCatalogue`).
+  //
+  // Guarded by a flag the loader sets **synchronously**, before its await. This function is called
+  // from `renderTimeline`, which runs on every `pointermove` of a clip drag, and a flag set on the
+  // reply would send sixty requests during one gesture.
+  if (transitionCatalogue === null && !transitionCatalogueAsked && !transitionCatalogueError) {
+    loadTransitionCatalogue();
+  }
   // A selected section owns the panel: this is where its shared prompt is written, the
   // Director's design ("when selecting that Section the info panel on the right would be
   // for where the shared prompt for that sections shots would be input").
@@ -4059,7 +4317,7 @@ export function renderShotInspector() {
   showEffectPicker(inspector, false);
   restoreInspectorEdit(inspector, place);
   bindShotTabs(inspector);
-  bindEffectsPanel(inspector, shot, effects.model);
+  bindEffectsPanel(inspector, shot, effects.model, effects.transitions);
   ["shot-start", "shot-duration", "shot-mode", "shot-singing", "shot-prompt", "shot-song-audio", "shot-locked"].forEach((id) => $("#" + id).addEventListener("change", updateShotFromInspector));
   // The seed is bound apart from the list above for one reason: typing a number by hand is a
   // statement that you want *that* number, so it clears the randomize toggle. Nothing else in this
@@ -5353,6 +5611,13 @@ function saveShotsSilently(kind = "edit") {
   }
   const projectId = state.project.id;
   const shots = structuredClone(state.project.shots);
+  // R-36, at the moment the plan is stored rather than on every pointer move: an Overlap that has
+  // gone away since this browser last saw the plan at rest turns a stored pair into a one-sided
+  // treatment, and that is announced. Here rather than inside the drag's release so that every
+  // path which stores a plan is covered by it -- the drag, the Start/Duration boxes, the gap fill,
+  // a snapped cut and an undo all arrive here -- and because "which Overlaps went away" is then a
+  // comparison of two plans rather than a hook inside a gesture.
+  announceOverlapRemovals(shots);
   const revision = ++shotSaveRevision;
   state.shotsDirty = true;
   state.dirty = true;

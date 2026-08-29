@@ -6585,6 +6585,16 @@ export function adoptedShotEffects(shots, saved) {
   ));
 }
 
+//: How many of this Shot's two transition rows carry a type. Its own function because the tab's
+//: count and the panel's rows must not come to two views of "does this Shot hold a transition".
+export function shotTransitionCount(shot) {
+  return (shot?.transition_in?.type ? 1 : 0) + (shot?.transition_out?.type ? 1 : 0);
+}
+
+//: The sentence under the tab's count, so the number is never a bare digit whose unit has to be
+//: guessed at. Two nouns, because the count really is two things -- see `shotTabStrip`.
+export const SHOT_TAB_COUNT_TITLE = "{effects} and {transitions} on this shot.";
+
 // The strip itself: every tab, whether it is the active one, what it says, and the roving
 // tabindex that makes the pair a single tab stop. Derived rather than templated so the count and
 // the active mark cannot be drawn from two different readings of the same Shot.
@@ -6593,9 +6603,29 @@ export function adoptedShotEffects(shots, saved) {
 // parameters (FX-5) and a Shot carrying three cards of which two are off is still a Shot the
 // Director has done work on. The chip is drawn only when there is something to count: a `0`
 // on every unstyled Shot is a number nobody reads.
+//
+// **And it counts transitions** (Epic 11's decision, taken 2026-08-29). `EXPERIENCE.md` said *"An
+// Overlap transition counts toward it"* while this function counted effect cards only and its
+// docstring said so; the two could not both be right and the epic that owns transitions owns the
+// call. It counts them because the count's stated job is *"the Shot has anything"* and a Shot
+// whose only Director work is a Dissolve would otherwise read as untouched in the one place the
+// strip could say otherwise. The cost is real and is paid deliberately: `clipEffectsChip` on the
+// timeline counts effects alone and says *"Carries 3 effects"* in words, so the two numbers can
+// differ -- which is why the count carries `SHOT_TAB_COUNT_TITLE` naming what is in it, rather
+// than being a digit a Director has to guess the unit of.
+//
+// It counts a transition **whether or not an Overlap is under it**, which is narrower than
+// `EXPERIENCE.md`'s "An Overlap transition" and is the amendment made to that sentence. A count
+// that fell as a Director dragged two clips apart would say the row went empty while the row goes
+// on showing the type it holds.
 export function shotTabStrip(shot, activeId) {
   const active = shotTab(activeId).id;
-  const count = shotEffectStack(shot).length;
+  const effects = shotEffectStack(shot).length;
+  const transitions = shotTransitionCount(shot);
+  const count = effects + transitions;
+  const title = SHOT_TAB_COUNT_TITLE
+    .replace("{effects}", effects === 1 ? "1 effect" : `${effects} effects`)
+    .replace("{transitions}", transitions === 1 ? "1 transition" : `${transitions} transitions`);
   return SHOT_TABS.map((tab) => ({
     id: tab.id,
     label: tab.label,
@@ -6606,6 +6636,7 @@ export function shotTabStrip(shot, activeId) {
     tabIndex: tab.id === active ? 0 : -1,
     count: tab.id === "effects" ? count : 0,
     countLabel: tab.id === "effects" && count ? `· ${count}` : "",
+    countTitle: tab.id === "effects" && count ? title : "",
   }));
 }
 
@@ -9342,6 +9373,421 @@ export function clipEffectsChip(shot) {
   };
 }
 
+//: ------------------------------------------------------------------------------------------
+//: Transitions: the Overlap band, and the two rows.
+//:
+//: Everything here is a **decision**; `app.js` positions what it is handed and re-derives none of
+//: it. That is `beatMarkerPlan`'s division and it is taken for its reason: which pixels a band
+//: spans, which label it carries, whether a row is paired, one-sided or inert, and what each of
+//: those states says are all executable without a browser, and a template that decided any of
+//: them would be checkable only by looking.
+//:
+//: **`transition_out` on the earlier Shot is the only field the picture is drawn from** (AD-30).
+//: The export reads that field and no other -- `assembly._paired_transitions` for a blend,
+//: `app._compose_one_sided_transitions` for a one-sided treatment -- so a band drawn from the
+//: later Shot's `transition_in` would name a blend the render does not perform the moment a
+//: hand-edited manifest diverges. The *rows* still show each Shot its own field, because that is
+//: what makes a divergence visible at all; the *band* is always the outgoing side's.
+//: ------------------------------------------------------------------------------------------
+
+//: What an overlap with no type chosen says. An untyped overlap is still a hard cut and must not
+//: borrow the transition's treatment (UX-DR8), so the band takes no `--blue` and says the thing it
+//: actually is.
+export const TRANSITION_UNTYPED_LABEL = "CUT";
+
+//: The width a band is never drawn narrower than. `BOUNDARY_TOLERANCE_SECONDS` is what makes an
+//: overlap an overlap, and 1/48 s is **0.35 px at the default 16.6 px/s** -- an overlap the
+//: assembler really will blend across, at a width that rounds to nothing. `.vocal-span`'s
+//: `Math.max(2, ...)` is the precedent and this is the same number, for the same reason: a
+//: measured thing that draws as zero is the exact defect Epic 9 shipped when a 1px band was
+//: swallowed by a baseline, and it is invisible to every gate but a screenshot.
+export const TRANSITION_BAND_MIN_PX = 2;
+
+//: What one character of the band's label costs, and the padding around it. 9px Consolas at .08em
+//: tracking, **measured in a real browser** by `e2e_overlap_band.py`, which reads the rendered
+//: width of every label the catalogue can produce and asserts these two numbers bound it -- so the
+//: threshold is a measurement rather than a guess, and a stylesheet change that widens the label
+//: fails there rather than clipping a word in silence.
+//:
+//: Per **character** rather than one flat minimum, because the labels run from `CUT` to
+//: `FADE THROUGH BLACK` and a single number would either clip the long ones or withhold the short
+//: ones. A band too narrow for its own label draws no label at all: a fragment of a word says
+//: something false, where nothing says only that there is not room.
+//:
+//: **The measured consequence, which no design artifact states.** At the default 16.6 px/s a
+//: 0.50 s Overlap is **8.3 px** -- too narrow for any label, and `DISSOLVE` needs about 3.1 s of
+//: Overlap before it letters. So at a working zoom the band's *type* lives in its `title` and its
+//: accessible name, and what the picture carries is the distinction the treatment makes: a soft
+//: `--blue` fill for typed against a `--line-strong` hatch for untyped, which is a difference in
+//: texture and not in colour alone (UX-DR15). `DESIGN.md` section 3 is amended with this.
+export const TRANSITION_BAND_LABEL_CHAR_PX = 5.7;
+export const TRANSITION_BAND_LABEL_PAD_PX = 6;
+
+//: What the label gives up to the clip chip column, where the earlier Shot has one.
+//:
+//: **Found by looking, on the second pass.** A band's right edge *is* the earlier clip's right
+//: edge, which is where `.clip-chips` is anchored -- so a bottom-aligned label lands on the `f`
+//: chip on every graded Shot with an Overlap after it, at every zoom wide enough to letter. The
+//: first fix was an opaque ground under the label, which makes the label readable and hides the
+//: chip: one state signal drawn over another.
+//:
+//: 33px is `.clip-prompt`'s own inset around that column and is the same measurement -- 14px
+//: offset plus a 15px chip plus the gap -- reused rather than re-derived, so a chip that changes
+//: size moves both. It is added to the width a band needs before it letters at all, which is what
+//: keeps "the label fits" and "the label is drawn" one decision instead of two.
+export const TRANSITION_BAND_CHIP_INSET_PX = 33;
+
+//: What the band says to a screen reader, and in its tooltip -- the state in a sentence, at every
+//: width, including the widths too narrow to letter. UX-DR15: the Overlap always carries its type
+//: as text, and a label that is not drawn is not text.
+export const TRANSITION_BAND_TYPED_NOTE =
+  "{label} across a {seconds}s overlap between {before} and {after}.";
+export const TRANSITION_BAND_UNTYPED_NOTE =
+  "A {seconds}s overlap between {before} and {after} with no transition set — it cuts.";
+
+//: The two rows, in the order the Effects tab draws them: `Transition in` above `Transition out`,
+//: which is the order the song plays them -- what leads into this Shot, then what leads out of it.
+//: DESIGN section 4.8 names both rows and neither order; this one is chosen because the panel is
+//: read downwards and the Shot's own window is read left to right.
+export const TRANSITION_ROWS = [
+  { side: "transition_in", label: "Transition in", control: "transition-in" },
+  { side: "transition_out", label: "Transition out", control: "transition-out" },
+];
+
+//: The empty choice. A transition is cleared by choosing it, and it is a real value rather than a
+//: placeholder for the reason `shotModeOptions`' "Not declared" is: every Shot in every manifest
+//: written before this epic carries no transition, and a Director who set one by accident has to
+//: be able to take it back.
+export const TRANSITION_NONE_LABEL = "No transition — hard cut";
+
+//: What a row says when there is no Overlap under it and there is a Shot on the other side of the
+//: boundary: the transition treats the **outgoing** Shot's own last frames and then cuts (FX-18,
+//: story 11.4). Verbatim from EXPERIENCE.md.
+export const TRANSITION_ONE_SIDED_NOTE =
+  "No overlap — this treats {shot}'s last frames, then cuts.";
+
+//: What a `Transition in` says on the **first** Shot in song order, where there is no boundary at
+//: all.
+//:
+//: **No artifact in this epic describes this state**, and it is not the one above. With no earlier
+//: Shot there is nothing for the write route to mirror onto, and the export reads `transition_out`
+//: and only that -- `app._compose_one_sided_transitions`' own docstring names this as the one
+//: boundary *"where an incoming field has no pair to mirror"* and leaves it to a later story. So
+//: the field stores and nothing renders from it, and the row says so.
+//:
+//: **The control stays live**, on `effectCopySectionHtml`'s rule: a greyed control states that
+//: something is impossible without stating why, and this one becomes meaningful the moment a Shot
+//: is added ahead of this one. What is refused is the *silence*, not the gesture.
+export const TRANSITION_HEADLESS_NOTE =
+  "Nothing plays before {shot} — this transition in has no frames to treat, and the export "
+  + "renders nothing from it.";
+
+//: The Overlap's length beside a paired row, and the treated length beside a one-sided one. Two
+//: readouts because they are two different facts: the first is a length the Director dragged and
+//: the second is the server's own ceiling (`one_sided_frames`) clamped by this Shot's window.
+//: Story 11.4's *"bounded by the Shot's own duration and by nothing invisible"* is why the second
+//: is drawn at all, and why the number is read off the catalogue rather than written here.
+export const TRANSITION_PAIRED_LENGTH = "{seconds}s · from overlap";
+export const TRANSITION_ONE_SIDED_LENGTH = "{seconds}s · own frames";
+
+//: The mirror's announcement (FX-17, UX-DR12, story 11.3). Past tense, at the moment it happens,
+//: **naming both Shots** -- which is story 11.3's own acceptance criterion and this slice's spec.
+//: EXPERIENCE.md's example sentence (`Shot 05's transition in set to Dissolve to match.`) names
+//: one, and is amended in place to this.
+//:
+//: Said only when a mirror really fired. A `Transition out` on the last Shot has nothing on the
+//: other side of it to write, and announcing a change that did not happen is the failure this
+//: idiom exists to prevent.
+export const TRANSITION_MIRROR_TOAST =
+  "{other}'s {otherSide} set to {label} to match {shot}'s {side}.";
+export const TRANSITION_MIRROR_CLEARED_TOAST =
+  "{other}'s {otherSide} cleared to match {shot}'s {side}.";
+
+//: R-36's converse: an Overlap dragged away turns a stored pair into a one-sided treatment that
+//: changes the rendered picture, with no gesture and nothing on the timeline to show it.
+//:
+//: **Not R-36's own sentence, and the difference is a correction.** That ruling says *"both
+//: transitions now treat their own frames"*, on its own premise that *"A's tail fades, B's head
+//: fades"*. Neither is what shipped: the export reads `transition_out` and no other field, so
+//: **only the outgoing Shot's tail is treated** and the incoming Shot's `transition_in` renders
+//: nothing at all. Announcing two treatments where one happens is exactly the kind of statement
+//: this application's voice rules bar. R-36 is amended in place with this measurement.
+export const TRANSITION_OVERLAP_REMOVED_TOAST =
+  "{before} and {after} no longer overlap — {before}'s transition now treats its own last "
+  + "frames, then cuts.";
+
+//: The catalogue never arrived. `EFFECTS_CATALOGUE_UNAVAILABLE`'s shape and its reason: the rows
+//: cannot say what any transition is, so they say that instead of offering twelve unlabelled ids.
+export const TRANSITIONS_CATALOGUE_UNAVAILABLE =
+  "The transition catalogue could not be read, so these rows cannot say what any transition is. "
+  + "Nothing has been changed, and a transition already stored on this shot is untouched. Reload "
+  + "the workspace to try again.";
+
+//: `SHOT 04 (shot_a1b2)` is the label a refusal names a Shot by; a *sentence* names it `shot 04`.
+//: One function, so the two forms cannot come to different numbers -- `songOrderRanks` decides the
+//: number in both, which is the fix 2026-08-19's `Delete SHOT 03?`-over-a-clip-reading-05 defect
+//: bought, and it is not being paid for twice.
+export function shotOrdinalName(project, shotId, capital = false) {
+  const rank = songOrderRanks(project?.shots).get(shotId);
+  if (!rank) return String(shotId ?? "");
+  return `${capital ? "Shot" : "shot"} ${String(rank).padStart(2, "0")}`;
+}
+
+//: One catalogue entry, or `null`. A stored type this build's catalogue does not know is a real
+//: state -- a manifest from a newer build, or hand-edited -- and it is answered by the caller
+//: rather than here, because the band and the row say different things about it.
+export function transitionEntry(catalogue, transitionId) {
+  const wanted = String(transitionId || "");
+  if (!wanted) return null;
+  return (catalogue || []).find((entry) => entry?.transition_id === wanted) || null;
+}
+
+//: The Consolas micro-label for a type: the catalogue's own name, uppercased (DESIGN section 2 --
+//: every micro-label is uppercase and letter-spaced). A type the catalogue does not know is
+//: printed as the id it is, spaced out, rather than dropped: a band that fell back to `CUT` would
+//: say a hard cut is what will happen, and the export refuses an unknown type instead of cutting.
+export function transitionBandLabel(catalogue, transitionId) {
+  const entry = transitionEntry(catalogue, transitionId);
+  const text = entry ? entry.label : String(transitionId || "").replace(/_/g, " ");
+  return text.toUpperCase();
+}
+
+//: Every Overlap on the plan, as a region on the shots track with its label and its sentence.
+//:
+//: Built on the **same predicate the server blends by** -- `earlier.end - later.start` against
+//: `BOUNDARY_TOLERANCE_SECONDS`, which is `assembly._paired_transitions`',
+//: `app._boundary_is_overlapped`' and `routes/shots.replace_shot_transitions`' one arithmetic, and
+//: is `contiguityProblems`' too. Below half a frame an "overlap" is one boundary written twice, and
+//: a band there would draw a transition the export will not perform. The Director's live plan
+//: carries four of those (0.002 s to 0.015 s) and every one of them is correctly not a band.
+//:
+//: The scale goes **in** and offsets come **out**, `beatMarkerPlan`'s shape: no `pixelsPerSecond`
+//: arithmetic appears in the template that draws these.
+export function overlapBands(shots, { pixelsPerSecond = 1, catalogue = null } = {}) {
+  const ordered = [...(shots || [])].filter(Boolean).sort((a, b) => a.start - b.start);
+  const ranks = songOrderRanks(shots);
+  const named = (id) => {
+    const rank = ranks.get(id);
+    return rank ? `shot ${String(rank).padStart(2, "0")}` : String(id ?? "");
+  };
+  const bands = [];
+  for (let index = 0; index < ordered.length - 1; index += 1) {
+    const before = ordered[index];
+    const after = ordered[index + 1];
+    const overlap = exactSeconds((before.start + before.duration) - after.start);
+    if (!(overlap > BOUNDARY_TOLERANCE_SECONDS)) continue;
+    const type = String(before.transition_out?.type || "");
+    const width = Math.max(TRANSITION_BAND_MIN_PX, overlap * pixelsPerSecond);
+    const label = type ? transitionBandLabel(catalogue, type) : TRANSITION_UNTYPED_LABEL;
+    // How many chips the **earlier** clip carries, because the band's right edge is that clip's
+    // right edge and the chip column is anchored there. `clipEffectsChip` decides whether one is
+    // drawn; this asks the same question of the same field so the two cannot disagree.
+    const chips = clipEffectsChip(before).shown ? 1 : 0;
+    const needed = label.length * TRANSITION_BAND_LABEL_CHAR_PX + TRANSITION_BAND_LABEL_PAD_PX
+      + chips * TRANSITION_BAND_CHIP_INSET_PX;
+    const note = (type ? TRANSITION_BAND_TYPED_NOTE : TRANSITION_BAND_UNTYPED_NOTE)
+      .replace("{label}", label)
+      .replace("{seconds}", overlap.toFixed(2))
+      .replace("{before}", named(before.id))
+      .replace("{after}", named(after.id));
+    bands.push({
+      before: before.id,
+      after: after.id,
+      typed: Boolean(type),
+      type,
+      seconds: overlap,
+      label,
+      // How many chips the earlier clip carries, so the drawing can hold the label off the
+      // column without measuring anything itself.
+      chips,
+      // Whether the label is *drawn*, decided against this label's own length **and** the room
+      // the chip column takes out of the band. The sentence is carried either way -- see
+      // `TRANSITION_BAND_LABEL_CHAR_PX`.
+      labelled: width >= needed,
+      // Rounded to a thousandth of a pixel: these go into a style attribute the contract tests
+      // read back, and `0.5 * 16.6` is `8.299999999999999` in this arithmetic.
+      left: Math.round(after.start * pixelsPerSecond * 1000) / 1000,
+      width: Math.round(width * 1000) / 1000,
+      className: type ? "overlap-band typed" : "overlap-band untyped",
+      note,
+    });
+  }
+  return bands;
+}
+
+//: One row's state, decided once. Three of them, and each renders a different picture:
+//:
+//: * `paired` -- an Overlap under this boundary. The blend is `xfade` across it and the Overlap
+//:   *is* the duration (AD-19).
+//: * `one-sided` -- a boundary with no Overlap, or the end of the song. The **outgoing** Shot's
+//:   own last frames are treated and then it cuts (story 11.4). A `Transition out` on the last
+//:   Shot is this, not nothing: `_compose_one_sided_transitions` treats it exactly like any other
+//:   unoverlapped boundary, which is a fade at the end of the video.
+//: * `headless` -- a `Transition in` on the first Shot in song order. Nothing precedes it, so
+//:   there is no outgoing field for the write route to mirror onto and nothing composes.
+export function transitionRowState(ordered, position, side) {
+  if (position < 0) return { state: "headless", outgoing: null, incoming: null, seconds: 0 };
+  const outgoing = side === "transition_out" ? ordered[position] : ordered[position - 1];
+  const incoming = side === "transition_out" ? ordered[position + 1] : ordered[position];
+  if (!outgoing) {
+    return { state: "headless", outgoing: null, incoming: incoming || null, seconds: 0 };
+  }
+  const overlap = incoming
+    ? exactSeconds((outgoing.start + outgoing.duration) - incoming.start)
+    : 0;
+  if (incoming && overlap > BOUNDARY_TOLERANCE_SECONDS) {
+    return { state: "paired", outgoing, incoming, seconds: overlap };
+  }
+  return { state: "one-sided", outgoing, incoming: incoming || null, seconds: 0 };
+}
+
+//: How long a one-sided treatment actually runs on this Shot, in seconds.
+//:
+//: **The ceiling is the server's** (`one_sided_frames`, put on the wire by story 11.4 precisely so
+//: a row need not hard-code it), and the clamp is the Shot's own window on the assembly grid --
+//: which is what *"bounded by the Shot's own duration and by nothing invisible"* means. `null`
+//: where there is no one-sided form to have a length, which is the same fact `pair_only` states.
+export function oneSidedTransitionSeconds(entry, shot) {
+  const ceiling = Number(entry?.one_sided_frames);
+  if (!Number.isFinite(ceiling) || ceiling <= 0) return null;
+  const own = Math.round(Number(shot?.duration || 0) * ASSEMBLY_FPS);
+  return Math.max(1, Math.min(ceiling, own)) / ASSEMBLY_FPS;
+}
+
+//: The two transition rows for one Shot: what each selects from, which state it is in, what it
+//: says, and which edge token it takes.
+//:
+//: **Every pair-only entry is offered on every row** (FX-19, R-34). It is present in the list and
+//: refuses one-sided use *with the route's own reason* rather than being absent from a list a
+//: Director is trying to learn -- and that reason is the route's sentence shown whole, never a
+//: second wording invented here to pre-empt it.
+export function transitionRows(project, shot, catalogue, { error = "" } = {}) {
+  const problem = error ? TRANSITIONS_CATALOGUE_UNAVAILABLE : "";
+  const ordered = [...(project?.shots || [])].filter(Boolean).sort((a, b) => a.start - b.start);
+  const position = ordered.findIndex((item) => item?.id === shot?.id);
+  const locked = Boolean(shot?.locked);
+  const options = [{ value: "", label: TRANSITION_NONE_LABEL, pairOnly: false }].concat(
+    (catalogue || []).map((entry) => ({
+      value: String(entry?.transition_id || ""),
+      label: String(entry?.label || ""),
+      pairOnly: Boolean(entry?.pair_only),
+    })));
+  const rows = TRANSITION_ROWS.map((row) => {
+    const place = transitionRowState(ordered, position, row.side);
+    const stored = String(shot?.[row.side]?.type || "");
+    const entry = transitionEntry(catalogue, stored);
+    const treated = place.state === "one-sided" && stored
+      ? oneSidedTransitionSeconds(entry, place.outgoing)
+      : null;
+    const note = place.state === "one-sided"
+      ? TRANSITION_ONE_SIDED_NOTE.replace("{shot}", shotOrdinalName(project, place.outgoing?.id))
+      : place.state === "headless"
+        ? TRANSITION_HEADLESS_NOTE.replace("{shot}", shotOrdinalName(project, shot?.id))
+        : "";
+    const length = place.state === "paired"
+      ? TRANSITION_PAIRED_LENGTH.replace("{seconds}", place.seconds.toFixed(2))
+      : treated === null
+        ? ""
+        : TRANSITION_ONE_SIDED_LENGTH.replace("{seconds}", treated.toFixed(2));
+    return {
+      side: row.side,
+      label: row.label,
+      control: row.control,
+      value: stored,
+      // A stored type this build's catalogue does not know. Kept as the row's value so the
+      // Director can see and clear it, and named so the select does not silently draw "No
+      // transition" over a manifest that holds one -- `EFFECT_UNKNOWN_NOTE`'s rule, for a row.
+      unknown: Boolean(stored) && !entry,
+      state: place.state,
+      paired: place.state === "paired",
+      // The edge token, decided here so `--blue` cannot be painted by a template that has come to
+      // its own view of whether an Overlap exists. `--blue` means transition-or-reactive and
+      // nothing else (DESIGN section 1), so a row with nothing to blend across does not take it.
+      edge: place.state === "paired" ? "blue" : "dim",
+      seconds: place.seconds,
+      length,
+      note,
+      // Never disabled for want of an Overlap. A one-sided transition is a real editorial choice
+      // (FX-18); the one thing that disables every writing control on this tab is the lock (FX-7).
+      disabled: locked,
+      options,
+      neighbour: (row.side === "transition_out" ? place.incoming?.id : place.outgoing?.id) || "",
+    };
+  });
+  return { shown: !problem, problem, rows: problem ? [] : rows, locked };
+}
+
+//: What a transition write sends. **Exactly one side is named**, because the route reads an unsaid
+//: side as unsaid and a body naming neither is a refusal by name
+//: (`app.SHOT_TRANSITION_ABSENT_REFUSAL`) rather than a way to clear both. `null` clears; a
+//: `{type}` sets. One function builds the body, so no caller composes one.
+export function transitionWriteBody(side, transitionId) {
+  return { [side]: transitionId ? { type: String(transitionId) } : null };
+}
+
+//: What the mirror's toast says, or `""` when no mirror fired.
+//:
+//: The route writes both halves of one blend whichever end the client named (AD-30), and this is
+//: the announcement of the half the Director did not touch. It is `""` where there is no Shot on
+//: the other side of that boundary -- the last Shot's `Transition out`, the first Shot's
+//: `Transition in` -- because nothing was mirrored there, and announcing a change that did not
+//: happen is the failure the past-tense idiom exists to prevent.
+export function transitionMirrorToast(project, shot, side, transitionId, catalogue) {
+  const ordered = [...(project?.shots || [])].filter(Boolean).sort((a, b) => a.start - b.start);
+  const position = ordered.findIndex((item) => item?.id === shot?.id);
+  if (position < 0) return "";
+  const other = side === "transition_out" ? ordered[position + 1] : ordered[position - 1];
+  if (!other) return "";
+  const otherSide = side === "transition_out" ? "transition in" : "transition out";
+  const mine = side === "transition_out" ? "transition out" : "transition in";
+  const wording = transitionId ? TRANSITION_MIRROR_TOAST : TRANSITION_MIRROR_CLEARED_TOAST;
+  const entry = transitionEntry(catalogue, transitionId);
+  return wording
+    .replace("{other}", shotOrdinalName(project, other.id, true))
+    .replace("{otherSide}", otherSide)
+    .replace("{label}", entry ? entry.label : String(transitionId || ""))
+    .replace("{shot}", shotOrdinalName(project, shot?.id, true))
+    .replace("{side}", mine);
+}
+
+//: Every adjacent pair that was overlapping and is not any more, as the sentence R-36 requires --
+//: **one per pair**, and only where the outgoing Shot really carries a stored type, because a pair
+//: with nothing stored has nothing to convert into a one-sided treatment and nothing to announce.
+//:
+//: A pure comparison of two plans rather than a hook inside the drag, so "which overlaps went
+//: away" is executable without a pointer. The Shot numbers come from the plan **after** the edit:
+//: the numbers a Director is looking at on the clips are the numbers the sentence has to use.
+export function overlapRemovalToasts(before, after) {
+  const overlappingPairs = (shots) => {
+    const ordered = [...(shots || [])].filter(Boolean).sort((a, b) => a.start - b.start);
+    const found = new Set();
+    for (let index = 0; index < ordered.length - 1; index += 1) {
+      const earlier = ordered[index];
+      const later = ordered[index + 1];
+      const overlap = exactSeconds((earlier.start + earlier.duration) - later.start);
+      if (overlap > BOUNDARY_TOLERANCE_SECONDS) found.add(`${earlier.id}|${later.id}`);
+    }
+    return found;
+  };
+  const was = overlappingPairs(before);
+  const now = overlappingPairs(after);
+  const held = new Map((after || []).filter(Boolean).map((shot) => [shot.id, shot]));
+  const lines = [];
+  for (const key of was) {
+    if (now.has(key)) continue;
+    const [earlierId, laterId] = key.split("|");
+    const earlier = held.get(earlierId);
+    // A pair gone from the plan entirely -- a delete, or a re-plan -- is not "no longer overlap",
+    // and a pair with nothing stored has nothing to say.
+    if (!earlier || !held.has(laterId) || !earlier.transition_out?.type) continue;
+    lines.push(TRANSITION_OVERLAP_REMOVED_TOAST
+      .replace("{before}", shotOrdinalName({ shots: after }, earlierId, true))
+      .replace("{after}", shotOrdinalName({ shots: after }, laterId, true))
+      .replace("{before}", shotOrdinalName({ shots: after }, earlierId, true)));
+  }
+  return lines;
+}
+
 // FastAPI reports handler failures as a plain `detail` string but validation
 // failures (422) as a list of {loc, msg, type} objects, which would otherwise
 // reach the Director as "[object Object]". Render both into readable text.
@@ -9457,6 +9903,19 @@ export const api = {
   // time it opens, and `?rescan=true` is a Director's explicit "I just added a look", never
   // something a panel does on its own.
   effectCatalogue: () => request("/api/effects/catalogue"),
+  // One Shot's Transition pair, **and the twelve this application offers**. The catalogue is a
+  // constant and rides on this read because story 11.1's own last acceptance criterion is that the
+  // route be sufficient with no interface at all -- there is no second, unscoped route to ask, and
+  // adding one to save this client a shot id would be a route added for a client's convenience.
+  // So it is asked once per process, from whichever Shot the workspace has, and cached: see
+  // `loadTransitionCatalogue` in `app.js`.
+  shotTransitions: (projectId, shotId) => request(`/api/projects/${projectId}/shots/${shotId}/transitions`),
+  // The one route that writes either transition field (AD-16). The body is `transitionWriteBody`'s
+  // and names **exactly one side**: an unsaid side is unsaid, `null` clears, and a body naming
+  // neither is a refusal by name rather than a way to clear both. The route writes the mirror on
+  // the other side of the boundary itself (AD-30), which is why the reply is the whole Project --
+  // two Shots moved, and only one of them was named.
+  saveShotTransitions: (projectId, shotId, body) => request(`/api/projects/${projectId}/shots/${shotId}/transitions`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify(body) }),
   // The one route that edits an existing Shot's stack. The body is `effectStackWrite`'s and
   // nothing else composes one, because the shape is load-bearing: a body naming no `effects` at
   // all is a 422 by name (a misspelled key used to answer 200 and erase a grade), while

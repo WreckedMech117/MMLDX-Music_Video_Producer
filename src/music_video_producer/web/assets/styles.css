@@ -1090,6 +1090,111 @@ dialog p { color: var(--muted); line-height: 1.5; }
    ran under the chip before the column existed. Measured identical with the inset on and off, at
    every chip count. */
 .shot-clip[data-chips]:not([data-chips="1"]) .clip-prompt { padding-right: 33px; }
+
+/* ---- The Overlap band on the SHOTS track (story 11.2, FX-16, DESIGN 3 and 4.7) --------------
+
+   **Above the clips, not behind them** (R-40, amending DESIGN 5). Behind is what DESIGN asked
+   for, so state borders and the corner chips would stay legible on top of it -- and it is
+   unbuildable here: `.shot-clip` is `background: #232919` with `overflow: hidden`, so two clips
+   cover the overlap region completely and a band behind them paints nothing at all. At 22% alpha
+   above them, both properties the design was protecting survive: everything underneath stays
+   readable through the fill, and `pointer-events: none` keeps it from being a drag target. That
+   is `#beat-band`'s and `#vocal-band`'s own technique, one track down.
+
+   **`z-index: 1`, and it is load-bearing.** A later clip already paints over the earlier one's
+   right resize handle, which is why `.resize-handle` carries `z-index: 2` while `.shot-clip`
+   carries none -- the handles resolve against this track and float above every clip body. A band
+   at 1 is above every body and **below every handle**, so this overlay cannot take back the fix
+   `e2e_clip_overlap_and_split.py` gates. Any number at or above 2 here would bury eighteen handles
+   on the Director's own plan.
+
+   Top and height match `.shot-clip`'s 12px/82px exactly, so the band spans the clips it is about
+   and nothing else. The clip geometry is the stylesheet's, as it already is for the clips; only
+   the horizontal offsets come out of `overlapBands`. */
+.overlap-bands { position: absolute; inset: 0; z-index: 1; pointer-events: none; }
+.overlap-band { position: absolute; top: 12px; height: 82px; display: flex; align-items: flex-end; justify-content: center; overflow: hidden; box-sizing: border-box; }
+/* Fill, not outline. Error states in this application are outlines -- `--red-edge` borders,
+   dashed MISSING boxes -- so a soft filled region is structurally unlike one and cannot be misread
+   as a fault (DESIGN 3, UX-DR8). 22% is R-40's number.
+
+   **The 8-digit hex first, then `color-mix`.** `#d4f75e66` on `.vocal-span` is this
+   stylesheet's own way of spending an accent at an alpha, and it is kept as the fallback
+   declaration for one reason: a browser that does not resolve `color-mix` would drop the
+   whole declaration and draw a band with no fill, which is the *measured thing that draws
+   as nothing* this slice exists after. The token form wins wherever it is understood, so
+   `--blue` stays the source; the hex is the floor, and the browser gate reads the computed
+   background back to say which one landed. */
+.overlap-band.typed { background: #5b9bd538; background: color-mix(in srgb, var(--blue) 22%, transparent); border-top: 1px solid var(--blue); border-bottom: 1px solid var(--blue); }
+/* An untyped overlap is still a hard cut and must not borrow the transition's treatment: no
+   `--blue` anywhere in this rule. A `--line-strong` hatch at 6px, which reads as texture rather
+   than as a second colour and is therefore not a state carried by hue. */
+.overlap-band.untyped { background: repeating-linear-gradient(135deg, transparent 0 3px, #454a498c 3px 6px); background: repeating-linear-gradient(135deg, transparent 0 3px, color-mix(in srgb, var(--line-strong) 55%, transparent) 3px 6px); border-top: 1px solid var(--line-strong); border-bottom: 1px solid var(--line-strong); }
+/* The type as text, in the Consolas micro-label idiom every other index and id on this timeline
+   uses. `--ink` on the fill rather than `--blue` on `--bg`: DESIGN 1's contrast note says `--blue`
+   labels but is never body text. `overlapBands` decides whether this element is drawn at all --
+   below its own label's measured width it is left out rather than clipped to a fragment of a word,
+   and the band's `title` and `aria-label` carry the whole sentence at every width.
+
+   **Along the bottom of the band, on its own ground, and both of those were found by looking.**
+   The first pass centred it, as DESIGN 3 says, and browser QA on 2026-08-29 showed why that
+   cannot work here: the band spans a *boundary*, so the region under it is the later clip's own
+   left edge -- which is exactly where `.clip-id` and `.clip-prompt` are drawn. A centred `CUT`
+   landed on top of "dark." and **both** words became unreadable. This is `#beat-band`'s lesson in
+   the other direction: that band was moved to a 13px strip at the top of its row because
+   full-height marks buried the waveform, and the requirement there and here is the same -- the
+   label has to read *against* what is under it.
+
+   A clip is 82px and its prompt stops painting at 47.8px (59.8px on a clip also carrying a
+   RENDERING line, measured 2026-08-25), so the bottom of the band is the one strip where the clip
+   draws nothing at all. The ground is what covers the remaining case: `.clip-chips` is anchored
+   `bottom: 4px` at the clip's right edge, which is inside a narrow band's whole width, and a
+   translucent `--bg` plate keeps the label legible over a `f` chip without reading as a hole cut
+   in the clip. Not a shadow and not chrome -- DESIGN 5 bars both, and this is neither. */
+/* The label gives the chip column its 33px back where the earlier clip has one. That is
+   `.clip-prompt`'s own inset around the same column -- 14px offset, a 15px chip, the gap -- and
+   it is the same number for the same reason rather than a second measurement of one thing.
+
+   Found by looking, on the second pass: a band's right edge **is** the earlier clip's right edge,
+   so a bottom-aligned label lands on the `f` chip of every graded Shot with an Overlap after it.
+   The ground below made the label readable and hid the chip, which is one state signal drawn over
+   another. `overlapBands` adds this to the width a band needs before it letters at all, so the
+   inset can never squeeze the label instead of withholding it.
+
+   **What this costs, and why it is still worth it, measured.** Under an overlap the earlier
+   clip's chip is usually *already* covered -- the later clip's opaque body is painted over it,
+   which is the 2026-08-20 layering ruling working as designed -- so the inset often protects a
+   chip nobody can see, and it costs 33px of band before a label is drawn on a graded Shot.
+   `renderTimeline` draws clips in **manifest** order rather than song order, though, so which
+   clip is on top is not a property of the plan: a Split appends the new half to the end of the
+   manifest, so a shot dragged over its neighbour after a split paints its chip on top of that
+   neighbour. The inset is right in that case and the label is only deferred to a wider zoom in
+   the other -- the band's `title` and accessible name say the type at every width regardless. */
+.overlap-band[data-chips] .overlap-label { margin-right: 33px; }
+.overlap-band .overlap-label { margin-bottom: 5px; padding: 1px 3px; border-radius: 2px; background: #0c0d0dd9; background: color-mix(in srgb, var(--bg) 85%, transparent); color: var(--ink); font: 9px Consolas, monospace; letter-spacing: .08em; white-space: nowrap; }
+.overlap-band.untyped .overlap-label { color: var(--muted); }
+
+/* ---- The transition pair in the Effects tab (stories 11.3 and 11.4, DESIGN 4.8) -------------
+
+   Two rows, each a select of catalogue types, under the family micro-label the picker's groups
+   already use. The left edge is the second signal and never the only one: `app.js` writes
+   `data-edge` from `transitionRows`' answer, and the sentence under the select says the same thing
+   in words (UX-DR15). Nothing here decides which edge a row takes.
+
+   `--blue` where an Overlap exists, because that is the one thing `--blue` means (DESIGN 1);
+   `--dim` where there is none, so the palette's last accent is not spent on a row with nothing to
+   blend across. */
+.transition-pair { margin-top: 14px; }
+.transition-row { margin: 6px 0 0; padding: 7px 9px; border: 1px solid var(--line); border-left: 2px solid var(--line-strong); border-radius: var(--radius); background: var(--surface-1); }
+.transition-row[data-edge="blue"] { border-left-color: var(--blue); }
+.transition-row[data-edge="dim"] { border-left-color: var(--dim); }
+.transition-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.transition-head label { color: var(--muted); font-size: 12px; }
+/* The Overlap's length, or a one-sided treatment's. Consolas because it is a measurement, and
+   `--blue` only on a paired row for the reason the edge is. */
+.transition-length { flex: none; color: var(--muted); font: 9px Consolas, monospace; letter-spacing: .08em; }
+.transition-row[data-edge="blue"] .transition-length { color: var(--blue); }
+.transition-row select { width: 100%; margin-top: 5px; }
+.transition-row .control-reason { margin: 6px 0 0; }
 @media (max-width: 1180px) {
   .topbar { grid-template-columns: 220px minmax(170px, 1fr) auto; }
   .transport-mini { display: none; }

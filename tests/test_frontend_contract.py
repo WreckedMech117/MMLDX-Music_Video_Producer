@@ -46,6 +46,7 @@ from music_video_producer.app import (
     document_not_requested_notice,
     document_restore_notice,
 )
+from music_video_producer.assembly import BOUNDARY_TOLERANCE_SECONDS
 from music_video_producer.batch import (
     TERMINAL_JOB_STATUSES,
     format_duration,
@@ -54,6 +55,11 @@ from music_video_producer.batch import (
     render_timing_summary,
     sampling_bundle_cell,
     sampling_bundle_summary,
+)
+from music_video_producer.effects import (
+    ONE_SIDED_TRANSITION_FRAMES,
+    TRANSITION_CATALOGUE,
+    TRANSITION_PAIR_ONLY_REFUSAL,
 )
 from music_video_producer.models import (
     ASSET_ROLE_LABELS,
@@ -98,6 +104,13 @@ RELEASED_IN_FINALLY = re.compile(r'finally \{\s*shotWriteInFlight = "";')
 API_JS = Path("src/music_video_producer/web/assets/api.js")
 INDEX_HTML = Path("src/music_video_producer/web/index.html")
 STYLES_CSS = Path("src/music_video_producer/web/assets/styles.css")
+
+#: The transition catalogue's one read. It rides on a Shot-scoped route because that is the route
+#: story 11.1 shipped -- the twelve are a constant and there is no unscoped door to ask through --
+#: and `app.js` asks it once per process, from the first render that has a Shot to ask with.
+#: Named here so the request-log assertions across this file say *which* extra request they expect
+#: rather than filtering by method, and so a **second** unexpected one still fails them.
+TRANSITIONS_CATALOGUE_READ = "/api/projects/p1/shots/shot_a/transitions"
 
 # Every preset the markup actually offers, and the endpoint it must resolve to.
 # A typo in either the markup or the mapping must not silently route a cover
@@ -12465,7 +12478,8 @@ def test_the_timeline_paints_the_beat_band_and_the_toggle_changes_only_that():
                         song: {json.dumps(MEASURED_SONG)} }};
       state.songMeasurement = {json.dumps(SMALL_ENVELOPE)};
       state.pixelsPerSecond = 16;
-      const before = {{ project: JSON.stringify(state.project), requests: requests.length }};
+      const before = {{ project: JSON.stringify(state.project),
+                       requests: requests.map((entry) => entry.path) }};
       // The toggle is both the gesture under test and the shortest path to a real
       // `renderTimeline` from outside it: off first, then back on.
       fire('#beat-markers:click');
@@ -12484,7 +12498,8 @@ def test_the_timeline_paints_the_beat_band_and_the_toggle_changes_only_that():
       const zoomed = {{ band: at('#beat-band').innerHTML, scale: state.pixelsPerSecond }};
       console.log(JSON.stringify({{
         hidden, shown, zoomed, before,
-        after: {{ project: JSON.stringify(state.project), requests: requests.length }},
+        after: {{ project: JSON.stringify(state.project),
+                 requests: requests.map((entry) => entry.path) }},
       }}));
     """)
 
@@ -12530,7 +12545,10 @@ def test_the_timeline_paints_the_beat_band_and_the_toggle_changes_only_that():
     assert drawn["hidden"]["shots"] == drawn["shown"]["shots"]
     assert "a wolf at the window" in drawn["shown"]["shots"]
     assert drawn["after"]["project"] == drawn["before"]["project"]
-    assert drawn["after"]["requests"] == drawn["before"]["requests"], (
+    # The transition catalogue's one read, which the *first* render of this workspace issues and
+    # no later one does (`loadTransitionCatalogue`). Named rather than counted, so a second
+    # unexpected request still fails this exactly as it always did.
+    assert drawn["after"]["requests"] == [*drawn["before"]["requests"], TRANSITIONS_CATALOGUE_READ], (
         "toggling a display-only marker sent a request"
     )
 
@@ -19957,8 +19975,9 @@ def test_the_render_phase_rides_the_existing_poll_and_adds_no_request_of_its_own
         },
     )
 
-    # One tick, one request. The phase cost nothing.
-    assert polled["requests"] == ["/api/projects/p1/render-status"]
+    # One tick, one request. The phase cost nothing. The transition catalogue's single read is
+    # the first render's, not the poll's, and is named rather than filtered.
+    assert polled["requests"] == ["/api/projects/p1/render-status", TRANSITIONS_CATALOGUE_READ]
     assert polled["phase"] == {"shot_a": "running", "shot_b": "queued"}
     # And the two clips really draw apart, which is the whole of what the Director asked for.
     clips = {
@@ -20238,6 +20257,32 @@ def drawn_effects_panel(shot: str, responses: dict | None = None, catalogue=EFFE
     return drawn
 
 
+def count_chip(html: str) -> tuple[str, str]:
+    """The tab strip's count chip as `(text, its sentence)`, read out of the inspector's markup.
+
+    Read as a pair because the number and the sentence are one statement: the count mixes effects
+    and transitions since Epic 11, so a chip that said `. 4` with no unit would be a digit a
+    Director has to guess at -- which is the thing the sentence exists to stop.
+    """
+    found = re.search(
+        r'<span class="shot-tab-count" title="([^"]*)" aria-label="([^"]*)">([^<]*)</span>', html)
+    assert found, html
+    assert found.group(1) == found.group(2), "the tooltip and the accessible name disagree"
+    return found.group(3), found.group(1)
+
+
+def without_the_transition_pair(effects_html: str) -> str:
+    """The Effects tab without the two transition rows at the foot of it.
+
+    For the sweeps that assert a marker appears *nowhere* among the effect cards. Two of those
+    markers are single characters -- `EFFECT_PARAMETER_NO_READING` is one em dash -- and the
+    transition rows carry ordinary prose containing them, so a panel-wide substring search stopped
+    meaning what it meant the day those rows were added. The claim is about the cards, and this is
+    the cards.
+    """
+    return effects_html.split('<div class="transition-pair">', 1)[0]
+
+
 def inspector_panels(html: str) -> tuple[str, str]:
     """The `Shot Info` panel's markup and the `Effects` panel's, split out of the inspector."""
     opening = '<div class="shot-tab-panel" id="shot-panel-effects"'
@@ -20305,15 +20350,35 @@ def test_the_inspector_opens_on_two_tabs_with_shot_info_active_and_holding_what_
 
 
 def test_the_effects_tab_carries_a_trailing_count_of_everything_the_shot_holds():
-    """Including the disabled ones: a retained Effect is work the Director did."""
+    """Including the disabled ones: a retained Effect is work the Director did.
+
+    **And including transitions** (Epic 11's decision, 2026-08-29). `EXPERIENCE.md` said an
+    Overlap transition counts toward this chip while `shotTabStrip` counted effect cards only and
+    said so in its docstring; the epic that owns transitions settled it in the document's favour,
+    because a Shot whose only Director work is a Dissolve would otherwise read as untouched in the
+    one place the strip could say otherwise.
+
+    The cost of that is real and is what the sentence on the chip is for: `clipEffectsChip` on the
+    timeline counts effects alone and says *"Carries 1 effect"* in words, so the two numbers can
+    differ. A digit whose unit has to be guessed at is what is refused here, not the difference.
+    """
     empty = drawn_effects_panel(effects_shot())
     carrying = drawn_effects_panel(effects_shot(effects=[
         {"effect": "grain", "enabled": True, "parameters": {}},
         {"effect": "punch_in", "enabled": False, "parameters": {}},
     ]))
+    blended = drawn_effects_panel(effects_shot(
+        effects=[{"effect": "grain", "enabled": True, "parameters": {}}],
+        transition_out={"type": "dissolve"},
+    ))
+    # A Shot with no stack at all, and one transition. The chip has to appear for this Shot: it is
+    # the whole case the decision was taken for.
+    only = drawn_effects_panel(effects_shot(transition_in={"type": "fade_black"}))
 
     assert 'class="shot-tab-count"' not in empty["html"]
-    assert '<span class="shot-tab-count">· 2</span>' in carrying["html"]
+    assert count_chip(carrying["html"]) == ("· 2", "2 effects and 0 transitions on this shot.")
+    assert count_chip(blended["html"]) == ("· 2", "1 effect and 1 transition on this shot.")
+    assert count_chip(only["html"]) == ("· 1", "0 effects and 1 transition on this shot.")
 
 
 def test_the_tab_strip_moves_by_arrow_key_and_the_aria_state_follows():
@@ -20463,7 +20528,7 @@ def test_adding_an_effect_from_the_picker_writes_the_stack_and_draws_the_card():
     assert '<span class="effect-name">Grain</span>' in added["effects"]
     assert '<span class="effect-family">texture</span>' in added["effects"]
     # And the count on the tab follows the stack the server sent back.
-    assert '<span class="shot-tab-count">· 1</span>' in added["html"]
+    assert count_chip(added["html"]) == ("· 1", "1 effect and 0 transitions on this shot.")
 
 
 def test_the_picker_is_a_disclosure_that_opens_and_closes_and_ships_closed():
@@ -21318,9 +21383,10 @@ def test_an_in_bounds_value_and_an_unstored_one_still_draw_ordinary_cards():
         control = drawn_parameter_control(panel["effects"], "0-zoom")
         assert control == {"value": value, "fill": fill, "readout": readout,
                            "invalid": False, "describes": False, "disabled": False}
-        assert exports["refusedClass"] not in panel["effects"]
-        assert "effect-row-note" not in panel["effects"]
-        assert exports["noReading"] not in panel["effects"]
+        cards = without_the_transition_pair(panel["effects"])
+        assert exports["refusedClass"] not in cards
+        assert "effect-row-note" not in cards
+        assert exports["noReading"] not in cards
 
 
 def test_a_refused_row_draws_its_control_empty_rather_than_at_the_default():
@@ -23190,7 +23256,7 @@ def test_the_effects_panel_does_not_re_decide_which_moves_are_legal():
     A family comparison written into a handler is a second rule, and the one that is tested would
     not be the one that ran.
     """
-    binder = app_js_block("function bindEffectsPanel(inspector, shot, model) {")
+    binder = app_js_block("function bindEffectsPanel(inspector, shot, model, transitions) {")
     drag = app_js_block("function startEffectDrag(inspector, model, shotId, from, event) {")
     candidates = app_js_block("function effectDragCandidates(inspector, model, stack, from) {")
     body = without_comments(binder) + without_comments(drag) + without_comments(candidates)
@@ -26224,3 +26290,835 @@ def test_every_child_of_the_timeline_column_is_placed_on_a_track_of_its_own():
     assert [child["classes"] for child in children if "hidden" in child["attributes"]], (
         "no child of `.timeline-main` ships `hidden` any more -- if that is deliberate, this "
         "test's reason has changed and its comment needs to say what the new one is")
+
+
+# ------------------------------------------------------------------------------------------
+# The Overlap band, and the transition pair (stories 11.2, 11.3, 11.4)
+# ------------------------------------------------------------------------------------------
+#
+# Epic 11's server side shipped complete and invisible: a transition could be set only through a
+# route, and the Overlap that gives a paired one its length looked like two clips that happen to
+# touch. Everything below is the drawn half, and it is executed rather than read wherever a browser
+# is not needed to see it -- the geometry, the labels, the sentences, the request bodies and the
+# toasts. What is left for `tests/e2e_overlap_band.py` is the part only paint order answers: that
+# the band is above the clips and below every resize handle, and that it draws at all.
+
+
+def transition_catalogue_wire() -> list[dict]:
+    """The twelve, exactly as `read_shot_transitions` puts them on the wire.
+
+    **Built from `effects.TRANSITION_CATALOGUE` rather than written out**, for the reason F2 paid
+    for once already: a fixture must contain the thing under test. A hand-written list of twelve
+    would go on serving four one-sided forms and eight pair-only entries the day the catalogue
+    stopped having them, and the row that says *"this treats shot 04's last frames"* would be
+    tested against a catalogue nothing renders from.
+    """
+    return [
+        {
+            "transition_id": entry.transition_id,
+            "label": entry.label,
+            "xfade": entry.xfade,
+            "pair_only": entry.pair_only,
+            "one_sided_frames": None if entry.pair_only else ONE_SIDED_TRANSITION_FRAMES,
+        }
+        for entry in TRANSITION_CATALOGUE.values()
+    ]
+
+
+PAIR_ONLY_ID = next(
+    entry.transition_id for entry in TRANSITION_CATALOGUE.values() if entry.pair_only
+)
+ONE_SIDED_ID = next(
+    entry.transition_id for entry in TRANSITION_CATALOGUE.values() if not entry.pair_only
+)
+
+
+def transition_plan(**overrides) -> str:
+    """Three contiguous Shots as the workspace holds them, `shot_a` first in song order.
+
+    Contiguous by default and overlapped by moving a start, so a fixture that means "these two
+    overlap" says so in one number rather than in three.
+    """
+    windows = {"shot_a": (0.0, 4.0), "shot_b": (4.0, 4.0), "shot_c": (8.0, 4.0)}
+    windows.update(overrides.pop("windows", {}))
+    fields = overrides.pop("fields", {})
+    shots = []
+    for shot_id, (start, duration) in windows.items():
+        shots.append(effects_shot(
+            id=shot_id, start=start, duration=duration, prompt=f"{shot_id} prompt",
+            **fields.get(shot_id, {}),
+        ))
+    return ", ".join(shots)
+
+
+def band_constants() -> dict:
+    """The band's own floor and its per-character label budget, read off `api.js`.
+
+    Read rather than restated: a second copy of either number here would go on passing after the
+    stylesheet moved, which is the whole reason `e2e_overlap_band.py` measures them in a browser.
+    """
+    return run_module("""
+      import { TRANSITION_BAND_MIN_PX, TRANSITION_BAND_LABEL_CHAR_PX,
+               TRANSITION_BAND_LABEL_PAD_PX } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({ min: TRANSITION_BAND_MIN_PX,
+        perCharacter: TRANSITION_BAND_LABEL_CHAR_PX, padding: TRANSITION_BAND_LABEL_PAD_PX }));
+    """)
+
+
+def bands(shots: str, pixels_per_second: float = 16.6, catalogue: bool = True) -> list[dict]:
+    """`overlapBands` over one plan, with the real catalogue behind it or with none at all."""
+    return run_module("""
+      import { overlapBands } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify(overlapBands([__SHOTS__], {
+        pixelsPerSecond: __PPS__, catalogue: __CATALOGUE__,
+      })));
+    """.replace("__SHOTS__", shots)
+       .replace("__PPS__", json.dumps(pixels_per_second))
+       .replace("__CATALOGUE__", json.dumps(transition_catalogue_wire() if catalogue else None)))
+
+
+def transition_rows(shots: str, shot_id: str = "shot_a", catalogue: bool = True,
+                    error: str = "") -> dict:
+    """`transitionRows` for one Shot of one plan."""
+    return run_module("""
+      import { transitionRows } from './src/music_video_producer/web/assets/api.js';
+      const shots = [__SHOTS__];
+      const shot = shots.find((item) => item.id === __ID__);
+      console.log(JSON.stringify(transitionRows({ shots }, shot, __CATALOGUE__,
+        { error: __ERROR__ })));
+    """.replace("__SHOTS__", shots)
+       .replace("__ID__", json.dumps(shot_id))
+       .replace("__CATALOGUE__", json.dumps(transition_catalogue_wire() if catalogue else None))
+       .replace("__ERROR__", json.dumps(error)))
+
+
+def transitions_panel(shots: str, responses: dict | None = None, extra: str = "",
+                      shot_id: str = "shot_a") -> dict:
+    """Draw the inspector over a plan with the transition catalogue answered, and report it."""
+    canned = {TRANSITIONS_CATALOGUE_READ: {"body": {
+        "shot_id": "shot_a", "transition_out": None, "transition_in": None,
+        "catalogue": transition_catalogue_wire(),
+    }}}
+    canned.update(responses or {})
+    return run_effects_workspace(f"""
+      const toasts = [];
+      at('#toast-region').append = (item) => toasts.push(item.textContent);
+      state.project = {effects_project(shots)};
+      state.selectedShotId = {json.dumps(shot_id)};
+      app.renderShotInspector();
+      await flush();
+      app.renderShotInspector();
+      requests.length = 0;
+      {extra}
+      await flush();
+      console.log(JSON.stringify({{
+        html: at('#shot-inspector').innerHTML,
+        track: at('#shots-track').innerHTML,
+        requests: requests.map((item) => ({{ path: item.path, method: item.method, body: item.body }})),
+        toasts,
+      }}));
+    """, responses=canned)
+
+
+def transition_row_markup(html: str, control: str) -> dict:
+    """The row that owns one select, read back off the inspector's markup."""
+    rows = re.findall(
+        r'<div class="transition-row" data-edge="(\w+)" data-state="([a-z-]+)">(.*?)'
+        r'(?=<div class="transition-row"|<div class="effect-copy|$)', html, re.DOTALL)
+    for edge, state, body in rows:
+        if f'id="{control}"' not in body:
+            continue
+        length = re.search(rf'<span class="transition-length" id="{control}-length">([^<]*)</span>', body)
+        note = re.search(rf'<p class="control-reason" id="{control}-note">([^<]*)</p>', body)
+        chosen = re.search(r'<option value="([^"]*)" selected>', body)
+        return {
+            "edge": edge,
+            "state": state,
+            "length": length.group(1) if length else "",
+            "note": html_unescape(note.group(1)) if note else "",
+            "disabled": f'id="{control}" data-side="{"transition_out" if control.endswith("out") else "transition_in"}" disabled' in body,
+            "value": chosen.group(1) if chosen else "",
+            "options": re.findall(r'<option value="([^"]*)"', body),
+        }
+    raise AssertionError(f"no transition row carries {control}: {html}")
+
+
+def html_escaped(text: str) -> str:
+    """One sentence as `api.escapeHtml` writes it into the markup.
+
+    `html.escape` is not the same function: it writes `&#x27;` where `escapeHtml`'s own table
+    writes `&#39;`, and every refusal this application shows a Director has an apostrophe in it.
+    """
+    return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;").replace("'", "&#39;"))
+
+
+def html_unescape(text: str) -> str:
+    return (text.replace("&#39;", "'").replace("&quot;", '"').replace("&amp;", "&")
+            .replace("&lt;", "<").replace("&gt;", ">"))
+
+
+def test_the_overlap_band_is_every_overlap_the_assembler_will_blend_and_no_other():
+    """`overlapBands` against the one predicate the server blends by, and against its edges.
+
+    Below `BOUNDARY_TOLERANCE_SECONDS` an "overlap" is one boundary written twice -- the Director's
+    live plan carries four of those, from 0.002 s to 0.015 s -- and `app._boundary_is_overlapped`,
+    `assembly._paired_transitions` and `routes/shots.replace_shot_transitions` all agree it is not
+    an overlap. A band there would draw a transition the export will not perform.
+    """
+    tolerance = BOUNDARY_TOLERANCE_SECONDS
+
+    # Exactly at the tolerance is not an overlap; a hair past it is.
+    at_the_line = transition_plan(windows={"shot_b": (4.0 - tolerance, 4.0)})
+    past_it = transition_plan(windows={"shot_b": (4.0 - tolerance - 0.001, 4.0)})
+    assert bands(at_the_line) == []
+    assert len(bands(past_it)) == 1
+
+    # A real overlap, with a type on the outgoing Shot.
+    typed = bands(transition_plan(
+        windows={"shot_b": (3.5, 4.5)},
+        fields={"shot_a": {"transition_out": {"type": "dissolve"}}},
+    ))
+    assert len(typed) == 1
+    band = typed[0]
+    assert (band["before"], band["after"]) == ("shot_a", "shot_b")
+    assert band["typed"] is True
+    assert band["label"] == "DISSOLVE"
+    assert band["className"] == "overlap-band typed"
+    assert round(band["seconds"], 6) == 0.5
+    # The region is the overlap: it starts where the later clip starts and runs to where the
+    # earlier one ends. Both in pixels, because the scale goes in and the offsets come out.
+    assert band["left"] == round(3.5 * 16.6, 3)
+    assert band["width"] == round(0.5 * 16.6, 3)
+
+    # Untyped: a hatch and `CUT`, and the class carries no hint of the transition's treatment.
+    untyped = bands(transition_plan(windows={"shot_b": (3.5, 4.5)}))[0]
+    assert untyped["typed"] is False
+    assert untyped["label"] == "CUT"
+    assert untyped["className"] == "overlap-band untyped"
+    assert untyped["note"] == (
+        "A 0.50s overlap between shot 01 and shot 02 with no transition set — it cuts.")
+
+
+def test_the_band_is_drawn_from_the_outgoing_shots_field_and_never_the_mirror():
+    """AD-30 on the timeline. The export reads `transition_out` on the earlier Shot and no other
+    field, so a band drawn from the later Shot's `transition_in` would name a blend the render does
+    not perform the moment a hand-edited manifest diverges.
+
+    The fixture *is* the divergence: the two halves of one pair hold different types, which is
+    exactly the manifest `ExportLook.transitions` reports once and exports anyway.
+    """
+    diverged = bands(transition_plan(
+        windows={"shot_b": (3.5, 4.5)},
+        fields={
+            "shot_a": {"transition_out": {"type": "dissolve"}},
+            "shot_b": {"transition_in": {"type": "fade_black"}},
+        },
+    ))
+
+    assert [band["label"] for band in diverged] == ["DISSOLVE"]
+
+    # And the mirror alone draws no type at all: nothing composes from it, so the band says the
+    # boundary cuts, which is what the export will do.
+    mirror_only = bands(transition_plan(
+        windows={"shot_b": (3.5, 4.5)},
+        fields={"shot_b": {"transition_in": {"type": "dissolve"}}},
+    ))
+    assert [band["label"] for band in mirror_only] == ["CUT"]
+    assert mirror_only[0]["typed"] is False
+
+
+def test_a_real_overlap_is_never_drawn_at_zero_width_and_never_letters_a_fragment():
+    """The two failures a screenshot catches and nothing else does.
+
+    `BOUNDARY_TOLERANCE_SECONDS` is 1/48 s, which is **0.35 px** at the default 16.6 px/s: an
+    overlap the assembler really will blend across, at a width that rounds away. Epic 9 shipped a
+    measured band that drew as nothing for the same class of reason. And a band narrower than its
+    own label draws a *fragment of a word*, which says something false rather than nothing.
+    """
+    sliver = bands(transition_plan(
+        windows={"shot_b": (4.0 - BOUNDARY_TOLERANCE_SECONDS - 0.0001, 4.0)}))[0]
+    assert sliver["width"] == band_constants()["min"]
+    assert sliver["labelled"] is False
+    # Narrow or not, it says what it is -- on `title` and on the accessible name, which is what
+    # stops the state being carried by the fill alone (UX-DR15).
+    assert "overlap between shot 01 and shot 02" in sliver["note"]
+
+    # Per label, not one flat minimum: `CUT` letters at a width `FADE THROUGH BLACK` cannot.
+    # A 3.0 s overlap is 49.8 px at the default scale -- room for three characters and their
+    # padding, and less than half of what eighteen need.
+    plan = {"windows": {"shot_b": (1.0, 7.0)}}
+    short = bands(transition_plan(**plan))[0]
+    long = bands(transition_plan(
+        fields={"shot_a": {"transition_out": {"type": "fade_black"}}}, **plan))[0]
+    assert short["width"] == long["width"]
+    assert short["label"] == "CUT" and short["labelled"] is True
+    assert long["label"] == "FADE THROUGH BLACK" and long["labelled"] is False
+
+    # And every label the catalogue can produce letters at some width, so no entry is unreadable
+    # at every zoom -- which a flat threshold above the longest name would have made true.
+    wide = bands(transition_plan(
+        windows={"shot_b": (0.5, 8.0)},
+        fields={"shot_a": {"transition_out": {"type": "fade_black"}}}), pixels_per_second=60)[0]
+    assert wide["labelled"] is True
+
+
+def test_the_band_s_label_gives_the_chip_column_its_room_back():
+    """A band's right edge **is** the earlier clip's right edge, and that is where `.clip-chips`
+    is anchored -- so a bottom-aligned label lands on the `f` chip of every graded Shot with an
+    Overlap after it. Found by looking, on the second pass of this slice's browser QA; the first
+    pass put an opaque ground under the label, which made the label readable and hid the chip.
+
+    33px is `.clip-prompt`'s own inset around that column -- 14px offset, a 15px chip, the gap --
+    reused rather than measured a second time. It is added to the width a band needs **before it
+    letters at all**, so the inset can never squeeze a word into the column: the band either has
+    room for both or draws no label and says its type on the tooltip and the accessible name, the
+    way every band too narrow to letter already does.
+
+    The fixture carries a real stack on the earlier Shot, because a fixture with no chip on it
+    makes this check impossible to fail.
+    """
+    room = 3.4 * 16.6
+    plain = bands(transition_plan(
+        windows={"shot_b": (4.0 - 3.4, 4.0 + 3.4)},
+        fields={"shot_a": {"transition_out": {"type": "dissolve"}}}))[0]
+    graded = bands(transition_plan(
+        windows={"shot_b": (4.0 - 3.4, 4.0 + 3.4)},
+        fields={"shot_a": {
+            "transition_out": {"type": "dissolve"},
+            "effects": [{"effect": "grain", "enabled": True, "parameters": {}}],
+        }}))[0]
+
+    assert plain["width"] == graded["width"] == round(room, 3)
+    assert plain["chips"] == 0 and graded["chips"] == 1
+    assert plain["labelled"] is True
+    assert graded["labelled"] is False, (
+        "a band on a graded Shot lettered in the room the chip column is anchored in", graded)
+    # The type is still text at that width, which is what keeps it off the fill alone (UX-DR15).
+    assert "DISSOLVE across a 3.40s overlap" in graded["note"]
+
+    # And the inset only defers it: given the 33px as well, the same band letters.
+    wider = bands(transition_plan(
+        windows={"shot_b": (4.0 - 3.4, 4.0 + 3.4)},
+        fields={"shot_a": {
+            "transition_out": {"type": "dissolve"},
+            "effects": [{"effect": "grain", "enabled": True, "parameters": {}}],
+        }}), pixels_per_second=16.6 + 33 / 3.4)[0]
+    assert wider["labelled"] is True
+
+
+def test_a_stored_type_this_build_cannot_name_is_spelled_out_and_never_read_as_a_cut():
+    """A manifest from a newer build, or hand-edited. The export refuses an unknown type by name
+    (`_transition_catalogue_refusals`), so a band that fell back to `CUT` would say a hard cut is
+    what will happen -- which is the one thing that is certainly not going to happen."""
+    unknown = bands(transition_plan(
+        windows={"shot_b": (3.5, 4.5)},
+        fields={"shot_a": {"transition_out": {"type": "iris_wipe"}}}))[0]
+
+    assert unknown["typed"] is True
+    assert unknown["label"] == "IRIS WIPE"
+    assert unknown["label"] != "CUT"
+
+    # With no catalogue read at all the band still says the type rather than nothing: the two rows
+    # need the catalogue to offer twelve labelled options, the band does not.
+    without = bands(transition_plan(
+        windows={"shot_b": (3.5, 4.5)},
+        fields={"shot_a": {"transition_out": {"type": "fade_black"}}}), catalogue=False)[0]
+    assert without["label"] == "FADE BLACK"
+    assert without["typed"] is True
+
+
+def test_the_timeline_draws_the_band_over_the_overlap_and_moves_no_clip_to_do_it():
+    """The band through a real `renderTimeline`, and the clips read either side of it.
+
+    The acceptance a source read cannot reach: setting a transition draws a region and changes
+    **nothing else** on the track. The clip markup is compared byte for byte across it, which is
+    what would fail if the band had been built by widening a clip or by inserting an element into
+    the run.
+    """
+    drawn = run_effects_workspace(f"""
+      state.project = {effects_project(transition_plan(windows={"shot_b": (2.5, 5.5)}))};
+      state.selectedShotId = 'shot_a';
+      state.pixelsPerSecond = 40;
+      app.renderShotInspector();
+      await flush();
+      // The beat toggle is this workspace's shortest path to a real `renderTimeline` from
+      // outside it -- the same door `test_the_timeline_paints_the_beat_band` uses -- and pressed
+      // twice it leaves the marks exactly as it found them.
+      const repaint = () => {{ fire('#beat-markers:click'); fire('#beat-markers:click'); }};
+      const cut = at('#shots-track').innerHTML;
+      state.project.shots[0].transition_out = {{ type: 'dissolve' }};
+      repaint();
+      const blended = at('#shots-track').innerHTML;
+      // The same band at a zoom where its own label does not fit.
+      state.pixelsPerSecond = 8;
+      repaint();
+      const narrow = at('#shots-track').innerHTML;
+      state.pixelsPerSecond = 40;
+      state.project.shots[1].start = 4;
+      state.project.shots[1].duration = 4;
+      repaint();
+      console.log(JSON.stringify({{
+        cut, blended, narrow, apart: at('#shots-track').innerHTML }}));
+    """, responses={TRANSITIONS_CATALOGUE_READ: {"body": {
+        "shot_id": "shot_a", "transition_out": None, "transition_in": None,
+        "catalogue": transition_catalogue_wire(),
+    }}})
+
+    def clips(markup: str) -> str:
+        return markup.split('<div class="overlap-bands">')[0]
+
+    assert clips(drawn["cut"]) == clips(drawn["blended"])
+
+    assert '<div class="overlap-bands">' in drawn["cut"]
+    assert 'class="overlap-band untyped"' in drawn["cut"]
+    assert 'class="overlap-band typed"' not in drawn["cut"]
+    assert ">CUT<" in drawn["cut"]
+
+    assert 'class="overlap-band typed"' in drawn["blended"]
+    # The region is the overlap and nothing more: 1.5 s from 2.5 s, at 40 px/s.
+    assert 'style="left:100px;width:60px"' in drawn["blended"]
+    assert 'data-before="shot_a" data-after="shot_b"' in drawn["blended"]
+    assert '<span class="overlap-label">DISSOLVE</span>' in drawn["blended"]
+    for attribute in ("title", "aria-label"):
+        assert f'{attribute}="DISSOLVE across a 1.50s overlap between shot 01 and shot 02."' in drawn["blended"]
+
+    # At 8 px/s the same band is 12 px, which holds no label at all. It draws no fragment of one --
+    # and it still says what it is, on both the tooltip and the accessible name, which is what keeps
+    # the type off the fill alone at every zoom (UX-DR15).
+    assert 'style="left:20px;width:12px"' in drawn["narrow"]
+    assert "overlap-label" not in drawn["narrow"]
+    assert 'aria-label="DISSOLVE across a 1.50s overlap between shot 01 and shot 02."' in drawn["narrow"]
+
+    # Dragged apart: the band is gone from the track entirely, rather than drawn at zero width.
+    assert "overlap-band" not in drawn["apart"]
+    assert '<div class="overlap-bands">' not in drawn["apart"]
+
+
+def test_the_band_sits_above_every_clip_and_below_every_resize_handle():
+    """The standing hazard this overlay must not make worse, as a stylesheet fact.
+
+    A later clip already paints over the earlier one's right resize handle -- the Director's report
+    of 2026-08-21, eighteen overlapping pairs on their own plan, the largest 5.49 s. The fix is
+    `z-index: 2` on `.resize-handle` against clip bodies at `auto`, and it works only because
+    `.shot-clip` is not a stacking context. An overlay at 2 or above would bury all eighteen
+    handles again; one *behind* the clips would paint nothing at all, because `.shot-clip` is
+    opaque with `overflow: hidden` (R-40).
+
+    `tests/e2e_clip_overlap_and_split.py` is what proves the handles are still hit-testable. This
+    is what fails first, in the suite that always runs.
+    """
+    css = STYLES_CSS.read_text(encoding="utf-8")
+    layer = re.search(r"\.overlap-bands \{([^}]*)\}", css)
+    handle = re.search(r"\.resize-handle \{([^}]*)\}", css)
+    clip = re.search(r"\.shot-clip \{([^}]*)\}", css)
+    assert layer and handle and clip
+
+    band_z = int(re.search(r"z-index:\s*(\d+)", layer.group(1)).group(1))
+    handle_z = int(re.search(r"z-index:\s*(\d+)", handle.group(1)).group(1))
+    assert band_z < handle_z, (band_z, handle_z)
+    assert "z-index" not in clip.group(1), (
+        "`.shot-clip` has acquired a z-index, which makes it a stacking context and traps the "
+        "handles' z-index inside their own clip -- the 2026-08-21 defect, back")
+
+    # Not a drag target: the clip edges remain the only handles (R-40, DESIGN 4.7).
+    assert "pointer-events: none" in layer.group(1)
+
+    # And the band spans exactly the clips it is about, so it cannot bleed into the row above.
+    band = re.search(r"\.overlap-band \{([^}]*)\}", css).group(1)
+    for rule in ("top: 12px", "height: 82px"):
+        assert rule in band, band
+        assert rule in clip.group(1), clip.group(1)
+
+
+def test_an_untyped_overlap_borrows_nothing_from_the_transitions_treatment():
+    """UX-DR8, as a stylesheet fact: an overlap with no type set *is* a hard cut, and must not
+    take `--blue` -- the palette's last accent, which means transition-or-reactive and nothing
+    else. Told apart by texture rather than by hue, which is the accessibility floor's own rule."""
+    css = STYLES_CSS.read_text(encoding="utf-8")
+    untyped = re.search(r"\.overlap-band\.untyped \{([^}]*)\}", css).group(1)
+    typed = re.search(r"\.overlap-band\.typed \{([^}]*)\}", css).group(1)
+
+    assert "--blue" not in untyped and "5b9bd5" not in untyped, untyped
+    assert "--line-strong" in untyped
+    assert "repeating-linear-gradient" in untyped
+    assert "--blue" in typed and "5b9bd5" in typed, (
+        "the token form and its hex floor are both wanted here: a browser that cannot resolve "
+        "`color-mix` drops that declaration and would draw a band with no fill at all")
+
+
+def test_the_transition_rows_state_every_case_they_can_be_in():
+    """Paired, one-sided and headless, each with its edge, its readout and its sentence.
+
+    **The sentence is the state and the edge is the second signal** (UX-DR15). A row that carried
+    only a `--blue` or `--dim` border would be a state in colour alone, which this application says
+    it does not do about anything else it draws.
+    """
+    overlapping = transition_plan(windows={"shot_b": (3.5, 4.5)})
+
+    # Paired: the Overlap's length in Consolas, and the one accent that means transition.
+    out_of_a = transition_row_markup(
+        transitions_panel(overlapping)["html"], "transition-out")
+    assert out_of_a["edge"] == "blue"
+    assert out_of_a["state"] == "paired"
+    assert out_of_a["length"] == "0.50s · from overlap"
+    assert out_of_a["note"] == ""
+    assert out_of_a["disabled"] is False
+
+    # One-sided: a `--dim` edge, and what will actually happen, naming the outgoing Shot.
+    into_a = transition_row_markup(transitions_panel(overlapping)["html"], "transition-in")
+    contiguous = transitions_panel(transition_plan())["html"]
+    out_of_a_alone = transition_row_markup(contiguous, "transition-out")
+    assert out_of_a_alone["edge"] == "dim"
+    assert out_of_a_alone["state"] == "one-sided"
+    assert out_of_a_alone["note"] == "No overlap — this treats shot 01's last frames, then cuts."
+    assert out_of_a_alone["disabled"] is False, (
+        "a one-sided transition is a real editorial choice (FX-18) and this control is live")
+
+    # A `Transition in` names the Shot **before** it, because that is the field the export reads:
+    # the route mirrors this write onto the earlier Shot's `transition_out`, and only that composes.
+    into_b = transition_row_markup(
+        transitions_panel(transition_plan(), shot_id="shot_b")["html"], "transition-in")
+    assert into_b["note"] == "No overlap — this treats shot 01's last frames, then cuts."
+
+    # Headless: the first Shot's `Transition in`. Nothing precedes it, so the field stores and
+    # nothing renders from it -- a state no artifact in this epic describes, and it says so.
+    assert into_a["state"] == "headless"
+    assert into_a["edge"] == "dim"
+    assert into_a["note"] == (
+        "Nothing plays before shot 01 — this transition in has no frames to treat, and the "
+        "export renders nothing from it.")
+    assert into_a["disabled"] is False
+
+    # A `Transition out` on the **last** Shot is one-sided rather than headless, and that is the
+    # export's own reading: `_compose_one_sided_transitions` treats an unoverlapped final boundary
+    # exactly like any other, which is a fade at the end of the video.
+    out_of_c = transition_row_markup(
+        transitions_panel(transition_plan(), shot_id="shot_c")["html"], "transition-out")
+    assert out_of_c["state"] == "one-sided"
+    assert out_of_c["note"] == "No overlap — this treats shot 03's last frames, then cuts."
+
+
+def test_the_one_sided_row_states_the_length_the_server_bounds_it_by():
+    """Story 11.4: *"bounded by the Shot's own duration and by nothing invisible"*.
+
+    `one_sided_frames` is on the wire precisely so this row need not hard-code a number
+    (`TransitionCatalogueEntry`'s own docstring says so), and the export clamps it to the clip's
+    own frames. **The fixture carries a Shot shorter than the ceiling**, which is what makes the
+    clamp observable: a row that printed the catalogue's 12 frames flat would pass on a four-second
+    Shot and be wrong by four times on a quarter-second one.
+    """
+    ceiling = ONE_SIDED_TRANSITION_FRAMES / 24
+    roomy = transition_rows(transition_plan(
+        fields={"shot_a": {"transition_out": {"type": ONE_SIDED_ID}}}))
+    cramped = transition_rows(transition_plan(
+        windows={"shot_a": (0.0, 0.25), "shot_b": (0.25, 4.0), "shot_c": (4.25, 4.0)},
+        fields={"shot_a": {"transition_out": {"type": ONE_SIDED_ID}}}))
+    out_of = lambda read: next(row for row in read["rows"] if row["side"] == "transition_out")
+
+    assert out_of(roomy)["length"] == f"{ceiling:.2f}s · own frames"
+    assert out_of(cramped)["length"] == "0.25s · own frames"
+    assert ceiling != 0.25, "the fixture no longer separates the ceiling from the clamp"
+
+    # And with nothing chosen there is no length, because nothing will be treated.
+    assert out_of(transition_rows(transition_plan()))["length"] == ""
+
+
+def test_every_pair_only_type_is_offered_on_every_row_rather_than_hidden_from_the_list():
+    """FX-19 and R-34: a pair-only entry is *present in the list* and refuses one-sided use with
+    its reason, rather than being silently absent from a list a Director is trying to learn.
+
+    Nothing in the client pre-empts the refusal with a wording of its own -- the route's sentence
+    is the one that ships, and `test_the_route_s_own_refusal_reaches_the_panel_whole` is where it
+    is asserted.
+    """
+    contiguous = transition_rows(transition_plan())
+    overlapping = transition_rows(transition_plan(windows={"shot_b": (3.5, 4.5)}))
+    every_id = [entry["transition_id"] for entry in transition_catalogue_wire()]
+
+    for read in (contiguous, overlapping):
+        for row in read["rows"]:
+            assert [option["value"] for option in row["options"]] == ["", *every_id]
+
+    # The catalogue really does contain both kinds, or this test proves nothing.
+    assert any(option["pairOnly"] for option in contiguous["rows"][0]["options"])
+    assert any(
+        option["pairOnly"] is False and option["value"]
+        for option in contiguous["rows"][0]["options"])
+
+
+def test_the_rows_say_so_when_the_catalogue_could_not_be_read_rather_than_offering_nothing():
+    """`EFFECTS_CATALOGUE_UNAVAILABLE`'s posture. A select holding one option would be a control
+    that silently claims this application has no transitions."""
+    refused = transition_rows(transition_plan(), error="500 Internal Server Error")
+
+    assert refused["shown"] is False
+    assert refused["rows"] == []
+    assert "could not be read" in refused["problem"]
+
+
+def test_setting_one_side_writes_that_side_only_and_announces_the_mirror():
+    """The whole gesture, and the sentence the Director did not ask for.
+
+    **One side is named** -- the route reads an unsaid side as unsaid and refuses a body naming
+    neither by name, so a write that carried both would be a client deciding the mirror for itself
+    (AD-30). **The mirror is announced in the past tense, naming both Shots**, which is story
+    11.3's own acceptance criterion; `EXPERIENCE.md`'s example sentence named one and was amended.
+    """
+    overlapping = transition_plan(windows={"shot_b": (3.5, 4.5)})
+    reply = json.loads(f"[{overlapping}]")
+    reply[0]["transition_out"] = {"type": "dissolve"}
+    reply[1]["transition_in"] = {"type": "dissolve"}
+    landed = {"id": "p1", "jobs": [], "song": None, "assets": [], "messages": [], "sections": [],
+              "shot_sections": {}, "shots": reply}
+
+    set_it = transitions_panel(
+        overlapping,
+        responses={TRANSITIONS_CATALOGUE_READ: [
+            {"body": {"shot_id": "shot_a", "transition_out": None, "transition_in": None,
+                      "catalogue": transition_catalogue_wire()}},
+            {"body": landed},
+        ]},
+        extra="""
+          at('#transition-out').value = 'dissolve';
+          await fire('#transition-out:change', { target: at('#transition-out') });
+        """,
+    )
+
+    assert [(item["path"], item["method"]) for item in set_it["requests"]] == [
+        (TRANSITIONS_CATALOGUE_READ, "PUT")
+    ]
+    assert json.loads(set_it["requests"][0]["body"]) == {"transition_out": {"type": "dissolve"}}
+    assert set_it["toasts"] == [
+        "Shot 02's transition in set to Dissolve to match Shot 01's transition out."
+    ]
+
+    # Cleared, in the same idiom and the same tense.
+    cleared = transitions_panel(
+        overlapping,
+        responses={TRANSITIONS_CATALOGUE_READ: [
+            {"body": {"shot_id": "shot_a", "transition_out": None, "transition_in": None,
+                      "catalogue": transition_catalogue_wire()}},
+            {"body": {**landed, "shots": json.loads(f"[{overlapping}]")}},
+        ]},
+        extra="""
+          at('#transition-out').value = '';
+          await fire('#transition-out:change', { target: at('#transition-out') });
+        """,
+    )
+    assert json.loads(cleared["requests"][0]["body"]) == {"transition_out": None}
+    assert cleared["toasts"] == [
+        "Shot 02's transition in cleared to match Shot 01's transition out."
+    ]
+
+    # **The other end of the same blend.** The route mirrors backwards too -- writing
+    # `transition_in` writes the *previous* Shot's `transition_out` -- so a Director may author a
+    # transition from either Shot's panel, and the announcement has to name the right pair either
+    # way. Driven as the pure function rather than as a second browser gesture: which Shot the
+    # sentence names is the decision, and it is the same one in both directions.
+    said = run_module("""
+      import { transitionMirrorToast } from './src/music_video_producer/web/assets/api.js';
+      const shots = [__SHOTS__];
+      const project = { shots };
+      console.log(JSON.stringify({
+        backwards: transitionMirrorToast(project, shots[1], 'transition_in', 'dissolve', __CAT__),
+        forwards: transitionMirrorToast(project, shots[0], 'transition_out', 'dissolve', __CAT__),
+        firstShotsIn: transitionMirrorToast(project, shots[0], 'transition_in', 'dissolve', __CAT__),
+        lastShotsOut: transitionMirrorToast(project, shots[2], 'transition_out', 'dissolve', __CAT__),
+      }));
+    """.replace("__SHOTS__", overlapping)
+       .replace("__CAT__", json.dumps(transition_catalogue_wire())))
+
+    assert said["backwards"] == (
+        "Shot 01's transition out set to Dissolve to match Shot 02's transition in.")
+    assert said["forwards"] == (
+        "Shot 02's transition in set to Dissolve to match Shot 01's transition out.")
+    # Neither end of the plan has anything on the far side of it to mirror onto.
+    assert said["firstShotsIn"] == "" and said["lastShotsOut"] == ""
+
+
+def test_nothing_is_announced_where_no_mirror_could_have_fired():
+    """A `Transition out` on the last Shot has nothing on the other side of it to write, so there
+    is no automatic change to announce -- and announcing one that did not happen is exactly what
+    the past-tense idiom exists to prevent."""
+    plan = transition_plan()
+    reply = json.loads(f"[{plan}]")
+    reply[2]["transition_out"] = {"type": ONE_SIDED_ID}
+
+    last = transitions_panel(
+        plan,
+        shot_id="shot_c",
+        responses={"/api/projects/p1/shots/shot_c/transitions": {"body": {
+            "id": "p1", "jobs": [], "song": None, "assets": [], "messages": [],
+            "sections": [], "shot_sections": {}, "shots": reply,
+        }}},
+        extra=f"""
+          at('#transition-out').value = {json.dumps(ONE_SIDED_ID)};
+          await fire('#transition-out:change', {{ target: at('#transition-out') }});
+        """,
+    )
+
+    # The write really did go out, to the Shot the row belongs to -- and said nothing, because
+    # nothing on the other side of that boundary was written.
+    assert [(item["path"], item["method"]) for item in last["requests"]] == [
+        ("/api/projects/p1/shots/shot_c/transitions", "PUT")
+    ]
+    assert last["toasts"] == []
+
+
+def test_the_routes_own_refusal_reaches_the_panel_whole():
+    """A pair-only type on a boundary with no Overlap. The route writes that sentence to be read by
+    a Director -- it names the type, the Shot, the gesture that would make the Overlap and every
+    alternative -- and a second wording here would be a second refusal.
+
+    Asserted **verbatim against the Python constant**, formatted the way the route formats it.
+    """
+    entry = TRANSITION_CATALOGUE[PAIR_ONLY_ID]
+    sentence = TRANSITION_PAIR_ONLY_REFUSAL.format(
+        label=entry.label,
+        shot="SHOT 01 (shot_a)",
+        alternatives=", ".join(sorted(
+            item.label for item in TRANSITION_CATALOGUE.values() if not item.pair_only)),
+    )
+
+    refused = transitions_panel(
+        transition_plan(),
+        responses={TRANSITIONS_CATALOGUE_READ: [
+            {"body": {"shot_id": "shot_a", "transition_out": None, "transition_in": None,
+                      "catalogue": transition_catalogue_wire()}},
+            {"status": 422, "body": {"detail": sentence}},
+        ]},
+        extra=f"""
+          at('#transition-out').value = {json.dumps(PAIR_ONLY_ID)};
+          await fire('#transition-out:change', {{ target: at('#transition-out') }});
+          app.renderShotInspector();
+        """,
+    )
+
+    assert sentence in refused["toasts"]
+    # And kept where it can be read after the toast has gone, in the panel's own refusal idiom.
+    assert f"<p>{html_escaped(sentence)}</p>" in refused["html"]
+    assert "NOT WRITTEN" in refused["html"]
+
+
+def test_an_overlap_dragged_away_is_announced_once_naming_both_shots():
+    """R-36's converse, as a pure comparison of the plan before and the plan being stored.
+
+    **Not R-36's own sentence.** That ruling says *"both transitions now treat their own frames"*,
+    on its own premise that *"A's tail fades, B's head fades"* -- and neither is what shipped.
+    `app._compose_one_sided_transitions` reads `transition_out` and no other field; its own
+    docstring names the incoming half as the boundary *"where an incoming field has no pair to
+    mirror"* and leaves it to a later story. Only the outgoing Shot's tail is treated, and the
+    sentence says that.
+    """
+    before = json.loads(f"[{transition_plan(windows={'shot_b': (3.5, 4.5)}, fields={'shot_a': {'transition_out': {'type': 'dissolve'}}, 'shot_b': {'transition_in': {'type': 'dissolve'}}})}]")
+    apart = [{**shot, "start": 4.0, "duration": 4.0} if shot["id"] == "shot_b" else shot
+             for shot in before]
+
+    said = run_module("""
+      import { overlapRemovalToasts } from './src/music_video_producer/web/assets/api.js';
+      const before = __BEFORE__;
+      const apart = __APART__;
+      console.log(JSON.stringify({
+        removed: overlapRemovalToasts(before, apart),
+        unmoved: overlapRemovalToasts(before, before),
+        again: overlapRemovalToasts(apart, apart),
+        untyped: overlapRemovalToasts(
+          before, apart.map((shot) => ({ ...shot, transition_out: null }))),
+        deleted: overlapRemovalToasts(before, apart.filter((shot) => shot.id !== 'shot_b')),
+        unread: overlapRemovalToasts(null, apart),
+      }));
+    """.replace("__BEFORE__", json.dumps(before)).replace("__APART__", json.dumps(apart)))
+
+    assert said["removed"] == [(
+        "Shot 01 and Shot 02 no longer overlap — Shot 01's transition now treats its own "
+        "last frames, then cuts."
+    )]
+    # Once per pair, and only for a change: an unmoved plan and a plan that was already apart both
+    # say nothing, which is what stops the two-second background reload announcing this for ever.
+    assert said["unmoved"] == [] and said["again"] == []
+    # Nothing stored is nothing to convert into a one-sided treatment.
+    assert said["untyped"] == []
+    # A Shot gone from the plan entirely is a delete, not "no longer overlap".
+    assert said["deleted"] == []
+    # And with no snapshot at all nothing is claimed -- the safe direction.
+    assert said["unread"] == []
+
+
+def test_the_announcement_rides_the_write_so_every_path_that_stores_a_plan_carries_it():
+    """The gesture R-36 names is a drag, and it is not the only way an Overlap goes away: the
+    Start and Duration boxes, the gap fill, a snapped cut and an undo all store a plan too. So the
+    comparison sits where every one of them arrives -- `saveShotsSilently` -- and this drives the
+    numeric path, which is the one a stub DOM can perform.
+    """
+    plan = transition_plan(
+        windows={"shot_b": (3.5, 4.5)},
+        fields={"shot_a": {"transition_out": {"type": "dissolve"}}})
+
+    moved = transitions_panel(
+        plan,
+        responses={"/api/projects/p1/shots": {"body": {"updated_at": "later"}}},
+        extra="""
+          at('#shot-duration').value = '3.5';
+          await fire('#shot-duration:change', { target: at('#shot-duration') });
+          await flush();
+        """,
+    )
+
+    assert moved["toasts"] == [(
+        "Shot 01 and Shot 02 no longer overlap — Shot 01's transition now treats its own "
+        "last frames, then cuts."
+    )]
+    # The stored types are retained: nothing about removing an Overlap clears a field (FX-16).
+    assert '"transition_out":{"type":"dissolve"}' in "".join(
+        item["body"] or "" for item in moved["requests"])
+    # And the band is gone from the track, rather than drawn over clips that no longer touch.
+    assert "overlap-band" not in moved["track"]
+
+
+def test_a_locked_shot_s_transition_rows_are_disabled_and_the_lock_is_the_stated_reason():
+    """FX-7: a lock disables every writing control on this tab, and it is the **only** thing that
+    disables these two.
+
+    The distinction is the whole of story 11.4's second criterion. A row with no Overlap under it
+    stays live, because a one-sided transition is a real editorial choice; a row on a locked Shot
+    does not, because the Director said hands off. The panel already carries the lock's own
+    sentence above the stack (`EFFECTS_LOCKED_NOTE`), so nothing is greyed without a reason on
+    screen -- which is the rule `effectCopySectionHtml` states and the reason the unlocked
+    one-sided row is not disabled.
+    """
+    unlocked = transition_rows(transition_plan())
+    locked = transition_rows(transition_plan(fields={"shot_a": {"locked": True}}))
+
+    assert [row["disabled"] for row in unlocked["rows"]] == [False, False]
+    assert [row["disabled"] for row in locked["rows"]] == [True, True]
+    assert locked["locked"] is True
+
+    # And it reaches the markup: the select really carries `disabled`, which is what a browser
+    # honours -- a model field nothing drew would be a lock nobody enforced.
+    drawn = transitions_panel(transition_plan(fields={"shot_a": {"locked": True}}))
+    for control in ("transition-in", "transition-out"):
+        assert transition_row_markup(drawn["html"], control)["disabled"] is True, control
+    # The lock's own sentence is on screen beside them, so nothing is greyed in silence.
+    assert 'id="effects-locked"' in drawn["html"]
+
+
+def test_the_transition_rows_survive_a_catalogue_that_never_arrived_for_the_other_panel():
+    """Two catalogues, two reads, two failures. A Shot whose effect stack cannot be labelled still
+    has boundaries a Director can author, and folding the two together would hide a working control
+    for an unrelated failure."""
+    without_effects = run_effects_workspace(f"""
+      state.project = {effects_project(transition_plan())};
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      await flush();
+      app.renderShotInspector();
+      console.log(JSON.stringify({{ html: at('#shot-inspector').innerHTML }}));
+    """, catalogue=None, responses={TRANSITIONS_CATALOGUE_READ: {"body": {
+        "shot_id": "shot_a", "transition_out": None, "transition_in": None,
+        "catalogue": transition_catalogue_wire(),
+    }}})
+
+    assert 'id="effects-problem"' in without_effects["html"]
+    assert 'id="transition-out"' in without_effects["html"]
+    assert "Dissolve" in without_effects["html"]

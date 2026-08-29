@@ -40,7 +40,7 @@ The house voice: **plain, specific, and never reassuring about something it cann
 
 - Name the mechanism, not the feeling. `Cut at 2.417s into the take` — not `Looking good`.
 - A refusal names the thing and the reason in one sentence, and offers the next action where one exists. `No song analysis yet — bands need it. [Analyze song]`
-- An automatic change announces itself in the past tense at the moment it happens. `Shot 05's transition in set to Dissolve to match.`
+- An automatic change announces itself in the past tense at the moment it happens. ~~`Shot 05's transition in set to Dissolve to match.`~~ `Shot 05's transition in set to Dissolve to match Shot 04's transition out.` *(amended 2026-08-29 by story 11.3: story 11.3's own acceptance criterion says the toast names **both** Shots, and this example named one. Two documents could not both be right; the epic's criterion won, and the sentence is now the one that ships.)*
 - Never imply precision the system does not have. The BPM estimate reads `~124 BPM (estimated)`, and nothing refuses on it.
 - Stale is a state with a name, not a silence. `Preview is stale — re-rendering` and never a frozen picture presented as current.
 
@@ -51,7 +51,7 @@ The house voice: **plain, specific, and never reassuring about something it cann
 Follows the existing Assets subtab pattern in `api.js` (`ASSET_TABS`) — a strip built from a data array rather than written into markup, so tabs stay declarative.
 
 - Two tabs: `Shot Info`, `Effects`. `Shot Info` is the default and contains today's inspector unchanged in content, order, and behaviour.
-- The `Effects` tab carries a trailing count when the Shot has anything: `Effects · 3`. An Overlap transition counts toward it.
+- The `Effects` tab carries a trailing count when the Shot has anything: `Effects · 3`. ~~An Overlap transition counts toward it.~~ **A transition set on either of the Shot's two boundaries counts toward it, whether or not an Overlap is under it** *(decided 2026-08-29 by Epic 11, which owns transitions. `api.shotTabStrip` counted effect cards only and its docstring said so, so the two could not both be right. The count is the document's way, because the chip's stated job is "the Shot has anything" and a Shot whose only Director work is a Dissolve would otherwise read as untouched in the one place the strip could say otherwise. The narrowing from "an Overlap transition" is the other half: a count that fell as a Director dragged two clips apart would say the row went empty while the row goes on showing the type it holds. The cost is that `clipEffectsChip` on the timeline counts effects alone and says "Carries 3 effects" in words, so the two numbers can differ — which is why the chip now carries its own sentence, `2 effects and 1 transition on this shot.`, rather than being a digit whose unit has to be guessed at.)*
 - **Tab selection persists across inspector rebuilds for the same Shot** — including the background reload that already rebuilds this panel every two seconds. Selecting a *different* Shot returns to `Shot Info`.
 - The existing focus-preserving rebuild (`captureInspectorEdit` / `restoreInspectorEdit`) extends to cover the active tab and any open band panel. An in-progress edit in either tab survives a rebuild and survives a tab switch.
 
@@ -81,9 +81,16 @@ Two rows in the Effects tab, `Transition in` and `Transition out`, each selectin
 
 **When an Overlap exists** — the row carries a `{colors.blue}` left edge and the Overlap's length in Consolas (`0.50s · from overlap`). Setting one side sets the other and says so:
 
-> `Shot 05's transition in set to Dissolve to match.`
+> ~~`Shot 05's transition in set to Dissolve to match.`~~
+> `Shot 05's transition in set to Dissolve to match Shot 04's transition out.`
 
-announced in the existing toast idiom, in the past tense, naming both Shots. The pair can never hold two types (FX-17).
+announced in the existing toast idiom, in the past tense, naming both Shots. The pair can never hold two types (FX-17). *(Amended 2026-08-29 by story 11.3: the example named one Shot while the sentence under it — and story 11.3's own acceptance criterion — asks for both. Clearing a side says the same thing in the same shape: `Shot 05's transition in cleared to match Shot 04's transition out.` And **nothing is said where no mirror could have fired** — the last Shot's `Transition out` and the first Shot's `Transition in` have nothing on the other side of them to write, and announcing a change that did not happen is what this idiom exists to prevent.)*
+
+**When there is no boundary at all** — a `Transition in` on the **first** Shot in song order. *(Added 2026-08-29 by story 11.3; no artifact in this epic described this state, and it is not the one below.)* Nothing precedes it, so the write route has nothing to mirror onto, and the export reads `transition_out` and only that — `app._compose_one_sided_transitions`' own docstring names this as the one boundary *"where an incoming field has no pair to mirror"* and leaves it to a later story. The field stores and nothing renders from it, so the row says exactly that:
+
+> `Nothing plays before shot 01 — this transition in has no frames to treat, and the export renders nothing from it.`
+
+The control stays live, on the same rule that keeps the one-sided row live: a greyed control states that something is impossible without stating why, and this one becomes meaningful the moment a Shot is added ahead of it. What is refused is the silence, not the gesture.
 
 **When no Overlap exists** — the row carries a `{colors.dim}` left edge and states what will actually happen:
 
@@ -121,10 +128,12 @@ The Director's requirement was blue. The design requirement is that it **reads a
 Three things carry that meaning together:
 
 1. **Fill, not outline.** A `{colors.blue}` band at 22 % behind the clip content, with 1px `{colors.blue}` top and bottom edges. Error states in this application are *outlines* (`--red-edge` borders, dashed `MISSING` boxes); a soft filled region is structurally unlike them.
-2. **A name.** The transition type as a centred Consolas micro-label — `DISSOLVE`, `FADE`, `WIPE →`. A region with a name is a decision; a region without one is a warning.
+2. **A name.** The transition type as a Consolas micro-label — `DISSOLVE`, `FADE`, `WIPE →`. A region with a name is a decision; a region without one is a warning. *(~~centred~~ amended 2026-08-29 by story 11.2: centred, the label lands on the clip text under it and both go illegible — see `DESIGN.md` §3. It is drawn along the band's bottom edge, where the clip paints nothing.)*
 3. **An untyped overlap looks different.** `{colors.line-strong}` hatch and a `CUT` label, no blue. An overlap with no transition set *is* a hard cut, so it must not borrow the transition's treatment.
 
-The band draws **behind** clip content, so state borders and the `✓ ƒ ⚑` chips stay fully legible on top of it. The band itself is not a drag target — the existing clip edges remain the only handles, so nothing new competes with edge dragging.
+~~The band draws **behind** clip content, so state borders and the `✓ ƒ ⚑` chips stay fully legible on top of it.~~ **The band draws above the clip content at 22 % alpha with `pointer-events: none`** *(amended 2026-08-29 by story 11.2, on R-40: behind is unbuildable — `.shot-clip` is opaque with `overflow: hidden`, so two clips cover the overlap region completely and a band behind them paints nothing. Above at 22 % keeps both properties this sentence was protecting, and `DESIGN.md` §3 carries the measurement.)* The band itself is not a drag target — the existing clip edges remain the only handles, so nothing new competes with edge dragging, and its layer sits below the resize handles' own so an overlay cannot bury a handle a neighbour was already covering.
+
+**The name is drawn where it fits, and always said where it does not.** *(Added 2026-08-29 by story 11.2, measured.)* At the default 16.6 px/s a 0.50 s Overlap is 8.3 px wide, and `DISSOLVE` needs roughly 3.1 s of Overlap before it letters at that zoom. Below its own label's measured width the band draws no label rather than a clipped fragment of one, and the whole sentence stays on its `title` and its accessible name at every width — so the type is text at every zoom, even where it is not drawn as one.
 
 ### The `ƒ` chip (timeline signal)
 
@@ -193,10 +202,10 @@ Inherits the MVP floor and extends it:
 ### KF-3 — The Director dissolves one Shot into the next (UJ-6)
 
 1. Drags shot 05's left edge back over shot 04. A hatched region with a `CUT` label appears — honest: an untyped overlap is still a hard cut.
-2. Opens shot 04's `Effects` tab, sets `Transition out` to `Dissolve`. Toast: `Shot 05's transition in set to Dissolve to match.` The region turns `--blue` and its label becomes `DISSOLVE`.
+2. Opens shot 04's `Effects` tab, sets `Transition out` to `Dissolve`. Toast: `Shot 05's transition in set to Dissolve to match Shot 04's transition out.` The region turns `--blue` and its label becomes `DISSOLVE` — at a zoom wide enough to hold it.
 3. Drags the edge further; the band grows and the row's length readout follows.
 4. **Climax:** scrubs the playhead through the boundary. The Monitor plays shot 04, the dissolve, and shot 05 as one continuous piece — and the timeline's total length has not moved by a frame.
-5. Drags shot 05 back off the overlap. The band disappears; both rows keep their stored types and now read `No overlap — this treats shot 04's last frames, then cuts.`
+5. Drags shot 05 back off the overlap. The band disappears; both rows keep their stored types and now read `No overlap — this treats shot 04's last frames, then cuts.` And the change is announced, because it changes the rendered picture with no gesture of its own (R-36): `Shot 04 and Shot 05 no longer overlap — Shot 04's transition now treats its own last frames, then cuts.`
 
 ## Key-screen reference
 
