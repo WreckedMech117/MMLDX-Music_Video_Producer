@@ -76,6 +76,7 @@ from ..app import (
     SHOT_EFFECTS_TOO_MANY_REFUSAL,
     SHOT_TRANSITION_ABSENT_REFUSAL,
     SHOT_TRANSITION_LOCKED_REFUSAL,
+    SHOT_TRANSITION_MIRROR_LOCKED_REFUSAL,
     SHOT_TRANSITION_UNSAID,
     TAKE_MISSING_FILE_REFUSAL,
     TAKE_NOT_RENDERED_REFUSAL,
@@ -1018,6 +1019,36 @@ def register(ctx: RouterContext) -> None:
                         ),
                     ),
                 )
+        # **The lock, on the other end of the blend** (2026-08-30). The gate above holds the
+        # addressed Shot; this holds the Shot the mirror would write. It is judged over the same
+        # `said` sides and the same neighbour arithmetic the write loop below uses -- one walk,
+        # written twice, would be two answers to "which Shot does this touch" and that is the
+        # shape the frame rule was just corrected for.
+        #
+        # It covers a clear as well as a set: `null` on `transition_out` un-authors the locked
+        # successor's `transition_in` exactly as a type authors it, and a lock that held the
+        # writing but not the erasing would be no lock.
+        for side in said:
+            if position is None:
+                continue
+            mirrored = None
+            if side == "transition_out" and position + 1 < len(ordered):
+                mirrored = ordered[position + 1]
+            elif side == "transition_in" and position > 0:
+                mirrored = ordered[position - 1]
+            if mirrored is None or not mirrored.locked:
+                continue
+            earlier, later = (
+                (shot, mirrored) if side == "transition_out" else (mirrored, shot)
+            )
+            raise HTTPException(
+                status_code=422,
+                detail=SHOT_TRANSITION_MIRROR_LOCKED_REFUSAL.format(
+                    shot=shot_label(project, mirrored),
+                    before=shot_label(project, earlier),
+                    after=shot_label(project, later),
+                ),
+            )
         # Written after every refusal can no longer be raised, and both sides of one blend are
         # written together whichever end the client named (AD-30).
         for side, value in said.items():
@@ -1170,11 +1201,26 @@ def register(ctx: RouterContext) -> None:
             raise HTTPException(
                 status_code=422, detail=PREVIEW_NO_GEOMETRY_REFUSAL.format(shot=label)
             )
+        # **Both Shots, not just the addressed one** (2026-08-30). `position` and `after` are read
+        # off `ordered_shots`, which holds *every* Shot; the plan comes from `preview_assembly`,
+        # which leaves out any Shot whose take cannot be resolved or measured. So the two lists
+        # are not the same list, and matching on `before.shot_id` alone bound this route to a
+        # `TransitionClip` whose `after` was a **different Shot** -- reproduced: the response named
+        # `shot_b`, the frames showed `shot_a` blending into `shot_c`, and `tail_frames` collapsed
+        # to 0 because `_margin_frames` found no `shot_b` clip beside the entry.
+        #
+        # The mismatch has exactly one cause, which is why it needs no sentence of its own: pairs
+        # in the plan are consecutive among the Shots the plan holds, so a plan pairing `shot_a`
+        # with something other than its own successor is a plan the successor's take never reached.
+        # `BOUNDARY_PREVIEW_TAKE_MISSING_REFUSAL` below says that, and it is the fifth of the five
+        # absences this route's docstring enumerates rather than a sixth.
         index = next(
             (
                 spot
                 for spot, item in enumerate(plan.clips)
-                if isinstance(item, TransitionClip) and item.before.shot_id == shot.id
+                if isinstance(item, TransitionClip)
+                and item.before.shot_id == shot.id
+                and item.after.shot_id == after.id
             ),
             None,
         )

@@ -3,7 +3,7 @@
 `create_app` builds one `RouterContext` -- the seven injected dependencies and the handful of
 helpers built from them -- and hands the same instance to each module's `register`, which
 declares its routes on the application with the same decorators it used inside the factory.
-Sixty of the seventy-six routes live here now; of the sixteen left, fifteen are held by tests
+Sixty-five of the eighty-one routes live here now; of the sixteen left, fifteen are held by tests
 named below and the sixteenth is `index`, which serves the workspace's `index.html` from inside
 the block that mounts the static assets. `create_app` went from 7,882 lines and 94 nested
 definitions to 4,836 and 64 when the split landed, and to 3,542 and 44 when the file-scoped

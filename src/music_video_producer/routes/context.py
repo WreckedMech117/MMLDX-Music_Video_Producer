@@ -22,7 +22,7 @@ chosen over the alternatives:
   source for that call. The diff for a moved route is the move.
 * **Nothing happens per request.** These are plain closure variables, not FastAPI
   dependencies. `Depends` was the other candidate and is the more idiomatic shape, but it puts
-  a resolution step in front of all seventy-six routes, rewrites all seventy-six signatures,
+  a resolution step in front of all eighty-one routes, rewrites all eighty-one signatures,
   and -- because this application builds a fresh `create_app()` per test, hundreds of times in
   one process, each with its own injected doubles -- would need per-application
   `dependency_overrides` to keep those doubles apart. That is a behaviour change wearing a
@@ -102,7 +102,7 @@ class RouterContext:
     song_envelope_report: Callable[..., Any]
     discovered_looks: Callable[..., Any]
     run_tool: Callable[..., Any]
-    #: The four preview helpers, shared by the Shot preview -- pinned in `app.py` by the tests
+    #: The five preview helpers, shared by the Shot preview -- pinned in `app.py` by the tests
     #: that monkeypatch its neighbours -- and the boundary preview, which is a new route and
     #: therefore lives in `routes/shots.py`. They are here for `song_envelope_report`'s reason
     #: and it is the same reason: **two resources read them and neither owns them**. A preview

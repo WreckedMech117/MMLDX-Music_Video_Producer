@@ -26358,6 +26358,82 @@ def test_the_transition_route_refuses_by_name_and_stores_nothing_when_it_does(tm
     assert ProjectStore(tmp_path).get(project_id).shots[0].transition_out is None
 
 
+def test_a_locked_shot_cannot_be_given_a_blend_through_the_shot_beside_it(tmp_path: Path):
+    """The lock, held at **both** ends of one blend (2026-08-30).
+
+    `replace_shot_transitions` gated on the addressed Shot and then AD-30's mirror wrote the
+    *other* Shot's field with no lock check at all, so every one of the four writes below reached
+    a Shot the Director had put a hands-off on.
+
+    **The second pair is the one that matters, and it is not symmetric with the first.**
+    `transition_in` mirrors **backwards** onto the predecessor's `transition_out`, and that is the
+    only side the export reads (AD-30, `ExportSubject.transitions`) -- so naming the *unlocked*
+    later Shot's incoming field is how a locked earlier Shot acquires the outgoing blend that
+    actually renders. The divergence report stayed silent about it too, because the mirror sets
+    both sides and `_report_transition_divergence` only speaks when they differ.
+
+    **A clear is refused with a set**, because a lock that held the writing and not the erasing
+    would not be a lock: `null` un-authors the neighbour's field exactly as a type authors it.
+
+    Refused rather than mirrored-silently: skipping the mirror would answer 200 to a
+    `transition_in` write that changed nothing the export reads, and would leave
+    `api.transitionMirrorToast` saying in the past tense that both Shots were set.
+    """
+    from music_video_producer.app import SHOT_TRANSITION_MIRROR_LOCKED_REFUSAL
+
+    client, _store, _ = make_client(tmp_path)
+
+    def with_lock_on(index: int) -> str:
+        project_id = overlapping_project(client)
+        stored = ProjectStore(tmp_path).get(project_id)
+        stored.shots[index].locked = True
+        ProjectStore(tmp_path).save(stored)
+        return project_id
+
+    def pair(project_id: str) -> list[tuple[str | None, str | None]]:
+        return [
+            (
+                shot.transition_out.type if shot.transition_out else None,
+                shot.transition_in.type if shot.transition_in else None,
+            )
+            for shot in ProjectStore(tmp_path).get(project_id).shots
+        ]
+
+    both = SHOT_TRANSITION_MIRROR_LOCKED_REFUSAL.format(
+        shot="SHOT 02 (shot_two)",
+        before="SHOT 01 (shot_one)",
+        after="SHOT 02 (shot_two)",
+    )
+    backwards = SHOT_TRANSITION_MIRROR_LOCKED_REFUSAL.format(
+        shot="SHOT 01 (shot_one)",
+        before="SHOT 01 (shot_one)",
+        after="SHOT 02 (shot_two)",
+    )
+    cases = [
+        # The locked Shot, the addressed Shot, the side named, the body, the sentence.
+        (1, "shot_one", {"transition_out": {"type": "dissolve"}}, both),
+        (1, "shot_one", {"transition_out": None}, both),
+        (0, "shot_two", {"transition_in": {"type": "dissolve"}}, backwards),
+        (0, "shot_two", {"transition_in": None}, backwards),
+    ]
+    for locked_index, addressed, body, sentence in cases:
+        project_id = with_lock_on(locked_index)
+        before = ProjectStore(tmp_path).get(project_id).model_dump(mode="json")
+        held = client.put(transitions_url(project_id, addressed), json=body)
+        assert held.status_code == 422, (addressed, body, held.text)
+        assert held.json()["detail"] == sentence, (addressed, body)
+        assert pair(project_id) == [(None, None), (None, None)]
+        assert ProjectStore(tmp_path).get(project_id).model_dump(mode="json") == before
+
+    # And with nothing locked the identical bodies are the ordinary mirrored write, so the four
+    # refusals above are a statement about the lock rather than about the route.
+    open_project = overlapping_project(client)
+    assert client.put(
+        transitions_url(open_project, "shot_one"), json={"transition_out": {"type": "dissolve"}}
+    ).status_code == 200
+    assert pair(open_project) == [("dissolve", None), (None, "dissolve")]
+
+
 def test_a_new_shot_never_inherits_a_transition_from_the_one_it_was_made_from(tmp_path: Path):
     """`SHOT_UNINHERITED_DECISION_FIELDS`, executed at the door a copy actually arrives through.
 

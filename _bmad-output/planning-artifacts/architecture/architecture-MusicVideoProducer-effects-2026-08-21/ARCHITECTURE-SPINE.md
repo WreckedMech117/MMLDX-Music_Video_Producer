@@ -155,7 +155,39 @@ Binding, read-only. Not re-derived here.
 > crowding count (it is exactly two clips) nor a no-overlap check. The first implementation of the
 > three-entry split produced `frames = [48, 144, -96, 96]` — a plan that **added up to the song by
 > cancelling a window against itself**, which is the one way the frame rule can be satisfied and
-> wrong at once. `all(count > 0 for count in plan.frames)` is asserted at the split now.
+> wrong at once. ~~`all(count > 0 for count in plan.frames)` is asserted at the split now.~~
+> **That sentence was false when it was written, and it was mine** (corrected 2026-08-30): the
+> assertion existed in exactly one test, on exactly one fixture, and nowhere in the code at all.
+> It is the most expensive kind of false record this repository produces — a claim that an
+> invariant is *held* stops the next reader looking for the place that holds it.
+>
+> A day later two more geometries reached the split, both satisfying the frame rule the same way
+> by cancelling a window against itself: a third clip starting inside the half-frame band below
+> the Overlap's end (`A[0,4.0625] B[3,6] C[4.05,8]` → `[72, 26, -1, 95]`), and its sibling with a
+> clip snapped exactly to the previous clip's end (`A[0,4] B[3,6] C[4,8]` → `[72, 24, 0, 96]`) —
+> **which needs no off-grid arithmetic at all and is the snapper's preferred outcome.** The first
+> shipped `-frames:v -1`, which ffmpeg *ignores at rc 0 with no warning*, encoding the whole rest
+> of the take: measured end to end, a **200**, `look.transitions` recording the blend as a
+> success, `verification_problems` empty, and roughly a third of the running time showing a Shot
+> the Director never put there.
+>
+> **Amended 2026-08-30 — the invariant now exists, and not at the split.** It is on
+> `assembly_plan`'s **output**, because every enumeration of geometries so far has been short by
+> one and the next one would have been too: a negative count raises `ASSEMBLY_NEGATIVE_FRAMES_ERROR`
+> and is unreachable by construction; a zero count is dropped, provably sum-neutral, because
+> `round(start * 24) == round(end * 24)` is exactly what made it zero. The split itself now makes
+> **one** decision — `_split_frames` lays the three stretches a blend would become and reads each
+> off `clip_frames_on_grid` at the boundaries the split writes — and composes only when all three
+> are positive. `TRANSITION_NESTED_REFUSAL` and `TRANSITION_CROWDED_REFUSAL` survive verbatim as
+> *names* for what that measurement found, deciding nothing.
+>
+> Two things fell out that no enumeration reached. A **zero-frame entry needs no transition at
+> all**: `A[0,10]` with `B[0.483333, 0.516667]` gives `[12, 0, 228]` with no blend anywhere, and
+> `-frames:v 0` writes a 261-byte file with no video stream at rc 0 that `concat -c copy` accepts
+> silently — which is why the guarantee had to be on the output rather than on the split. And the
+> nested check was **one-directional**: the mirror, an outgoing Shot buried inside the incoming
+> one, reached the split and opened a video with four seconds of a Shot that renders nothing
+> without the transition.
 >
 > A related boundary, also measured: below `BOUNDARY_TOLERANCE_SECONDS` (half a frame) an "overlap"
 > is the same boundary written twice rather than an overlap — `_seam_overlaps` and `tiling_refusals`
@@ -270,7 +302,7 @@ Binding, read-only. Not re-derived here.
 > |---|---|
 > | **filter-stage construction** | **As-built.** `build_effect_stages`, twenty-five composers, the catalogue, `validate_stack`, `preview_fingerprint`, the LUT discovery and quoting. |
 > | ~~`sendcmd` generation~~ | ~~**Planned — Epic 10 (Slice E).** Grep the module for `sendcmd` and you get two lines of *prose*, in the module docstring and in `lut_file_argument`, both saying that `lut3d`'s quoted form is more robust than the cwd-relative remedy `sendcmd` needs. There is no generator, no script text, and no caller.~~ **Shipped 2026-08-27 in `ad67a14`, and this row was left standing by that very commit — corrected 2026-08-28 by Epic 10's retrospective.** `effects.py` now holds `drive_samples`, `sendcmd_script`, `DriveScript` and `drive_readout`; `app.py` and `routes/shots.py` call them. The sentence above was true when written and false in the commit that published it, which is the single failure this epic repeated most: **a commit that changes what a document describes must correct that document in the same commit.** |
-> | ~~transition-segment argv~~ | ~~**Planned — Epic 11 (Slice F).** No `xfade` anywhere in the module. The only occurrences of the word are `preview_fingerprint`'s seventh input slot, deliberately hashed empty so Epic 11 moves only the Shots that acquire a transition.~~ **Shipped 2026-08-29 — and in `assembly.py`, not here.** Two reasons, the second stronger. `assembly.py` is a leaf and may not import `effects`; and R-38 requires the segment be concat-identical to `trim_args`' output, for which the only *structural* guarantee is one shared stage builder — `assembly.normalized_stages`, with `trim_args` byte-identical to before. The **catalogue** is in `effects.py`, and `assembly.py` receives a resolved `xfade` name the way it already receives finished stage strings. AD-25's Rule sentence above still names this module and is wrong about it. |
+> | ~~transition-segment argv~~ | ~~**Planned — Epic 11 (Slice F).** No `xfade` anywhere in the module. The only occurrences of the word are `preview_fingerprint`'s seventh input slot, deliberately hashed empty so Epic 11 moves only the Shots that acquire a transition.~~ **Shipped 2026-08-29 — and in `assembly.py`, not here.** Two reasons, the second stronger. `assembly.py` is a leaf and may not import `effects`; and R-38 requires the segment be concat-identical to `trim_args`' output, for which the only *structural* guarantee is one shared stage builder — `assembly.normalized_stages`, with `trim_args` byte-identical to before. The **catalogue** is in `effects.py`, and `assembly.py` receives a resolved `xfade` name the way it already receives finished stage strings. ~~AD-25's Rule sentence above still names this module and is wrong about it.~~ *(Corrected 2026-08-30: the Rule sentence was struck through in the same commit this row was written, so the row spent a day telling readers to distrust a sentence that had already been fixed. Both halves of one correction, and only one of them knew the other had happened — which is the same defect as the row above it, in the same table, one commit later.)* |
 >
 > Both remain the right home for the work and AD-25's placement decision is unchanged — what is
 > corrected is the tense. **The idiom to keep:** an amendment block in this spine describes what
@@ -300,11 +332,11 @@ Binding, read-only. Not re-derived here.
 - **Prevents:** an unknown effect id or an out-of-range parameter reaching a filter string
 - **Rule:** The catalogue is server-side data. An incoming `EffectSpec` is validated against it — known id, known parameters, every value inside its declared range — and refused with a 422 naming the offender before anything is stored. **Nothing the client sends is ever interpolated into a filter string unvalidated.** A LUT is referenced by catalogue id, never by a client-supplied path; a missing LUT file is reported by name at export (FX-23) and the effect is never silently skipped.
 
-### AD-28 — One fingerprint function, with enumerated inputs
+### AD-28 — ~~One fingerprint function~~ **One rule per fingerprint**, with enumerated inputs
 
 - **Binds:** FX-1, FX-15, FX-20, AD-20, AD-21, AD-23
 - **Prevents:** two builders hashing the same state differently, so a cache never hits or a live envelope is reported stale
-- **Rule:** Both fingerprints this feature depends on are produced by **one function in `effects.py`** over an explicitly ordered, explicitly formatted input list — never an ad-hoc hash of a dict, whose ordering and float repr are not contracts. The **song fingerprint** (AD-20) is content-derived: the song file's size and a hash of its bytes, never mtime, which changes on a copy and not on an edit. The **preview fingerprint** (AD-23) covers, in this order: approved-output path, window start and duration, trim offset, **the filter chain the Effect Stack composes to**, every Parameter Binding, the song fingerprint, the transition spec, and the preview geometry. Adding an input to either — **or changing what one of them holds** — is a change to this AD.
+- **Rule:** ~~Both fingerprints this feature depends on are produced by **one function in `effects.py`**~~ **Every fingerprint this feature depends on is produced by exactly one function in `effects.py`, over one subject** — an explicitly ordered, explicitly formatted input list, never an ad-hoc hash of a dict, whose ordering and float repr are not contracts. *(Corrected 2026-08-30. The 2026-08-29 amendment below announced this change to the title and the Rule and then made neither, so the heading and the first sentence went on stating the opposite of what shipped — which is this AD's own failure mode, one subject described twice and the two copies disagreeing. There are three functions: `song_fingerprint`, `preview_fingerprint` and `boundary_fingerprint`.)* The **song fingerprint** (AD-20) is content-derived: the song file's size and a hash of its bytes, never mtime, which changes on a copy and not on an edit. The **preview fingerprint** (AD-23) covers, in this order: approved-output path, window start and duration, trim offset, **the filter chain the Effect Stack composes to**, every Parameter Binding, the song fingerprint, the transition spec, and the preview geometry. Adding an input to either — **or changing what one of them holds** — is a change to this AD.
 
 > **Amended 2026-08-26.** The fourth slot used to hold *"the Effect Stack serialized canonically"*, and that was the defect rather than the description. A cached preview is named after what produced it, and what produces it is the composed chain — so a corrected composer or a corrected catalogue default moved the picture and left the name alone. Measured: Epic 9's own last commit (`e4aec46`) fixed `scanlines` drawing a 26-pixel black bar down the left edge, and every preview already rendered with a Scanlines card went on being served **from cache, still showing the bar**, because the stack had not changed. Nothing evicts `previews/`, so it was permanent.
 >

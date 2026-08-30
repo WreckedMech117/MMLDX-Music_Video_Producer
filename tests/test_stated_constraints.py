@@ -22,12 +22,12 @@ in this codebase*, *never imports*, *may not import* — gives **135**, of which
 from that 135: each is a claim that, if it silently stopped holding, would change what the
 application does rather than only what a comment says.
 
-**The headline: of the ~~twenty-two~~ ~~twenty-six~~ twenty-eight, ~~seven~~ ~~eight~~ twelve were
-asserted before this pass, three are closed by the leaf-module guard added beside it, and
-~~twelve~~ ~~eleven~~ thirteen remain unenforced and are named as such.** Nothing here tried to close the twelve — item 23
+**The headline: of the ~~twenty-two~~ ~~twenty-six~~ ~~twenty-eight~~ thirty-one, ~~seven~~ ~~eight~~
+~~twelve~~ fifteen were asserted before this pass, three are closed by the leaf-module guard added
+beside it, and ~~twelve~~ ~~eleven~~ thirteen remain unenforced and are named as such.** Nothing here tried to close the twelve — item 23
 asked for the list, not the fixes.
 
-*Six rows added 2026-08-29 and 2026-08-30 by story 11.5, in the commits that stated them* — which is the standing
+*Six rows added 2026-08-29 and 2026-08-30 by story 11.5, and three more by the Slice F remediation of 2026-08-30, in the commits that stated them* — which is the standing
 practice `docs/project-context.md` records, and the only mechanism there is: nothing finds an
 unenumerated constraint and nothing will. Three of the four are asserted, and the one that is not
 is named honestly: the cache's single implementation is a claim about how many functions exist,
@@ -228,7 +228,35 @@ CONSTRAINTS: tuple[Constraint, ...] = (
         "*constant* is safe exactly while something compares the two; a duplicated *rule* is not, "
         "which is why the clamp itself is compared on answers instead.",
     ),
+    Constraint(
+        "assembly.py, `assembly_plan` / `AssemblyPlan.frames`",
+        "nothing leaves this function with a non-positive frame count",
+        "test_no_plan_this_module_returns_holds_a_non_positive_frame_count",
+        "AD-18's 2026-08-29 amendment recorded this as *asserted at the split now* and it was "
+        "not: it existed in one test, on one fixture, and three further shapes of the same defect "
+        "shipped under it. A negative count keeps `sum(frames)` correct by cancelling a window "
+        "against itself, which is the one way the frame rule can hold while the export ships the "
+        "wrong Shot.",
+    ),
+    Constraint(
+        "assembly.py, `_paired_transitions`",
+        "one rule decides whether a boundary blends, and it measures the split it would make",
+        "test_a_split_that_would_lay_no_frames_is_refused_with_all_three_numbers_in_it",
+        "2026-08-30. The two conditions it replaces each described a geometry somebody had "
+        "enumerated and each asked its question of a different object than the split used. "
+        "`TRANSITION_NESTED_REFUSAL` and `TRANSITION_CROWDED_REFUSAL` are now names for what the "
+        "measurement found rather than tests of their own.",
+    ),
     # --- app.py -------------------------------------------------------------------------------
+    Constraint(
+        "app.py, `SHOT_TRANSITION_MIRROR_LOCKED_REFUSAL`",
+        "a lock holds both ends of one blend, not only the Shot the request names",
+        "test_a_locked_shot_cannot_be_given_a_blend_through_the_shot_beside_it",
+        "2026-08-30. AD-30's mirror wrote the neighbour's field with no lock check, and because "
+        "`transition_in` mirrors *backwards* onto the predecessor's `transition_out` -- the only "
+        "side the export reads -- naming the unlocked end authored the blend that actually "
+        "renders on the locked Shot.",
+    ),
     Constraint(
         "app.py, `MARK_READY_STATUSES`",
         "the exact complement of `RENDER_AGAIN_STATUSES` plus the in-flight pair",
@@ -336,9 +364,9 @@ def test_the_enumeration_reports_its_own_split():
     asserted = [c for c in CONSTRAINTS if c.asserted_by]
     by_new_guards = [c for c in asserted if c.asserted_by in added_here]
 
-    assert len(CONSTRAINTS) == 28
+    assert len(CONSTRAINTS) == 31
     assert len(by_new_guards) == 3
-    assert len(asserted) - len(by_new_guards) == 12
+    assert len(asserted) - len(by_new_guards) == 15
     assert len(CONSTRAINTS) - len(asserted) == 13
 
 

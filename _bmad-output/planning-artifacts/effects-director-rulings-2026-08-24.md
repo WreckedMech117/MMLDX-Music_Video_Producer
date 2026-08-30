@@ -780,8 +780,10 @@ measured working, frames bit-identical outside the ramp.
 >
 > * `transition=fade` tracks a plain `fade=t=out` over the whole length to within 0.9 of a luma
 >   level per frame — 110.9 → 19.6 against 110.9 → 20.0. **A dissolve never arrives at black**;
-> * `transition=fadeblack` is fully black by frame 5 of 24 and **stays there** until the incoming
->   picture arrives.
+> * `transition=fadeblack` is fully black by frame 5 of 24 and ~~**stays there** until the incoming
+>   picture arrives~~ **then climbs back to Y=16, which is the black leg's own limited-range level
+>   and not a returning picture** *(corrected 2026-08-30; see the amendment below, which measured
+>   it and replaced the second telling of this same block)*.
 >
 > So the two are separated by *when* the black arrives, and both one-sided forms are the paired
 > operation with the second picture absent: `fade_out` ramps over the whole treatment and does not
@@ -798,29 +800,51 @@ measured working, frames bit-identical outside the ramp.
 > too thin to be a real difference, the correct fix is `pair_only=True` on `dissolve` and not a
 > substitution**, and it is one line plus the two tests that name the four.
 
-> **Amended 2026-08-29 — the ruling named twelve transitions and three one-sided compositions, and
-> never said what a Dissolve does with one picture.** The implementer found the gap and refused to
-> close it silently, which was right: the obvious answer — a cross-fade with nothing to cross into
-> becomes a fade to black — is *another entry's name*, and is exactly the substitution this ruling
-> exists to forbid.
+> **Amended 2026-08-30 — the two blocks above were written the same day about the same measurement
+> and they disagree, so both are superseded by this one.** The block immediately above this one
+> used to carry a second telling of the amendment before it: a table starting at 120.9 where the
+> first says 110.9, and — the part that matters — `fadeblack` **rising** after black (`~4, ~10,
+> ~15`) where the first block says it *"stays there until the incoming picture arrives"*. Those
+> are not two roundings of one number; they are opposite claims about the second half of the same
+> clip. **Neither was checkable against the other, because neither said what it measured on.**
 >
-> **Measured over a 24-frame treatment against a black leg**, mean luma per frame:
+> **Re-measured 2026-08-30**, ffmpeg 7.0-full_build, 24 frames of `testsrc2` at 320x240 against a
+> `color=black` leg, `xfade` over the whole clip, mean luma per frame off `signalstats`:
 >
-> | | frame 1 | 6 | 12 | 18 | 24 |
-> |---|---|---|---|---|---|
-> | `fade` (Dissolve) | 120.9 | 98.9 | 72.8 | 46.2 | **20.0** |
-> | `fadeblack` (Dip to black) | 120.8 | **0** | ~4 | ~10 | ~15 |
+> | | frame 1 | 6 | 12 | 18 | 24 | min |
+> |---|---|---|---|---|---|---|
+> | `fade` (Dissolve) | 122.1 | 99.8 | 73.3 | 46.6 | **20.0** | 20.0 at frame 24 |
+> | `fadeblack` (Dip to black) | 122.1 | **0.0** | 4.0 | 10.0 | 15.0 | 0.0 at frame 6 |
 >
-> Three distinct pictures, and no borrowed name. **Ruled: keep it.** One-sided, a **Dissolve ramps
-> down and hard-cuts at roughly 16 % luma** — a partial fade, deliberately not reaching black, which
-> is what distinguishes it from the dip. `Dip to black` and `Dip to white` reach the colour at the
-> midpoint and hold it to the cut.
+> **The second block's numbers were right and the first block's sentence was wrong, and the reason
+> nobody could tell is worth more than the correction.** `fadeblack` really does rise after it
+> reaches black — but it is not a picture coming back. It is fading *into* the second leg, and the
+> second leg's own black is **Y=16**, because `color=black` through `yuv420p` is limited-range
+> (measured directly: the leg alone reads `YAVG=16` on every frame). So the tail climbing 0 → 15 is
+> the clip arriving at the black it was always going to arrive at. The first block described the
+> *picture* correctly and the *number* wrongly; the second described the number correctly and left
+> a reader to infer a returning picture that is not there. **A measurement with no units and no
+> apparatus beside it cannot be reconciled with another one, only preferred.**
+>
+> The starting luma is 122.1 for both, and neither block's figure was right — which changes
+> nothing and is recorded because a number quoted twice at two values is a number nobody
+> re-derived.
+>
+> **The ruling is unchanged: keep it.** Three distinct pictures, no borrowed name. One-sided, a
+> **Dissolve ramps down and hard-cuts at roughly 16 % luma** — a partial fade, deliberately not
+> reaching black, which is what distinguishes it from the dip. `Dip to black` and `Dip to white`
+> reach the colour at the midpoint and hold it to the cut.
 >
 > **The argument against, recorded because it is real:** "dissolve" arguably names a blend between
 > two pictures and there is only one here. The alternative was `pair_only=True`, which is the shape
 > wipes and slides already take — honest about the name, but it refuses the most-used transition on
 > every boundary without an Overlap, which is most boundaries. If that judgement is ever revisited,
 > the fix is one flag and two tests, **not** a substitution.
+>
+> **What the product actually composes is not `xfade` at all**, and that is why this disagreement
+> never reached a Director: `effects.one_sided_transition_stages` writes `fade` and a `gblur.sigma`
+> ramp on a single leg. The `xfade`-against-black measurement is evidence about *what the names
+> should mean*, not about what ships.
 
 ## R-35 — A boundary preview is a second route and a second fingerprint
 
@@ -916,6 +940,31 @@ still assembles.
 Not hypothetical: `assembly_plan` already resolves a nested overlay into two `ClipWindow`s for one
 Shot, and Story 9.7 shipped composing them apart on purpose. Refusing the whole export would be
 **stricter than `assembly_plan` itself**, and would cost a Director a render over one geometry.
+
+> **Amended 2026-08-30 — the count was refusing boundaries that are perfectly blendable, and letting
+> through ones that are not. Both were mine.** *"More than two clips cover one instant"* was the
+> whole test, and it is a proxy for the thing that actually matters, which is whether the split
+> lays a positive number of frames in each of its three stretches.
+>
+> **A false positive, now composed:** `Z[0,10] A[1,4] B[3,7]` with a Dissolve on A was refused,
+> because three input windows cover the Overlap. But Z is completely buried under A and B there —
+> `assembly_plan` resolves overlaps as layers, later-on-top — so only **two pictures** exist over
+> that stretch and the blend is exactly right. A Director was told to move something out from under
+> a boundary where nothing was in the way.
+>
+> **A false negative, and it shipped a wrong video:** the count applies `BOUNDARY_TOLERANCE_SECONDS`
+> *inwards*, correctly — a boundary written twice within half a frame is one boundary — so a third
+> clip starting inside that band was **not counted** while still truncating the incoming Shot's
+> head. `A[0,4.0625] B[3,6] C[4.05,8]` produced `[72, 26, -1, 95]`, refused nothing, summed to the
+> song exactly, and exported at **200** with a third of its running time showing the wrong Shot.
+>
+> **What is unchanged is this ruling's actual decision**, which was never about counting: a bad
+> geometry refuses the *transition* and the export still assembles. That holds, and the refusal is
+> still recorded on `ExportLook.transitions` rather than in `EXPORT_PLAN_CHECKS`. What changed is
+> that `assembly._split_frames` now makes the decision by measuring the split, and the crowding
+> sentence — still worded exactly as this ruling asks, still with its nested sibling holding `SNAP_NESTED`'s
+> wording character for character — is chosen to *name* what the measurement found. A boundary that
+> really is crowded still gets this ruling's sentence. See AD-18's 2026-08-30 amendment.
 
 ## R-38 — The transition segment reads the two takes, in one invocation
 

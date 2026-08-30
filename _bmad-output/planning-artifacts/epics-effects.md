@@ -46,7 +46,7 @@ FX-14: Choose the Drive — punch or sustain, explicitly, with a Trigger Floor a
 FX-15: Refuse binding without a Song Envelope, by name and with an action; retain stored bindings as unresolvable rather than dropping them
 FX-16: Author a Transition by overlapping clips; the Overlap's length is the Transition's length; the region highlights blue
 FX-17: Set a Transition Pair — setting one side sets the other to match across an Overlap, and says so
-FX-18: One-sided transitions treat the Shot's own final or opening frames, followed or preceded by a hard cut
+FX-18: One-sided transitions treat the Shot's own final ~~or opening~~ frames, followed ~~or preceded~~ by a hard cut *(amended 2026-08-30: **only the outgoing half is built.** `_compose_one_sided_transitions` reads `subject.transitions`, which `assemble_project` builds from `transition_out` alone — so a stored `transition_in` on a boundary with no Overlap composes nothing and exports untreated. Measured through the shipped routes at `3322ace`. Recorded in `deferred-work.md` with what it would take to close; the shipped toast promises only the half that happens.)*
 FX-19: A curated transition catalogue named in the Director's language, not an exhaustive dump
 FX-20: Preview a Shot's Effect Stack as a looping clip through the real filter chain
 FX-21: Preview a Transition across the boundary it spans
@@ -95,7 +95,7 @@ UX-DR4: Parameter row component — label, slider on `--line` track with `--acid
 UX-DR5: Band panel component — inline beneath its parameter row, `--surface-2`, `--blue` left edge, containing spectrum strip, `punch | sustain` segmented control, floor and depth sliders, and an explicit `Remove binding`
 UX-DR6: Spectrum strip canvas — whole-song average as `--dim` bars with the Band as a `--blue` region with softness falloff; draggable region, edges and softness handle; three labelled numeric inputs as the keyboard and screen-reader equivalent
 UX-DR7: Drive readout canvas beneath the Monitor — envelope in `--blue`, ~~Trigger Floor as a `--dim` hairline~~, `--acid` playhead drawn through, and the envelope drawn `--dim` where it falls below the floor; `aria-hidden` with its facts also stated in text *(amended 2026-08-27, R-31: the floor is compared against the **band level** while the readout draws the **compiled parameter value** — different units, so a hairline at the floor's number names a value it has nothing to say about. The `--dim` hairline is the **rest line**, and the floor is drawn as ground under the silenced runs. Below the floor a `punch` drive is exactly zero, so colour alone could not have marked it: the silenced line lies on the rest line in the same token, and the state needs width.)* *(amended 2026-08-27, R-32: the band panel is closed most of the time, so a screen reader meeting the canvas with no panel open would get nothing — which is the case this rule exists to serve. The facts are stated in a caption inside the readout's own `<figure>`; the band panel points at it without restating them.)*
-UX-DR8: Overlap band on the timeline — typed: `--blue` fill at 22% behind clip content with blue hairlines and a centred Consolas type label; untyped: `--line-strong` hatch with a `CUT` label and no blue; never a drag target, so clip-edge dragging is unaffected
+UX-DR8: Overlap band on the timeline — typed: `--blue` fill at 22% ~~behind~~ **above** clip content with blue hairlines and a centred Consolas type label **drawn only when the band is wide enough to letter it**; untyped: `--line-strong` hatch with a `CUT` label and no blue; never a drag target, so clip-edge dragging is unaffected *(amended 2026-08-30 on both counts, each measured rather than argued. **"Behind" is unbuildable** — R-40: `.shot-clip` is an opaque background with `overflow: hidden`, so a band behind two clips paints nothing at all; it ships above at 22% with `pointer-events: none`, which preserves both properties the design was protecting. **And the label is conditional** — `DISSOLVE` needs about 3.1 s of Overlap to letter at the default 16.6 px/s and a typical 0.50 s Overlap is 8.3 px wide, so the band withholds the label rather than squeezing it, and reserves `.clip-prompt`'s own 33 px inset before lettering so it cannot land on the `ƒ` chip. UX-DR15 still holds: the row carries the type as text and an untyped overlap draws a distinct hatch, so the band's state is never colour-alone.)*
 UX-DR9: `ƒ` corner chip on clips carrying Effects, in the existing 14px idiom, reading order `✓ ƒ ⚑`; three chips is the corner's maximum
 UX-DR10: Transition pair rows — `--blue` left edge with the Overlap's length when paired, `--dim` left edge with the one-sided explanation when not; both live, neither disabled
 UX-DR11: Monitor `STALE` state — the previous picture continues playing with a Consolas corner label; never a frozen frame, never a spinner over black, never a percentage
@@ -123,7 +123,7 @@ FX-14: Epic 10 — punch/sustain Drive with floor and depth
 FX-15: Epic 10 — refusal without a Song Envelope, bindings retained
 FX-16: Epic 11 — Overlap-authored Transitions with the blue band
 FX-17: Epic 11 — the Transition Pair and its auto-match
-FX-18: Epic 11 — one-sided transitions
+FX-18: Epic 11 — one-sided transitions **(outgoing half only; the incoming half is open — see FX-18's own line above and `deferred-work.md`)**
 FX-19: Epic 11 — the curated transition catalogue
 FX-20: Epic 9 — looping Preview Clip through the real chain
 FX-21: Epic 11 — Transition preview across the boundary
@@ -154,7 +154,7 @@ The Director ties a parameter to a frequency band and the video answers the trac
 
 ### Epic 11: Cuts That Blend
 The Director drags two clips together and the cut between them becomes a transition, visible on the timeline and exactly as long as the overlap. The only epic that touches the cumulative frame grid, and isolated for that reason.
-**FRs covered:** FX-16, FX-17, FX-18, FX-19, FX-21, FX-NFR-1, FX-NFR-2
+**FRs covered:** FX-16, FX-17, **FX-18 in part**, FX-19, FX-21, FX-NFR-1, FX-NFR-2 *(corrected 2026-08-30: FX-18 names a Shot's opening frames as well as its final ones and only the final ones ship. Listing it flatly as covered is the third of three places that said so, and the three together are why the gap survived a slice, a review pass and a closing audit — each one read as confirmation of the others.)*
 
 ## Epic 8: The Song Becomes Measurable
 
@@ -714,7 +714,7 @@ So that its length is something I set by hand and can see.
 
 **Given** two clips dragged until they overlap, with a Transition type set
 **When** the timeline is drawn
-**Then** the overlapping region shows a `--blue` fill at 22% with 1px `--blue` top and bottom edges and a centred Consolas type label (FX-16, UX-DR8)
+**Then** the overlapping region shows a `--blue` fill at 22% **above the clips** with 1px `--blue` top and bottom edges and a centred Consolas type label **wherever the band is wide enough to carry one** (FX-16, UX-DR8, R-40) *(amended 2026-08-30; see UX-DR8's own line, which carries the measurements)*
 **And** the band draws **behind** clip content, so state borders and the corner chips stay fully legible on top of it
 **And** the band is not a drag target, so the existing clip edges remain the only handles.
 

@@ -13,10 +13,12 @@ Three features, one story-numbering space, three epic files that cross-link each
 | Feature | Epics | Stories | State |
 |---|---|---|---|
 | Base product | 1–7 | 23 | Largely built; see `docs/ROADMAP.md` for verified-vs-unverified |
-| **Shot Effects and Transitions** | 8–11 | 19 | **Epics 8 and 9 shipped. Epics 10 and 11 planned, not built** |
+| **Shot Effects and Transitions** | 8–11 | 19 | **All four epics shipped (8, 9, 10, 11).** See §2 for what is open. |
 | **Treatment Planning** | 12–17 | 17 | **Fully planned, nothing built** |
 
 *Corrected 2026-08-27.* The effects row read ~~**Fully planned, nothing built**~~ and the story counts read ~~24 / 18~~ for the first two features. The state claim was true on 2026-08-23 and is two epics stale; the treatment count of 17 was right and is untouched. `sprint-status.yaml` carries **`epic-8: done`** (8.1–8.3) and **`epic-9: done`** (9.1–9.7), across roughly fifteen commits ending at `0b0bb96`; `audio.py` and `effects.py` both ship, with the envelope sidecar, beat markers and snapping, the Effects tab, the preview cache and an effects-aware export behind them. Counted today against `epics.md`, `epics-effects.md` and `epics-treatment.md`: **23 / 19 / 17**. The effects figure moved because Epic 9 gained Story 9.7 during the build, and the base figure was never 24. This is the row `AGENTS.md` sends every new session to read first, and it was two epics stale — the same failure Epic 9's retrospective found in the tracker.
+
+*Corrected 2026-08-30.* The effects row then read ~~**Epics 8 and 9 shipped. Epics 10 and 11 planned, not built**~~, which was **the third time this one cell has gone stale**, each time in the commit that made it stale. Epic 10 shipped 2026-08-27 (`ad67a14`…`4fd9b41`, four stories) and Epic 11 on 2026-08-29 (`0929538`…`7ef2b82`, five stories); `sprint-status.yaml` carries `epic-10: done` and `epic-11: done`. A cell that has been wrong three times is not a writing problem — it is the one claim in this document that no guard reads, and it is worth one. The story counts are unchanged and were re-counted: **23 / 19 / 17**.
 
 Sprint tracking: `_bmad-output/implementation-artifacts/sprint-status.yaml` — 17 epics, 59 stories. **It is gitignored** (`.gitignore` excepts only `deferred-work.md` under `implementation-artifacts/`), so it is local-only by design. Regenerate it with `bmad-sprint-planning` after any epic change.
 
@@ -33,7 +35,9 @@ All paths relative to `_bmad-output/planning-artifacts/` — *corrected 2026-08-
 
 ## 2. Where to start
 
-**Effects Epic 10 — Reactive Binding, which is `BUILD-ORDER.md`'s Slice E.** Slices A (song analysis), B (the chain builder), C (the Effects tab) and D (preview) are all built, which is precisely the foundation E was sequenced onto: an envelope to read, parameter rows to bind, and a preview to judge a binding against. **Read Slice E's risk paragraph before you start** — it was rewritten on 2026-08-27 because the original named the wrong danger.
+**Treatment Epic 12 or Epic 17 — the effects `BUILD-ORDER.md` has no unbuilt slice left.** Slices A (song analysis), B (the chain builder), C (the Effects tab), D (preview), E (reactive binding) and F (transitions) are all built. Pick from the independent quick wins below, or from §6's open items — which is where the effects work that is genuinely still owed now lives.
+
+*Corrected 2026-08-30.* This said ~~**Effects Epic 10 — Reactive Binding, which is `BUILD-ORDER.md`'s Slice E**~~ and went on describing E's foundation as though nothing had been built on it. Epic 10 shipped 2026-08-27 and Epic 11 on 2026-08-29. This is §1's stale cell met a second time in the same document: the *state* was corrected on 2026-08-27 and the *instruction that reads it* was not, so a session that skipped the table and read this heading — which is what §8 tells it to do — would have started an epic that was already in `git log`.
 
 *Corrected 2026-08-27.* This said ~~**Effects Story 8.1 — Analyze the Song into an Envelope.** No dependencies, no blockers, and it ships beat markers and beat-snapping on its own even if nothing else in that feature ever lands.~~ Story 8.1 shipped on 2026-08-24 and the whole of Epics 8 and 9 with it. The ordering *was* the Director's decision and it still has the consequence §5 records, which is why that section is amended rather than deleted.
 
@@ -46,7 +50,7 @@ All paths relative to `_bmad-output/planning-artifacts/` — *corrected 2026-08-
 - Treatment **Story 16.1** — plain proceed-to-next-step buttons, without their offers.
 - ~~Effects **Epic 8** — song analysis, beat markers, beat-snapping.~~ **Shipped 2026-08-24.**
 
-**Merge alone:** effects **Epic 11** (transitions). It is the only work touching `assembly_plan` and the cumulative frame grid, and it needs its own verification pass against `FX-NFR-1` before it merges.
+~~**Merge alone:** effects **Epic 11** (transitions).~~ **Shipped 2026-08-29.** It was the only work touching `assembly_plan` and the cumulative frame grid, it did get its own verification pass against `FX-NFR-1`, and **that pass is the reason this instruction was worth following**: the frame rule held on every plan while three geometries shipped a non-positive frame count, because a window that runs backwards cancels against itself. See AD-18's 2026-08-30 amendment. Anything else that touches the frame grid still merges alone.
 
 ---
 
@@ -358,7 +362,7 @@ Helpers are a separate question from routes: `_adopt_shot_effects`, `_adopt_job_
 
 ### The generic project PUT is this codebase's recurring guard hole
 
-`replace_project` — in **`routes/project.py`** since the split, not in `app.py` — carries comments counting the **fourteenth** finding of the same hole. The established remedy is an `_adopt_*` helper that takes the field off the **stored** project before the body is trusted — `_adopt_song_recovery_slots`, `_adopt_song_vocal_type`, `_adopt_song_analysis`, `_adopt_expansion_maps`, `_adopt_shot_effects`, `_adopt_job_measurements`.
+`replace_project` — in **`routes/project.py`** since the split, not in `app.py` — carries comments counting the **fifteenth** finding of the same hole *(fifteenth as of 2026-08-29: the Transition pair, `_adopt_shot_transitions`, guarded in the same commit as the field; this said **fourteenth** until 2026-08-30 while §8 of this same document already said fifteen — one number, two places, and they disagreed for a day)*. The established remedy is an `_adopt_*` helper that takes the field off the **stored** project before the body is trusted — `_adopt_song_recovery_slots`, `_adopt_song_vocal_type`, `_adopt_song_analysis`, `_adopt_expansion_maps`, `_adopt_shot_effects`, `_adopt_job_measurements`.
 
 *Corrected 2026-08-27.* This said ~~"`replace_project` in `app.py` carries a comment counting the **sixth** finding"~~, and both halves were wrong. The route moved; and the count reached **fourteen** — the envelope pointer was the twelfth, the Effect Stack the thirteenth (Epic 9, `_adopt_shot_effects`) and the record of what an export looked like the fourteenth. **Re-counted 2026-08-27 and it is fourteen, not thirteen:** the envelope-pointer guard (`_adopt_song_analysis`, 2026-08-24) had been numbered *seventh*, a number `character_slot` already held since 2026-08-21, so one instance was invisible in the route's own ledger. Dated from `git log -S` on each comment, it falls twelfth; the Effect Stack is the thirteenth and the export-look record the fourteenth. **The ordinals in that route are instance numbers, not a running total:** `routes/song.py`'s "the sixth time that route has had to be defended" is `Song.vocal_type`, instance six, and it is correct and stays six. Only a claim about *how many times in total* has to move.
 
@@ -430,4 +434,4 @@ Violating one of these is a defect even when the code works.
 
 ## 8. If you only read one thing
 
-Start on **effects Epic 10 — Slice E of the effects `BUILD-ORDER.md`** *(corrected 2026-08-27; this said ~~Start on **effects Story 8.1**~~, which shipped on 2026-08-24 along with the rest of Epics 8 and 9)*. Put a new route in `src/music_video_producer/routes/`, not in `app.py`. Before writing any LLM-facing schema, read §3's model envelope and use `_promoted()`. Before adding any field to `Project` or `Shot`, write its `_adopt_*` guard and its test in the same commit — that hole has now been found ~~fourteen~~ **fifteen** times in one route *(the transition pair, 2026-08-29 — guarded in the same commit as the field, as the Rule asks, and still counted)*. Before planning around any constraint written more than a few days ago, re-run it.
+Start on **treatment Epic 12 or Epic 17** *(corrected 2026-08-30; this said ~~Start on **effects Epic 10 — Slice E**~~, itself a 2026-08-27 correction of ~~Start on **effects Story 8.1**~~, and Slice E shipped that same day with Slice F two days after it)*. **This one sentence has now been stale three times, and it is the sentence whose whole job is to be read alone** — which is why §1's table, §2's heading and this line are three copies of one fact and were corrected together rather than one at a time. Put a new route in `src/music_video_producer/routes/`, not in `app.py`. Before writing any LLM-facing schema, read §3's model envelope and use `_promoted()`. Before adding any field to `Project` or `Shot`, write its `_adopt_*` guard and its test in the same commit — that hole has now been found ~~fourteen~~ **fifteen** times in one route *(the transition pair, 2026-08-29 — guarded in the same commit as the field, as the Rule asks, and still counted)*. Before planning around any constraint written more than a few days ago, re-run it.

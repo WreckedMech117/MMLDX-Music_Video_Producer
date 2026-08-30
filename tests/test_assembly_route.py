@@ -3175,6 +3175,147 @@ def test_the_rendered_transition_segment_holds_exactly_the_overlaps_frames(
     assert comfy.prompts == []
 
 
+def project_with_three_detailed_takes(client, tmp_path: Path):
+    """Three Shots over a 12 s song, blending at an **interior** boundary, on takes with detail.
+
+    Built because the two-Shot fixtures beside it cannot fail in the way the transition legs fail,
+    and all four reasons are this epic's own documented failure mode:
+
+    * **every transition fixture puts its Shots at song second 0 or writes no lead at all.**
+      `timeline.over_render_lead` is 0.25 s for every interior Shot and exactly 0.0 only at second
+      0, so a take offset dropped from a leg is the identity there. Three mutations on
+      `_paired_transitions`' offset terms survived the whole suite on that alone. Here the two
+      Shots that blend are both interior and carry **different** leads, so a leg reading the other
+      leg's offset fails too;
+    * **`synthesize_take` writes a uniform colour field**, and reading a uniform field at the wrong
+      second is a byte-identical picture. `testsrc2` moves every frame, which is F2's own lesson --
+      *a fixture must contain the thing under test* -- learned there for `gblur` and not carried
+      across to `trim`.
+
+    The plan tiles the song and the boundary is a real 0.5 s Overlap between the second and third
+    Shots. Each take runs longer than its window by its own lead plus a margin, the way a real
+    over-rendered take does.
+    """
+    project_id = client.post("/api/projects", json={"name": "Detailed"}).json()["id"]
+    upload = client.post(
+        f"/api/projects/{project_id}/songs/upload",
+        data={"title": "Detailed Song", "duration": "0"},
+        files={"file": ("song.wav", wav_bytes(12.0), "audio/wav")},
+    )
+    assert upload.status_code == 200, upload.text
+    shots_dir = (
+        tmp_path / "comfy" / "output" / "music-video-producer" / project_id / "shots"
+    )
+    prefix = f"music-video-producer/{project_id}/shots"
+    windows = (
+        # id, start, duration, recorded lead, take seconds
+        ("shot_a", 0.0, 4.0, 0.0, 4.5),
+        ("shot_b", 4.0, 4.0, 0.25, 4.75),
+        ("shot_c", 7.5, 4.5, 0.375, 5.25),
+    )
+    for shot_id, _start, _duration, _lead, seconds in windows:
+        synthesize_detailed_take(shots_dir / f"{shot_id}-h3_00001-audio.mp4", seconds)
+    saved = client.put(
+        f"/api/projects/{project_id}/shots",
+        json={
+            "shots": [
+                {
+                    "id": shot_id,
+                    "start": start,
+                    "duration": duration,
+                    "prompt": f"Detail in {shot_id}",
+                    "status": "complete",
+                    "latest_output": f"{prefix}/{shot_id}-h3_00001-audio.mp4",
+                    "latest_take_lead": lead,
+                }
+                for shot_id, start, duration, lead, _seconds in windows
+            ]
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    for shot_id, *_rest in windows:
+        approved = client.post(f"/api/projects/{project_id}/shots/{shot_id}/approve")
+        assert approved.status_code == 200, approved.text
+    return project_id, shots_dir
+
+
+def test_every_take_offset_a_transition_splits_is_the_shots_own_lead_advanced(
+    tmp_path: Path, monkeypatch
+):
+    """**The three terms three surviving mutations were free to delete**, each asserted against a
+    number that is not zero, and then shown on the decoded picture.
+
+    A blend splits one boundary into three entries and every one of them reads a take at an offset:
+    the outgoing leg at the Shot's own recorded lead **plus** the seconds from its start to the
+    Overlap's; the incoming leg at the incoming Shot's own lead, because the Overlap begins where
+    that Shot does; and the remainder at that lead advanced by the blend's own length. Drop any one
+    of the three `offset` terms and every fixture in this repository went on passing, because every
+    one of them put its Shots where `timeline.over_render_lead` is 0.0.
+
+    The last two assertions are the fixture proving it can fail: the shipped segment differs, frame
+    for frame, from the identical argv rendered at offset zero. On the flat colour field
+    `synthesize_take` writes, those two files are byte-identical whatever the offsets say.
+    """
+    import music_video_producer.app as app_module
+    from music_video_producer.assembly import clip_frames_on_grid, transition_segment_args
+
+    client, _store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_three_detailed_takes(client, tmp_path)
+    assert set_transition(client, project_id, "shot_b", "dissolve").status_code == 200
+
+    segment_calls: list[tuple[tuple, dict]] = []
+    trim_calls: list[tuple[tuple, dict]] = []
+    real_segment = app_module.transition_segment_args
+    real_trim = app_module.trim_args
+
+    def record_segment(*args, **kwargs):
+        segment_calls.append((args, kwargs))
+        return real_segment(*args, **kwargs)
+
+    def record_trim(*args, **kwargs):
+        trim_calls.append((args, kwargs))
+        return real_trim(*args, **kwargs)
+
+    monkeypatch.setattr(app_module, "transition_segment_args", record_segment)
+    monkeypatch.setattr(app_module, "trim_args", record_trim)
+    survivors = kept_intermediates(monkeypatch, tmp_path)
+
+    response = client.post(f"/api/projects/{project_id}/assemble")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["job"]["look"]["transitions"] == ["shot_b=dissolve"]
+    # A truncated, B truncated, the blend, C from the Overlap's end.
+    assert body["clip_count"] == 4 and len(survivors) == 4
+    frames = clip_frames_on_grid(7.5, 8.0)
+    assert frames == 12
+
+    assert len(segment_calls) == 1
+    _args, kwargs = segment_calls[0]
+    # `shot_b`'s own lead plus the 3.5 s from its start to the Overlap's. Without the lead it is
+    # 3.5; with the wrong Shot's lead it is 3.875.
+    assert kwargs["before_offset"] == 3.75
+    # `shot_c`'s own lead and nothing added: the Overlap begins where `shot_c` does.
+    assert kwargs["after_offset"] == 0.375
+    # And the remainder is that lead advanced by the blend's own length. Without the lead it is
+    # 0.5, which is the mutation that survived.
+    assert [call[1]["offset"] for call in trim_calls] == [0.0, 0.25, 0.875]
+
+    # **And the picture moves when the offset does.** Same argv, offsets zeroed: on a take with
+    # detail in it these are different files, and on a flat colour field they are the same one.
+    control = tmp_path / "control-at-zero.mp4"
+    subprocess.run(
+        transition_segment_args(
+            *_args[:7], before_offset=0.0, after_offset=0.0, preset=kwargs["preset"]
+        )[:-1]
+        + [control.as_posix()],
+        check=True,
+        capture_output=True,
+    )
+    assert rendered_frames(control) == frames
+    assert frame_checksums(survivors[2]) != frame_checksums(control)
+    assert comfy.prompts == []
+
+
 def test_a_transition_between_two_branched_looks_still_renders_every_frame(
     tmp_path: Path, monkeypatch
 ):

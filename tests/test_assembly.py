@@ -6,12 +6,16 @@ mutation-testable at the speed a mutation pass needs.
 """
 
 import itertools
+from dataclasses import replace
 from pathlib import Path
+
+import pytest
 
 from music_video_producer.assembly import (
     ASSEMBLY_FPS,
     ASSEMBLY_GAP_REFUSAL,
     ASSEMBLY_LEGACY_APPROVAL_REFUSAL,
+    ASSEMBLY_NEGATIVE_FRAMES_ERROR,
     ASSEMBLY_NO_AUDIO_TO_MIX_REFUSAL,
     ASSEMBLY_NO_SHOTS_REFUSAL,
     ASSEMBLY_OFFSET_NEGATIVE_REFUSAL,
@@ -21,6 +25,7 @@ from music_video_producer.assembly import (
     ASSEMBLY_TAKE_MISSING_REFUSAL,
     ASSEMBLY_TOO_SHORT_REFUSAL,
     ASSEMBLY_UNAPPROVED_REFUSAL,
+    BOUNDARY_TOLERANCE_SECONDS,
     DEFAULT_EXPORT_PRESET,
     DRAFT_PRESET,
     EXPORT_DURATION_PROBLEM,
@@ -31,6 +36,7 @@ from music_video_producer.assembly import (
     SONG_END_LABEL,
     SONG_START_LABEL,
     TRANSITION_CROWDED_REFUSAL,
+    TRANSITION_EMPTY_SPLIT_REFUSAL,
     TRANSITION_NESTED_REFUSAL,
     TRIM_SHARE,
     AudioOverlay,
@@ -900,9 +906,14 @@ def test_a_shot_swallowed_whole_refuses_the_transition_by_the_same_sentence():
     """The nested geometry `timeline.SNAP_NESTED` refuses on the timeline, met from the other side.
 
     An Overlap reaching past the incoming Shot's own end leaves no remainder, so there is no third
-    entry and the "transition" would be the entire clip. It is counted by the crowding sentence
-    because it *is* crowded: `assembly_plan` splits the underneath clip around the overlay and
-    resumes it afterwards, so three visible ranges exist wherever one window is inside another.
+    entry and the "transition" would be the entire clip.
+
+    **This docstring said the geometry is "counted by the crowding sentence" and the body has
+    always asserted the nested one; corrected 2026-08-30.** Both halves were wrong in the same
+    direction. It is not counted by anything now -- the decision is `_split_frames`' measurement
+    of the split, which finds the incoming Shot with no frames of its own after the blend -- and
+    the sentence is the nested one because the geometry is nested, which is what
+    `_degenerate_refusal` decides after the rule has already refused it.
     """
     a = clip("a", 0.0, 8.0)
     b = clip("b", 2.0, 2.0)
@@ -918,6 +929,243 @@ def test_a_shot_swallowed_whole_refuses_the_transition_by_the_same_sentence():
     # to the grid sum -- a plan that added up to the song by cancelling a window against itself.
     assert all(count > 0 for count in plan.frames)
     assert sum(plan.frames) == round(8.0 * ASSEMBLY_FPS)
+
+
+def test_a_split_that_would_lay_no_frames_is_refused_with_all_three_numbers_in_it():
+    """**The defect this remediation exists for, in the two shapes that reached HTTP 200.**
+
+    Both satisfy `sum(plan.frames) == round(song * 24)` exactly, and both were wrong, because a
+    window that runs backwards cancels against itself. Neither is caught by any count of clips or
+    any description of a nesting: the third clip lands in the half-frame band below the Overlap's
+    end, so `covering` -- which applies `BOUNDARY_TOLERANCE_SECONDS` inwards, deliberately, because
+    a boundary written twice is one boundary -- does not see it, while the resolution loop truncates
+    the incoming Shot's head against it all the same.
+
+    * `A[0,4.0625] B[3,6] C[4.05,8]` gave `[72, 26, -1, 95]`. Downstream that is `-frames:v -1`,
+      which ffmpeg **ignores at rc 0 with no warning** (measured 2026-08-30: asked -1, encoded the
+      whole rest of the take), `concat` joins the over-long segment, `-shortest` trims back to the
+      song, `verification_problems` returns `[]` and half the running time is the wrong Shot.
+    * `A[0,4] B[3,6] C[4,8]` gave `[72, 24, 0, 96]`, **needs no off-grid arithmetic at all**, and
+      is the snapper's preferred outcome: a clip whose start snaps to the previous clip's end.
+
+    The sentence states all three numbers rather than the empty one, because which of the three is
+    empty is the finding, and it names both Shots -- which `render_boundary_preview` relies on,
+    since that route picks this plan's sentence out by the outgoing Shot's label.
+    """
+    for windows, blend, incoming in (
+        ([("a", 0.0, 4.0625), ("b", 3.0, 3.0), ("c", 4.05, 3.95)], 26, -1),
+        ([("a", 0.0, 4.0), ("b", 3.0, 3.0), ("c", 4.0, 4.0)], 24, 0),
+    ):
+        clips = [clip(shot_id, start, duration) for shot_id, start, duration in windows]
+        plan = plan_of(clips, 8.0, {"a": DISSOLVE})
+        assert plan.transition_refusals == [
+            TRANSITION_EMPTY_SPLIT_REFUSAL.format(
+                before=clips[0].label,
+                after=clips[1].label,
+                start=clips[1].start,
+                end=clips[0].end,
+                outgoing=72,
+                blend=blend,
+                incoming=incoming,
+            )
+        ], windows
+        assert not any(isinstance(entry, TransitionClip) for entry in plan.clips), windows
+        # The boundary is the hard cut it already was, and the plan is the plan with no
+        # transition in it at all -- which is what "refuse the transition, never the export"
+        # means (R-37).
+        assert [(entry.start, entry.end) for entry in plan.clips] == [
+            (entry.start, entry.end) for entry in plan_of(clips, 8.0, {}).clips
+        ], windows
+        assert sum(plan.frames) == round(8.0 * ASSEMBLY_FPS), windows
+        assert all(count > 0 for count in plan.frames), windows
+
+
+def test_the_outgoing_shot_buried_under_the_incoming_one_is_nested_the_other_way():
+    """The mirror of the nested case, which the one-directional check could not see.
+
+    `A[0,4]` lying wholly under `B[0,10]` is exactly as nested as `B` inside `A` -- and the old
+    branch only fired when the *incoming* Shot was the inner one. So the split ran, and because
+    `A` contributes no visible range at all (the resolution loop drops it), the "Overlap" was the
+    **whole** of the outgoing Shot: four seconds of a Shot that renders nothing without the
+    transition opened the video, recorded as an ordinary `shot_a=dissolve`.
+
+    It falls out of the same rule as everything else -- the outgoing Shot has no frames of its own
+    before the blend -- and `TRANSITION_NESTED_REFUSAL` is formatted with the **outer** Shot as its
+    `{before}`, which is not the earlier one here.
+    """
+    a = clip("a", 0.0, 4.0)
+    b = clip("b", 0.0, 10.0)
+    plan = plan_of([a, b], 10.0, {"a": DISSOLVE})
+    assert plan.transition_refusals == [
+        TRANSITION_NESTED_REFUSAL.format(
+            before=b.label, after=a.label, start=0.0, end=10.0, inner_start=0.0, inner_end=4.0
+        )
+    ]
+    assert not any(isinstance(entry, TransitionClip) for entry in plan.clips)
+    assert all(count > 0 for count in plan.frames)
+    assert sum(plan.frames) == round(10.0 * ASSEMBLY_FPS)
+
+
+def test_an_overlap_longer_than_the_tolerance_that_lays_no_frames_is_refused_too():
+    """The third shape nobody enumerated, and the reason the rule is about frames.
+
+    `BOUNDARY_TOLERANCE_SECONDS` is half a frame *in seconds*, and the grid telescopes rather than
+    subtracting: an Overlap of 0.8 of a frame whose two ends round to the same grid position is a
+    real Overlap by the seconds test and a **zero-frame blend** by the arithmetic that renders it.
+    `-frames:v 0` writes a file `ffprobe` reports no streams for, at rc 0, and `concat` accepts it.
+
+    **The seconds test is deliberately left where it is** and is not replaced by a frame count.
+    `app._boundary_is_overlapped` and `routes/shots.replace_shot_transitions` ask the same question
+    in seconds, and a boundary the three disagreed about would be composed as a blend here *and* as
+    a one-sided treatment there -- one boundary treated twice. So this is refused with the number
+    in the sentence rather than quietly reclassified as one-sided.
+    """
+    a = clip("a", 0.0, 0.516667)
+    b = clip("b", 0.483333, 7.516667)
+    assert a.end - b.start > BOUNDARY_TOLERANCE_SECONDS
+    assert clip_frames_on_grid(b.start, a.end) == 0
+    plan = plan_of([a, b], 8.0, {"a": DISSOLVE})
+    assert plan.transition_refusals == [
+        TRANSITION_EMPTY_SPLIT_REFUSAL.format(
+            before=a.label, after=b.label, start=b.start, end=a.end,
+            outgoing=12, blend=0, incoming=180,
+        )
+    ]
+    assert all(count > 0 for count in plan.frames)
+    assert sum(plan.frames) == round(8.0 * ASSEMBLY_FPS)
+
+
+def test_no_plan_this_module_returns_holds_a_non_positive_frame_count():
+    """**AD-18's amendment, made true where it says it is.**
+
+    That amendment records `all(count > 0 for count in plan.frames)` as *"asserted at the split
+    now"*. Until 2026-08-30 it was asserted in exactly one test, on one fixture, and the claim was
+    false everywhere else -- which is how three more shapes of the same defect shipped.
+
+    Swept over every three-window arrangement a Director can drag on a quarter-frame lattice, with
+    and without a blend on each boundary. The claim is the conjunction of three: every count is
+    positive, every count is the grid's own answer for its own entry, and the sum still telescopes
+    to the plan's end. The third is what makes the first safe to enforce -- a positivity rule that
+    was bought by dropping frames would be a worse defect than the one it replaced.
+
+    **The zero-frame entry is reachable with no transition anywhere**, which is why the invariant
+    is on this function's output and not on the transition pass: a Shot shorter than a frame nested
+    inside another resolves to a segment longer than `BOUNDARY_TOLERANCE_SECONDS` whose two ends
+    round to the same grid frame. `A[0,10]` with `B[0.483333, 0.516667]` gave `[12, 0, 228]`. It
+    lays no frames, so it is dropped, and the drop is sum-neutral by construction.
+    """
+    lattice = [round(step / 96, 6) for step in range(1, 25)]
+    for a_end in lattice[6:]:
+        for b_start in lattice:
+            for b_end in lattice:
+                if not (b_start < a_end < b_end):
+                    continue
+                clips = [
+                    clip("a", 0.0, a_end),
+                    clip("b", b_start, round(b_end - b_start, 6)),
+                    clip("c", b_end, 1.0),
+                ]
+                for transitions in ({}, {"a": DISSOLVE}, {"b": DISSOLVE},
+                                    {"a": DISSOLVE, "b": DISSOLVE}):
+                    plan = plan_of(clips, round(b_end + 1.0, 6), transitions)
+                    case = (a_end, b_start, b_end, sorted(transitions))
+                    assert all(count > 0 for count in plan.frames), (case, plan.frames)
+                    assert plan.frames == [
+                        clip_frames_on_grid(entry.start, entry.end) for entry in plan.clips
+                    ], case
+                    # **Guarded, and the guard is a finding rather than a convenience.** The sum
+                    # telescopes only across boundaries the entries share, and this sweep reaches
+                    # arrangements where they do not: a window no longer than
+                    # `BOUNDARY_TOLERANCE_SECONDS` is discarded whole by `assembly_plan`'s
+                    # resolution loop, leaving a hole its neighbours do not close --
+                    # `a[0,0.104167] b[0.09375,0.114583] c[0.114583,1.114583]` lays 26 frames for
+                    # a 27-frame plan. **That is not this remediation's doing and is not new**:
+                    # the three windows tile contiguously, so `tiling_refusals` reports no gap,
+                    # and one frame short is exactly the bound `EXPORT_DURATION_PROBLEM` accepts.
+                    # It is recorded here rather than asserted away, because the claim being made
+                    # is about the transition split and quietly widening it would hide the other.
+                    telescopes = all(
+                        round(earlier.end * ASSEMBLY_FPS)
+                        == round(later.start * ASSEMBLY_FPS)
+                        for earlier, later in zip(plan.clips, plan.clips[1:])
+                    )
+                    if telescopes:
+                        assert sum(plan.frames) == round(
+                            max(entry.end for entry in plan.clips) * ASSEMBLY_FPS
+                        ), case
+
+    sliver = [clip("a", 0.0, 10.0), clip("b", 0.483333, 0.033334)]
+    dropped = plan_of(sliver, 10.0)
+    assert clip_frames_on_grid(0.483333, 0.516667) == 0
+    assert [(entry.shot_id, entry.start) for entry in dropped.clips] == [
+        ("a", 0.0), ("a", 0.516667)
+    ]
+    assert dropped.frames == [12, 228]
+    assert sum(dropped.frames) == round(10.0 * ASSEMBLY_FPS)
+
+
+def test_a_backwards_entry_reaching_the_grid_is_raised_rather_than_summed(monkeypatch):
+    """The guard on the invariant, reached the only way it can be.
+
+    `assembly_plan` refuses to return a plan holding a window that runs backwards, and the split
+    rule above makes that unreachable -- so the guard survived a mutation, which is the honest
+    signal and not a passing one. **A guard nothing exercises is a guard nobody knows the shape
+    of**, and this one has to raise rather than clamp: a negative count is the *only* defect in
+    this module that keeps `sum(frames)` correct while the export ships the wrong Shot, so
+    salvaging it would mean choosing which wrong video to deliver.
+
+    Reached by replacing the split itself, which is the fault the guard is against: a future
+    change to `_paired_transitions` that emits a backwards entry fails here at once instead of
+    reaching `-frames:v -1`, which ffmpeg **ignores at rc 0** and answers by encoding the whole
+    rest of the take.
+    """
+    from music_video_producer import assembly
+
+    a = clip("a", 0.0, 4.0)
+    b = clip("b", 3.5, 4.5)
+
+    def backwards(ordered, resolved, transitions):
+        head, tail = resolved
+        return [head, replace(tail, start=4.0, duration=-0.5), tail], []
+
+    monkeypatch.setattr(assembly, "_paired_transitions", backwards)
+    with pytest.raises(ValueError) as raised:
+        plan_of([a, b], 8.0, {"a": DISSOLVE})
+    assert str(raised.value) == ASSEMBLY_NEGATIVE_FRAMES_ERROR.format(
+        frames=-12, label=b.label, start=4.0, end=3.5
+    )
+
+
+def test_both_legs_and_the_remainder_carry_their_own_takes_own_offsets():
+    """R-38's arithmetic with the fixture's zeros taken out of it.
+
+    `test_both_legs_of_a_transition_read_their_own_takes_own_overlap_seconds` asserts the same
+    rule on clips whose `offset` is **0**, and three mutations on these very terms survived the
+    whole suite because of it: dropping `before.offset` from the outgoing leg, dropping
+    `head.offset` from the third entry, and forcing the incoming leg to `offset=0.0`. Every one of
+    them is the identity when the offset is zero, and `timeline.over_render_lead` is 0.0 at exactly
+    one position on a timeline -- song second 0 -- which is where the fixtures put their Shots.
+
+    So both Shots carry a real recorded lead here, and the two are **different** numbers, because
+    one lead shared between the legs would let the outgoing leg read the incoming Shot's offset and
+    still pass. Neither is a whole number of frames on purpose either: `0.2604167 s` is 6.25 frames,
+    so a leg offset that reaches `trim=start_frame=` through `int()` rather than `round()` reads a
+    different frame of the take.
+    """
+    a = clip("a", 10.0, 4.0)
+    b = clip("b", 13.5, 4.5)
+    a.offset, b.offset = 0.2604167, 0.3854167
+    plan = plan_of([a, b], 18.0, {"a": DISSOLVE})
+    head, blend, remainder = plan.clips
+
+    assert (head.shot_id, head.offset) == ("a", 0.2604167)
+    # The outgoing leg is `a`'s own lead plus the 3.5 s from its start to the Overlap's.
+    assert (blend.before.shot_id, blend.before.offset) == ("a", 3.7604167)
+    # The incoming leg is `b`'s own lead and nothing else: the Overlap begins where `b` does.
+    assert (blend.after.shot_id, blend.after.offset) == ("b", 0.3854167)
+    # And the remainder is that lead advanced by the blend's own length.
+    assert (remainder.shot_id, remainder.offset) == ("b", 0.8854167)
+    assert blend.before.offset + blend.before.duration <= a.offset + a.duration
 
 
 def test_the_nested_refusal_says_what_the_snapper_says():
@@ -1111,6 +1359,36 @@ def test_the_transition_segment_argv_is_pinned_and_both_legs_close_themselves():
         "a rate filter downstream of a framesync filter is what BRANCH_FRAME_GUARD compensates for"
     )
 
+
+
+def test_a_leg_offset_that_is_not_a_whole_number_of_frames_is_rounded_onto_the_grid():
+    """`round`, not `int`, and the fixtures could not tell the difference.
+
+    Every leg offset in this file was a whole number of frames -- 3.5 s is 84 -- so
+    `round(offset * 24)` and `int(offset * 24)` wrote the same `trim=start_frame=` and a mutation
+    swapping them survived the whole suite. A Director's offset is a **recorded lead plus a trim
+    nudge**, neither of which is obliged to land on a frame, and truncating instead of rounding
+    reads the take up to a frame early: 0.28125 s is 6.75 frames, and the frame that is nearest to
+    it is the seventh.
+
+    Both legs are asserted, and the second lands on a half frame, which is where `round`'s own
+    to-the-nearer-even rule shows -- 11.5 frames is frame 12, the same answer the frontend's
+    `api.gridFrames` gives through its own `roundHalfToEven` (R-42).
+    """
+    graph = transition_segment_args(
+        Path("before.mp4"),
+        Path("after.mp4"),
+        Path("segment.mp4"),
+        12,
+        128,
+        72,
+        "fade",
+        before_offset=0.28125,
+        after_offset=0.4791667,
+    )
+    filters = graph[graph.index("-filter_complex") + 1]
+    assert "trim=start_frame=7:end_frame=19" in filters, filters
+    assert "trim=start_frame=12:end_frame=24" in filters, filters
 
 
 def test_the_boundary_previews_margins_are_absent_from_the_exports_own_argv():

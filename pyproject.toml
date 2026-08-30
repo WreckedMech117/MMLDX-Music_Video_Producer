@@ -70,8 +70,11 @@ extend-select = ["C901"]
 max-complexity = 300
 # Corrected 2026-08-28: the prose above argues for 400 and the value is 300.
 # 300 is what `e6f6b23` set and what has held since; the argument was not updated with it.
-# Measured 2026-08-28, so the next reader does not re-derive it: this gate binds on exactly
-# one thing in the repository, `create_app` at 264. `effects.py`'s worst function is 14.
+# Re-measured 2026-08-30, so the next reader does not re-derive it: the closest thing in the
+# repository to this gate is `create_app` at 273 -- it was 264 on 2026-08-28, and a measured
+# number in a comment goes stale every time a route is added, which is why it carries a date.
+# Second is `routes/shots.register` at 141, which Epics 10 and 11 roughly doubled.
+# `effects.py`'s worst function is still 14 (`validate_stack`).
 # **Nothing here constrains length at all** -- a 4,081-line module and a 25,000-line test
 # file are invisible to every gate, which is what Epic 10's retrospective found when it went
 # looking for a second god-class.

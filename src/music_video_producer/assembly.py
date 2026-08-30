@@ -131,11 +131,19 @@ ASSEMBLY_OFFSET_OVERRUN_REFUSAL = (
 #: to reach this, and no window is nested in it. A refusal that stated a falsehood about the
 #: geometry would be worse than a second sentence. The remedy is `SNAP_NESTED`'s own, because it
 #: is the same remedy: move one of them out from under the others.
-#: The other geometry a transition has no legs for: the incoming Shot laid **wholly inside** the
-#: outgoing one. There is then no head to blend into — the Overlap swallows the later Shot's whole
-#: window — so the third entry would have negative length, which is the defect the first run of
-#: `test_a_shot_swallowed_whole_...` produced (`frames=[48, 144, -96, 96]`, a frame count below
-#: zero reaching the grid sum).
+#: The other geometry a transition has no legs for: one of the two Shots laid **wholly inside** the
+#: other. Nested either way there is a leg with nothing behind it — the incoming Shot swallowed
+#: leaves no head after the blend, the outgoing Shot swallowed leaves no tail before it — which is
+#: the defect the first run of `test_a_shot_swallowed_whole_...` produced (`frames=[48, 144, -96,
+#: 96]`, a frame count below zero reaching the grid sum).
+#:
+#: **This sentence no longer decides anything, and that is the correction of 2026-08-30.** Nesting
+#: was a *condition* here, tested against `after.end` while the split's own third entry was cut
+#: from `head.end`, and two answers to one question in adjacent lines is how the same defect went
+#: on shipping in two shapes this branch could not see. The decision is now `_split_frames`' —
+#: one measurement of what the split would lay — and this constant is what that measurement is
+#: *called* when the emptiness it found is a nested window. Both directions are named by it: the
+#: format's `{before}` is whichever Shot is on the outside, which is not always the earlier one.
 #:
 #: **This is as close to reusing `timeline.SNAP_NESTED` as this module can get, and the distance
 #: is worth stating.** R-37 asks for that constant's wording, and `assembly.py` **may not import
@@ -158,6 +166,40 @@ TRANSITION_CROWDED_REFUSAL = (
     "of that stretch. A transition blends exactly two pictures, so there is no single pair here "
     "to blend and this boundary stays a hard cut. Move the others out from under it, or shorten "
     "the overlap so only these two share it."
+)
+#: What a degenerate split is called when neither of the two sentences above describes it, and it
+#: is the one that says the measurement out loud: the three stretches the boundary would become,
+#: in the order they play, in the frames the export would write for each.
+#:
+#: **Two geometries reach this and no enumeration of geometries found either** (2026-08-30). A
+#: third clip starting inside the half-frame band below the Overlap's end is excluded from the
+#: crowding count — the tolerance is applied inwards, deliberately, because a boundary written
+#: twice is one boundary — while still truncating the incoming Shot's head, so the third entry
+#: runs backwards: `A[0,4.0625] B[3,6] C[4.05,8]` gave `[72, 26, -1, 95]`, summing to the song
+#: exactly, refusing nothing, and shipping half the running time as the wrong Shot at HTTP 200
+#: because `-frames:v -1` is *ignored* by ffmpeg at rc 0 (measured: asked −1, wrote the whole rest
+#: of the take). Its sibling `A[0,4] B[3,6] C[4,8]` needs no off-grid arithmetic at all and is the
+#: snapper's preferred outcome — a clip whose start snaps to the previous clip's end — and gives
+#: `[72, 24, 0, 96]`.
+#:
+#: The sentence therefore states **all three numbers** rather than the empty one, because which of
+#: them is empty is the finding and a Director who can see 26 frames of blend between 72 and −1 can
+#: see which end of their timeline to go and look at. It names the boundary by both Shots, which
+#: `routes/shots.render_boundary_preview` also relies on: that route picks this plan's sentence out
+#: by the outgoing Shot's label.
+TRANSITION_EMPTY_SPLIT_REFUSAL = (
+    "{before} and {after} overlap from {start:.3f}s to {end:.3f}s, and on the assembly grid that "
+    "boundary is {outgoing} frames of {before}, a {blend}-frame blend, then {incoming} frames of "
+    "{after}. A transition is a stretch of frames with one shot before it and the other after it, "
+    "so a boundary where any of the three is empty stays a hard cut. Shorten the overlap, or move "
+    "whatever else covers this stretch out from under it."
+)
+#: The guard on `assembly_plan`'s own output, and it is meant to be unreachable. See
+#: `assembly_plan`'s docstring for why a negative count is raised where a zero is dropped.
+ASSEMBLY_NEGATIVE_FRAMES_ERROR = (
+    "assembly_plan produced {frames} for {label} ({start:.3f}s to {end:.3f}s), which is not a "
+    "number of frames anything can render. The frame grid is only exact while every entry lays "
+    "frames forwards."
 )
 ASSEMBLY_NO_AUDIO_TO_MIX_REFUSAL = (
     "{shot}'s take audio is accepted into the mix, but its take carries no audio stream. "
@@ -453,6 +495,12 @@ class AssemblyPlan:
     #: the grid's guarantee telescopes over one sequence of boundaries. Every consumer decides
     #: what a transition entry means to it, and the type is what makes that decision compulsory.
     clips: list[ClipWindow | TransitionClip]
+    #: **Every count is positive**, and `assembly_plan` is where that is made true rather than
+    #: hoped for (AD-18's 2026-08-29 amendment, whose "asserted at the split now" was false until
+    #: 2026-08-30 -- the assertion existed in one test, on one fixture). A negative count is a
+    #: window that runs backwards, which keeps `sum(frames)` correct by cancelling against itself
+    #: and is the one way the frame rule can hold while the export ships the wrong Shot; a zero
+    #: count is an entry that lays nothing and is dropped. See `assembly_plan`.
     frames: list[int]
     width: int
     height: int
@@ -466,6 +514,114 @@ class AssemblyPlan:
     @property
     def total_frames(self) -> int:
         return sum(self.frames)
+
+
+def _split_frames(
+    before: ClipWindow,
+    entries: Sequence[ClipWindow | TransitionClip],
+    position: int | None,
+    overlap_start: float,
+    overlap_end: float,
+) -> tuple[int, int, int]:
+    """The three stretches an Overlap's split would lay, in the order they play, as frames.
+
+    **This is the whole of the decision `_paired_transitions` makes**, and it is a measurement
+    rather than a description. A boundary that blends becomes exactly three consecutive stretches
+    of the plan -- the outgoing Shot's own frames up to the Overlap, the blend, the incoming
+    Shot's own frames after it -- and each is read off `clip_frames_on_grid` at the very
+    boundaries the split writes, from the entries the resolution loop actually produced. Nothing
+    here consults a window; the windows are what lied.
+
+    **A stretch that is not in the plan at all is 0**, because that is how many frames it
+    contributes. `position` is `None` when the incoming Shot has no entry beginning at the
+    Overlap; `entries[position - 1]` is not the outgoing Shot when the outgoing Shot has no
+    surviving frames before the blend -- which is the mirror nesting the old one-directional check
+    could not see, and which reached the split with the Overlap being the *whole* of the outgoing
+    Shot. `A[0,4]` under `B[0,10]` with a dissolve on A opened the video with four seconds of a
+    Shot that renders nothing without the transition, recorded as an ordinary `shot_a=dissolve`.
+
+    The entry before the incoming Shot's head is the outgoing Shot's tail whenever that tail
+    exists: everything starting before the Overlap is at or before `before` in song order, and
+    `before` covers the instant, so later-on-top makes `before` the visible picture there.
+    """
+    blend = clip_frames_on_grid(overlap_start, overlap_end)
+    if position is None:
+        return 0, blend, 0
+    head = entries[position]
+    assert isinstance(head, ClipWindow)
+    lead = entries[position - 1] if position else None
+    outgoing = (
+        clip_frames_on_grid(lead.start, overlap_start)
+        if isinstance(lead, ClipWindow) and lead.shot_id == before.shot_id
+        else 0
+    )
+    return outgoing, blend, clip_frames_on_grid(overlap_end, head.end)
+
+
+def _degenerate_refusal(
+    *,
+    before: ClipWindow,
+    after: ClipWindow,
+    ordered: Sequence[ClipWindow],
+    overlap_start: float,
+    overlap_end: float,
+    outgoing: int,
+    blend: int,
+    incoming: int,
+) -> str:
+    """What to call the emptiness `_split_frames` found. **It decides nothing** (2026-08-30).
+
+    Every sentence here is true of a boundary the rule has already refused, and the rule refused
+    it for the same reason whichever sentence comes back. That separation is the correction: both
+    of the older conditions used to *be* the decision, and both were wrong about it -- the nested
+    one in the direction it did not cover, the crowding count in the half-frame band it excludes.
+    The count is still excluded from the sentence's arithmetic, because a boundary written twice
+    within half a frame is one boundary and always was; what has changed is that it no longer
+    lets a plan through.
+
+    Order is most specific first. A nested window is named as nested **in whichever direction it
+    is nested**, since `TRANSITION_NESTED_REFUSAL`'s `{before}` is the outer Shot and the outer
+    Shot is not always the earlier one. Then the crowding count, where there really are more than
+    two pictures over the stretch. Then the numbers, for the two shapes that are neither.
+    """
+    if incoming <= 0 and after.end - overlap_end <= BOUNDARY_TOLERANCE_SECONDS:
+        outer, inner = before, after
+    elif outgoing <= 0 and overlap_start - before.start <= BOUNDARY_TOLERANCE_SECONDS:
+        outer, inner = after, before
+    else:
+        outer = inner = None
+    if outer is not None and inner is not None:
+        return TRANSITION_NESTED_REFUSAL.format(
+            before=outer.label,
+            after=inner.label,
+            start=outer.start,
+            end=outer.end,
+            inner_start=inner.start,
+            inner_end=inner.end,
+        )
+    covering = [
+        clip
+        for clip in ordered
+        if clip.start < overlap_end - BOUNDARY_TOLERANCE_SECONDS
+        and clip.end > overlap_start + BOUNDARY_TOLERANCE_SECONDS
+    ]
+    if len(covering) != 2:
+        return TRANSITION_CROWDED_REFUSAL.format(
+            before=before.label,
+            after=after.label,
+            start=overlap_start,
+            end=overlap_end,
+            count=len(covering),
+        )
+    return TRANSITION_EMPTY_SPLIT_REFUSAL.format(
+        before=before.label,
+        after=after.label,
+        start=overlap_start,
+        end=overlap_end,
+        outgoing=outgoing,
+        blend=blend,
+        incoming=incoming,
+    )
 
 
 def _paired_transitions(
@@ -493,17 +649,33 @@ def _paired_transitions(
     earlier Shot is authoritative and the later Shot's `transition_in` is a mirror. Only the
     outgoing field is read here, so a manifest whose pair disagrees has a decidable export.
 
-    Two geometries are refused, both by returning the boundary to the hard cut it already is:
+    **One rule decides whether a boundary blends, and it is a measurement of the split rather
+    than a description of a geometry** (2026-08-30). `_split_frames` lays the three stretches the
+    split would produce -- the outgoing Shot's own frames, the blend, the incoming Shot's own
+    frames -- reads each off `clip_frames_on_grid`, and the transition is composed only when all
+    three are positive. Otherwise the boundary is returned to the hard cut it already is and one
+    sentence is recorded.
 
-    * **more than two clips over one instant** -- `TRANSITION_CROWDED_REFUSAL`, R-37. Counted over
-      the *input* windows, because that is where the third clip is visible: by the time the
-      resolution loop has run, a third clip has already eaten a piece of the Overlap and the
-      damage reads as an ordinary short clip.
-    * **the later Shot swallowed whole** -- an Overlap that reaches past the later Shot's own end
-      leaves no `[a_end, b_end]` remainder, so there is no third entry and the "transition" would
-      be the entire clip. It is the nested case `timeline.SNAP_NESTED` refuses on the timeline,
-      met here from the other side, and it is counted by the same sentence: a window nested inside
-      another is covered by more than two clips wherever the third one is.
+    **Why one rule and not three conditions.** Until 2026-08-30 there were two conditions, each
+    written for a geometry somebody had enumerated, and both asked their question of a *different*
+    object than the split used: the nested branch tested `after.end`, the incoming Shot's full
+    window, while the third entry's length came from `head.end`, its end *after* the resolution
+    loop truncated it; and the crowding count applied `BOUNDARY_TOLERANCE_SECONDS` inwards, so a
+    third clip in the half-frame band below the Overlap's end was not counted and still truncated
+    the head. Three degenerate shapes got through -- a nested **outgoing** Shot, which the nested
+    branch was one-directional about, and both bands above -- and every one of them satisfied
+    `sum(plan.frames) == round(song * 24)`, because a window that runs backwards cancels against
+    itself. **That is the one way this project's oldest invariant can hold while the export ships
+    something a Director never authored**, and no fourth condition would have been the last one.
+    Asking the split what it produced is answerable once and covers the shapes nobody enumerated,
+    including two this function refuses today that no `covering` count can see.
+
+    The two older sentences are kept, and they are now **names for what the measurement found**
+    rather than tests of their own (see `_degenerate_refusal`). R-37 asks for both, a nested
+    boundary really is nested and a crowded one really is crowded, and a Director reading
+    `TRANSITION_NESTED_REFUSAL` gets the remedy `timeline.SNAP_NESTED` gives for the same picture.
+    Where neither describes the geometry, `TRANSITION_EMPTY_SPLIT_REFUSAL` states the three
+    numbers the rule measured.
     """
     if not transitions:
         return list(resolved), []
@@ -515,26 +687,6 @@ def _paired_transitions(
             continue
         after = ordered[index + 1]
         overlap_start, overlap_end = after.start, before.end
-        if after.end - overlap_end <= BOUNDARY_TOLERANCE_SECONDS < (
-            overlap_end - overlap_start
-        ):
-            # The incoming Shot swallowed whole. Checked **before** the no-overlap branch below
-            # and before the crowding count, because neither sees it: two clips is exactly two
-            # clips however they are nested, and the arithmetic that follows would produce a third
-            # entry running from the Overlap's end back to the incoming Shot's earlier end — a
-            # window of negative length, whose frame count reaches `sum(plan.frames)` as a
-            # negative number and breaks FX-NFR-1 in the one direction nothing else here can.
-            refusals.append(
-                TRANSITION_NESTED_REFUSAL.format(
-                    before=before.label,
-                    after=after.label,
-                    start=before.start,
-                    end=before.end,
-                    inner_start=after.start,
-                    inner_end=after.end,
-                )
-            )
-            continue
         if overlap_end - overlap_start <= BOUNDARY_TOLERANCE_SECONDS:
             # No Overlap, so no paired transition. A stored type on a boundary with no Overlap is
             # a **one-sided** treatment of this clip's own frames (AD-19, FX-16) -- story 11.4,
@@ -543,32 +695,18 @@ def _paired_transitions(
             # this module changes when a boundary is one-sided, which is the property that let
             # story 11.4 be built without going near the frame grid: it is a filter spliced into
             # an argv this function's output was already going to produce.
+            #
+            # **This stays a question about seconds and not about frames**, deliberately, even
+            # though the rule below is about frames. `app._boundary_is_overlapped` and
+            # `routes/shots.replace_shot_transitions` ask it in seconds too, and a boundary the
+            # three of them disagreed about would be composed as a blend here *and* as a one-sided
+            # treatment there -- one boundary treated twice. An Overlap longer than half a frame
+            # that still lays no frames on the grid is therefore not sent down this branch; it is
+            # measured by the rule below and refused with the number in the sentence.
             continue
-        # Every input window that covers any of the Overlap's interior. The two legs are two of
-        # them by construction, so anything past two is the third picture R-37 is about. The
-        # tolerance is applied inwards on both ends for `tiling_refusals`' reason: a boundary
-        # written twice within half a frame is one boundary, not an overlap.
-        covering = [
-            clip
-            for clip in ordered
-            if clip.start < overlap_end - BOUNDARY_TOLERANCE_SECONDS
-            and clip.end > overlap_start + BOUNDARY_TOLERANCE_SECONDS
-        ]
-        if len(covering) != 2:
-            refusals.append(
-                TRANSITION_CROWDED_REFUSAL.format(
-                    before=before.label,
-                    after=after.label,
-                    start=overlap_start,
-                    end=overlap_end,
-                    count=len(covering),
-                )
-            )
-            continue
-        # The later Shot's resolved range that begins at the Overlap. It is the only entry the
-        # split touches, and it must still be the whole of that Shot's head -- a `position` that
-        # finds nothing means the resolution loop cut this boundary some other way, which the
-        # count above should have caught, and refusing to guess is cheaper than assuming.
+        # The later Shot's resolved range that begins at the Overlap: the only entry the split
+        # touches. `None` is not a fault to guess about -- it is nothing of the incoming Shot at
+        # this boundary, which the rule below counts as the zero frames it is.
         position = next(
             (
                 spot
@@ -579,8 +717,26 @@ def _paired_transitions(
             ),
             None,
         )
-        if position is None:
+        # **The one rule.** Three stretches, measured on the grid the export writes, off the
+        # entries the resolution loop actually produced. All three positive or no blend.
+        outgoing, blend, incoming = _split_frames(
+            before, entries, position, overlap_start, overlap_end
+        )
+        if min(outgoing, blend, incoming) <= 0:
+            refusals.append(
+                _degenerate_refusal(
+                    before=before,
+                    after=after,
+                    ordered=ordered,
+                    overlap_start=overlap_start,
+                    overlap_end=overlap_end,
+                    outgoing=outgoing,
+                    blend=blend,
+                    incoming=incoming,
+                )
+            )
             continue
+        assert position is not None
         head = entries[position]
         assert isinstance(head, ClipWindow)
         entries[position : position + 1] = [
@@ -624,6 +780,13 @@ def assembly_plan(
     clip that is already there. Aspect is preserved and padded, never stretched — the
     house resolutions differ in aspect (640×384 is 5:3, 1056×608 is ~1.74:1), and a 5 %
     silent stretch is a defect with a face in it.
+
+    **Nothing leaves here with a non-positive frame count** (AD-18, made true 2026-08-30). The
+    guarantee is on this function's *output* rather than on any enumeration of geometries, because
+    every enumeration so far has been short by one: a negative count is raised, a zero count is
+    dropped, and the transition split refuses any boundary that would produce either. See the
+    comment on the loop below for why those are two answers rather than one, and
+    `_paired_transitions` for the rule that keeps the negative branch unreachable.
     """
     ordered = sorted(clips, key=lambda clip: clip.start)
     # Overlaps resolve as layers, later-on-top — the Director's ruling (2026-08-20):
@@ -672,6 +835,39 @@ def assembly_plan(
         ordered, resolved, transitions or {}
     )
     frames = [clip_frames_on_grid(clip.start, clip.end) for clip in entries]
+    # **The invariant, on this function's own output** (AD-18's 2026-08-29 amendment, made true
+    # 2026-08-30). `all(count > 0 for count in plan.frames)` holds on every plan this function
+    # returns, and it holds in two halves because the two failures are not the same failure.
+    #
+    # A **negative** count cannot happen and is a defect if it does: it means an entry runs
+    # backwards, which is the one shape that keeps `sum(frames)` correct while the plan is wrong,
+    # because the window cancels against itself. Downstream it is `-frames:v -1`, which ffmpeg
+    # **ignores at rc 0 with no warning** and answers by encoding the entire rest of the take
+    # (measured 2026-08-30: asked -1, wrote 142 frames), which `concat` then joins and `-shortest`
+    # trims back to the song, so `verification_problems` finds nothing and the export ships half
+    # its running time as the wrong Shot. There is nothing to salvage and nothing to report to a
+    # Director, because no Director authored it: it is raised.
+    #
+    # A **zero** count can happen without any transition at all, and is not a defect: a Shot
+    # shorter than a frame nested inside another resolves to a segment longer than
+    # `BOUNDARY_TOLERANCE_SECONDS` whose two ends round to the same grid frame -- `A[0,10]` with
+    # `B[0.483333, 0.516667]` gives `[12, 0, 228]`. It lays no frames, so it is dropped, and the
+    # drop is **provably sum-neutral**: the entry contributed 0, and its neighbours telescope
+    # across it because `round(start * 24) == round(end * 24)` is exactly what made it 0. What it
+    # costs today is an intermediate with no video stream in the concat list (`-frames:v 0` writes
+    # a 261-byte file that `ffprobe` reports no streams for, at rc 0), which is one more thing
+    # answering rc 0 while meaning nothing.
+    for entry, count in zip(entries, frames, strict=True):
+        if count < 0:
+            raise ValueError(
+                ASSEMBLY_NEGATIVE_FRAMES_ERROR.format(
+                    frames=count, label=entry.label, start=entry.start, end=entry.end
+                )
+            )
+    if not all(frames):
+        laid = [pair for pair in zip(entries, frames, strict=True) if pair[1]]
+        entries = [entry for entry, _ in laid]
+        frames = [count for _, count in laid]
     # A transition contributes both legs' Shots, and the normalization target is still the
     # largest-area take present: the segment is rendered at the export's grid like every other
     # intermediate, and a leg is one of the takes this already considered.

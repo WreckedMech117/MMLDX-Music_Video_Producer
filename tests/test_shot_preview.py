@@ -969,6 +969,147 @@ def test_a_boundary_with_nothing_to_blend_says_which_absence_it_is(tmp_path: Pat
     assert all("SHOT 01 (shot_a)" in line or "SHOT 02 (shot_b)" in line for line in said.values())
 
 
+def test_a_boundary_preview_blends_the_pair_it_names_or_refuses_to_blend_at_all(
+    tmp_path: Path,
+):
+    """**It named one Shot and showed another** (2026-08-30), and both halves are asserted here.
+
+    `position` and `after` come from `ordered_shots`, which holds **every** Shot; the plan comes
+    from `preview_assembly`, which leaves out any Shot whose take cannot be resolved or measured.
+    The index lookup matched a `TransitionClip` on `before.shot_id` alone, so a plan that had
+    dropped the middle Shot bound this route to the blend between the **first and third** -- 200,
+    the response naming `shot_b`, the frames showing `shot_a` into `shot_c`, and `tail_frames`
+    silently 0 because `_margin_frames` found no `shot_b` clip beside the entry.
+
+    The mismatch has exactly one cause and therefore needs no sentence of its own: pairs in the
+    plan are consecutive among the Shots the plan holds, so a plan pairing `shot_a` with anything
+    other than its own successor is a plan that successor's take never reached.
+    `BOUNDARY_PREVIEW_TAKE_MISSING_REFUSAL` says that, and it is the fifth of the five absences
+    this route's docstring enumerates rather than a sixth.
+
+    **The refusal is not vacuous, and that is the third step.** With `shot_b` removed from the
+    manifest as well as from disk, this route answers 200 and names `shot_c` -- so the blend the
+    plan holds really is `shot_a` into `shot_c`, and it really was being served under `shot_b`'s
+    name a moment earlier. A test that only asserted the 422 could not tell that apart from a
+    boundary with nothing in the plan at all.
+    """
+    from music_video_producer.app import BOUNDARY_PREVIEW_TAKE_MISSING_REFUSAL
+
+    client, _store, _comfy, _app = make_client(tmp_path)
+    project_id = client.post("/api/projects", json={"name": "Three"}).json()["id"]
+    assert client.post(
+        f"/api/projects/{project_id}/songs/upload",
+        data={"title": "Three Song", "duration": "0"},
+        files={"file": ("song.wav", wav_bytes(8.0), "audio/wav")},
+    ).status_code == 200
+    shots_dir = tmp_path / "comfy" / "output" / "music-video-producer" / project_id / "shots"
+    prefix = f"music-video-producer/{project_id}/shots"
+    windows = (("shot_a", 0.0, 4.0, "red"), ("shot_b", 3.5, 4.5, "green"),
+               ("shot_c", 3.6, 4.4, "blue"))
+    for shot_id, _start, duration, colour in windows:
+        synthesize_take(
+            shots_dir / f"{shot_id}-h3_00001-audio.mp4", duration + 0.5, "128x72", colour
+        )
+    assert client.put(
+        f"/api/projects/{project_id}/shots",
+        json={
+            "shots": [
+                {
+                    "id": shot_id, "start": start, "duration": duration,
+                    "prompt": f"Room {shot_id}", "status": "complete",
+                    "latest_output": f"{prefix}/{shot_id}-h3_00001-audio.mp4",
+                }
+                for shot_id, start, duration, _colour in windows
+            ]
+        },
+    ).status_code == 200
+    for shot_id, *_rest in windows:
+        assert client.post(
+            f"/api/projects/{project_id}/shots/{shot_id}/approve"
+        ).status_code == 200
+    assert set_transition(client, project_id, "shot_a", "dissolve").status_code == 200
+
+    # With all three takes present the boundary is genuinely crowded -- `shot_c` starts inside the
+    # `shot_a`/`shot_b` Overlap -- so the plan refuses the blend in its own words (R-37).
+    crowded = client.post(f"/api/projects/{project_id}/shots/shot_a/boundary-preview")
+    assert crowded.status_code == 422, crowded.text
+    assert "3 clips cover part of that stretch" in crowded.json()["detail"]
+
+    # Now the middle Shot's take is gone. `preview_assembly` skips it, the plan pairs `shot_a`
+    # with `shot_c` over an Overlap that is no longer crowded -- and this route must not serve
+    # that blend as a preview of `shot_b`.
+    (shots_dir / "shot_b-h3_00001-audio.mp4").unlink()
+    orphaned = client.post(f"/api/projects/{project_id}/shots/shot_a/boundary-preview")
+    assert orphaned.status_code == 422, orphaned.text
+    assert orphaned.json()["detail"] == BOUNDARY_PREVIEW_TAKE_MISSING_REFUSAL.format(
+        before="SHOT 01 (shot_a)", after="SHOT 02 (shot_b)"
+    )
+
+    # And the blend it was serving is real: take `shot_b` out of the manifest too and the same
+    # request answers 200 naming `shot_c`, which is the picture the response above claimed was
+    # `shot_b`'s.
+    remaining = [
+        shot
+        for shot in client.get(f"/api/projects/{project_id}").json()["shots"]
+        if shot["id"] != "shot_b"
+    ]
+    assert client.put(
+        f"/api/projects/{project_id}/shots", json={"shots": remaining}
+    ).status_code == 200
+    paired = client.post(f"/api/projects/{project_id}/shots/shot_a/boundary-preview")
+    assert paired.status_code == 200, paired.text
+    assert paired.json()["after_shot_id"] == "shot_c"
+    assert paired.json()["tail_frames"] > 0
+
+
+def test_the_boundary_preview_composes_both_legs_against_the_exports_own_width(
+    tmp_path: Path, monkeypatch
+):
+    """`reference_width` was proved on the function and never at this call site.
+
+    Forcing `reference_width=0` here survived the whole suite -- and `effects.pixel_scale` answers
+    `1.0` for `0`, so a one-sided `blur_wipe` preview or any of the five pixel-denominated
+    parameters would render at **twice** its relative weight in a half-size preview while the
+    stage text stayed byte-identical. That is the exact defect story 11.5's own argument was
+    written for, asserted there for `render_shot_preview` and not for its sibling.
+
+    Asserted as the relationship the route promises rather than as a number, exactly as
+    `test_the_chain_the_route_renders_is_the_chain_it_names_the_clip_after` does: the preview's
+    width is `preview_side` of the reference, so passing the preview's own width, or nothing, or
+    zero, all fail. **Both legs**, because they are two separate calls and a mutation on one is
+    not a mutation on the other.
+    """
+    from music_video_producer.routes import shots as shots_module
+
+    client, _store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots = project_with_an_overlapping_pair(client, tmp_path)
+    assert client.put(
+        f"/api/projects/{project_id}/shots/shot_b/effects",
+        json={"effects": [{"effect": "pixelate", "parameters": {"size": 16}}]},
+    ).status_code == 200
+    assert set_transition(client, project_id, "shot_a", "dissolve").status_code == 200
+
+    composed = shots_module.build_effect_stages
+    calls: list[dict] = []
+
+    def watched(stack, **kwargs):
+        calls.append(kwargs)
+        return composed(stack, **kwargs)
+
+    monkeypatch.setattr(shots_module, "build_effect_stages", watched)
+    answer = client.post(f"/api/projects/{project_id}/shots/shot_a/boundary-preview")
+    assert answer.status_code == 200, answer.text
+
+    body = answer.json()
+    assert len(calls) == 2, calls
+    assert {call["leg"] for call in calls} == {"A", "B"}
+    for kwargs in calls:
+        reference = kwargs["reference_width"]
+        half = reference // 2
+        assert kwargs["width"] == body["width"] == max(2, half - (half % 2))
+        assert reference > kwargs["width"]
+
+
 def test_an_unknown_stored_type_refuses_the_boundary_preview_in_the_exports_own_words(
     tmp_path: Path,
 ):

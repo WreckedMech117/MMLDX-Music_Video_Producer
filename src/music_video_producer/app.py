@@ -7204,6 +7204,24 @@ SHOT_TRANSITION_ABSENT_REFUSAL = (
 SHOT_TRANSITION_LOCKED_REFUSAL = (
     "{shot} is locked, so its transition was not changed. Unlock the shot to change it."
 )
+#: The same lock, met from the other end of one blend (2026-08-30). AD-30's mirror writes the
+#: *neighbour* Shot's field, and until this constant existed it did so with no lock check at all --
+#: so a Director who had locked a Shot could still author a blend on it by naming the unlocked end.
+#: It is not a cosmetic hole: `transition_in` mirrors **backwards** onto the predecessor's
+#: `transition_out`, which is the only side the export reads, so writing the unlocked later Shot's
+#: incoming field is how you set the locked earlier Shot's outgoing blend. The mirror sets both
+#: sides, so `_report_transition_divergence` saw nothing to say either.
+#:
+#: **It refuses rather than skipping the mirror**, and the reason is the shape of the alternative.
+#: Skipping would answer 200 to a `transition_in` write that changed nothing the export reads, and
+#: would leave `api.transitionMirrorToast` announcing a mirror that did not fire -- a past-tense
+#: sentence about something that did not happen, which is the one idiom this application has a
+#: rule about. A blend is a fact about **both** Shots, so a lock on either end holds it, and the
+#: refusal names the end that is locked rather than the one the request was addressed to.
+SHOT_TRANSITION_MIRROR_LOCKED_REFUSAL = (
+    "{shot} is locked, and a transition between {before} and {after} is written on both of them, "
+    "so nothing was changed. Unlock {shot} to change this boundary."
+)
 
 class ShotTransitionsRequest(BaseModel):
     """The body of a Transition write: which type, on which side, or `null` to clear it.

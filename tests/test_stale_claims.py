@@ -344,3 +344,98 @@ def test_the_range_scan_fires_on_the_citation_ad67a14_wrote(text, fires):
     beside it goes past, and this test says so rather than leaving it to be discovered.
     """
     assert bool(stale_range_citations("probe", text)) is fires
+
+
+#: The deferred-work ledger, which is the one document in this repository whose **position** is a
+#: claim. Everything under `## Resolved` asserts, by sitting there, that it shipped.
+LEDGER = REPO / "_bmad-output" / "implementation-artifacts" / "deferred-work.md"
+
+
+def misfiled_ledger_entries(ledger: Path | None = None) -> list[str]:
+    """Every entry under `## Resolved` that carries no `resolved:` line, by its summary.
+
+    An entry is a `- source_spec:` line and the indented lines under it. The `resolved:` line is
+    what makes the heading's claim true for that entry; without one, the entry is open work filed
+    under a heading that says it is finished.
+
+    **One-directional, deliberately.** A shipped entry annotated in place *above* the heading is
+    not scanned: it over-reports open work, which costs a reader a re-read and misleads nobody.
+    The failure this exists for is the other one.
+    """
+    lines = (ledger or LEDGER).read_text(encoding="utf-8").splitlines()
+    start = next(
+        (index for index, line in enumerate(lines) if line.strip() == "## Resolved"), None
+    )
+    if start is None:  # pragma: no cover - the heading's presence is asserted by the test
+        return []
+    misfiled: list[str] = []
+    entry: list[str] = []
+    for line in [*lines[start + 1 :], "- source_spec: sentinel"]:
+        if line.startswith("- source_spec:"):
+            if entry and not any(item.strip().startswith("resolved:") for item in entry):
+                summary = next(
+                    (item.strip()[9:] for item in entry if item.strip().startswith("summary:")),
+                    entry[0].strip(),
+                )
+                misfiled.append(summary[:120])
+            entry = [line]
+        elif entry and line.startswith("  "):
+            entry.append(line)
+    return misfiled
+
+
+def test_the_deferred_ledgers_resolved_section_holds_only_resolved_work():
+    """Nothing under `## Resolved` without a `resolved:` line saying where it shipped.
+
+    **This is a guard against a lie no reader of an entry can see.** On 2026-08-30 fourteen open
+    gaps sat under that heading -- three from Epic 11, six from Epic 10, two from Epic 8 and three
+    older -- and every one of them was *correct*: the right summary, the right evidence, the right
+    source spec. What was false was where they sat, and they sat there because appending an entry
+    to a markdown file means appending to the end of the file, while the end of the file has been
+    inside the `## Resolved` section since that section was added. My own append script did it
+    twice in one epic, holding the record open in front of me both times.
+
+    So the scan is positional, because the defect is. It is the same kind as this module's other
+    two -- a record the repository writes about itself and then falsifies -- with the difference
+    that no amount of care while writing the entry could have prevented it.
+    """
+    assert LEDGER.exists(), f"{where(LEDGER)} is the ledger this scan is about"
+    assert "## Resolved" in LEDGER.read_text(encoding="utf-8"), (
+        f"{where(LEDGER)} has no `## Resolved` heading, so this scan is watching nothing. If the "
+        "ledger was restructured, this guard moves with it rather than being deleted."
+    )
+    misfiled = misfiled_ledger_entries()
+    assert not misfiled, (
+        f"{len(misfiled)} entries under `## Resolved` in {where(LEDGER)} carry no `resolved:` "
+        "line, so that heading claims work shipped that has not. A new entry goes at the end of "
+        "the **open** section, above the heading:"
+        + "".join(f"{chr(10)}  - {summary}" for summary in misfiled)
+    )
+
+
+@pytest.mark.parametrize(
+    ("entry", "misfiled"),
+    [
+        ("- source_spec: x", True),
+        ("- source_spec: x\n  summary: s", True),
+        ("- source_spec: x\n  summary: s\n  resolved: abc1234 -- shipped", False),
+    ],
+)
+def test_the_ledger_scan_fires_on_an_entry_with_no_resolved_line(tmp_path, entry, misfiled):
+    """The positive control, built on its own file rather than read off the ledger.
+
+    That is this module's own rule, learned twice: a control that depends on the state of the
+    thing under observation bills its own maintenance to whoever does the work the guard exists to
+    protect. This one says the same thing on both sides of any future correction to the ledger.
+
+    The rows are the two shapes that occur and the one that must not fire. A bare `- source_spec:`
+    with nothing under it is included because that is what a truncated append leaves behind, and a
+    scan that needed a `summary:` line to notice would go quiet on exactly the worst case.
+    """
+    probe = tmp_path / "deferred-work.md"
+    probe.write_text(
+        "# Deferred Work\n\n- source_spec: open\n  summary: still open\n\n"
+        "## Resolved\n\nKept for the audit trail.\n\n" + entry + "\n",
+        encoding="utf-8",
+    )
+    assert bool(misfiled_ledger_entries(probe)) is misfiled
