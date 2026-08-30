@@ -263,6 +263,7 @@ from typing import Any
 __all__ = [
     "BINDING_SETTINGS",
     "BINDING_SPEC_KEYS",
+    "BOUNDARY_FINGERPRINT_INPUTS",
     "BRANCH_FRAME_GUARD",
     "BRANCH_LEG_FORMAT",
     "DEBAND_FLOOR",
@@ -323,6 +324,7 @@ __all__ = [
     "agreed_bindings",
     "band_series",
     "binding_drive",
+    "boundary_fingerprint",
     "build_effect_stages",
     "cube_text",
     "discover_luts",
@@ -336,6 +338,7 @@ __all__ = [
     "lut_file_argument",
     "lut_id_for_name",
     "one_sided_transition_stages",
+    "pixel_scale",
     "preview_fingerprint",
     "sendcmd_script",
     "song_fingerprint",
@@ -1110,6 +1113,27 @@ class LutParameter:
 Parameter = NumberParameter | ChoiceParameter | LutParameter
 
 
+def pixel_scale(width: int, reference_width: int) -> float:
+    """What one pixel of a stored number is worth on the grid being composed for.
+
+    Exactly `1.0` -- the identity, not a float that rounds to it -- whenever no reference was
+    named or the reference is this very grid, which is every export. Every caller short-circuits
+    on that value, so a chain composed at the size its numbers were written for is byte-identical
+    to the chain this module has always built.
+
+    **A function rather than only a property on `StageContext`**, because two things now scale by
+    it and only one of them is an effect stage. `one_sided_transition_stages` composes a `gblur`
+    ramp whose sigma is a count of pixels (`ONE_SIDED_BLUR_SIGMA`), and story 11.5 previews that
+    composition at half the delivery grid -- so it has the same resolution-dependence the five
+    pixel-denominated effect parameters have, answered by the same arithmetic rather than by a
+    second copy of it. See `StageContext.reference_width` for the measurement.
+    """
+    if reference_width <= 0 or reference_width == width:
+        return 1.0
+    return width / reference_width
+
+
+
 @dataclass(frozen=True, slots=True)
 class StageContext:
     """What a composer is allowed to know: the geometry being composed for, the geometry the
@@ -1242,9 +1266,7 @@ class StageContext:
         `_pixels_at_reference` short-circuit on that value, so a chain composed at the size its
         numbers were written for is byte-identical to the chain this module has always built.
         """
-        if self.reference_width <= 0 or self.reference_width == self.width:
-            return 1.0
-        return self.width / self.reference_width
+        return pixel_scale(self.width, self.reference_width)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2684,8 +2706,14 @@ ONE_SIDED_TRANSITION_FRAMES = 12
 #: The sigma `blur_ramp` reaches at the last frame of the ramp. It is a **pixel** figure, so it
 #: covers a larger fraction of a 640-wide frame than of a 1056-wide one -- the same
 #: resolution-dependence the five pixel-denominated effect parameters carry, and answered there by
-#: `StageContext.reference_width`. Nothing scales it today because every export composes at the
-#: delivery grid; a preview of a one-sided transition would need to, and that is story 11.5's.
+#: `StageContext.reference_width`.
+#:
+#: ~~Nothing scales it today because every export composes at the delivery grid; a preview of a
+#: one-sided transition would need to, and that is story 11.5's.~~ **Shipped 2026-08-29 by story
+#: 11.5.** `one_sided_transition_stages` takes `width` and `reference_width` and multiplies this by
+#: `pixel_scale`, which is the same arithmetic the five parameters use and not a second copy of it.
+#: An export names no reference, so the scale is exactly `1.0` and the number it writes is the
+#: number it has always written.
 ONE_SIDED_BLUR_SIGMA = 20.0
 
 #: The instance label the one-sided blur's `gblur` carries, and the whole of the namespace this
@@ -2717,7 +2745,12 @@ class OneSidedTransition:
 
 
 def one_sided_transition_stages(
-    transition_id: str, *, clip_frames: int, fps: int
+    transition_id: str,
+    *,
+    clip_frames: int,
+    fps: int,
+    width: int = 0,
+    reference_width: int = 0,
 ) -> OneSidedTransition | None:
     """A transition with no Overlap under it, as stages on the clip's own chain -- or `None`.
 
@@ -2741,6 +2774,14 @@ def one_sided_transition_stages(
     `fps` arrives from the caller for the same reason every other number in this module does: this
     is a leaf and `assembly.ASSEMBLY_FPS` is not importable from here. It is used only to turn a
     frame index into a `sendcmd` timestamp.
+
+    **`width` and `reference_width` are `build_effect_stages`' pair, and they are here for the one
+    stage in this composition that counts pixels** (story 11.5). `blur_ramp` ramps `gblur.sigma` to
+    `ONE_SIDED_BLUR_SIGMA`, which is a count of pixels and therefore covers twice as much of a
+    half-size frame as of a full one -- so a preview composed at the preview's grid and named after
+    the export's would show a blur twice as heavy as the export will ship. Left at their defaults
+    the scale is exactly `1.0` and every stage below is the text this function has always written,
+    which is every export. `fade_out` and the two dips carry no pixel figure and ignore both.
     """
     entry = transition_definition(transition_id)
     if not entry.one_sided:
@@ -2748,7 +2789,12 @@ def one_sided_transition_stages(
     frames = max(1, min(ONE_SIDED_TRANSITION_FRAMES, clip_frames))
     start = max(0, clip_frames - frames)
     if entry.one_sided == "blur_ramp":
-        script = _one_sided_blur_script(start=start, frames=frames, fps=fps)
+        script = _one_sided_blur_script(
+            start=start,
+            frames=frames,
+            fps=fps,
+            sigma=ONE_SIDED_BLUR_SIGMA * pixel_scale(width, reference_width),
+        )
         return OneSidedTransition(
             geometry=(f"sendcmd=f={script.filename}",),
             treatment=(f"gblur@{ONE_SIDED_TRANSITION_LABEL}=sigma=0",),
@@ -2777,7 +2823,9 @@ def one_sided_transition_stages(
     )
 
 
-def _one_sided_blur_script(*, start: int, frames: int, fps: int) -> DriveScript:
+def _one_sided_blur_script(
+    *, start: int, frames: int, fps: int, sigma: float = ONE_SIDED_BLUR_SIGMA
+) -> DriveScript:
     """The `gblur.sigma` ramp R-34 measured, as the `sendcmd` file that drives it.
 
     **The target carries the class and the `@`**, and that is not decoration. Measured 2026-08-27
@@ -2806,7 +2854,7 @@ def _one_sided_blur_script(*, start: int, frames: int, fps: int) -> DriveScript:
     span = frames - 1
     lines = [
         f"{_number((start + step) / fps)} gblur@{ONE_SIDED_TRANSITION_LABEL} sigma "
-        f"{_number(ONE_SIDED_BLUR_SIGMA * step / span if span else ONE_SIDED_BLUR_SIGMA)};"
+        f"{_number(sigma * step / span if span else sigma)};"
         for step in range(frames)
     ]
     text = "\n".join(lines) + "\n"
@@ -4581,5 +4629,102 @@ def preview_fingerprint(
     payload = "\n".join(
         f"{name}={value}"
         for name, value in zip(PREVIEW_FINGERPRINT_INPUTS, fields, strict=True)
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+#: The eight inputs of the **boundary** fingerprint, in the order they are hashed in. Its own
+#: tuple beside `PREVIEW_FINGERPRINT_INPUTS` rather than a widening of it, which is R-35 and is
+#: measured rather than tidy: an input added to that one that does not canonicalise to nothing
+#: when absent renames every Shot preview in every project on the day this merges, and Epic 10
+#: already paid for the version of that where the client key and the server fingerprint disagreed.
+#:
+#: **The names are the client's too.** `api.BOUNDARY_KEY_INPUTS` carries the ones a browser can
+#: compute and `api.BOUNDARY_KEY_UNSEEN` the ones it cannot, and
+#: `test_the_client_and_the_server_enumerate_one_boundary_key` asserts the two lists together are
+#: exactly this one, in this order. A ninth input added here fails that test until the client
+#: either keys it or records in writing that it cannot -- which is the guard nobody had when
+#: `previewInputKey` and `preview_fingerprint` disagreed for a whole epic.
+BOUNDARY_FINGERPRINT_INPUTS: tuple[str, ...] = (
+    "takes",
+    "window",
+    "offsets",
+    "chains",
+    "bindings",
+    "song",
+    "transition",
+    "geometry",
+)
+
+
+def boundary_fingerprint(
+    *,
+    takes: Sequence[str],
+    window_start: float,
+    lead_frames: int,
+    blend_frames: int,
+    tail_frames: int,
+    offsets: Sequence[float],
+    chains: Sequence[EffectStages],
+    bindings: Iterable[Any] = (),
+    song_fingerprint: str = "",
+    transition: str,
+    xfade: str,
+    width: int,
+    height: int,
+) -> str:
+    """The name of the Preview Clip for one **boundary**: a SHA-256 over the eight inputs of
+    `BOUNDARY_FINGERPRINT_INPUTS`, in that order.
+
+    **A second function and not a widened first one** (R-35). `preview_fingerprint` takes one
+    `take` and one window, and its docstring asserts as an invariant that a preview is *"never one
+    half of a resolved overlap"* -- which a boundary preview contradicts directly, because it is
+    exactly two halves of one. A boundary is a different subject, so it gets a different key, and
+    the seventh slot over there stays what it was reserved for: a transition on a Shot's **own**
+    preview, which is what a one-sided transition needs. Nothing about a Shot with no transition
+    moves, which is the property this shape exists to keep.
+
+    **The chains arrive composed, and that is the one difference from `preview_fingerprint`.**
+    That one composes the stack itself, so that the name cannot describe a picture the route did
+    not render -- a real defect, closed by composing twice from one set of arguments and pinned by
+    a test that the two agree. Here there is nothing to agree about: the caller composes each leg
+    once, with its own leg prefix (R-41), and hands the same objects to ffmpeg and to this. Two
+    compositions cannot disagree when there is only one.
+
+    `scripts` are deliberately **not** hashed beside the chains. A `sendcmd` stage carries its
+    script's filename and that filename carries a digest of the script's own text
+    (`_drive_script_name`), so the script is already in the chain, by name. Hashing it again would
+    say one thing twice.
+
+    `window` is the whole clip this names -- where the blend sits in the song, how many frames of
+    the outgoing Shot lead into it, how long the blend is, and how many frames of the incoming
+    Shot follow it. The lead and the tail are in there because they are picture: a boundary close
+    to the start of a Shot shows less of that Shot, and that is a different clip rather than the
+    same one cropped.
+
+    `transition` and `xfade` are hashed as a pair, and both of them are needed. The id is what a
+    Director chose; the `xfade` name is what ffmpeg will run. A catalogue entry re-pointed at a
+    different `xfade` -- which is precisely what R-34's *"Blur wipe"* argument is about -- is a
+    different picture under an unchanged stored id, and a clip named only by the id would go on
+    being served for ever, because nothing in this application evicts `previews/`.
+
+    `song_fingerprint` is gated by the caller on whether either leg is driven, exactly as the Shot
+    preview's sixth slot is and for the same measured reason: hashed unconditionally it renames
+    every cached clip in the project the moment a Director analyses their song, for pictures that
+    cannot have changed by it.
+    """
+    fields = (
+        _canonical([str(take) for take in takes]),
+        f"{_number(window_start)}+{int(lead_frames)}/{int(blend_frames)}/{int(tail_frames)}",
+        _canonical([_number(offset) for offset in offsets]),
+        _canonical([[list(chain.geometry), list(chain.treatment)] for chain in chains]),
+        _canonical(list(bindings)),
+        _canonical(song_fingerprint),
+        _canonical([transition, xfade]),
+        f"{int(width)}x{int(height)}",
+    )
+    payload = "\n".join(
+        f"{name}={value}"
+        for name, value in zip(BOUNDARY_FINGERPRINT_INPUTS, fields, strict=True)
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()

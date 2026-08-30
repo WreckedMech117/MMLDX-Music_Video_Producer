@@ -47,7 +47,7 @@ from music_video_producer.assembly import (
 from music_video_producer.comfy import ComfyError
 from music_video_producer.config import Settings
 from music_video_producer.effects import EFFECT_CATALOGUE, preview_fingerprint
-from music_video_producer.models import SongAnalysis
+from music_video_producer.models import SongAnalysis, TransitionSpec
 from music_video_producer.store import ProjectStore
 from music_video_producer.timeline import over_render_frames, over_render_lead
 
@@ -697,6 +697,696 @@ def test_the_preview_cache_is_never_an_input_to_an_export(tmp_path: Path):
 # Supersede, do not queue.
 # ------------------------------------------------------------------------------------------
 
+
+
+# ------------------------------------------------------------------------------------------
+# The boundary preview (story 11.5, FX-21, R-35), and the one-sided treatment on a Shot's own
+# preview (the seventh fingerprint slot). Both driven with real ffmpeg over synthesized media,
+# and both asserted on the **decoded artefact** rather than on the exit code: five wrong outputs
+# at rc 0 across three epics, three of them in Epic 11 alone.
+# ------------------------------------------------------------------------------------------
+
+
+def frame_pixel(path: Path, index: int) -> tuple[int, int, int]:
+    """One RGB sample from the top-left of frame `index` of a clip, decoded.
+
+    `select=eq(n,index)` rather than a seek: these clips are a second and a half long, a seek
+    lands on a keyframe, and the whole point of reading a specific frame here is to say what the
+    picture is doing *at* that frame of the blend.
+    """
+    width, height = (int(part) for part in probe(path, "stream=width,height").split(","))
+    raw = subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-i", path.as_posix(),
+            "-vf", f"select=eq(n\\,{index})", "-frames:v", "1",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+        ],
+        check=True, capture_output=True,
+    ).stdout
+    assert len(raw) >= width * height * 3, (path, index, len(raw))
+    return tuple(raw[:3])
+
+
+def project_with_an_overlapping_pair(client, tmp_path: Path, *, overlap: float = 0.5):
+    """An 8 s song tiled by two approved takes that **overlap**, which is what a transition needs.
+
+    `shot_a` runs 0 → 4 s and `shot_b` starts `overlap` seconds before that, running to the song's
+    end — so the plan tiles the whole song, the export will actually assemble, and the boundary is
+    a real Overlap rather than a hand-written field. The trailing lead is computed from
+    `over_render_lead` rather than typed, exactly as the sibling fixture computes it, so the
+    fixture cannot drift from the rule that produces it.
+
+    **The two takes are different colours on purpose.** A blend between two identical pictures is
+    indistinguishable from no blend at all, and this file has already paid once for a fixture that
+    did not contain the thing under test.
+    """
+    project_id = client.post("/api/projects", json={"name": "Boundary"}).json()["id"]
+    upload = client.post(
+        f"/api/projects/{project_id}/songs/upload",
+        data={"title": "Boundary Song", "duration": "0"},
+        files={"file": ("song.wav", wav_bytes(8.0), "audio/wav")},
+    )
+    assert upload.status_code == 200, upload.text
+    shots_dir = tmp_path / "comfy" / "output" / "music-video-producer" / project_id / "shots"
+    b_start = 4.0 - overlap
+    b_duration = 8.0 - b_start
+    first_seconds = over_render_frames(4.0) / ASSEMBLY_FPS
+    second_seconds = over_render_frames(b_duration) / ASSEMBLY_FPS
+    synthesize_take(shots_dir / "shot_a-h3_00001-audio.mp4", first_seconds, "128x72", "red")
+    synthesize_take(shots_dir / "shot_b-h3_00001-audio.mp4", second_seconds, "128x72", "blue")
+    trailing_lead = over_render_lead(
+        start=b_start,
+        duration=b_duration,
+        picture_seconds=second_seconds,
+        song_duration=8.0,
+    )
+    prefix = f"music-video-producer/{project_id}/shots"
+    shots = [
+        {
+            "id": "shot_a", "start": 0.0, "duration": 4.0, "prompt": "Red room",
+            "status": "complete",
+            "latest_output": f"{prefix}/shot_a-h3_00001-audio.mp4",
+        },
+        {
+            "id": "shot_b", "start": b_start, "duration": b_duration, "prompt": "Blue room",
+            "status": "complete",
+            "latest_output": f"{prefix}/shot_b-h3_00001-audio.mp4",
+            "latest_take_lead": trailing_lead,
+        },
+    ]
+    saved = client.put(f"/api/projects/{project_id}/shots", json={"shots": shots})
+    assert saved.status_code == 200, saved.text
+    for shot_id in ("shot_a", "shot_b"):
+        approved = client.post(f"/api/projects/{project_id}/shots/{shot_id}/approve")
+        assert approved.status_code == 200, approved.text
+    return project_id, shots_dir
+
+
+def set_transition(client, project_id: str, shot_id: str, kind: str | None):
+    written = client.put(
+        f"/api/projects/{project_id}/shots/{shot_id}/transitions",
+        json={"transition_out": {"type": kind} if kind else None},
+    )
+    return written
+
+
+
+def store_transition(store, project_id: str, shot_id: str, kind: str):
+    """One `transition_out` written straight into the manifest, past every route.
+
+    Two states this file needs are unreachable through `PUT .../transitions` by design: an unknown
+    type, which the catalogue refuses at the write, and a pair-only type on a boundary with no
+    Overlap, which FX-19 refuses there. Both are reachable in a real project -- a hand edit, a
+    manifest from a newer build, or simply dragging two clips apart after authoring a wipe across
+    them (FX-16, R-36) -- and AD-21 is the rule that says a stored value is asked about again
+    rather than trusted, so they have to be testable.
+    """
+    project, _generation = store.read_for_update(project_id)
+    for shot in project.shots:
+        if shot.id == shot_id:
+            shot.transition_out = TransitionSpec.model_construct(type=kind)
+    store.save(project)
+
+def test_a_boundary_preview_spans_the_cut_and_the_blend_plays_between_the_two_shots(
+    tmp_path: Path,
+):
+    """FX-21 and story 11.5's first acceptance criterion, measured on the decoded file.
+
+    **One clip, and the blend plays continuously between the two Shots.** The window is the
+    outgoing Shot's last frames, the transition, and the incoming Shot's first frames — so the
+    assertions walk it: pure red before the blend, a mixture inside it, pure blue after it.
+
+    **Every one of these is on the artefact, not the exit code.** `xfade` truncating to its shorter
+    leg is rc 0 and silent, so the frames are *counted* out of the decoded stream rather than read
+    off the container; `xfade` emitting `yuv444p` that a `concat -c copy` then mislabels is rc 0
+    too, so the pixel format is probed; and the whole point of the clip is a picture, so the
+    picture is sampled.
+    """
+    client, _store, comfy, _app = make_client(tmp_path)
+    project_id, _shots = project_with_an_overlapping_pair(client, tmp_path)
+    assert set_transition(client, project_id, "shot_a", "dissolve").status_code == 200
+
+    answer = client.post(f"/api/projects/{project_id}/shots/shot_a/boundary-preview")
+    assert answer.status_code == 200, answer.text
+    body = answer.json()
+    assert body["shot_id"] == "shot_a" and body["after_shot_id"] == "shot_b"
+    assert body["transition"] == "dissolve"
+    assert body["rendered"] is True
+    # The three parts of one clip: half a second of each Shot around a half-second blend.
+    assert (body["lead_frames"], body["blend_frames"], body["tail_frames"]) == (12, 12, 12)
+    assert body["frames"] == 36 and body["window_seconds"] == pytest.approx(1.5)
+    assert body["transition_seconds"] == pytest.approx(0.5)
+
+    clip = tmp_path / "projects" / project_id / "media" / body["preview"]
+    assert clip.is_file()
+    # **The decoded count, never the header.** A leg that came up short is rc 0 with a correct
+    # container; this is the only assertion that can see it.
+    assert counted_frames(clip) == 36
+    # Half the export's geometry (AD-29), and the pixel format every intermediate carries.
+    assert probe(clip, "stream=width,height") == "64,36"
+    assert probe(clip, "stream=pix_fmt") == "yuv420p"
+
+    # The picture itself, walked across the boundary.
+    red_before = frame_pixel(clip, 0)
+    still_red = frame_pixel(clip, body["lead_frames"] - 1)
+    middle = frame_pixel(clip, body["lead_frames"] + body["blend_frames"] // 2)
+    blue_after = frame_pixel(clip, body["lead_frames"] + body["blend_frames"])
+    still_blue = frame_pixel(clip, 35)
+    assert red_before[0] > 200 and red_before[2] < 40, red_before
+    assert still_red[0] > 200 and still_red[2] < 40, still_red
+    assert 60 < middle[0] < 200 and 60 < middle[2] < 200, (
+        "the middle of the blend must be a mixture of the two shots, not either of them", middle
+    )
+    assert blue_after[2] > 200 and blue_after[0] < 40, blue_after
+    assert still_blue[2] > 200 and still_blue[0] < 40, still_blue
+    # Nothing went near ComfyUI, and nothing was written to the manifest.
+    assert comfy.prompts == []
+
+
+def test_the_previewed_transition_is_the_exports_own_by_name_and_duration(tmp_path: Path):
+    """FX-NFR-3, and story 11.5's second acceptance criterion — **proved by string against the
+    export's own composed graph** rather than by inspection.
+
+    Both command lines are captured where this application actually starts a process, so what is
+    compared is what ffmpeg was really handed on each path: the export's segment argv from
+    `POST /assemble`, and the boundary preview's from its own route. The `xfade` clause — the
+    transition's name and its duration — must be character for character the same.
+
+    What is allowed to differ is named too, so the test says what it is *not* claiming: the offset
+    (where the blend sits in the window), the geometry (half), the preset (`ultrafast` CRF 28), and
+    the trims (the preview's legs are longer on their own sides). A test that asserted the two argv
+    equal would be asserting the preview is the export, which it is not and must not be.
+    """
+    client, _store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots = project_with_an_overlapping_pair(client, tmp_path)
+    assert set_transition(client, project_id, "shot_a", "fade_black").status_code == 200
+
+    started: list[list[str]] = []
+    real = asyncio.create_subprocess_exec
+
+    async def spy(*args, **kwargs):
+        started.append([str(arg) for arg in args])
+        return await real(*args, **kwargs)
+
+    graphs: dict[str, str] = {}
+    import music_video_producer.app as app_module
+
+    for name, request in (
+        ("export", lambda: client.post(f"/api/projects/{project_id}/assemble")),
+        ("preview", lambda: client.post(
+            f"/api/projects/{project_id}/shots/shot_a/boundary-preview")),
+    ):
+        started.clear()
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(asyncio, "create_subprocess_exec", spy)
+            answer = request()
+        assert answer.status_code == 200, (name, answer.text)
+        complex_argvs = [argv for argv in started if "-filter_complex" in argv]
+        assert len(complex_argvs) == 1, (name, "exactly one two-input graph runs on each path")
+        graphs[name] = complex_argvs[0][complex_argvs[0].index("-filter_complex") + 1]
+
+    clause = lambda graph: graph.split("xfade=")[1].split(":offset=")[0]
+    assert clause(graphs["export"]) == clause(graphs["preview"]), (
+        "the previewed transition is not the export's", graphs
+    )
+    assert clause(graphs["export"]) == "transition=fadeblack:duration=0.500000"
+    # And they really are two different clips, so this is not one graph compared with itself.
+    assert graphs["export"] != graphs["preview"]
+    assert ":offset=0," in graphs["export"] and ":offset=0.500000," in graphs["preview"]
+    assert app_module.PREVIEW_PRESET.crf == "28"
+
+
+def test_a_boundary_with_nothing_to_blend_says_which_absence_it_is(tmp_path: Path):
+    """Story 11.5's last acceptance criterion, at the route: four states with no blend, four
+    different sentences, and never a 200 carrying a picture of a hard cut.
+
+    A control that simply did nothing here reads as a fault. Each sentence names the state and the
+    gesture that leaves it — which is this application's own rule about a refusal being worth
+    saying once.
+    """
+    client, _store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots = project_with_an_overlapping_pair(client, tmp_path)
+
+    said: dict[str, str] = {}
+    # An Overlap with no type chosen: a hard cut (UX-DR8), and the state a Director is most
+    # likely to be in at the moment they want to look.
+    untyped = client.post(f"/api/projects/{project_id}/shots/shot_a/boundary-preview")
+    assert untyped.status_code == 422, untyped.text
+    said["untyped"] = untyped.json()["detail"]
+
+    # Nothing after the last Shot.
+    assert set_transition(client, project_id, "shot_b", "dissolve").status_code == 200
+    last = client.post(f"/api/projects/{project_id}/shots/shot_b/boundary-preview")
+    assert last.status_code == 422, last.text
+    said["last"] = last.json()["detail"]
+
+    # A type stored on a boundary the Director then dragged apart (FX-16, R-36): one-sided, and
+    # the Shot's *own* preview is the picture of it — which the sentence says.
+    assert set_transition(client, project_id, "shot_a", "dissolve").status_code == 200
+    project = client.get(f"/api/projects/{project_id}").json()
+    for shot in project["shots"]:
+        if shot["id"] == "shot_b":
+            shot["start"] = 4.0
+            shot["duration"] = 4.0
+    assert client.put(
+        f"/api/projects/{project_id}/shots", json={"shots": project["shots"]}
+    ).status_code == 200
+    apart = client.post(f"/api/projects/{project_id}/shots/shot_a/boundary-preview")
+    assert apart.status_code == 422, apart.text
+    said["apart"] = apart.json()["detail"]
+
+    # A Shot this project does not hold at all is still a 404 rather than a sentence.
+    assert client.post(
+        f"/api/projects/{project_id}/shots/nobody/boundary-preview"
+    ).status_code == 404
+
+    assert len(set(said.values())) == 3, said
+    assert "no transition is set" in said["untyped"]
+    assert "last shot in the song" in said["last"]
+    assert "do not overlap" in said["apart"]
+    # Every one of them names the Shots the way a refusal in this application names one, so the
+    # sentence can be read beside a timeline.
+    assert all("SHOT 01 (shot_a)" in line or "SHOT 02 (shot_b)" in line for line in said.values())
+
+
+def test_an_unknown_stored_type_refuses_the_boundary_preview_in_the_exports_own_words(
+    tmp_path: Path,
+):
+    """AD-21: nothing stored says a transition is valid, and a manifest is hand-editable.
+
+    The export refuses by name at its plan stage (`_transition_catalogue_refusals`), so a preview
+    that quietly rendered the untreated picture would be predicting an export that will not run —
+    which is the one thing a preview must never do. Same sentence, same catalogue, one wording.
+    """
+    from music_video_producer.effects import TRANSITION_UNKNOWN_REFUSAL
+
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots = project_with_an_overlapping_pair(client, tmp_path)
+    # Written past the route on purpose: `replace_shot_transitions` asks the catalogue before it
+    # stores a byte, so a hand-edited manifest is the only way to reach this state -- which is
+    # exactly why AD-21 has the export ask again rather than trust what is stored.
+    store_transition(store, project_id, "shot_a", "ripple")
+
+    answer = client.post(f"/api/projects/{project_id}/shots/shot_a/boundary-preview")
+    assert answer.status_code == 422, answer.text
+    detail = answer.json()["detail"]
+    assert TRANSITION_UNKNOWN_REFUSAL.format(transition="ripple", known="") .split("The")[0] in detail
+    assert "ripple" in detail and "SHOT 01 (shot_a)" in detail
+
+
+def test_dragging_the_overlap_longer_moves_the_previewed_blend_and_names_a_new_clip(
+    tmp_path: Path,
+):
+    """Story 11.5's fourth acceptance criterion and its fifth constraint, at the route.
+
+    The Overlap **is** the transition's duration (AD-19), so dragging it has to move the blend —
+    and it has to move the *name*, or a Director would drag the clips and be served the previous
+    picture out of the cache for ever, because nothing in this application evicts `previews/`.
+
+    The row's readout follows the identical subtraction and is asserted in
+    `test_the_overlaps_length_and_the_rows_readout_are_one_number`; what is asserted here is that
+    the number the render is built from is that same one.
+    """
+    client, _store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots = project_with_an_overlapping_pair(client, tmp_path, overlap=0.5)
+    assert set_transition(client, project_id, "shot_a", "dissolve").status_code == 200
+    half = client.post(f"/api/projects/{project_id}/shots/shot_a/boundary-preview").json()
+
+    project = client.get(f"/api/projects/{project_id}").json()
+    for shot in project["shots"]:
+        if shot["id"] == "shot_b":
+            shot["start"] = 3.0
+            shot["duration"] = 5.0
+    assert client.put(
+        f"/api/projects/{project_id}/shots", json={"shots": project["shots"]}
+    ).status_code == 200
+    longer = client.post(f"/api/projects/{project_id}/shots/shot_a/boundary-preview").json()
+
+    assert half["blend_frames"] == 12 and half["transition_seconds"] == pytest.approx(0.5)
+    assert longer["blend_frames"] == 24 and longer["transition_seconds"] == pytest.approx(1.0)
+    assert longer["fingerprint"] != half["fingerprint"], (
+        "a longer Overlap is a different picture and must be a different clip"
+    )
+    assert longer["frames"] == 48 and longer["rendered"] is True
+    clip = tmp_path / "projects" / project_id / "media" / longer["preview"]
+    assert counted_frames(clip) == 48
+
+
+def test_a_longer_outgoing_shot_moves_the_blend_without_moving_where_it_starts(tmp_path: Path):
+    """The window slot's three frame counts, isolated — and this test exists because a mutation
+    survived without it.
+
+    `test_dragging_the_overlap_longer...` moves the **incoming** Shot, which moves the Overlap's
+    start as well as its length — so the fingerprint moved on `window_start` alone and the three
+    frame counts beside it were never load-bearing. Dropping them from the payload left every test
+    green. Dragging the **outgoing** Shot's right edge instead is the same gesture from the other
+    side: the Overlap starts at the same second and is twice as long, so `window_start` cannot
+    explain the difference and the blend count has to.
+
+    The lead is asserted with it because it moves under the identical rule: the frames of the
+    outgoing Shot before the blend are fewer once the blend has eaten into them.
+    """
+    client, _store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots = project_with_an_overlapping_pair(client, tmp_path, overlap=0.5)
+    assert set_transition(client, project_id, "shot_a", "dissolve").status_code == 200
+    half = client.post(f"/api/projects/{project_id}/shots/shot_a/boundary-preview").json()
+
+    project = client.get(f"/api/projects/{project_id}").json()
+    for shot in project["shots"]:
+        if shot["id"] == "shot_a":
+            shot["duration"] = 4.5
+    assert client.put(
+        f"/api/projects/{project_id}/shots", json={"shots": project["shots"]}
+    ).status_code == 200
+    longer = client.post(f"/api/projects/{project_id}/shots/shot_a/boundary-preview").json()
+
+    assert half["blend_frames"] == 12 and longer["blend_frames"] == 24
+    # The Overlap begins at the same second in both, which is what makes this the isolated case.
+    assert half["lead_frames"] == 12 and longer["lead_frames"] == 12
+    assert longer["fingerprint"] != half["fingerprint"], (
+        "the blend doubled in length and the clip kept its name, so the cache serves the old one"
+    )
+    assert longer["frames"] == 48
+    clip = tmp_path / "projects" / project_id / "media" / longer["preview"]
+    assert counted_frames(clip) == 48
+
+
+def test_an_off_grid_overlap_blends_for_the_length_the_row_states(tmp_path: Path):
+    """The ruled number, end to end on the artefact: an Overlap of 0.51 s blends for 0.50 s.
+
+    A Director drags freehand, so an Overlap is a float and a blend is that float in frames. The
+    row was made to state the second one on 2026-08-30 — *the row shows what renders* — and this is
+    the other end of that claim: what the route serves as `transition_seconds`, what it puts in
+    `xfade`'s `duration=`, and what ffmpeg actually writes are one number, and it is the number on
+    screen.
+
+    Asserted on the **decoded** clip, not the response: `xfade` truncating to its shorter leg is
+    rc 0 and silent, so a `blend_frames` field agreeing with a readout would prove nothing about
+    the picture if the file came up short.
+    """
+    client, _store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots = project_with_an_overlapping_pair(client, tmp_path, overlap=0.51)
+    assert set_transition(client, project_id, "shot_a", "dissolve").status_code == 200
+    body = client.post(f"/api/projects/{project_id}/shots/shot_a/boundary-preview").json()
+
+    # 0.51 s at 24 fps is twelve frames and a fraction, and the grid keeps the twelve.
+    assert body["blend_frames"] == 12
+    assert body["transition_seconds"] == pytest.approx(0.5)
+    assert clip_frames_on_grid(4.0 - 0.51, 4.0) == 12
+    clip = tmp_path / "projects" / project_id / "media" / body["preview"]
+    assert counted_frames(clip) == body["frames"] == 36
+    # And the graph ffmpeg was handed carries the same half-second, not the 0.51 that was dragged.
+    started: list[list[str]] = []
+    real = asyncio.create_subprocess_exec
+
+    async def spy(*args, **kwargs):
+        started.append([str(arg) for arg in args])
+        return await real(*args, **kwargs)
+
+    for path in (tmp_path / "projects" / project_id / "media" / "previews").glob("*.mp4"):
+        path.unlink()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(asyncio, "create_subprocess_exec", spy)
+        again = client.post(f"/api/projects/{project_id}/shots/shot_a/boundary-preview")
+    assert again.status_code == 200, again.text
+    graph = next(argv for argv in started if "-filter_complex" in argv)
+    graph = graph[graph.index("-filter_complex") + 1]
+    assert "xfade=transition=fade:duration=0.500000" in graph, graph
+
+
+def test_a_boundary_preview_is_served_from_the_cache_and_renamed_when_the_type_changes(
+    tmp_path: Path,
+):
+    """AD-23 for the second subject: the fingerprint names a file, and the file is either there or
+    it is not.
+
+    The type is the seventh input of `BOUNDARY_FINGERPRINT_INPUTS` and it is hashed with the
+    `xfade` name beside it, so choosing a different transition is a different clip. An unchanged
+    request re-renders nothing, which is the property `rendered` exists to make observable.
+    """
+    client, _store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots = project_with_an_overlapping_pair(client, tmp_path)
+    assert set_transition(client, project_id, "shot_a", "dissolve").status_code == 200
+    first = client.post(f"/api/projects/{project_id}/shots/shot_a/boundary-preview").json()
+    again = client.post(f"/api/projects/{project_id}/shots/shot_a/boundary-preview").json()
+    assert again["fingerprint"] == first["fingerprint"]
+    assert again["rendered"] is False, "an unchanged request must re-render nothing"
+
+    assert set_transition(client, project_id, "shot_a", "wipe_left").status_code == 200
+    wiped = client.post(f"/api/projects/{project_id}/shots/shot_a/boundary-preview").json()
+    assert wiped["fingerprint"] != first["fingerprint"]
+    assert wiped["rendered"] is True and wiped["transition"] == "wipe_left"
+    # Both clips are on disk; the older one is inert rather than wrong (AD-23).
+    previews = tmp_path / "projects" / project_id / "media" / "previews"
+    assert {path.stem for path in previews.glob("*.mp4")} >= {
+        first["fingerprint"], wiped["fingerprint"]
+    }
+
+
+def test_a_boundary_preview_renders_at_the_same_grid_the_shot_preview_does(tmp_path: Path):
+    """AD-29 across the two subjects: preview geometry is a fact about the **project**.
+
+    The boundary route asks `assembly_plan` for a plan *with* transitions in it and the Shot route
+    asks for one without, and both take half of `plan.width`/`plan.height`. That is only one grid
+    while the transition pass cannot move it — and it cannot, structurally: `_paired_transitions`
+    runs after the resolution loop and the normalization target is taken from `resolved`, which it
+    does not touch (R-39's "the grid is what stays"). Asserted rather than reasoned, because a
+    preview at a different grid from the export's is FX-NFR-3 broken in the one way a Director
+    cannot see: the picture looks right and the letterbox is wrong.
+    """
+    client, _store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots = project_with_an_overlapping_pair(client, tmp_path)
+    shot = client.post(f"/api/projects/{project_id}/shots/shot_a/preview")
+    assert shot.status_code == 200, shot.text
+    assert set_transition(client, project_id, "shot_a", "dissolve").status_code == 200
+    boundary = client.post(f"/api/projects/{project_id}/shots/shot_a/boundary-preview")
+    assert boundary.status_code == 200, boundary.text
+    assert (boundary.json()["width"], boundary.json()["height"]) == (
+        shot.json()["width"], shot.json()["height"]
+    )
+    # And the Shot's own preview is unmoved by the transition existing: same grid, same clip.
+    again = client.post(f"/api/projects/{project_id}/shots/shot_a/preview")
+    assert again.json()["fingerprint"] == shot.json()["fingerprint"]
+
+
+def test_a_boundary_preview_writes_nothing_to_the_manifest(tmp_path: Path):
+    """AD-23's load-bearing absence, for the route this story adds. No stored stale flag, no
+    cached geometry, no record that a preview exists — so a state that is derived cannot outlive
+    the thing it describes."""
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots = project_with_an_overlapping_pair(client, tmp_path)
+    assert set_transition(client, project_id, "shot_a", "dissolve").status_code == 200
+    before = (store.project_dir(project_id) / "project.json").read_bytes()
+    assert client.post(
+        f"/api/projects/{project_id}/shots/shot_a/boundary-preview"
+    ).status_code == 200
+    assert (store.project_dir(project_id) / "project.json").read_bytes() == before
+
+
+def test_both_legs_of_a_boundary_compose_their_own_shots_effects_in_their_own_namespace(
+    tmp_path: Path,
+):
+    """R-41, on the graph the render was actually handed.
+
+    Two graded Shots must blend their **graded** pictures, or the segment would not match the clips
+    on either side of it (FX-NFR-3). And both legs start at chain slot 0, so without a leg prefix
+    two branched Shots emit the same filtergraph link label twice in one `-filter_complex` — which
+    is at least loud — and two *bound* Shots emit one `sendcmd` target driving both legs, which is
+    silent at rc 0.
+
+    The fixture carries a real effect on each leg for the reason this file has learned twice: a
+    fixture that does not contain the thing under test proves nothing about it.
+    """
+    client, _store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots = project_with_an_overlapping_pair(client, tmp_path)
+    assert set_transition(client, project_id, "shot_a", "dissolve").status_code == 200
+    # **A branching effect on each leg, which is what the fixture has to contain.** Bloom composes
+    # a `split`/treat/`blend` filtergraph with its own link labels, and those labels are the thing
+    # R-41 is about; a flat stage would leave the claim untested and the test green. Two different
+    # intensities, so a leg composed from the wrong Shot's stack is visible rather than inferred.
+    for shot_id, intensity in (("shot_a", 0.6), ("shot_b", 0.3)):
+        written = client.put(
+            f"/api/projects/{project_id}/shots/{shot_id}/effects",
+            json={"effects": [{
+                "effect": "bloom",
+                "parameters": {"intensity": intensity, "radius": 8, "threshold": 0.5},
+            }]},
+        )
+        assert written.status_code == 200, written.text
+
+    started: list[list[str]] = []
+    real = asyncio.create_subprocess_exec
+
+    async def spy(*args, **kwargs):
+        started.append([str(arg) for arg in args])
+        return await real(*args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(asyncio, "create_subprocess_exec", spy)
+        answer = client.post(f"/api/projects/{project_id}/shots/shot_a/boundary-preview")
+    assert answer.status_code == 200, answer.text
+    graph = next(argv for argv in started if "-filter_complex" in argv)
+    graph = graph[graph.index("-filter_complex") + 1]
+    # Each leg carries its **own** Shot's value, so neither is a picture of the other.
+    outgoing, incoming = graph.split("[xfa];")[0], graph.split("[xfa];")[1]
+    assert "all_opacity=0.6" in outgoing and "all_opacity=0.3" in incoming, graph
+    # And the branch labels are in a per-leg namespace (R-41). Both legs start at chain slot 0, so
+    # without the prefix each of these would appear twice in one `-filter_complex`.
+    for label in ("fxA0a", "fxA0b", "fxA0c", "fxB0a", "fxB0b", "fxB0c"):
+        assert graph.count("[" + label + "]") == 2, (label, "a link label is written and read once")
+    assert "fxA" in outgoing and "fxB" not in outgoing, outgoing
+    assert "fxB" in incoming and "fxA" not in incoming, incoming
+    # And a clip really came out of it, at the right length, rather than a graph that only reads
+    # correctly.
+    body = answer.json()
+    clip = tmp_path / "projects" / project_id / "media" / body["preview"]
+    assert counted_frames(clip) == body["frames"] == 36
+
+
+# ------------------------------------------------------------------------------------------
+# The smaller half: a one-sided transition on a Shot's own preview, through the seventh
+# fingerprint slot (R-35). It was the one thing an export did that a preview did not.
+# ------------------------------------------------------------------------------------------
+
+
+def test_a_one_sided_transition_previews_the_treated_frames_and_the_cut(tmp_path: Path):
+    """Story 11.5's third acceptance criterion, measured on the decoded picture.
+
+    A Shot with a transition and no Overlap treats its own last frames and then hard-cuts (FX-18,
+    story 11.4). `dip_black` reaches the colour at the midpoint of the treatment and **holds** it
+    to the cut, which is the measurement `ONE_SIDED_FORMS` records — so the assertions are: the
+    picture untouched before the treatment starts, black by its midpoint, and still black on the
+    very last frame, where the clip simply ends.
+    """
+    from music_video_producer.effects import ONE_SIDED_TRANSITION_FRAMES
+
+    client, _store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots = project_with_two_approved_takes(client, tmp_path)
+    # `shot_b` is the last Shot in the song, so its `transition_out` has no Overlap under it.
+    assert set_transition(client, project_id, "shot_b", "fade_black").status_code == 200
+
+    answer = client.post(f"/api/projects/{project_id}/shots/shot_b/preview")
+    assert answer.status_code == 200, answer.text
+    body = answer.json()
+    clip = tmp_path / "projects" / project_id / "media" / body["preview"]
+    frames = body["frames"]
+    assert counted_frames(clip) == frames, (
+        "a treatment must consume no timeline length and change no frame count (FX-NFR-1)"
+    )
+    start = frames - ONE_SIDED_TRANSITION_FRAMES
+    untouched = frame_pixel(clip, start - 1)
+    midpoint = frame_pixel(clip, start + ONE_SIDED_TRANSITION_FRAMES // 2)
+    last = frame_pixel(clip, frames - 1)
+    assert untouched[2] > 200, ("the frames before the treatment are the Shot's own", untouched)
+    assert max(midpoint) < 20, ("dip_black reaches the colour at the midpoint", midpoint)
+    assert max(last) < 20, ("and holds it to the cut", last)
+
+
+def test_a_one_sided_transition_moves_the_shots_preview_fingerprint_and_nothing_else_does(
+    tmp_path: Path,
+):
+    """The seventh slot, filled — and story 11.5's constraint that no existing preview is renamed.
+
+    Four states of one Shot are keyed here and the divisions are the whole claim. **No transition**
+    and **a pair-only type with no Overlap** are one picture, because a wipe with nothing to wipe
+    onto composes nothing and the export renders the clip untreated (FX-19, R-34) — so they must be
+    one clip. **A one-sided type** is a different picture and a different name. And a **paired**
+    transition leaves the Shot's own clip alone entirely: the blend is a `TransitionClip` of its
+    own, so this Shot's preview must go back to the name it had before.
+    """
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots = project_with_an_overlapping_pair(client, tmp_path)
+    # No Overlap under `shot_b`'s outgoing boundary: it is the last Shot in the song.
+    named: dict[str, str] = {}
+    for state, kind in (
+        ("none", None), ("pair-only", "wipe_left"), ("one-sided", "fade_black"),
+    ):
+        # `wipe_left` is written past the route deliberately: the write refuses a pair-only type
+        # on a boundary with no Overlap (FX-19), and FX-16/R-36's own case -- a Director dragging
+        # the two clips apart afterwards -- reaches the identical stored state with no refusal to
+        # go through. That is the state being keyed here.
+        if kind == "wipe_left":
+            store_transition(store, project_id, "shot_b", kind)
+        else:
+            assert set_transition(client, project_id, "shot_b", kind).status_code == 200
+        answer = client.post(f"/api/projects/{project_id}/shots/shot_b/preview")
+        assert answer.status_code == 200, (state, answer.text)
+        named[state] = answer.json()["fingerprint"]
+    assert named["none"] == named["pair-only"], (
+        "a wipe with nothing to wipe onto composes nothing, so it is the clip that was there"
+    )
+    assert named["one-sided"] != named["none"], (
+        "a treatment that changes the picture must change the name, or the cache serves the old one"
+    )
+
+    # And the *outgoing* Shot of a real Overlap: its own preview is untouched by the pair.
+    plain = client.post(f"/api/projects/{project_id}/shots/shot_a/preview").json()["fingerprint"]
+    assert set_transition(client, project_id, "shot_a", "dissolve").status_code == 200
+    paired = client.post(f"/api/projects/{project_id}/shots/shot_a/preview").json()["fingerprint"]
+    assert paired == plain, (
+        "a paired transition is its own clip; the outgoing Shot's own preview did not change"
+    )
+
+
+def test_a_shot_with_no_transition_is_named_exactly_as_it_was_at_3322ace():
+    """Story 11.5's third constraint, on the function rather than on the route.
+
+    The seventh fingerprint input was reserved and hashed empty, and filling it must rename
+    nothing that was already cached — `previews/` is never evicted, so a payload that moved would
+    orphan every clip in every project on this machine for pictures that did not change (R-20).
+
+    **The two digests below were taken from `effects.py` at `3322ace`** and compared against
+    today's, which is a comparison a test cannot make for itself without shelling out to git. They
+    are pinned instead, and the pin is what fails if the payload ever moves.
+    """
+    from music_video_producer.effects import preview_fingerprint
+
+    bare = preview_fingerprint(
+        take="t.mp4", window_start=0.0, window_duration=1.0, offset=0.0, width=2, height=2
+    )
+    assert bare == "38b50d6884b62d5cbe7724fea84bf137665fdb88a453869437edf477fa1394a8"
+    graded = {
+        "take": "music-video-producer/p/shots/shot_a-h3_00001-audio.mp4",
+        "window_start": 0.0, "window_duration": 4.0, "offset": 0.25,
+        "stack": [{"effect": "monochrome", "parameters": {"amount": 1}}],
+        "width": 64, "height": 36, "reference_width": 128,
+    }
+    assert preview_fingerprint(**graded) == (
+        "8d46e0b13fe1d20dcd0b56a9bc1d9eddd5f9c9430029f4bb7e051234b7ba17e4"
+    )
+    # And passing the slot explicitly as absent is the same bytes as not passing it, which is what
+    # "canonicalises to nothing when absent" has to mean.
+    assert preview_fingerprint(**graded, transition=None) == preview_fingerprint(**graded)
+
+
+def test_a_one_sided_blur_previews_at_the_previews_own_grid():
+    """`ONE_SIDED_BLUR_SIGMA` is a count of pixels, so it scales — the same resolution-dependence
+    the five pixel-denominated effect parameters carry, answered by the same arithmetic.
+
+    An export names no reference and its ramp is the number it has always written; a preview at
+    half the delivery grid halves it, or the Director would judge a blur twice as heavy as the one
+    the export ships.
+    """
+    from music_video_producer.effects import (
+        ONE_SIDED_BLUR_SIGMA,
+        one_sided_transition_stages,
+        pixel_scale,
+    )
+
+    export = one_sided_transition_stages("blur_wipe", clip_frames=24, fps=ASSEMBLY_FPS)
+    preview = one_sided_transition_stages(
+        "blur_wipe", clip_frames=24, fps=ASSEMBLY_FPS, width=480, reference_width=960
+    )
+    last = lambda ramp: float(ramp.scripts[0].text.strip().splitlines()[-1].split()[-1][:-1])
+    assert last(export) == ONE_SIDED_BLUR_SIGMA
+    assert last(preview) == ONE_SIDED_BLUR_SIGMA * 0.5
+    assert pixel_scale(960, 0) == 1.0 and pixel_scale(960, 960) == 1.0
+    # The two ramps are different scripts, so they cannot share a cached file.
+    assert export.scripts[0].filename != preview.scripts[0].filename
+    # And the `sendcmd` target is an `@label` the same call put in the chain — Epic 10's whole
+    # discipline, met by a composition that is not `build_effect_stages`'.
+    for ramp in (export, preview):
+        assert any(ramp.scripts[0].target in stage for stage in ramp.treatment)
 
 def wait_for_a_running_render(app, project_id: str, deadline: float = 20.0):
     """Block until this project's preview render has a live process attached to it.

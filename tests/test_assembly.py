@@ -1112,6 +1112,83 @@ def test_the_transition_segment_argv_is_pinned_and_both_legs_close_themselves():
     )
 
 
+
+def test_the_boundary_previews_margins_are_absent_from_the_exports_own_argv():
+    """Story 11.5's first constraint, from the side that matters most: the export's argv did not
+    move.
+
+    `lead_frames` and `tail_frames` default to nothing, so the segment this function builds for an
+    export is the argv it built at `3322ace` — including `offset=0` spelled `0` and not
+    `0.000000`, which is what every export argv this application has written carries. A preview is
+    not entitled to move the export's own bytes to make its own arithmetic tidier.
+    """
+    assert transition_segment_args(
+        Path("before.mp4"),
+        Path("after.mp4"),
+        Path("segment.mp4"),
+        12,
+        128,
+        72,
+        "fade",
+        before_offset=3.5,
+        lead_frames=0,
+        tail_frames=0,
+    ) == TODAYS_TRANSITION_ARGV
+
+
+def test_the_preview_margins_extend_each_leg_on_its_own_side_and_move_the_blend_not_its_length():
+    """FX-21 as arithmetic: the clip spans the boundary, and the blend inside it is unchanged.
+
+    Three things are asserted together because they are one property. The **outgoing** leg gains
+    its lead *before* the blend and still ends where the blend ends; the **incoming** leg gains its
+    tail *after* it and still starts where the blend starts; and `-frames:v` becomes the whole
+    window, because a cap that still said `12` would cut the clip back to the blend and the
+    Director would be looking at exactly what they were looking at before.
+    """
+    argv = transition_segment_args(
+        Path("before.mp4"),
+        Path("after.mp4"),
+        Path("segment.mp4"),
+        12,
+        128,
+        72,
+        "fade",
+        before_offset=3.5,
+        after_offset=0.0,
+        lead_frames=12,
+        tail_frames=6,
+    )
+    graph = argv[argv.index("-filter_complex") + 1]
+    lead_leg, follow_leg = graph.split(";")[0], graph.split(";")[1]
+    # 3.5 s at 24 fps is take frame 84; the lead reaches back twelve frames and the blend still
+    # ends at 84 + 12.
+    assert "trim=start_frame=72:end_frame=96" in lead_leg
+    assert "trim=start_frame=0:end_frame=18" in follow_leg
+    assert argv[argv.index("-frames:v") + 1] == "30"
+    assert "xfade=transition=fade:duration=0.500000:offset=0.500000" in graph
+
+
+def test_the_preview_and_the_export_write_one_xfade_by_name_and_by_duration():
+    """FX-NFR-3, proved by string on the two composed graphs rather than by reading two builders.
+
+    This is the measurement story 11.5's first constraint asks for. The preview's graph and the
+    export's graph for the **same boundary** are built from the same call with different margins,
+    and the clause `xfade_stage` writes — the transition's name and its duration — is character for
+    character the same in both. Only the offset differs, which is where the blend sits in the
+    window rather than what the blend is.
+    """
+    common = (Path("a.mp4"), Path("b.mp4"), Path("o.mp4"), 12, 128, 72, "fadeblack")
+    export = transition_segment_args(*common, before_offset=3.5)
+    preview = transition_segment_args(
+        *common, before_offset=3.5, lead_frames=12, tail_frames=12
+    )
+    clause = lambda argv: (
+        argv[argv.index("-filter_complex") + 1].split("xfade=")[1].split(":offset=")[0]
+    )
+    assert clause(export) == clause(preview) == "transition=fadeblack:duration=0.500000"
+    # And they really are two different clips, so the comparison is not of one graph with itself.
+    assert export != preview
+
 def test_a_transition_leg_is_normalized_by_the_same_builder_the_trim_uses():
     """FX-NFR-2 structurally: the two argv builders share `normalized_stages`, so a stage added to
     one is added to the other, and a segment cannot drift out of concat-identity with its

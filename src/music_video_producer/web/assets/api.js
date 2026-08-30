@@ -4164,6 +4164,45 @@ export const ASSEMBLY_FPS = 24;
 export const BOUNDARY_TOLERANCE_SECONDS = 1 / (2 * ASSEMBLY_FPS);
 export const COVERAGE_TOLERANCE_SECONDS = 1 / ASSEMBLY_FPS;
 
+//: Frames between two song seconds on the assembly grid -- `assembly.clip_frames_on_grid`'s
+//: counterpart, and **the one place this side rounds onto that grid**.
+//:
+//: `round(end) - round(start)`, never `round(end - start)`, and the difference is a whole frame.
+//: A 4.0 s window starting at 0.03 s is `round(96.72) - round(0.72)` = 97 - 1 = 96, and the same
+//: window starting at 0.02 s is `round(96.48) - round(0.48)` = 96 - 0 = 96 -- but a 3.9792 s
+//: window at 0.0208 s is `round(96) - round(0.5)` = 96 - 0 = 96 against `round(95.5)` = 96, and
+//: shift it a frame either way and the two answers part. The server has always telescoped this
+//: way, because that is what makes `sum(plan.frames)` exact over one ordered list of boundaries;
+//: anything on this side that names a rendered length has to round the same way, or it names a
+//: length the export will not write.
+//: Python's `round`, which is **not** `Math.round`. Half goes to the nearer *even* integer here
+//: and half goes *up* in JavaScript, so the two disagree on exactly the values that land on a
+//: half-frame -- and those are reachable by an ordinary freehand drag, because a boundary at an
+//: odd 48th of a second puts `start * 24` on `x.5`.
+//:
+//: **Measured 2026-08-30, on the number this row was just ruled to state honestly.** A Shot at
+//: 3.9375 s meeting one that ends at 4.0 s: `round(94.5)` is 94 in Python and 95 in JavaScript, so
+//: the export renders a **2**-frame blend and the row would have printed **1**. At 3.6875 s it is
+//: 8 against 7. Reproduced against `assembly.clip_frames_on_grid` before this was written.
+//:
+//: Exact rather than approximate, and it can be: a value that lands on a half-frame is exactly
+//: representable as a double (a multiple of 1/48 of a second times 24), so both engines compute
+//: the identical number and `remainder === 0.5` is a real comparison rather than a float dance.
+function roundHalfToEven(value) {
+  const floor = Math.floor(value);
+  const remainder = value - floor;
+  if (remainder > 0.5) return floor + 1;
+  if (remainder < 0.5) return floor;
+  // The tie. `floor % 2` is `-1` rather than `1` for a negative odd floor in JavaScript, and that
+  // is the branch that is right for it: `round(-0.5)` is `0` in Python, and `floor` is `-1` here.
+  return floor % 2 === 0 ? floor : floor + 1;
+}
+
+export function gridFrames(start, end) {
+  return roundHalfToEven((Number(end) || 0) * ASSEMBLY_FPS)
+    - roundHalfToEven((Number(start) || 0) * ASSEMBLY_FPS);
+}
+
 // Seconds are stored to the microsecond. Not a grid: the drag handlers quantise to frames
 // because a drag is an approximation of an intent, and these gestures are the opposite --
 // closing a 0.002 s gap and landing on the playhead are both requests for an *exact* number,
@@ -5629,7 +5668,38 @@ export function stackIsDriven(stack) {
 // key, so a Shot already previewed is not re-asked for. The clip on screen is then the right
 // look at the previous size. A Director who re-selects the Shot after such a change gets no new
 // request either; touching the stack does.
-export function previewInputKey(shot, song = null) {
+// The stored `transition_out` this Shot's **own** preview will be treated by, or `""`.
+//
+// A transition with no Overlap under it treats the outgoing Shot's own last frames and then cuts
+// (FX-18, story 11.4), and `render_shot_preview` composes exactly that into the clip — the seventh
+// fingerprint slot, filled by story 11.5. So it is part of this Shot's picture, and both of the
+// functions below have to know about it.
+//
+// `""` where there is an Overlap: the blend is a segment of its own and the Shot's own clip
+// carries no treatment at all, which is what keeps a paired transition from renaming a preview
+// that did not change.
+//
+// **A pair-only type is not excluded here, and the direction of that is deliberate.** A wipe left
+// behind by a dragged-apart Overlap composes nothing and the export renders the clip untreated, so
+// the server's fingerprint does not move — this key does, and the cost is one request whose answer
+// is the fingerprint already in hand and no swap (`previewAdoption`). Excluding it would mean this
+// function reading the catalogue, and the failure it would buy is the expensive one: a key that
+// does *not* move when the picture does.
+export function shotOneSidedTransition(shot, shots = null) {
+  const type = String(shot?.transition_out?.type || "");
+  if (!type) return "";
+  const ordered = [...(shots || [])].filter(Boolean).sort((a, b) => a.start - b.start);
+  const position = ordered.findIndex((item) => item?.id === shot?.id);
+  // A Shot the caller did not hand the plan for, and the last Shot in the song: neither has an
+  // Overlap after it that this side can see, and the server treats both one-sided.
+  if (position < 0 || !ordered[position + 1]) return type;
+  const overlap = exactSeconds(
+    (Number(shot?.start) || 0) + (Number(shot?.duration) || 0) - ordered[position + 1].start,
+  );
+  return overlap > BOUNDARY_TOLERANCE_SECONDS ? "" : type;
+}
+
+export function previewInputKey(shot, song = null, shots = null) {
   // The Shot's id is deliberately **not** in here. This names a picture, and two Shots sharing a
   // take, a window and a look are a picture of the same thing -- which is exactly the case the
   // server answers with one fingerprint and one cached clip. What is held per Shot is the clip;
@@ -5662,6 +5732,12 @@ export function previewInputKey(shot, song = null) {
     stackIsDriven(shotEffectStack(shot))
       ? String(song?.analysis?.song_fingerprint || "")
       : "",
+    // **The seventh fingerprint slot's counterpart** (story 11.5). A one-sided transition changes
+    // this Shot's own picture — its last frames are treated and then it cuts — so it changes the
+    // clip, and a key that ignored it would leave the Monitor playing the untreated take while
+    // the export shipped the fade. That is the same shape as the song slot two lines up, which is
+    // the one this repository has now paid for six times.
+    shotOneSidedTransition(shot, shots),
   ]);
 }
 
@@ -5671,14 +5747,22 @@ export function previewInputKey(shot, song = null) {
 // "Given a Shot carrying an Effect Stack", and with no stack the preview is the take with extra
 // steps -- a transcode, a cache entry and a swapped video element to arrive back at the picture
 // the Monitor is already playing.
-export function shotPreviewWanted(shot, song = null) {
-  if (!shotEffectStack(shot).length) return { wanted: false, key: "", note: "" };
+export function shotPreviewWanted(shot, song = null, shots = null) {
+  // **An empty stack is not previewed — unless the transition makes a picture out of it.** Story
+  // 9.2's rule was "given a Shot carrying an Effect Stack", and with no stack a preview was the
+  // take with extra steps. Story 11.5 makes that false for one state: a Shot with no effects and a
+  // one-sided transition has a *different picture* from its take — the treated frames and the cut
+  // — and the route renders it. Left as it was, the Monitor would show the untreated take and say
+  // nothing, which is the "control that appears to do nothing" this repository keeps rediscovering.
+  if (!shotEffectStack(shot).length && !shotOneSidedTransition(shot, shots)) {
+    return { wanted: false, key: "", note: "" };
+  }
   // The route refuses this by name (`PREVIEW_NO_TAKE_REFUSAL`), so asking would be asking for a
   // toast. The refusal is worth *saying*, once, over the picture -- it is not worth sending.
   if (!shot?.approved_output) {
     return { wanted: false, key: "", note: PREVIEW_WITHOUT_APPROVED_TAKE };
   }
-  return { wanted: true, key: previewInputKey(shot, song), note: "" };
+  return { wanted: true, key: previewInputKey(shot, song, shots), note: "" };
 }
 
 // What to do with the route's answer: keep the clip that is playing, or swap to a new one.
@@ -5732,10 +5816,12 @@ export function monitorPreviewView(
   // Left out, a song change would move the key `ensureMonitorPreview` asks by and not the one
   // this compares by, so the clip in hand would read *current* against a look nobody re-asked
   // for -- the same disagreement one layer up.
-  { held = null, failed = false, playing = "", song = null } = {},
+  // `shots` for the same reason `song` is here: this Shot's own picture carries its one-sided
+  // transition, and whether a transition is one-sided is a fact about the *next* Shot's window.
+  { held = null, failed = false, playing = "", song = null, shots = null } = {},
 ) {
   if (!monitorShowsTake(view)) return view;
-  const wanted = shotPreviewWanted(view.shot, song);
+  const wanted = shotPreviewWanted(view.shot, song, shots);
   if (!wanted.wanted) return wanted.note ? { ...view, label: view.label || wanted.note } : view;
   if (!held?.url) return failed ? { ...view, label: view.label || PREVIEW_FAILED_NOTE } : view;
   const stale = held.key !== wanted.key || (Boolean(playing) && playing !== held.url);
@@ -9482,11 +9568,18 @@ export const TRANSITION_HEADLESS_NOTE =
   "Nothing plays before {shot} — this transition in has no frames to treat, and the export "
   + "renders nothing from it.";
 
-//: The Overlap's length beside a paired row, and the treated length beside a one-sided one. Two
-//: readouts because they are two different facts: the first is a length the Director dragged and
-//: the second is the server's own ceiling (`one_sided_frames`) clamped by this Shot's window.
+//: The blend's length beside a paired row, and the treated length beside a one-sided one. Two
+//: readouts because they are two different facts: the first is the Overlap on the assembly grid
+//: and the second is the server's own ceiling (`one_sided_frames`) clamped by this Shot's window.
 //: Story 11.4's *"bounded by the Shot's own duration and by nothing invisible"* is why the second
 //: is drawn at all, and why the number is read off the catalogue rather than written here.
+//:
+//: ~~the first is a length the Director dragged~~ **Ruled 2026-08-30: both are lengths that
+//: render.** The paired row used to state the raw Overlap, so a 0.51 s drag read `0.51s` over a
+//: blend of twelve frames -- 0.50 s. A Director reads this number to know what they will get, and
+//: a readout that says one thing while another ships is the defect this project has paid for five
+//: times in three epics. Both now round through `gridFrames`, and `transition_seconds` on
+//: `BoundaryPreviewResponse` is the same number from the same subtraction on the server.
 export const TRANSITION_PAIRED_LENGTH = "{seconds}s · from overlap";
 export const TRANSITION_ONE_SIDED_LENGTH = "{seconds}s · own frames";
 
@@ -9625,20 +9718,36 @@ export function overlapBands(shots, { pixelsPerSecond = 1, catalogue = null } = 
 //:   unoverlapped boundary, which is a fade at the end of the video.
 //: * `headless` -- a `Transition in` on the first Shot in song order. Nothing precedes it, so
 //:   there is no outgoing field for the write route to mirror onto and nothing composes.
+//: **`seconds` is the Overlap the Director dragged; `blendSeconds` is what will render.** Two
+//: fields because they are two facts, named apart so nothing can reach for the wrong one: the
+//: Overlap is a float on the timeline and the blend is that float on the 24 fps grid, and they
+//: differ by up to half a frame. The readout takes `blendSeconds` -- ruled 2026-08-30, on this
+//: project's most-repeated defect, a number that says one thing while another ships. Dragging to
+//: 0.51 s and reading `0.50s` is the cost, and it is paid knowingly: the band and the clip both
+//: follow the drag visibly and immediately, and the number is the only thing that quantises.
 export function transitionRowState(ordered, position, side) {
-  if (position < 0) return { state: "headless", outgoing: null, incoming: null, seconds: 0 };
+  const nothing = { outgoing: null, incoming: null, seconds: 0, blendSeconds: 0 };
+  if (position < 0) return { ...nothing, state: "headless" };
   const outgoing = side === "transition_out" ? ordered[position] : ordered[position - 1];
   const incoming = side === "transition_out" ? ordered[position + 1] : ordered[position];
   if (!outgoing) {
-    return { state: "headless", outgoing: null, incoming: incoming || null, seconds: 0 };
+    return { ...nothing, state: "headless", incoming: incoming || null };
   }
   const overlap = incoming
     ? exactSeconds((outgoing.start + outgoing.duration) - incoming.start)
     : 0;
   if (incoming && overlap > BOUNDARY_TOLERANCE_SECONDS) {
-    return { state: "paired", outgoing, incoming, seconds: overlap };
+    return {
+      state: "paired",
+      outgoing,
+      incoming,
+      seconds: overlap,
+      // The same subtraction the route's `blend_frames` is, on the same grid, from the same two
+      // windows -- `gridFrames` is the only rounding on this side, so this cannot drift from it.
+      blendSeconds: gridFrames(incoming.start, outgoing.start + outgoing.duration) / ASSEMBLY_FPS,
+    };
   }
-  return { state: "one-sided", outgoing, incoming: incoming || null, seconds: 0 };
+  return { ...nothing, state: "one-sided", outgoing, incoming: incoming || null };
 }
 
 //: How long a one-sided treatment actually runs on this Shot, in seconds.
@@ -9650,7 +9759,14 @@ export function transitionRowState(ordered, position, side) {
 export function oneSidedTransitionSeconds(entry, shot) {
   const ceiling = Number(entry?.one_sided_frames);
   if (!Number.isFinite(ceiling) || ceiling <= 0) return null;
-  const own = Math.round(Number(shot?.duration || 0) * ASSEMBLY_FPS);
+  // `gridFrames` over the Shot's **own start and end**, never `round(duration)`. The export
+  // clamps against `plan.frames[index]`, which telescopes `round(end) - round(start)`, and the
+  // two answers part by a whole frame on a Shot whose start is off the grid -- so a readout taken
+  // from the duration alone can name a treatment one frame longer than the one that renders.
+  // Found 2026-08-30 while making the paired readout show what renders; it is the same defect in
+  // the same row's other state, and it is fixed here rather than reported because the remedy is
+  // this line and the reasoning is already written above it.
+  const own = gridFrames(shot?.start, (Number(shot?.start) || 0) + (Number(shot?.duration) || 0));
   return Math.max(1, Math.min(ceiling, own)) / ASSEMBLY_FPS;
 }
 
@@ -9661,7 +9777,7 @@ export function oneSidedTransitionSeconds(entry, shot) {
 //: refuses one-sided use *with the route's own reason* rather than being absent from a list a
 //: Director is trying to learn -- and that reason is the route's sentence shown whole, never a
 //: second wording invented here to pre-empt it.
-export function transitionRows(project, shot, catalogue, { error = "" } = {}) {
+export function transitionRows(project, shot, catalogue, { error = "", song = null } = {}) {
   const problem = error ? TRANSITIONS_CATALOGUE_UNAVAILABLE : "";
   const ordered = [...(project?.shots || [])].filter(Boolean).sort((a, b) => a.start - b.start);
   const position = ordered.findIndex((item) => item?.id === shot?.id);
@@ -9674,6 +9790,13 @@ export function transitionRows(project, shot, catalogue, { error = "" } = {}) {
     })));
   const rows = TRANSITION_ROWS.map((row) => {
     const place = transitionRowState(ordered, position, row.side);
+    // Which boundary this row names, as a position in song order: `Transition out` is the seam
+    // with the Shot that follows, `Transition in` the seam with the one before. The preview is a
+    // fact about the **boundary**, so both rows offer the same clip where they name the same seam
+    // -- which is what stops a Director seeing "watch this blend" on one row and nothing on the
+    // other for one transition.
+    const seam = row.side === "transition_out" ? position : position - 1;
+    const preview = boundaryPreviewWanted(ordered, seam, catalogue, song);
     const stored = String(shot?.[row.side]?.type || "");
     const entry = transitionEntry(catalogue, stored);
     const treated = place.state === "one-sided" && stored
@@ -9685,7 +9808,10 @@ export function transitionRows(project, shot, catalogue, { error = "" } = {}) {
         ? TRANSITION_HEADLESS_NOTE.replace("{shot}", shotOrdinalName(project, shot?.id))
         : "";
     const length = place.state === "paired"
-      ? TRANSITION_PAIRED_LENGTH.replace("{seconds}", place.seconds.toFixed(2))
+      // **What renders, not what was dragged** (ruled 2026-08-30). `blendSeconds` is the Overlap
+      // on the assembly grid, which is the number the route serves as `transition_seconds` and the
+      // number `xfade`'s `duration=` is built from. See `transitionRowState`.
+      ? TRANSITION_PAIRED_LENGTH.replace("{seconds}", place.blendSeconds.toFixed(2))
       : treated === null
         ? ""
         : TRANSITION_ONE_SIDED_LENGTH.replace("{seconds}", treated.toFixed(2));
@@ -9704,17 +9830,190 @@ export function transitionRows(project, shot, catalogue, { error = "" } = {}) {
       // its own view of whether an Overlap exists. `--blue` means transition-or-reactive and
       // nothing else (DESIGN section 1), so a row with nothing to blend across does not take it.
       edge: place.state === "paired" ? "blue" : "dim",
+      // The Overlap the Director dragged, and the blend that will render, carried apart.
+      // `length` above states the second one (ruled 2026-08-30); the first is kept because it
+      // is the geometry, and `overlapBands` names it in the band's own sentence.
       seconds: place.seconds,
+      blendSeconds: place.blendSeconds,
       length,
       note,
       // Never disabled for want of an Overlap. A one-sided transition is a real editorial choice
       // (FX-18); the one thing that disables every writing control on this tab is the lock (FX-7).
       disabled: locked,
+      // Whether this row offers to play the blend, and the sentence when it does not. Decided
+      // here rather than in the template for the reason every other state on this row is: what a
+      // Director is told about an absence is executable without a browser, and a template that
+      // decided it would be checkable only by looking (story 11.5).
+      preview,
+      // The absence's sentence, **only where the row is not already saying it**. A
+      // one-sided row's own note and `BOUNDARY_PREVIEW_ONE_SIDED` are one fact, and a
+      // panel that stated it twice would read as two different things being wrong.
+      previewNote: preview.wanted || note ? "" : preview.note,
       options,
       neighbour: (row.side === "transition_out" ? place.incoming?.id : place.outgoing?.id) || "",
     };
   });
   return { shown: !problem, problem, rows: problem ? [] : rows, locked };
+}
+
+// ------------------------------------------------------------------------------------------
+// The boundary preview (story 11.5, FX-21, R-35). A window spanning a cut, with the outgoing
+// Shot, the blend and the incoming Shot playing as one continuous piece -- which is the one
+// thing a Director could not see before exporting.
+//
+// **Its own key, because the server gives it its own fingerprint.** `preview_fingerprint` takes
+// one take and one window and asserts as an invariant that a preview is never one half of a
+// resolved overlap; a boundary is exactly two halves of one, so it is a different subject with a
+// different name (R-35). Widening the Shot preview's key was rejected on a measurement: an input
+// there that does not canonicalise to nothing when absent renames every cached clip in every
+// project on merge day.
+// ------------------------------------------------------------------------------------------
+
+//: How many frames of each Shot sit either side of the blend, at most.
+//: `assembly.TRANSITION_PREVIEW_MARGIN_FRAMES`' counterpart, and a duplicated *constant* rather
+//: than a duplicated rule -- the same division `ASSEMBLY_FPS` and `BOUNDARY_TOLERANCE_SECONDS`
+//: already take, and `test_the_client_and_the_server_agree_on_the_boundary_margin` holds the two
+//: numbers together.
+export const TRANSITION_PREVIEW_MARGIN_FRAMES = 12;
+
+//: The inputs of the boundary fingerprint **this side can compute**, named in the server's own
+//: order (`effects.BOUNDARY_FINGERPRINT_INPUTS`).
+//:
+//: **This list plus `BOUNDARY_KEY_UNSEEN` is that tuple, exactly**, and a test asserts it. That
+//: is the guard nobody had when `previewInputKey` and `preview_fingerprint` disagreed for a whole
+//: epic: a ninth server input fails here until this side either keys it or records in writing
+//: that it cannot see it. An omission then has to be a sentence somebody wrote, not a line
+//: somebody forgot.
+export const BOUNDARY_KEY_INPUTS = [
+  "takes", "window", "offsets", "chains", "bindings", "song", "transition",
+];
+
+//: The inputs a browser cannot compute, and why. One entry: the delivery geometry is the largest
+//: approved take in the whole project, which needs an ffprobe of every one of them.
+//:
+//: The gap it leaves is the same one `previewInputKey` names: approving a take on *another* Shot
+//: can move the export's geometry, which moves the server's fingerprint without moving this key,
+//: so a boundary already previewed is not re-asked for. The clip on screen is then the right
+//: blend at the previous size.
+export const BOUNDARY_KEY_UNSEEN = ["geometry"];
+
+//: What a `Transition out` row says when there is no boundary preview to offer, one sentence per
+//: absence -- story 11.5's last acceptance criterion, which is that the absence says *which*
+//: absence it is rather than sitting inert.
+//:
+//: **Not the route's refusals**, and that is `shotPreviewWanted`'s own division rather than a
+//: second wording of one condition: a refusal answers a request that was made and names the Shot
+//: the way a refusal does (`SHOT 01 (shot_a)`); these explain a control that is not offered, in
+//: the row's own voice, beside the select that would change the answer.
+export const BOUNDARY_PREVIEW_NO_NEIGHBOUR = "Nothing follows {shot}, so there is no blend here.";
+export const BOUNDARY_PREVIEW_ONE_SIDED =
+  "No overlap, so there is no blend to watch — {shot}'s own preview shows this transition.";
+export const BOUNDARY_PREVIEW_UNTYPED =
+  "This overlap has no transition set, so it cuts. Choose one to watch it.";
+export const BOUNDARY_PREVIEW_WITHOUT_TAKE =
+  "A blend needs an approved take on both shots, and one of these two has none.";
+
+//: The blend, and how much of each Shot is beside it, in frames on the assembly grid.
+//:
+//: **The same three numbers the route computes**, from the same windows and the same clamp. The
+//: blend is `clip_frames_on_grid` over the Overlap -- the arithmetic `snapSeconds` and
+//: `contiguityProblems` already round by -- and the lead and the tail are each capped at
+//: `TRANSITION_PREVIEW_MARGIN_FRAMES` and floored by what the neighbouring Shot actually has.
+//:
+//: **The Overlap's length is one number, not two** (story 11.5's fifth constraint). `blend` here
+//: and `seconds` on the paired transition row come out of the identical subtraction, so dragging
+//: the Overlap longer moves the readout and the previewed blend together or moves neither.
+export function boundaryPreviewFrames(before, after) {
+  const overlapStart = Number(after?.start) || 0;
+  const overlapEnd = (Number(before?.start) || 0) + (Number(before?.duration) || 0);
+  const clamp = (value) => Math.max(0, Math.min(TRANSITION_PREVIEW_MARGIN_FRAMES, value));
+  return {
+    lead: clamp(gridFrames(Number(before?.start) || 0, overlapStart)),
+    blend: Math.max(0, gridFrames(overlapStart, overlapEnd)),
+    tail: clamp(
+      gridFrames(overlapEnd, (Number(after?.start) || 0) + (Number(after?.duration) || 0)),
+    ),
+  };
+}
+
+//: What a boundary Preview Clip would be a picture of, as one string this client can compare.
+//:
+//: **Not the server's fingerprint and it must not pretend to be**, exactly as `previewInputKey`
+//: is not: the delivery geometry is not computable here. What it is, is the same *rule* --
+//: `BOUNDARY_KEY_INPUTS` is `effects.BOUNDARY_FINGERPRINT_INPUTS` minus that one slot, in that
+//: order, held together by a test that compares the two engines' **answers** over a table of
+//: manifests rather than their source text.
+export function boundaryPreviewInputKey(before, after, catalogue, song = null) {
+  const stacks = [shotEffectStack(before), shotEffectStack(after)];
+  const driven = stacks.some((stack) => stackIsDriven(stack));
+  const frames = boundaryPreviewFrames(before, after);
+  const type = String(before?.transition_out?.type || "");
+  const entry = transitionEntry(catalogue, type);
+  return JSON.stringify([
+    [String(before?.approved_output || ""), String(after?.approved_output || "")],
+    [
+      exactSeconds(Number(after?.start) || 0),
+      frames.lead, frames.blend, frames.tail,
+    ],
+    // The **legs'** offsets, which are not the Shots' own. The outgoing leg begins where the
+    // Overlap begins, so its take offset has advanced by the seconds skipped -- the same
+    // `replace(before, offset=before.offset + (overlap_start - before.start))` the plan's
+    // resolution loop makes. The incoming leg begins at its Shot's own first frame.
+    [
+      effectiveOffset(before) + ((Number(after?.start) || 0) - (Number(before?.start) || 0)),
+      effectiveOffset(after),
+    ],
+    // The card ids come out again for `previewInputKey`'s reason: an id names a card, not a
+    // picture, and two Shots given one look by `POST .../effects/copy` hold different ids and
+    // compose the identical chain.
+    stacks.map((stack) => effectStackWrite(stack).effects.map(({ id, ...card }) => card)),
+    driven
+      ? stacks.map((stack) => effectStackWrite(stack).effects.map((card) => card.bindings || []))
+      : [],
+    driven ? String(song?.analysis?.song_fingerprint || "") : "",
+    // The id **and** the `xfade` it resolves to, which is the server's pair and both of them: a
+    // catalogue entry re-pointed at a different `xfade` is a different picture under an unchanged
+    // stored id, and nothing in this application evicts `previews/`.
+    [type, String(entry?.xfade || "")],
+  ]);
+}
+
+//: Whether this boundary can be previewed, and the sentence when it cannot.
+//:
+//: `position` is the outgoing Shot's place in song order. The five absences are the route's five,
+//: judged here so a control is not offered for a request that would be refused -- `shotPreviewWanted`'s
+//: rule, and the reason a preview refusal is worth *saying* once and never worth sending.
+export function boundaryPreviewWanted(ordered, position, catalogue, song = null) {
+  const list = ordered || [];
+  const before = list[position];
+  const after = list[position + 1];
+  const absent = (note) => ({ wanted: false, key: "", note, shotId: "", afterId: "" });
+  if (!before) return absent("");
+  if (!after) {
+    return absent(BOUNDARY_PREVIEW_NO_NEIGHBOUR.replace("{shot}", shotName(list, before.id)));
+  }
+  const overlap = exactSeconds((before.start + before.duration) - after.start);
+  if (!(overlap > BOUNDARY_TOLERANCE_SECONDS)) {
+    return absent(BOUNDARY_PREVIEW_ONE_SIDED.replace("{shot}", shotName(list, before.id)));
+  }
+  if (!String(before?.transition_out?.type || "")) return absent(BOUNDARY_PREVIEW_UNTYPED);
+  if (!before.approved_output || !after.approved_output) {
+    return absent(BOUNDARY_PREVIEW_WITHOUT_TAKE);
+  }
+  return {
+    wanted: true,
+    key: boundaryPreviewInputKey(before, after, catalogue, song),
+    note: "",
+    shotId: String(before.id),
+    afterId: String(after.id),
+  };
+}
+
+//: A Shot's ordinal inside a list already in song order. `shotOrdinalName` takes a whole project;
+//: these three functions are handed the ordered list itself, so the rank is its own index.
+function shotName(ordered, shotId) {
+  const rank = (ordered || []).findIndex((item) => item?.id === shotId) + 1;
+  return rank ? `shot ${String(rank).padStart(2, "0")}` : String(shotId ?? "");
 }
 
 //: What a transition write sends. **Exactly one side is named**, because the route reads an unsaid
@@ -9947,6 +10246,11 @@ export const api = {
   // stale flag and no cached geometry; the answer's `fingerprint` names the clip and is the
   // whole of how this side tells one picture from another.
   shotPreview: (projectId, shotId) => request(`/api/projects/${projectId}/shots/${shotId}/preview`, { method: "POST" }),
+  // One **boundary**, previewed: the outgoing Shot, the blend and the incoming Shot as one
+  // continuous piece (FX-21, story 11.5). Addressed by the **outgoing** Shot, which is AD-30's
+  // authoritative side -- a route keyed on the incoming half would be keyed on the field the
+  // export never reads. No body, for `shotPreview`'s reason.
+  boundaryPreview: (projectId, shotId) => request(`/api/projects/${projectId}/shots/${shotId}/boundary-preview`, { method: "POST" }),
   // One Shot's Parameter Bindings, compiled -- the numbers the `sendcmd` scripts carry, which is
   // what the Drive readout draws (R-27). A read: nothing is written on any path, and it renders
   // nothing. No body, for `shotPreview`'s reason -- everything the compile is decided from is

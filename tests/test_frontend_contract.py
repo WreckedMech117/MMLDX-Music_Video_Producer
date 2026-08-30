@@ -23736,6 +23736,535 @@ def test_the_client_and_the_server_answer_driven_identically():
     assert {bool(stack_is_driven(stack)) for _label, stack in DRIVEN_TABLE} == {True, False}
 
 
+
+# ------------------------------------------------------------------------------------------
+# The boundary preview's key (story 11.5, R-35). The client asks for a blend under a key it
+# computes; the server names the clip with `effects.boundary_fingerprint`. They are one rule in
+# two engines, and the tests below hold them together on **answers** rather than on source text
+# -- `stackIsDriven`'s shape, for the defect that shape exists to catch.
+# ------------------------------------------------------------------------------------------
+
+
+def test_the_client_and_the_server_enumerate_one_boundary_key():
+    """`BOUNDARY_KEY_INPUTS` plus `BOUNDARY_KEY_UNSEEN` is `BOUNDARY_FINGERPRINT_INPUTS`, in
+    order.
+
+    **This is the guard nobody had.** `previewInputKey` and `preview_fingerprint` disagreed for a
+    whole epic about whether the song was part of a bound Shot's picture, and the disagreement was
+    silent because nothing enumerated the two lists side by side: the server renamed clips the
+    client never re-asked for, and the Monitor went on playing a picture driven by a song the
+    project no longer had.
+
+    A ninth server input therefore fails here until this side either keys it or writes down that
+    it cannot see it. The omission has to be a sentence somebody wrote rather than a line somebody
+    forgot, which is the whole difference.
+    """
+    from music_video_producer.effects import BOUNDARY_FINGERPRINT_INPUTS
+
+    served = run_module(
+        "import { BOUNDARY_KEY_INPUTS, BOUNDARY_KEY_UNSEEN }"
+        " from './src/music_video_producer/web/assets/api.js';\n"
+        "console.log(JSON.stringify([BOUNDARY_KEY_INPUTS, BOUNDARY_KEY_UNSEEN]));\n"
+    )
+    keyed, unseen = served
+    assert keyed + unseen == list(BOUNDARY_FINGERPRINT_INPUTS), (
+        ("the client and the server do not enumerate the same boundary key, so one of them is "
+         "keying on something the other is not"),
+        keyed,
+        unseen,
+        list(BOUNDARY_FINGERPRINT_INPUTS),
+    )
+    # And the omission is a real one rather than a way to declare anything unseeable: the geometry
+    # is the largest approved take in the project, which needs an ffprobe of every one of them.
+    assert unseen == ["geometry"], unseen
+
+
+def test_the_client_and_the_server_agree_on_the_boundary_margin():
+    """How many frames of each Shot sit beside the blend is one number in two files.
+
+    A duplicated constant, like `ASSEMBLY_FPS` and `BOUNDARY_TOLERANCE_SECONDS` beside it — the
+    client cannot import Python. What makes a duplicated constant safe is this test; what makes a
+    duplicated *rule* unsafe is that no test can be written for it.
+    """
+    from music_video_producer.assembly import TRANSITION_PREVIEW_MARGIN_FRAMES
+
+    served = run_module(
+        "import { TRANSITION_PREVIEW_MARGIN_FRAMES }"
+        " from './src/music_video_producer/web/assets/api.js';\n"
+        "console.log(JSON.stringify(TRANSITION_PREVIEW_MARGIN_FRAMES));\n"
+    )
+    assert served == TRANSITION_PREVIEW_MARGIN_FRAMES
+
+
+#: One table of boundaries, run through both engines. Geometry is held constant across every row
+#: -- one take size, one project -- because that is the single input the client cannot compute, so
+#: within this table the two keys must agree **exactly**, not merely in one direction.
+#:
+#: Every row is a state a manifest really reaches, and the last three are the ones that would slip
+#: past a key built from "the two Shots and the type": a longer Overlap, a boundary that moved
+#: without changing length, and a catalogue entry re-pointed at a different `xfade`.
+BOUNDARY_KEY_TABLE = [
+    ("the ordinary boundary", 0.0, 4.0, 3.5, 4.0, "dissolve", [], []),
+    ("a different type", 0.0, 4.0, 3.5, 4.0, "fade_black", [], []),
+    ("a longer overlap", 0.0, 4.0, 3.0, 4.0, "dissolve", [], []),
+    # The same Overlap lengthened from the **outgoing** side. It starts at the same second, so
+    # nothing but the blend's own frame count separates it from the first row — which is the case
+    # a mutation survived without: dropping the three frame counts from the server's `window` slot
+    # left every other row here identical.
+    ("the overlap lengthened by dragging the outgoing shot", 0.0, 4.5, 3.5, 4.5, "dissolve",
+     [], []),
+    ("the same overlap moved later", 0.5, 4.0, 4.0, 4.0, "dissolve", [], []),
+    ("the outgoing shot graded", 0.0, 4.0, 3.5, 4.0, "dissolve",
+     [{"effect": "monochrome", "parameters": {"amount": 1}}], []),
+    ("the incoming shot graded", 0.0, 4.0, 3.5, 4.0, "dissolve", [],
+     [{"effect": "monochrome", "parameters": {"amount": 1}}]),
+    ("both graded, and the same look on each", 0.0, 4.0, 3.5, 4.0, "dissolve",
+     [{"effect": "monochrome", "parameters": {"amount": 1}}],
+     [{"effect": "monochrome", "parameters": {"amount": 1}}]),
+    ("a grade at a different value", 0.0, 4.0, 3.5, 4.0, "dissolve",
+     [{"effect": "monochrome", "parameters": {"amount": 0.5}}], []),
+    ("one written as an int and one as a float", 0.0, 4.0, 3.5, 4.0, "dissolve",
+     [{"effect": "monochrome", "parameters": {"amount": 1.0}}], []),
+]
+
+
+def _boundary_key_answers():
+    """Both engines' answers for `BOUNDARY_KEY_TABLE`, as two lists of keys.
+
+    The server side composes each leg the way the route does — the export's geometry as the
+    reference, the preview's own grid, a leg prefix — so what is compared is what the route would
+    actually hash, not a simplified stand-in for it.
+    """
+    from music_video_producer.assembly import (
+        ASSEMBLY_FPS,
+        TRANSITION_PREVIEW_MARGIN_FRAMES,
+        clip_frames_on_grid,
+    )
+    from music_video_producer.effects import boundary_fingerprint, build_effect_stages
+
+    served = []
+    for _label, a_start, a_len, b_start, b_len, kind, a_stack, b_stack in BOUNDARY_KEY_TABLE:
+        overlap_start, overlap_end = b_start, a_start + a_len
+        blend = clip_frames_on_grid(overlap_start, overlap_end)
+        lead = min(
+            TRANSITION_PREVIEW_MARGIN_FRAMES,
+            clip_frames_on_grid(a_start, overlap_start),
+        )
+        tail = min(
+            TRANSITION_PREVIEW_MARGIN_FRAMES,
+            clip_frames_on_grid(overlap_end, b_start + b_len),
+        )
+        chains = [
+            build_effect_stages(
+                stack,
+                width=64,
+                height=36,
+                reference_width=128,
+                clip_offset=offset,
+                shot_seconds=duration,
+                clip_seconds=(lead + blend + tail) / ASSEMBLY_FPS,
+                leg=leg,
+            )
+            for stack, offset, duration, leg in (
+                (a_stack, overlap_start - a_start - lead / ASSEMBLY_FPS, a_len, "A"),
+                (b_stack, 0.0, b_len, "B"),
+            )
+        ]
+        served.append(
+            boundary_fingerprint(
+                takes=["a.mp4", "b.mp4"],
+                window_start=overlap_start,
+                lead_frames=lead,
+                blend_frames=blend,
+                tail_frames=tail,
+                offsets=[overlap_start - a_start, 0.0],
+                chains=chains,
+                bindings=(),
+                song_fingerprint="",
+                transition=kind,
+                xfade={"dissolve": "fade", "fade_black": "fadeblack"}[kind],
+                width=64,
+                height=36,
+            )
+        )
+    rows = [
+        {
+            "before": {
+                "id": "a", "start": a_start, "duration": a_len,
+                "approved_output": "a.mp4", "effects": a_stack,
+                "transition_out": {"type": kind},
+            },
+            "after": {
+                "id": "b", "start": b_start, "duration": b_len,
+                "approved_output": "b.mp4", "effects": b_stack,
+            },
+        }
+        for _label, a_start, a_len, b_start, b_len, kind, a_stack, b_stack in BOUNDARY_KEY_TABLE
+    ]
+    client = run_module(
+        "import { boundaryPreviewInputKey }"
+        " from './src/music_video_producer/web/assets/api.js';\n"
+        "const CAT = [{transition_id:'dissolve',label:'Dissolve',xfade:'fade'},"
+        "{transition_id:'fade_black',label:'Fade through black',xfade:'fadeblack'}];\n"
+        "const TABLE = " + json.dumps(rows) + ";\n"
+        "console.log(JSON.stringify(TABLE.map((row) =>"
+        " boundaryPreviewInputKey(row.before, row.after, CAT, null))));\n"
+    )
+    return served, client
+
+
+def test_the_client_and_the_server_key_a_boundary_identically():
+    """One table of boundaries, keyed by both engines, compared on **answers**.
+
+    Neither key is the other -- the client cannot compute the delivery geometry and does not
+    pretend to. What has to hold is that the two partition the same table the same way: two states
+    the server calls one picture the client must call one picture, and every state the server
+    renames the client must re-ask for. The second direction is the one that costs something, and
+    it is the one that failed in Epic 10: the server renamed a clip, the client did not notice,
+    and the Monitor showed the old picture permanently, because nothing evicts `previews/`.
+
+    Compared pairwise rather than element-wise, because the keys are different strings by
+    construction. What is asserted is the *equivalence relation* each induces.
+    """
+    served, client = _boundary_key_answers()
+    labels = [row[0] for row in BOUNDARY_KEY_TABLE]
+    assert len(served) == len(client) == len(labels)
+    disagreed = [
+        (labels[i], labels[j], served[i] == served[j], client[i] == client[j])
+        for i in range(len(labels))
+        for j in range(i + 1, len(labels))
+        if (served[i] == served[j]) != (client[i] == client[j])
+    ]
+    assert not disagreed, (
+        ("the client and the server disagree about which boundaries are one picture, so one of "
+         "them will serve a cached clip the other has renamed"),
+        disagreed,
+    )
+    # And the table exercises the question rather than answering it one way throughout: there are
+    # distinct pictures in it, and there is at least one pair the two engines both call identical
+    # -- the int and the float, which compose one filter string.
+    assert len(set(served)) > 1, "every row keyed the same, so the comparison proved nothing"
+    assert len(set(client)) > 1
+    # The pair that proves the comparison is about *pictures* rather than about spelling:
+    # `amount: 1` and `amount: 1.0` compose one filter string, so they are one clip in both
+    # engines. A key taken over the stored spec with `json.dumps` would call them two.
+    integer = labels.index("the outgoing shot graded")
+    floating = labels.index("one written as an int and one as a float")
+    assert served[integer] == served[floating] and client[integer] == client[floating], (
+        "1 and 1.0 are one look and must be one key in both engines"
+    )
+
+
+def test_a_boundary_preview_is_offered_only_where_there_is_a_blend_and_says_which_absence():
+    """Story 11.5's last acceptance criterion, as the row's own answer.
+
+    Four absences and each has its own sentence, because "the control is not there" teaches
+    nothing and reads as an oversight. The one that matters most is the third: an Overlap with no
+    type is a hard cut (UX-DR8), and it is the state a Director is in at the exact moment they
+    want to be told what to do next.
+    """
+    seen = run_module(r"""
+      import { boundaryPreviewWanted } from './src/music_video_producer/web/assets/api.js';
+      const shot = (id, start, extra = {}) => ({
+        id, start, duration: 4.0, approved_output: id + '.mp4', effects: [], ...extra });
+      const CAT = [{ transition_id: 'dissolve', label: 'Dissolve', xfade: 'fade' }];
+      const paired = [shot('a', 0, { transition_out: { type: 'dissolve' } }), shot('b', 3.5)];
+      const untyped = [shot('a', 0), shot('b', 3.5)];
+      const apart = [shot('a', 0, { transition_out: { type: 'dissolve' } }), shot('b', 4.0)];
+      const takeless = [
+        shot('a', 0, { transition_out: { type: 'dissolve' } }),
+        shot('b', 3.5, { approved_output: '' }),
+      ];
+      const at = (list, position) => {
+        const answer = boundaryPreviewWanted(list, position, CAT, null);
+        return { wanted: answer.wanted, note: answer.note, shotId: answer.shotId,
+                 afterId: answer.afterId, keyed: Boolean(answer.key) };
+      };
+      console.log(JSON.stringify({
+        paired: at(paired, 0),
+        last: at(paired, 1),
+        untyped: at(untyped, 0),
+        apart: at(apart, 0),
+        takeless: at(takeless, 0),
+      }));
+    """)
+    assert seen["paired"] == {
+        "wanted": True, "note": "", "shotId": "a", "afterId": "b", "keyed": True
+    }
+    for state in ("last", "untyped", "apart", "takeless"):
+        assert seen[state]["wanted"] is False, state
+        assert seen[state]["keyed"] is False, state
+        assert seen[state]["note"], (state, "an absence that says nothing reads as an oversight")
+    # Four absences, four distinct sentences: an absence that borrowed another's wording would
+    # send a Director to the wrong remedy.
+    said = {seen[state]["note"] for state in ("last", "untyped", "apart", "takeless")}
+    assert len(said) == 4, said
+    assert "no transition set" in seen["untyped"]["note"]
+    assert "No overlap" in seen["apart"]["note"]
+
+
+#: Where the incoming Shot starts, against an outgoing Shot running 0 -> 4 s. The first three are
+#: on the assembly grid and the rest are not, which is the whole point: an Overlap is a float a
+#: Director dragged and a blend is that float in frames, and the two part by up to half a frame.
+#:
+#: **Three rows land on a half-frame, and they are the ones that matter most.** `3.9375 * 24` is
+#: exactly `94.5`, where Python's `round` goes to the nearer *even* integer and JavaScript's
+#: `Math.round` goes *up* — so the export renders a two-frame blend and an unported client prints
+#: one. A boundary at an odd sixteenth of a second is an ordinary freehand drag away, and this is
+#: the whole reason `api.gridFrames` carries its own `roundHalfToEven` rather than calling
+#: `Math.round`. `3.9792` was in this table first and had to come out: `4.0 - 3.9792` is exactly
+#: `BOUNDARY_TOLERANCE_SECONDS`, the predicate is strictly greater, so it is one boundary written
+#: twice rather than an Overlap at all.
+#:
+#: **The last row is why the outgoing Shot's own length is a column.** It is the only shape that
+#: separates `round(end) - round(start)` from `round(end - start)` — 97.5 rounds up to 98 and 94.5
+#: rounds down to 94, so the grid telescopes to **4** frames where the subtraction gives **3**. A
+#: mutation that rounded the subtraction survived a table without it, and the server has always
+#: telescoped, because that is what makes `sum(plan.frames)` exact over one ordered list.
+#:
+#: `(outgoing duration, incoming start)`; the outgoing Shot always starts at zero.
+BOUNDARY_READOUT_TABLE = [
+    (4.0, 3.5), (4.0, 3.0), (4.0, 3.75), (4.0, 3.49), (4.0, 3.51), (4.0, 3.7708),
+    (4.0, 3.9375), (4.0, 3.6875), (4.0625, 3.9375),
+]
+
+
+def test_the_rows_readout_states_the_blend_that_will_render():
+    """Story 11.5's fifth constraint, as ruled on 2026-08-30: **the row shows what renders.**
+
+    The row used to state the raw Overlap, so a 0.51 s drag read `0.51s` over a blend of twelve
+    frames — 0.50 s. There is no version of this with one number, because the export quantises;
+    there is only a choice about which number the row shows, and a Director reads it to know what
+    they will get. A readout that says one thing while another ships is the defect this project has
+    paid for five times in three epics.
+
+    **Compared against the server's own arithmetic rather than against a literal.** What the row
+    prints and what `clip_frames_on_grid` answers for the same two windows are the same number, or
+    the two engines have come to different views of the grid — which is the failure this asserts,
+    not the formatting.
+
+    The Overlap itself is still carried, unrounded, as `seconds`: it is the geometry, the band's
+    sentence names it, and dropping it would leave nothing able to say what was dragged.
+    """
+    from music_video_producer.assembly import ASSEMBLY_FPS, clip_frames_on_grid
+
+    seen = run_module(
+        "import { transitionRows }"
+        " from './src/music_video_producer/web/assets/api.js';\n"
+        "const CAT = [{ transition_id: 'dissolve', label: 'Dissolve', xfade: 'fade',"
+        " pair_only: false, one_sided_frames: 12 }];\n"
+        "const TABLE = " + json.dumps(BOUNDARY_READOUT_TABLE) + ";\n"
+        "console.log(JSON.stringify(TABLE.map(([aLength, bStart]) => {\n"
+        "  const before = { id: 'a', start: 0, duration: aLength, approved_output: 'a.mp4',\n"
+        "                   effects: [], transition_out: { type: 'dissolve' } };\n"
+        "  const after = { id: 'b', start: bStart, duration: 4.0, approved_output: 'b.mp4',\n"
+        "                  effects: [], transition_in: { type: 'dissolve' } };\n"
+        "  const row = transitionRows({ shots: [before, after] }, before, CAT, {}).rows\n"
+        "    .find((item) => item.side === 'transition_out');\n"
+        "  return { readout: row.length, seconds: row.seconds,\n"
+        "           blendSeconds: row.blendSeconds, offered: row.preview.wanted };\n"
+        "})));\n"
+    )
+    assert len(seen) == len(BOUNDARY_READOUT_TABLE)
+    assert all(row["offered"] for row in seen), "every row in the table is a real blend"
+    disagreed = []
+    for (length, start), row in zip(BOUNDARY_READOUT_TABLE, seen, strict=True):
+        # `clip_frames_on_grid` and nothing reimplemented here: what is being asserted is that the
+        # two engines answer alike, and a third arithmetic in the test would only be a third thing
+        # able to be wrong.
+        rendered = clip_frames_on_grid(start, length) / ASSEMBLY_FPS
+        if row["readout"] != f"{rendered:.2f}s · from overlap" or row["blendSeconds"] != rendered:
+            disagreed.append((start, row, rendered))
+    assert not disagreed, (
+        "the row states a length the export will not render", disagreed,
+    )
+    # The table really exercises the difference rather than agreeing by construction: six of its
+    # nine rows print a number the raw Overlap would not have printed.
+    quantised = [
+        (window, row["seconds"], row["readout"])
+        for window, row in zip(BOUNDARY_READOUT_TABLE, seen, strict=True)
+        if row["readout"] != f"{row['seconds']:.2f}s · from overlap"
+    ]
+    assert len(quantised) == 6, quantised
+    # The two half-frame rows, which are the rounding *rule* rather than the rounding: `Math.round`
+    # would print 1 frame and 7 where the export writes 2 and 8.
+    assert seen[6]["blendSeconds"] == 2 / 24 and seen[7]["blendSeconds"] == 8 / 24, seen[6:8]
+    # And the telescoping row: 4 frames, where rounding the subtraction gives 3.
+    assert seen[8]["blendSeconds"] == 4 / 24, seen[8]
+    # And the Overlap itself is still there, unrounded, for the band's own sentence.
+    assert seen[3]["seconds"] == 0.51 and seen[3]["readout"] == "0.50s · from overlap"
+    assert seen[4]["seconds"] == 0.49 and seen[4]["readout"] == "0.50s · from overlap"
+
+
+def test_the_rows_readout_and_the_routes_transition_seconds_are_one_number():
+    """The two sides of the ruled number, compared as answers.
+
+    `BoundaryPreviewResponse.transition_seconds` is `blend_frames / ASSEMBLY_FPS` on the server and
+    the row prints `blendSeconds` on the client. Neither is derived from the other, so this is what
+    holds them together — the shape `stackIsDriven` uses, on the number a Director reads.
+    """
+    from music_video_producer.assembly import ASSEMBLY_FPS, clip_frames_on_grid
+
+    served = [
+        clip_frames_on_grid(start, length) / ASSEMBLY_FPS
+        for length, start in BOUNDARY_READOUT_TABLE
+    ]
+    client = run_module(
+        "import { transitionRowState }"
+        " from './src/music_video_producer/web/assets/api.js';\n"
+        "const TABLE = " + json.dumps(BOUNDARY_READOUT_TABLE) + ";\n"
+        "console.log(JSON.stringify(TABLE.map(([aLength, bStart]) => transitionRowState([\n"
+        "  { id: 'a', start: 0, duration: aLength },\n"
+        "  { id: 'b', start: bStart, duration: 4.0 },\n"
+        "], 0, 'transition_out').blendSeconds)));\n"
+    )
+    assert client == served, (
+        "the number the row prints and the number the route serves are not one number",
+        list(zip(BOUNDARY_READOUT_TABLE, served, client, strict=True)),
+    )
+
+
+def test_a_one_sided_readout_rounds_the_way_the_export_clamps():
+    """The same defect in the same row's other state, found while making the paired one honest.
+
+    `oneSidedTransitionSeconds` took `round(duration * 24)` while the export clamps against
+    `plan.frames[index]`, which telescopes `round(end * 24) - round(start * 24)`. Those part by a
+    whole frame on a Shot whose start is off the grid, so the row could state a treatment one frame
+    longer than the one that renders — a twelfth of the whole treatment at
+    `ONE_SIDED_TRANSITION_FRAMES`.
+    """
+    from music_video_producer.assembly import ASSEMBLY_FPS, clip_frames_on_grid
+    from music_video_producer.effects import ONE_SIDED_TRANSITION_FRAMES
+
+    # A Shot shorter than the ceiling, placed off the grid: the clamp is the Shot's own frames, so
+    # this is where the two roundings can differ.
+    # The last two land on a half-frame at one end, which is where `Math.round` and Python's
+    # `round` part company — the divergence `gridFrames`' own `roundHalfToEven` exists for.
+    windows = [
+        (0.0, 4.0), (0.0208, 0.25), (0.0208, 0.2292), (3.5, 0.3125), (0.03, 0.4792),
+        (3.9375, 0.3125), (0.0625, 0.4375),
+    ]
+    served = [
+        max(1, min(ONE_SIDED_TRANSITION_FRAMES, clip_frames_on_grid(start, start + duration)))
+        / ASSEMBLY_FPS
+        for start, duration in windows
+    ]
+    client = run_module(
+        "import { oneSidedTransitionSeconds }"
+        " from './src/music_video_producer/web/assets/api.js';\n"
+        "const ENTRY = { transition_id: 'fade_black', one_sided_frames: "
+        + str(ONE_SIDED_TRANSITION_FRAMES) + " };\n"
+        "const TABLE = " + json.dumps(windows) + ";\n"
+        "console.log(JSON.stringify(TABLE.map(([start, duration]) =>\n"
+        "  oneSidedTransitionSeconds(ENTRY, { start, duration }))));\n"
+    )
+    assert client == served, (
+        "the one-sided readout names a treatment the export will not run",
+        list(zip(windows, served, client, strict=True)),
+    )
+
+
+def test_a_boundary_row_offers_the_blend_from_whichever_side_names_the_seam():
+    """Both rows of one seam offer the same clip, and it is addressed to the outgoing Shot.
+
+    A `Transition in` names the boundary with the Shot *before* this one, so the request has to be
+    addressed to that Shot — AD-30's authoritative side, and not the Shot whose panel is open. A
+    Director told "watch this blend" on one Shot's `Transition out` and offered nothing on the next
+    Shot's `Transition in` would be looking at two accounts of one transition.
+    """
+    seen = run_module(r"""
+      import { transitionRows } from './src/music_video_producer/web/assets/api.js';
+      const CAT = [{ transition_id: 'dissolve', label: 'Dissolve', xfade: 'fade',
+                     pair_only: false, one_sided_frames: 12 }];
+      const before = { id: 'a', start: 0, duration: 4.0, approved_output: 'a.mp4',
+                       effects: [], transition_out: { type: 'dissolve' } };
+      const after = { id: 'b', start: 3.5, duration: 4.0, approved_output: 'b.mp4',
+                      effects: [], transition_in: { type: 'dissolve' } };
+      const project = { shots: [before, after] };
+      const rowsFor = (shot) => transitionRows(project, shot, CAT, {}).rows.map((row) => ({
+        side: row.side, wanted: row.preview.wanted, shotId: row.preview.shotId,
+        key: row.preview.key, note: row.previewNote,
+      }));
+      console.log(JSON.stringify({ a: rowsFor(before), b: rowsFor(after) }));
+    """)
+    outgoing = next(row for row in seen["a"] if row["side"] == "transition_out")
+    incoming = next(row for row in seen["b"] if row["side"] == "transition_in")
+    assert outgoing["wanted"] and incoming["wanted"]
+    assert outgoing["shotId"] == incoming["shotId"] == "a", (
+        "a boundary is addressed by its outgoing Shot on both rows (AD-30)"
+    )
+    assert outgoing["key"] == incoming["key"], "one seam, one picture, one key"
+    # And a row that already says why there is no blend does not say it twice.
+    headless = next(row for row in seen["a"] if row["side"] == "transition_in")
+    assert headless["wanted"] is False and headless["note"] == ""
+
+
+def test_a_one_sided_transition_makes_a_shot_with_no_effects_want_a_preview():
+    """The gap this story found by looking at the Monitor rather than at the route.
+
+    Story 9.2's rule was *"an empty stack is not previewed at all"*, and with no stack a preview
+    really was the take with extra steps — a transcode and a swapped video element to arrive back
+    at the picture already on screen. **Story 11.5 makes that false for one state.** A Shot with no
+    effects and a one-sided transition has a different picture from its take: its last frames are
+    treated and then it cuts, and `render_shot_preview` renders exactly that. Left as it was, a
+    Director setting a fade-out on an ungraded Shot would have watched the Monitor go on showing
+    the untreated take and say nothing — the "control that appears to do nothing" this repository
+    keeps rediscovering, and the route would have been right the whole time.
+
+    The other three states are asserted with it, because each is the reason the first is not just
+    "always preview": a Shot with nothing at all is still not previewed; a **paired** transition
+    leaves this Shot's own clip untreated, so it is not either; and changing the type has to move
+    the key, or the Monitor serves the previous treatment out of hand.
+    """
+    seen = run_module(r"""
+      import { shotPreviewWanted, shotOneSidedTransition, previewInputKey }
+        from './src/music_video_producer/web/assets/api.js';
+      const shot = (id, start, extra = {}) => ({
+        id, start, duration: 4.0, approved_output: id + '.mp4', effects: [], ...extra });
+      const plain = [shot('a', 0), shot('b', 4.0)];
+      const faded = [shot('a', 0, { transition_out: { type: 'fade_black' } }), shot('b', 4.0)];
+      const dipped = [shot('a', 0, { transition_out: { type: 'fade_white' } }), shot('b', 4.0)];
+      const paired = [shot('a', 0, { transition_out: { type: 'dissolve' } }), shot('b', 3.5)];
+      const at = (list) => {
+        const answer = shotPreviewWanted(list[0], null, list);
+        return {
+          wanted: answer.wanted,
+          key: answer.key,
+          oneSided: shotOneSidedTransition(list[0], list),
+        };
+      };
+      console.log(JSON.stringify({
+        plain: at(plain), faded: at(faded), dipped: at(dipped), paired: at(paired),
+        // The last Shot in the song has no Overlap after it by construction, and its own
+        // `transition_out` is a fade at the end of the video.
+        last: at([shot('b', 4.0, { transition_out: { type: 'fade_black' } })]),
+        // And a graded Shot's key still moves when its one-sided treatment does.
+        gradedPlain: previewInputKey(
+          { ...shot('a', 0), effects: [{ effect: 'monochrome', parameters: { amount: 1 } }] },
+          null, plain),
+        gradedFaded: previewInputKey(
+          { ...shot('a', 0, { transition_out: { type: 'fade_black' } }),
+            effects: [{ effect: 'monochrome', parameters: { amount: 1 } }] },
+          null, faded),
+      }));
+    """)
+    assert seen["plain"]["wanted"] is False, "a Shot with nothing on it is still not previewed"
+    assert seen["plain"]["oneSided"] == ""
+    assert seen["faded"]["wanted"] is True, (
+        "a one-sided transition is a picture, and the Monitor has to ask for it"
+    )
+    assert seen["faded"]["oneSided"] == "fade_black"
+    assert seen["last"]["wanted"] is True and seen["last"]["oneSided"] == "fade_black"
+    assert seen["paired"]["wanted"] is False, (
+        "a paired transition is a segment of its own; this Shot's clip carries no treatment"
+    )
+    assert seen["paired"]["oneSided"] == ""
+    # Two different treatments are two different pictures and therefore two different keys.
+    assert seen["faded"]["key"] != seen["dipped"]["key"]
+    assert seen["gradedPlain"] != seen["gradedFaded"], (
+        "a graded Shot's key must move when its one-sided treatment arrives"
+    )
+
 def test_a_song_change_moves_a_bound_shots_preview_key_and_leaves_an_unbound_ones_alone():
     """The client half of the gated sixth slot, and the reason the Monitor now re-asks.
 

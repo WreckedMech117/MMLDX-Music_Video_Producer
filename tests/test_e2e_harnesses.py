@@ -2,8 +2,8 @@
 
 Epic 10's retrospective action item **22**: *a gate that is not in the gate is not a gate.*
 `pyproject.toml` sets `testpaths = ["tests"]` with pytest's default `python_files`, so all
-twenty-four `tests/e2e_*.py` files — twenty-three harnesses and `e2e_support.py` — sit outside
-`uv run pytest -q`. What that cost, measured:
+~~twenty-four~~ **twenty-five** `tests/e2e_*.py` files — ~~twenty-three~~ **twenty-four** harnesses
+and `e2e_support.py` — sit outside `uv run pytest -q`. What that cost, measured:
 `e2e_effects_tab.py` broke on Epic 10's first slice and **four consecutive slices reported green**;
 `1933c2e` made `e2e_band_panel.py`'s step 7e unreachable, so Story 10.4's browser QA gate could not
 have passed as written; two more have been failing since before Epic 10; and `e2e_band_panel.py`

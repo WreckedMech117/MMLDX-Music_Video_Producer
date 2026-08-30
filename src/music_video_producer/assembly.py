@@ -915,6 +915,48 @@ TRANSITION_LEG_LABELS = ("xfa", "xfb")
 #: to introduce one where nothing needs it.
 TRANSITION_SEGMENT_TAIL = ("setsar=1", "format=yuv420p")
 
+#: How many frames of each Shot a **boundary preview** shows on either side of the blend, so the
+#: outgoing Shot, the transition and the incoming Shot play as one continuous piece (FX-21, story
+#: 11.5). Half a second at 24 fps, and it is a ceiling: the caller clamps it to the frames each
+#: neighbour actually has on the grid, because a leg cannot be read from frames its Shot does not
+#: cover.
+#:
+#: **Frames rather than seconds**, for `effects.ONE_SIDED_TRANSITION_FRAMES`' reason: the number
+#: becomes a `trim=start_frame=`/`end_frame=` pair and an `xfade` offset, and a seconds figure
+#: would have to be rounded back onto this grid by whoever read it.
+#:
+#: **Twelve is chosen against the measured budget rather than by taste.** FX-NFR-6 allows one
+#: second; a 2 s window around an `xfade` costs 143-187 ms (`docs/BUILD-HANDOFF.md`). A 12-frame
+#: margin either side of a half-second blend is a 1.5 s window, which is inside that measurement
+#: and leaves the Director enough of each Shot to see what the blend is between.
+TRANSITION_PREVIEW_MARGIN_FRAMES = 12
+
+
+def xfade_stage(xfade: str, frames: int, *, offset_frames: int = 0) -> str:
+    """The `xfade` filter, written once, for the export's segment and for its preview.
+
+    **This is what "the transition previewed is the export's, by name and by duration" is made
+    of** (FX-NFR-3, story 11.5). Both callers reach the same two numbers through this function, so
+    the claim is checkable by string comparison on the composed graphs rather than by reading two
+    argv builders and believing they agree -- which is the shape every other generated render
+    input in this project is already pinned by.
+
+    `offset_frames` is where the blend starts inside the *first* leg, and it is the one thing the
+    two callers differ on. An export's segment **is** the Overlap, so the blend starts at its first
+    frame and the offset is zero. A preview spans the boundary -- some of the outgoing Shot, the
+    blend, some of the incoming Shot, one continuous piece -- so the blend starts `offset_frames`
+    in. Neither the name nor the duration moves.
+
+    **Zero is spelled `0` and not `0.000000`, deliberately.** That is the text every export argv
+    this application has ever written carries, and a preview is not entitled to move the export's
+    own bytes to make its own arithmetic tidier. The pinned-argv tests in `tests/test_assembly.py`
+    are the record of that text.
+    """
+    offset = f"{offset_frames / ASSEMBLY_FPS:.6f}" if offset_frames else "0"
+    return (
+        f"xfade=transition={xfade}:duration={frames / ASSEMBLY_FPS:.6f}:offset={offset}"
+    )
+
 
 def transition_segment_args(
     before: Path,
@@ -932,6 +974,8 @@ def transition_segment_args(
     before_treatment: Sequence[str] = (),
     after_geometry: Sequence[str] = (),
     after_treatment: Sequence[str] = (),
+    lead_frames: int = 0,
+    tail_frames: int = 0,
 ) -> list[str]:
     """Two takes -> one blended intermediate: the Overlap's frames, from both Shots, in one run.
 
@@ -969,6 +1013,31 @@ def transition_segment_args(
     decimals, the formatter every generated render input in this project already uses -- and
     `offset=0`, because the blend *is* the whole segment (AD-19: a paired transition's duration is
     the Overlap's duration, and there is no second source for that number).
+
+    **`lead_frames` and `tail_frames` are the boundary preview's, and they default to nothing so
+    the export's argv is the argv this function has always written** (story 11.5). A preview of a
+    transition has to span the boundary -- the outgoing Shot, the blend, the incoming Shot, as one
+    continuous piece (FX-21) -- and that is the same graph with each leg extended on its own side
+    and the `xfade` moved off frame zero. The blend itself does not move: `xfade_stage` writes the
+    name and the duration for both callers, which is what makes *"the transition previewed is the
+    export's"* a string comparison rather than a reading of two builders.
+
+    Three things follow, and the third is why they are frames:
+
+    * the first leg gains `lead_frames` **before** the blend and still ends where the blend ends,
+      so `end_frame` is untouched and the leg is `lead_frames + frames` long;
+    * the second leg gains `tail_frames` **after** it and still starts where the blend starts;
+    * `-frames:v` becomes the whole window, so the cap goes on covering the output rather than one
+      third of it. `xfade`'s silent truncation to the shorter leg is measured above and it does not
+      go away because the legs are now deliberately unequal -- `offset + duration` is exactly the
+      first leg's length and `duration` exactly the second's head, so the graph is still fully
+      determined by construction, and `tests/test_shot_preview.py` counts the decoded frames.
+
+    **The caller clamps, and it clamps against the plan.** `before_offset` minus `lead_frames`
+    reaching behind the take's first frame would be the negative-trim failure `take_cut_refusal`
+    exists for -- silent, at rc 0, and a picture of the wrong seconds. The frames each neighbour
+    really has are `plan.frames` either side of the `TransitionClip`, which is the only source that
+    has already survived `assembly_refusals`.
     """
     lead, follow = TRANSITION_LEG_LABELS
     skips = (round(before_offset * ASSEMBLY_FPS), round(after_offset * ASSEMBLY_FPS))
@@ -976,7 +1045,7 @@ def transition_segment_args(
         ",".join(
             normalized_stages(
                 head=[
-                    f"trim=start_frame={skip}:end_frame={skip + frames}",
+                    f"trim=start_frame={start}:end_frame={stop}",
                     "setpts=PTS-STARTPTS",
                 ],
                 width=width,
@@ -985,16 +1054,17 @@ def transition_segment_args(
                 treatment_stages=treatment,
             )
         )
-        for skip, geometry, treatment in (
-            (skips[0], before_geometry, before_treatment),
-            (skips[1], after_geometry, after_treatment),
+        for start, stop, geometry, treatment in (
+            (skips[0] - lead_frames, skips[0] + frames, before_geometry, before_treatment),
+            (skips[1], skips[1] + frames + tail_frames, after_geometry, after_treatment),
         )
     ]
     graph = (
         f"[0:v]{legs[0]}[{lead}];"
         f"[1:v]{legs[1]}[{follow}];"
-        f"[{lead}][{follow}]xfade=transition={xfade}"
-        f":duration={frames / ASSEMBLY_FPS:.6f}:offset=0,"
+        f"[{lead}][{follow}]"
+        + xfade_stage(xfade, frames, offset_frames=lead_frames)
+        + ","
         + ",".join(TRANSITION_SEGMENT_TAIL)
     )
     return [
@@ -1009,7 +1079,7 @@ def transition_segment_args(
         "-filter_complex",
         graph,
         "-frames:v",
-        str(frames),
+        str(lead_frames + frames + tail_frames),
         "-an",
         "-c:v",
         "libx264",

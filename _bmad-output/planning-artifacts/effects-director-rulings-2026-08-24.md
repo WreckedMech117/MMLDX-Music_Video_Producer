@@ -985,6 +985,59 @@ extended to a two-leg composition. If the label work proves larger than it looks
 fallback is to refuse a transition where either Shot carries a binding — **as a recorded ruling with
 its reason, never as a silence.**
 
+## Ruling of 2026-08-30 — Epic 11's last, taken during story 11.5
+
+## R-42 — A length readout states what renders, not what was dragged
+
+Raised by story 11.5's implementer against that spec's own fifth constraint — *"the Overlap's
+length and the row's readout are the same number and must not become two"* — which cannot be
+satisfied as written. An Overlap is a float a Director dragged; a blend is that float in frames.
+**There is no version of this with one number, because the export quantises.** There is only a
+choice about which number the row shows, and the constraint did not make it.
+
+**Ruled: the row shows what renders.** The paired `Transition out` row states the Overlap **on the
+assembly grid** — the same figure `BoundaryPreviewResponse.transition_seconds` carries and the same
+one `xfade`'s `duration=` is built from. A 0.51 s drag reads `0.50s`.
+
+**The reasoning, so a later reader can weigh it rather than inherit it.** This project's
+most-repeated defect is a readout or a picture that says one thing while another ships — five times
+in three epics, and `shotLabel`, the H3 partition, the preview fingerprint's fourth slot, the
+section membership rule and the preview's own song slot are the list. A Director reads this number
+to know what they will get, and half a frame of honesty costs nothing.
+
+**The objection is real and is recorded rather than dismissed:** dragging to 0.51 s and reading
+0.50 s looks like the drag was ignored. It is mitigated because the band and the clip both follow
+the drag visibly and immediately — the number is the only thing that quantises, and it is the only
+thing that has to.
+
+> **Two findings from the implementation, both measured, both closed in the same commit.**
+>
+> **The two engines did not round alike.** `assembly.clip_frames_on_grid` uses Python's `round`,
+> which goes to the nearer **even** integer on a tie; `Math.round` goes **up**. They part on exactly
+> the values that land on a half-frame, and a boundary at an odd sixteenth of a second is an
+> ordinary freehand drag away: measured against the shipped function, a Shot at 3.9375 s meeting one
+> ending at 4.0 s renders a **two**-frame blend where `Math.round` prints **one**, and at 3.6875 s it
+> is 8 against 7. `api.gridFrames` carries its own `roundHalfToEven` for this, and it is the only
+> place this side rounds onto the grid.
+>
+> **And the grid telescopes rather than subtracting.** `round(end) - round(start)` is not
+> `round(end - start)`: an outgoing Shot ending at 4.0625 s over an incoming one starting at
+> 3.9375 s is **4** frames telescoped and **3** by subtraction. The server has always telescoped,
+> because that is what makes `sum(plan.frames)` exact over one ordered list of boundaries
+> (FX-NFR-1). A mutation that rounded the subtraction survived a table without that shape in it,
+> which is how the case was found.
+>
+> **The same defect was in the same row's other state and is fixed with it.**
+> `oneSidedTransitionSeconds` rounded `duration * 24` while the export clamps against
+> `plan.frames[index]`, so a Shot whose start is off the grid could read a treatment one frame
+> longer than the one that renders — a twelfth of the whole treatment at
+> `ONE_SIDED_TRANSITION_FRAMES`.
+>
+> **What is deliberately *not* changed:** `overlapBands`' sentence still names the raw Overlap
+> (`a 0.51s overlap between shot 01 and shot 02`), because it describes the **geometry a Director
+> dragged** rather than a rendered length, and `transitionRowState` still carries that float as
+> `seconds` beside `blendSeconds` so nothing has to re-derive it. Two facts, named apart.
+
 ---
 
 ## Delegated decisions

@@ -95,6 +95,7 @@ from .effects import (
     TRANSITION_CATALOGUE,
     TRANSITION_PAIR_ONLY_REFUSAL,
     ChoiceParameter,
+    DriveScript,
     EffectRefusal,
     EffectStages,
     LutEntry,
@@ -7547,6 +7548,54 @@ class ShotPreviewResponse(BaseModel):
     rendered: bool
 
 
+class BoundaryPreviewResponse(BaseModel):
+    """One Preview Clip of a **boundary**: the outgoing Shot, the blend and the incoming Shot as
+    one continuous piece (FX-21, story 11.5).
+
+    **A different subject from `ShotPreviewResponse`, which is R-35 stated on the wire.** That one
+    names a Shot and a window; this names a seam between two Shots, and its `fingerprint` comes
+    out of `effects.boundary_fingerprint` rather than `preview_fingerprint`. Widening the Shot
+    preview's key to carry two takes was rejected on a measurement: an input added there that does
+    not canonicalise to nothing when absent renames every cached clip in every project on the day
+    this merges, for pictures that did not change.
+
+    `transition` and `transition_seconds` are what the clip is a picture *of*, and they are here
+    for FX-NFR-3 rather than for decoration: a client showing "Dissolve, 0.50 s" beside the clip
+    is showing the export's own two facts, which are the two `assembly.xfade_stage` writes into
+    both graphs. `transition_seconds` is the blend on the assembly grid -- `blend_frames /
+    ASSEMBLY_FPS` -- so it is the Overlap's own length, quantised the one way the export quantises
+    it, and never a second number derived from a second rule.
+
+    `lead_frames` and `tail_frames` say how much of each Shot is on either side of the blend. They
+    are not always `assembly.TRANSITION_PREVIEW_MARGIN_FRAMES`: a Shot with less than that on its
+    own side of the boundary supplies what it has, which is the same clamp
+    `effects.one_sided_transition_stages` applies to a treatment and for the same reason -- a leg
+    read from frames its Shot does not cover is a picture of the wrong seconds, at rc 0.
+    """
+
+    #: The **outgoing** Shot, which is the boundary's identity: AD-30 makes `transition_out` on
+    #: the earlier Shot authoritative and the later Shot's `transition_in` a mirror, so a boundary
+    #: named by its incoming side would be named by the field nothing renders from.
+    shot_id: str
+    after_shot_id: str
+    fingerprint: str
+    preview: str
+    preview_url: str
+    width: int
+    height: int
+    #: Every frame in the clip: the lead, the blend and the tail. `frames` and `window_seconds`
+    #: mean here exactly what they mean on a Shot preview, so a client holding either can ask the
+    #: same two questions of it.
+    frames: int
+    window_seconds: float
+    lead_frames: int
+    blend_frames: int
+    tail_frames: int
+    transition: str
+    transition_seconds: float
+    rendered: bool
+
+
 class ShotEffectsCopyRequest(BaseModel):
     """Which Shots one stack is copied onto. Named, never inferred.
 
@@ -9041,7 +9090,9 @@ def _compose_transitions(
     return refusals
 
 
-def _boundary_is_overlapped(ordered: Sequence[ClipWindow], position: int) -> bool:
+def _boundary_is_overlapped(
+    ordered: Sequence[ClipWindow | Shot], position: int
+) -> bool:
     """Whether the Shot at `position` overlaps the one that follows it in song order.
 
     **The one predicate that separates story 11.4's work from story 11.1's**, and it is deliberately
@@ -9049,6 +9100,12 @@ def _boundary_is_overlapped(ordered: Sequence[ClipWindow], position: int) -> boo
     it, `routes/shots.replace_shot_transitions` refuses a pair-only type by it at the write, and
     this decides a one-sided treatment by its negation. `BOUNDARY_TOLERANCE_SECONDS` is applied for
     `tiling_refusals`' reason -- below half a frame an "overlap" is one boundary written twice.
+
+    **`ClipWindow` or `Shot`, because it reads only `start` and `end` and both carry the same
+    two.** The preview route asks this question of `project.shots` and the export asks it of
+    `subject.clips` -- and those are the same set, because `assemble_project` builds one
+    `ClipWindow` per Shot whether or not its take resolves. Two callers, one arithmetic, and the
+    widened annotation is what says so rather than a comment claiming it.
 
     Read off the **Shot windows** rather than off `plan.clips`, and that is what makes it right in
     the case that is easy to get wrong. A pair the plan *refused* -- three clips over one instant,
@@ -9109,11 +9166,18 @@ def _compose_one_sided_transitions(
     `transition_in` is not read at all: AD-30 makes it the mirror, `ExportSubject.transitions`
     carries only the outgoing field, and a one-sided *fade in* on the very first Shot -- the one
     boundary where an incoming field has no pair to mirror -- is described by no acceptance
-    criterion in Epic 11 and would need that mapping widened. And the **preview** does not show
-    this: `preview_fingerprint`'s seventh input is still hashed empty, which R-35 reserved for
-    exactly *"a transition on a Shot's own preview"* and gave to story 11.5. Until it lands, a
-    one-sided transition is the one thing in this application an export does that a preview does
-    not -- a real gap in FX-NFR-3, named here so the next reader inherits it rather than finds it.
+    criterion in Epic 11 and would need that mapping widened.
+
+    ~~And the **preview** does not show this: `preview_fingerprint`'s seventh input is still
+    hashed empty, which R-35 reserved for exactly *"a transition on a Shot's own preview"* and
+    gave to story 11.5. Until it lands, a one-sided transition is the one thing in this
+    application an export does that a preview does not -- a real gap in FX-NFR-3.~~ **Closed
+    2026-08-29 by story 11.5.** `render_shot_preview` composes `one_sided_transition_stages` from
+    the same catalogue with the same clamp, splices it onto the same two groups, and fills the
+    seventh fingerprint slot with what it composed -- so the treatment moves the clip's name and
+    an untreated Shot's name does not move at all. The one difference is deliberate and is the
+    preview's own geometry: the blur's sigma is a count of pixels and is scaled to the half-size
+    grid, which is `StageContext.reference_width`'s rule reached through `effects.pixel_scale`.
     """
     plan = subject.plan
     if plan is None or not subject.transitions:
@@ -9379,6 +9443,52 @@ PREVIEW_FAILED_ERROR = "{shot}'s preview could not be rendered: {detail}"
 #: a clip. It exists so that the render's `finally` always has something honest to release its
 #: joiners with; a joiner that is never released is the one outcome R-22 cannot have.
 PREVIEW_ABANDONED_DETAIL = "the render ended without producing a clip"
+
+
+#: Why there is no boundary to preview after this Shot: nothing follows it in song order. A
+#: `transition_out` on the last Shot is a real editorial choice and it is one-sided -- the Shot's
+#: own preview shows it, which is what the sentence sends the Director to rather than leaving the
+#: control looking broken.
+BOUNDARY_PREVIEW_NO_NEIGHBOUR_REFUSAL = (
+    "{shot} is the last shot in the song, so there is no boundary after it to preview. Its "
+    "transition treats its own last frames and its own preview shows them."
+)
+
+#: Why there is no boundary preview although both Shots exist: they do not overlap, so there is
+#: no blend -- the transition is one-sided and the outgoing Shot's own preview is the picture of
+#: it. **Which absence it is, said plainly** (story 11.5's last acceptance criterion): a control
+#: that simply did nothing here would read as a fault, where the honest answer is that this
+#: boundary has no blend to look at.
+BOUNDARY_PREVIEW_NO_OVERLAP_REFUSAL = (
+    "{before} and {after} do not overlap, so there is no blend between them to preview. "
+    "{before}'s transition treats its own last frames and its own preview shows them."
+)
+
+#: Why there is no boundary preview although the two Shots do overlap: no transition is stored on
+#: the outgoing side, so the boundary is a hard cut. An Overlap with nothing chosen is still a cut
+#: (UX-DR8, `api.TRANSITION_UNTYPED_LABEL`), and previewing it would show two clips meeting with
+#: nothing in between -- which is what the timeline already draws.
+BOUNDARY_PREVIEW_NO_TRANSITION_REFUSAL = (
+    "{before} and {after} overlap, but no transition is set on {before}, so the boundary is a "
+    "hard cut and there is no blend to preview. Choose a transition to see one."
+)
+
+#: Why the plan did not compose this boundary at all, said in the plan's own words. R-37's
+#: geometry refusals -- a third clip over the Overlap, or the incoming Shot swallowed whole -- are
+#: recorded on `ExportLook.transitions` at the export and are the same fact here: there is no
+#: blend to look at because there will be no blend in the video. The sentence travels whole rather
+#: than being reworded, so the preview and the export do not hold two opinions about one geometry.
+BOUNDARY_PREVIEW_REFUSED_BY_PLAN = (
+    "{before} and {after} will not blend, so there is nothing to preview: {detail}"
+)
+
+#: Why a boundary preview cannot be rendered although the blend exists: one of the two takes could
+#: not be resolved or measured, so it is not in the plan. `PREVIEW_TAKE_MISSING_REFUSAL`'s
+#: division, for a subject that needs two takes rather than one.
+BOUNDARY_PREVIEW_TAKE_MISSING_REFUSAL = (
+    "{before} and {after} cannot be previewed together: one of the two approved takes could not "
+    "be read, so the export has no plan for this boundary. Check both takes play, then try again."
+)
 
 
 class ShotListRequest(BaseModel):
@@ -10822,6 +10932,329 @@ def create_app(
     # see `routes/context.py` for what each field is and why it is a value and not a
     # `Depends`. Each module registers straight onto `app`, so `app.routes` stays the flat
     # list this repository's three route-enumerating guards walk.
+    # ------------------------------------------------------------------------------
+    # The preview helpers, declared **above** `RouterContext` because two modules now
+    # need them. `render_shot_preview` is pinned in this file by the tests that patch its
+    # neighbours' names, and the boundary preview is a new route and therefore lives in
+    # `routes/shots.py` -- so the take memo, the project's delivery plan, the halving rule
+    # and the envelope read are shared rather than owned by either. That is exactly the
+    # question `RouterContext`'s docstring asks of a new field, answered the way
+    # `song_envelope_report` answered it: two resources read these and neither owns them.
+    # ------------------------------------------------------------------------------
+
+    async def take_measurement(source: Path) -> tuple[int, int, float | None] | None:
+        """One take's `(width, height, seconds)` by ffprobe, remembered for the life of the
+        process.
+
+        `None` for a file that cannot be measured — missing, truncated, or not a video — which
+        is an answer rather than an error: the callers below drop such a take from the plan
+        exactly as the export's own refusal report would.
+
+        The length rides along because `probe_take_args` reads it in the same probe the
+        dimensions come from, and the preview needs both: the geometry decides what size to
+        render, and the length decides whether the cut fits inside the take at all
+        (`assembly.take_cut_refusal`). One probe answers both questions, as it does for the
+        export. A container that reports no readable duration answers `None` for that third
+        value alone and keeps its dimensions — an unmeasurable length is undecidable rather
+        than a fault, which is what `assembly_refusals` has always done with one.
+
+        The memo is keyed by path, byte length and modification time **together**. Neither half
+        is trusted alone: a take re-rendered under the same name changes at least one of them,
+        and this is a memo of a measurement rather than a stored verdict, so a stale entry could
+        only be produced by a file rewritten to the same length in the same nanosecond.
+        `song_fingerprint`'s content-not-mtime rule answers a different question — "is this still
+        the same audio?" — and reading every byte of every approved take to answer "how wide is
+        it?" would cost more than the measurement it guards.
+        """
+        try:
+            stat = source.stat()
+        except OSError:
+            return None
+        key = (source.as_posix(), stat.st_size, stat.st_mtime_ns)
+        remembered = app.state.take_measurements.get(key)
+        if remembered is not None:
+            return remembered
+        rc, out, _err = await run_tool(probe_take_args(source))
+        lines = out.splitlines() if rc == 0 else []
+        try:
+            width, height = (int(part) for part in lines[0].split(","))
+        except (ValueError, IndexError):
+            return None
+        try:
+            seconds: float | None = float(lines[1])
+        except (ValueError, IndexError):
+            seconds = None
+        measured = (width, height, seconds)
+        app.state.take_measurements[key] = measured
+        return measured
+
+    async def preview_assembly(
+        project: Project,
+        transitions: Mapping[str, TransitionChoice] | None = None,
+    ) -> AssemblyPlan | None:
+        """The plan the export would build for **this project**, or `None` if no approved take in
+        it can be measured.
+
+        AD-29, and it is computed by calling `assembly_plan` rather than by re-deriving its rule:
+        "the largest-area approved take" is a sentence, and a sentence copied into a second
+        function drifts from the one that ships the video. Two things this delegation gets right
+        that a `max()` here would not — the plan resolves overlaps first, so a take completely
+        covered by a later Shot contributes nothing to a geometry it will not appear at; and if
+        the normalization rule is ever changed, the preview follows it without anyone remembering
+        that a second copy exists.
+
+        `song_seconds` is `0.0`. Nothing here reads the plan's tiling: the geometry is `.width`
+        and `.height`, and the boundary preview reads `.clips` and `.frames`, which the tiling
+        does not decide.
+
+        Shots whose take cannot be resolved or measured are left out entirely. That is the same
+        set the export would refuse over, so the answer is either the export's own plan or the
+        export was never going to run.
+
+        **`transitions` changes what the plan *emits* and never what it measures** (R-39). A
+        `TransitionClip` is a union entry in `plan.clips` and the width and height are taken from
+        the resolved windows, which the transition pass runs after and does not touch — so
+        `export_geometry` below gets the identical answer whether it asks with transitions or
+        without, and a boundary preview gets the export's own segment rather than a second
+        arithmetic for one.
+        """
+        output_root = (settings.comfy_root / "output").resolve()
+        clips: list[ClipWindow] = []
+        dimensions: dict[str, tuple[int, int]] = {}
+        for shot in project.shots:
+            if not shot.approved_output:
+                continue
+            candidate = (output_root / Path(shot.approved_output)).resolve()
+            if output_root not in candidate.parents or not candidate.is_file():
+                continue
+            measured = await take_measurement(candidate)
+            if measured is None:
+                continue
+            dimensions[shot.id] = measured[:2]
+            clips.append(
+                ClipWindow(
+                    shot_id=shot.id,
+                    # The label a refusal names a Shot by, and it is `shot_label`'s rather than
+                    # the bare id: `plan.transition_refusals` is a Director-facing sentence and
+                    # the boundary preview reports it whole (R-37). Nothing else here reads it.
+                    label=shot_label(project, shot),
+                    start=shot.start,
+                    duration=shot.duration,
+                    approved_output=shot.approved_output,
+                    approved_start=shot.approved_start,
+                    approved_duration=shot.approved_duration,
+                    source=candidate,
+                )
+            )
+        if not clips:
+            return None
+        return assembly_plan(clips, 0.0, dimensions, transitions)
+
+    async def export_geometry(project: Project) -> tuple[int, int] | None:
+        """The dimensions the export would normalize **this project** to, or `None` if no
+        approved take in it can be measured. AD-29, one question of the plan above.
+        """
+        plan = await preview_assembly(project)
+        return None if plan is None else (plan.width, plan.height)
+
+    def preview_envelope(
+        project_id: str, project: Project, *, label: str
+    ) -> dict[str, Any]:
+        """The Song Envelope a **driven** preview is composed against, or the export's own
+        refusal.
+
+        Extracted 2026-08-29 so the Shot preview and the boundary preview cannot come to two
+        answers about one measurement (story 11.5). A boundary blends two Shots and either of them
+        may carry a Parameter Binding, so the question is asked at two routes now; asking it twice
+        in two places is the shape this repository has already paid for five times.
+
+        **Only ever called for a picture that asks the song something.** The verdict hashes the
+        whole master and reads a ~405 KB sidecar, and a preview is measured in tens of
+        milliseconds — so an unbound Shot must not pay it and its fingerprint must come out of
+        exactly the arguments it came out of before. The gate is the caller's (`stack_is_driven`,
+        whose client-side counterpart `api.stackIsDriven` is pinned to it by a cross-engine test).
+
+        A song whose file has gone is a *reason*, not a 404: `song_measurement_verdict` already
+        answers `SONG_ANALYSIS_MEDIA_MISSING` for a path it cannot `stat`, and that sentence sends
+        a Director somewhere useful where "Song media was not found" would read as a fault in the
+        preview. So the resolver's refusal becomes a path that does not exist and the verdict says
+        the rest.
+
+        The refusal is the **export's** sentence, whole. A preview is the export's promise, so the
+        two may not refuse one state in two wordings — and refusing is the only outcome with a
+        symptom: an undriven render succeeds and looks like a still look, at rc 0, with nothing in
+        the response saying the music was dropped.
+        """
+        try:
+            source_song = (
+                resolve_song_path(project_id, project.song)
+                if project.song
+                else store.project_dir(project_id) / "song-that-was-never-imported"
+            )
+        except HTTPException:
+            source_song = store.project_dir(project_id) / Path(project.song.path or "song")
+        verdict = song_measurement_verdict(
+            store,
+            project_id,
+            project.song.analysis if project.song else SongAnalysis(),
+            source_song,
+        )
+        if not verdict.current:
+            raise HTTPException(
+                status_code=422,
+                detail=BINDING_WITHOUT_ENVELOPE_REFUSAL.format(
+                    shot=label, reason=verdict.reason
+                ),
+            )
+        return verdict.envelope
+
+    async def preview_into_cache(
+        project_id: str,
+        *,
+        label: str,
+        fingerprint: str,
+        previews_root: Path,
+        scripts: Sequence[DriveScript],
+        argv: Callable[[Path], list[str]],
+    ) -> bool:
+        """Serve one Preview Clip out of the cache, or render it: AD-23, AD-24 and R-22 in one
+        place. `True` when a render produced the clip -- its own, or the identical one it joined
+        -- and `False` when the file named by `fingerprint` was already on disk.
+
+        Extracted 2026-08-29 so the Shot preview and the boundary preview share the cache and the
+        supersede registry rather than each keeping their own (story 11.5). **Sharing the registry
+        is the correct reading of AD-24 rather than a convenience**: it is keyed by project because
+        what it protects is one Director looking at one project, and a boundary render that let a
+        superseded Shot render go on burning CPU beside it would be exactly the waste that ruling
+        is about.
+
+        **The cache, and the whole of it**: the fingerprint names a file, and the file is either
+        there or it is not. Deleting the folder costs a re-render and nothing else, and no export
+        ever reads this directory -- `exports/` is the assemble route's, and it builds its own
+        intermediates from the approved takes every time.
+
+        **Supersede, never queue** (AD-24). Whatever this project already has in flight with a
+        *different* fingerprint is cancelled before this render starts, and the render writes to a
+        scratch file that is published -- one atomic rename -- only if `PreviewRender.superseded`
+        is still false when ffmpeg exits. Killing the subprocess is how a superseded render stops
+        burning CPU; the gate is what makes it impossible for its output to be served, including
+        in the two races a kill cannot cover -- the process that finished before the signal, and
+        the process that did not exist yet.
+
+        **Join an identical render, never restart it** (R-22). A request whose fingerprint equals
+        the one already rendering is not stale work, it is the same work asked for twice, and
+        there is no client that can promise never to ask twice: a retry, a poll and a re-render on
+        window focus each produce one. So it waits on that render and answers with its result,
+        spawning nothing.
+
+        `argv` is a callable rather than a list because the scratch path is this function's own
+        secret -- named by the render's token and hidden by a leading dot, so a half-written file
+        is neither a cache entry nor a collision with the render that replaced it.
+        """
+        clip = previews_root / f"{fingerprint}.mp4"
+        if clip.is_file():
+            return False
+        previews_root.mkdir(parents=True, exist_ok=True)
+        renders = app.state.preview_renders
+        in_flight = renders.get(project_id)
+        # R-22, and the one comparison that decides between the two rules. A *different*
+        # fingerprint is a different picture, so the render underway is stale work and AD-24
+        # discards it. An *equal* fingerprint is this exact render, asked for twice -- and
+        # restarting it would throw away completed effort to produce a byte-identical answer.
+        # Worse, under identical requests arriving faster than a render completes, nothing would
+        # ever land at all. So it joins.
+        if in_flight is not None and in_flight.fingerprint == fingerprint:
+            # No supersede, no second ffmpeg, no scratch file, and nothing published by this
+            # request: it reads the outcome the render records and answers with it. The publish
+            # gate is untouched -- a joiner can only ever be handed a clip that a render already
+            # renamed into the cache after finding `superseded` false.
+            waiter = in_flight.join()
+            if waiter is not None:
+                await waiter
+            if in_flight.published:
+                return True
+            if in_flight.superseded:
+                # What it was waiting for will never publish, so it is refused for the same
+                # reason and by the same sentence: something newer is the one that answers.
+                raise HTTPException(
+                    status_code=409, detail=PREVIEW_SUPERSEDED_REFUSAL.format(shot=label)
+                )
+            raise HTTPException(
+                status_code=502,
+                detail=PREVIEW_FAILED_ERROR.format(
+                    shot=label, detail=in_flight.error or PREVIEW_ABANDONED_DETAIL
+                ),
+            )
+        record = PreviewRender(token=new_id("preview"), fingerprint=fingerprint)
+        if in_flight is not None:
+            in_flight.supersede()
+        renders[project_id] = record
+        scratch = previews_root / f".{record.token}.mp4"
+        # The compiled drive scripts, into the cache folder this render is about to write its
+        # clip into, and read from there as bare relative names with ffmpeg's working directory
+        # set to it (R-30, `run_tool`'s `cwd`). Content-addressed like the clip beside them: the
+        # name carries a digest of the script's own text, so writing one that is already there
+        # rewrites identical bytes, and two renders that compile the same drive share a file.
+        # Nothing here is a cache entry -- the clip is named by the fingerprint and only the clip
+        # is served -- and emptying the folder costs a re-render exactly as it did before.
+        for script in scripts:
+            (previews_root / script.filename).write_text(script.text, encoding="utf-8")
+        try:
+            rc, _out, err = await run_tool(
+                argv(scratch),
+                on_start=record.attach,
+                # Only when there is a script to read: a render with no drive spawns ffmpeg in
+                # this process's own directory, exactly as it did before Epic 10.
+                cwd=previews_root if scripts else None,
+            )
+            if record.superseded:
+                # The gate. Whatever ffmpeg managed to write is deleted rather than published,
+                # so a render cancelled at any point -- including one that finished before the
+                # kill landed -- can never be served as the current picture.
+                scratch.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=409, detail=PREVIEW_SUPERSEDED_REFUSAL.format(shot=label)
+                )
+            if rc != 0 or not scratch.is_file():
+                scratch.unlink(missing_ok=True)
+                record.error = err[-500:] if err else "no error output"
+                raise HTTPException(
+                    status_code=502,
+                    detail=PREVIEW_FAILED_ERROR.format(shot=label, detail=record.error),
+                )
+            # One atomic rename into the cache. A reader either sees no file or sees a complete
+            # one; there is no window in which a partial preview carries a fingerprint's name.
+            #
+            # Everything from `run_tool` returning to here is synchronous, and that is what lets
+            # a joiner trust `published`: no supersede can be interleaved between reading the
+            # gate and passing through it, so `published` is only ever true of a render that was
+            # never superseded.
+            scratch.replace(clip)
+            record.finish(published=True)
+            return True
+        finally:
+            # Only if this render is still the registered one. A superseded render must not
+            # clear the entry belonging to the render that replaced it.
+            if renders.get(project_id) is record:
+                del renders[project_id]
+            # Unconditional, and idempotent: whatever happened above -- a publish, a refusal, a
+            # supersede, or an exception no branch here wrote -- every joiner is released with
+            # the outcome that was recorded, or with `error=None` and `published=False`, which is
+            # the abandoned case and still an answer. Nothing waits forever.
+            record.finish(error=record.error)
+
+    def preview_side(value: int) -> int:
+        """One export dimension, halved for the preview and kept even.
+
+        Even because `format=yuv420p` — which `trim_args` pins on every clip it builds — has
+        half-resolution chroma planes and refuses an odd dimension. Every size this pipeline
+        renders is a multiple of 32, so the rounding never fires on real media; it is here so
+        that a hand-placed take of an odd width is a smaller preview rather than an ffmpeg
+        failure with a sentence about chroma. Never below 2, for the same reason.
+        """
+        half = value // 2
+        return max(2, half - (half % 2))
+
     ctx = RouterContext(
         app=app,
         settings=settings,
@@ -10845,6 +11278,11 @@ def create_app(
         song_envelope_report=song_envelope_report,
         discovered_looks=discovered_looks,
         run_tool=run_tool,
+        take_measurement=take_measurement,
+        preview_assembly=preview_assembly,
+        preview_envelope=preview_envelope,
+        preview_into_cache=preview_into_cache,
+        preview_side=preview_side,
     )
     register_project_routes(ctx)
     register_song_routes(ctx)
@@ -11835,114 +12273,6 @@ def create_app(
         return _set_shot_commitment(project_id, shot_id, "draft")
 
 
-    async def take_measurement(source: Path) -> tuple[int, int, float | None] | None:
-        """One take's `(width, height, seconds)` by ffprobe, remembered for the life of the
-        process.
-
-        `None` for a file that cannot be measured — missing, truncated, or not a video — which
-        is an answer rather than an error: the callers below drop such a take from the plan
-        exactly as the export's own refusal report would.
-
-        The length rides along because `probe_take_args` reads it in the same probe the
-        dimensions come from, and the preview needs both: the geometry decides what size to
-        render, and the length decides whether the cut fits inside the take at all
-        (`assembly.take_cut_refusal`). One probe answers both questions, as it does for the
-        export. A container that reports no readable duration answers `None` for that third
-        value alone and keeps its dimensions — an unmeasurable length is undecidable rather
-        than a fault, which is what `assembly_refusals` has always done with one.
-
-        The memo is keyed by path, byte length and modification time **together**. Neither half
-        is trusted alone: a take re-rendered under the same name changes at least one of them,
-        and this is a memo of a measurement rather than a stored verdict, so a stale entry could
-        only be produced by a file rewritten to the same length in the same nanosecond.
-        `song_fingerprint`'s content-not-mtime rule answers a different question — "is this still
-        the same audio?" — and reading every byte of every approved take to answer "how wide is
-        it?" would cost more than the measurement it guards.
-        """
-        try:
-            stat = source.stat()
-        except OSError:
-            return None
-        key = (source.as_posix(), stat.st_size, stat.st_mtime_ns)
-        remembered = app.state.take_measurements.get(key)
-        if remembered is not None:
-            return remembered
-        rc, out, _err = await run_tool(probe_take_args(source))
-        lines = out.splitlines() if rc == 0 else []
-        try:
-            width, height = (int(part) for part in lines[0].split(","))
-        except (ValueError, IndexError):
-            return None
-        try:
-            seconds: float | None = float(lines[1])
-        except (ValueError, IndexError):
-            seconds = None
-        measured = (width, height, seconds)
-        app.state.take_measurements[key] = measured
-        return measured
-
-    async def export_geometry(project: Project) -> tuple[int, int] | None:
-        """The dimensions the export would normalize **this project** to, or `None` if no
-        approved take in it can be measured.
-
-        AD-29, and it is computed by calling `assembly_plan` rather than by re-deriving its
-        rule: "the largest-area approved take" is a sentence, and a sentence copied into a
-        second function drifts from the one that ships the video. Two things this delegation
-        gets right that a `max()` here would not — the plan resolves overlaps first, so a take
-        completely covered by a later Shot contributes nothing to a geometry it will not appear
-        at; and if the normalization rule is ever changed, the preview follows it without anyone
-        remembering that a second copy exists.
-
-        `song_seconds` is `0.0` because only `.width` and `.height` are read from the answer.
-        The plan's frame arithmetic and its tiling are the export's business; this asks it one
-        question, which is what size the delivery grid is.
-
-        Shots whose take cannot be resolved or measured are left out entirely. That is the same
-        set the export would refuse over, so the answer is either the export's own geometry or
-        the export was never going to run.
-        """
-        output_root = (settings.comfy_root / "output").resolve()
-        clips: list[ClipWindow] = []
-        dimensions: dict[str, tuple[int, int]] = {}
-        for shot in project.shots:
-            if not shot.approved_output:
-                continue
-            candidate = (output_root / Path(shot.approved_output)).resolve()
-            if output_root not in candidate.parents or not candidate.is_file():
-                continue
-            measured = await take_measurement(candidate)
-            if measured is None:
-                continue
-            dimensions[shot.id] = measured[:2]
-            clips.append(
-                ClipWindow(
-                    shot_id=shot.id,
-                    label=shot.id,
-                    start=shot.start,
-                    duration=shot.duration,
-                    approved_output=shot.approved_output,
-                    approved_start=shot.approved_start,
-                    approved_duration=shot.approved_duration,
-                    source=candidate,
-                )
-            )
-        if not clips:
-            return None
-        plan = assembly_plan(clips, 0.0, dimensions)
-        return plan.width, plan.height
-
-    def preview_side(value: int) -> int:
-        """One export dimension, halved for the preview and kept even.
-
-        Even because `format=yuv420p` — which `trim_args` pins on every clip it builds — has
-        half-resolution chroma planes and refuses an odd dimension. Every size this pipeline
-        renders is a multiple of 32, so the rounding never fires on real media; it is here so
-        that a hand-placed take of an odd width is a smaller preview rather than an ffmpeg
-        failure with a sentence about chroma. Never below 2, for the same reason.
-        """
-        half = value // 2
-        return max(2, half - (half % 2))
-
     @app.post(
         "/api/projects/{project_id}/shots/{shot_id}/preview",
         response_model=ShotPreviewResponse,
@@ -12107,37 +12437,11 @@ def create_app(
         envelope: dict[str, Any] | None = None
         driven = stack_is_driven(stack)
         if driven:
-            # A song whose file has gone is a *reason*, not a 404: `song_measurement_verdict`
-            # already answers `SONG_ANALYSIS_MEDIA_MISSING` for a path it cannot `stat`, and that
-            # sentence sends a Director somewhere useful where "Song media was not found" would
-            # read as a fault in the preview. So the resolver's refusal becomes a path that does
-            # not exist and the verdict says the rest.
-            try:
-                source_song = (
-                    resolve_song_path(project_id, project.song)
-                    if project.song
-                    else store.project_dir(project_id) / "song-that-was-never-imported"
-                )
-            except HTTPException:
-                source_song = store.project_dir(project_id) / Path(project.song.path or "song")
-            verdict = song_measurement_verdict(
-                store,
-                project_id,
-                project.song.analysis if project.song else SongAnalysis(),
-                source_song,
-            )
-            if not verdict.current:
-                # The export's own sentence, whole. A preview is the export's promise, so the
-                # two may not refuse one state in two wordings — and refusing is the only
-                # outcome with a symptom: an undriven render succeeds and looks like a still
-                # look, at rc 0, with nothing in the response saying the music was dropped.
-                raise HTTPException(
-                    status_code=422,
-                    detail=BINDING_WITHOUT_ENVELOPE_REFUSAL.format(
-                        shot=label, reason=verdict.reason
-                    ),
-                )
-            envelope = verdict.envelope
+            # `preview_envelope` above, which is the same read the boundary preview makes and
+            # refuses by the same sentence. It was written inline here until 2026-08-29 and was
+            # extracted rather than copied, on the rule this codebase applies everywhere else:
+            # one question, one implementation.
+            envelope = preview_envelope(project_id, project, label=label)
         # The composer's geometry is the **preview's**, not the export's, and that is what makes
         # this the same look rather than the same numbers. `StageContext` describes the delivery
         # grid a treatment is composed for — `chroma_split` stores a fraction and turns it into
@@ -12183,6 +12487,70 @@ def create_app(
                 status_code=422,
                 detail=ASSEMBLY_EFFECTS_REFUSAL.format(shot=label, detail=refusal),
             ) from refusal
+        # **The one-sided transition, which is the seventh fingerprint slot's whole reason**
+        # (R-35, story 11.5). A Transition with no Overlap under it treats this Shot's own last
+        # frames and then cuts, and until this landed it was the one thing an export did that a
+        # preview did not -- named as a gap in `_compose_one_sided_transitions`' own docstring.
+        #
+        # **Composed by the export's own function, with the export's own clamp.** `clip_frames`
+        # is `frames`, which is `clip_frames_on_grid` over this Shot's window -- the same number
+        # the export hands it, because a Shot with a one-sided transition is provably unsplit
+        # (`_final_clip_index`: any later Shot overlapping it would have sent this boundary down
+        # the pair path). So the treatment starts on the same frame in both.
+        #
+        # **`None` covers three states and they are all correct as nothing.** No transition
+        # stored; an Overlap under this boundary, where the blend is a `TransitionClip` of its
+        # own and this Shot's clip carries no treatment at all; and a pair-only type left behind
+        # by a dragged-apart Overlap, which the export records as a refusal and renders untreated
+        # (FX-19, R-34). In every one of the three the picture is the picture this Shot already
+        # had, so the fingerprint must be the fingerprint it already had -- and it is, because
+        # `None` canonicalises to exactly what the empty slot has hashed since 2026-08-26.
+        #
+        # The catalogue's refusal is raised here for the reason a missing `.cube` is: the export
+        # refuses an unknown type by name at its plan stage (`_transition_catalogue_refusals`),
+        # and a preview that quietly rendered the untreated picture would be predicting an export
+        # that will not run.
+        ordered_for_boundary = ordered_shots(project)
+        boundary = next(
+            (
+                spot
+                for spot, item in enumerate(ordered_for_boundary)
+                if item.id == shot.id
+            ),
+            None,
+        )
+        one_sided = None
+        stored_transition = shot.transition_out.type if shot.transition_out else None
+        if stored_transition is not None and (
+            boundary is None
+            or not _boundary_is_overlapped(ordered_for_boundary, boundary)
+        ):
+            try:
+                one_sided = one_sided_transition_stages(
+                    stored_transition,
+                    clip_frames=frames,
+                    fps=ASSEMBLY_FPS,
+                    # The preview's own grid and the export's, which is `build_effect_stages`'
+                    # pair above and is here for the identical reason: `ONE_SIDED_BLUR_SIGMA` is
+                    # a count of pixels, so a ramp composed for the delivery width and rendered
+                    # at half of it would show a blur twice as heavy as the export will ship.
+                    width=width,
+                    reference_width=delivery[0],
+                )
+            except EffectRefusal as refusal:
+                raise HTTPException(
+                    status_code=422,
+                    detail=ASSEMBLY_TRANSITION_REFUSAL.format(shot=label, detail=refusal),
+                ) from refusal
+        if one_sided is not None:
+            # Appended **after** the Shot's whole look, on both groups, exactly as the export
+            # splices it: a transition treats the finished picture, and the `sendcmd` a blur ramp
+            # needs rides the end of `geometry` so it stays upstream of the filter it drives.
+            stages = EffectStages(
+                geometry=(*stages.geometry, *one_sided.geometry),
+                treatment=(*stages.treatment, *one_sided.treatment),
+                scripts=(*stages.scripts, *one_sided.scripts),
+            )
         # The name of the clip, taken over the chain composed above rather than over the
         # stack it was composed from. The stack is stored sparsely, so a corrected catalogue
         # default and a corrected composer both change the picture without changing a byte of
@@ -12222,7 +12590,22 @@ def create_app(
             envelope=envelope,
             shot_start=shot.start,
             clip_seconds=frames / ASSEMBLY_FPS,
-            transition=None,
+            # **The seventh slot, filled by the epic that reserved it.** It carries the composed
+            # stages rather than the stored type, which is the fourth slot's own rule applied to
+            # the same question: the name has to be a function of the picture, so a corrected
+            # ramp, a changed clamp or a different sigma at this geometry each move it, and a
+            # stored type that composes nothing does not. `None` for every Shot without one, and
+            # `_canonical(None)` is byte-for-byte what this slot has hashed since it was
+            # reserved -- so no clip cached before today is renamed by this (R-20).
+            #
+            # The scripts are absent for `boundary_fingerprint`'s reason: a `sendcmd` stage
+            # carries its script's filename and that filename carries a digest of the script's
+            # own text, so the ramp is already in `geometry` by name.
+            transition=(
+                None
+                if one_sided is None
+                else [list(one_sided.geometry), list(one_sided.treatment)]
+            ),
             # **Gated on `driven`, and that gate is the whole of this slot's meaning.** The song
             # is part of this picture's identity exactly when the picture asks the song a
             # question, and for an unbound Shot it never does: `build_effect_stages` ignores
@@ -12263,129 +12646,40 @@ def create_app(
         # fragment and is untouched by this.
         previews_root = (store.media_dir(project_id) / "previews").resolve()
         relative = f"previews/{fingerprint}.mp4"
-        clip = previews_root / f"{fingerprint}.mp4"
 
-        def answer(*, rendered: bool) -> ShotPreviewResponse:
-            return ShotPreviewResponse(
-                shot_id=shot.id,
-                fingerprint=fingerprint,
-                preview=relative,
-                preview_url=f"/api/projects/{project_id}/media/{relative}",
-                width=width,
-                height=height,
-                frames=frames,
-                window_seconds=frames / ASSEMBLY_FPS,
-                rendered=rendered,
-            )
-
-        # The cache, and the whole of it: the fingerprint names a file, and the file is either
-        # there or it is not. Deleting the folder costs a re-render and nothing else, and no
-        # export ever reads this directory — `exports/` is the assemble route's, and it builds
-        # its own intermediates from the approved takes every time.
-        if clip.is_file():
-            return answer(rendered=False)
-        previews_root.mkdir(parents=True, exist_ok=True)
-        renders = app.state.preview_renders
-        in_flight = renders.get(project_id)
-        # R-22, and the one comparison that decides between the two rules. A *different*
-        # fingerprint is a different picture, so the render underway is stale work and AD-24
-        # discards it. An *equal* fingerprint is this exact render, asked for twice — a retry, a
-        # poll, a re-render on window focus, or simply a second Shot whose look resolves to the
-        # same clip — and restarting it would throw away completed effort to produce a
-        # byte-identical answer. Worse, under identical requests arriving faster than a render
-        # completes, nothing would ever land at all. So it joins.
-        if in_flight is not None and in_flight.fingerprint == fingerprint:
-            # No supersede, no second ffmpeg, no scratch file, and nothing published by this
-            # request: it reads the outcome the render records and answers with it. The publish
-            # gate is untouched — a joiner can only ever be handed a clip that a render already
-            # renamed into the cache after finding `superseded` false.
-            waiter = in_flight.join()
-            if waiter is not None:
-                await waiter
-            if in_flight.published:
-                return answer(rendered=True)
-            if in_flight.superseded:
-                # What it was waiting for will never publish, so it is refused for the same
-                # reason and by the same sentence: something newer is the one that answers.
-                raise HTTPException(
-                    status_code=409, detail=PREVIEW_SUPERSEDED_REFUSAL.format(shot=label)
-                )
-            raise HTTPException(
-                status_code=502,
-                detail=PREVIEW_FAILED_ERROR.format(
-                    shot=label, detail=in_flight.error or PREVIEW_ABANDONED_DETAIL
-                ),
-            )
-        record = PreviewRender(token=new_id("preview"), fingerprint=fingerprint)
-        if in_flight is not None:
-            in_flight.supersede()
-        renders[project_id] = record
-        # Named by this render's own token and hidden by the leading dot, so a half-written file
-        # is neither a cache entry nor a collision with the render that replaced it. The cache is
-        # only ever entered by the rename at the end.
-        scratch = previews_root / f".{record.token}.mp4"
-        # The compiled drive scripts, into the cache folder this render is about to write its
-        # clip into, and read from there as bare relative names with ffmpeg's working directory
-        # set to it (R-30, `run_tool`'s `cwd`). Content-addressed like the clip beside them:
-        # the name carries a digest of the script's own text, so writing one that is already
-        # there rewrites identical bytes, and two Shots that compile the same drive share a file.
-        # Nothing here is a cache entry — the clip is named by the fingerprint and only the clip
-        # is served — and emptying the folder costs a re-render exactly as it did before.
-        for script in stages.scripts:
-            (previews_root / script.filename).write_text(script.text, encoding="utf-8")
-        try:
-            rc, _out, err = await run_tool(
-                trim_args(
-                    source,
-                    scratch,
-                    frames,
-                    width,
-                    height,
-                    offset=offset,
-                    preset=PREVIEW_PRESET,
-                    geometry_stages=stages.geometry,
-                    treatment_stages=stages.treatment,
-                ),
-                on_start=record.attach,
-                # Only when there is a script to read: an unbound Shot's preview spawns ffmpeg
-                # in this process's own directory, exactly as it did before this epic.
-                cwd=previews_root if stages.scripts else None,
-            )
-            if record.superseded:
-                # The gate. Whatever ffmpeg managed to write is deleted rather than published,
-                # so a render cancelled at any point — including one that finished before the
-                # kill landed — can never be served as the current picture.
-                scratch.unlink(missing_ok=True)
-                raise HTTPException(
-                    status_code=409, detail=PREVIEW_SUPERSEDED_REFUSAL.format(shot=label)
-                )
-            if rc != 0 or not scratch.is_file():
-                scratch.unlink(missing_ok=True)
-                record.error = err[-500:] if err else "no error output"
-                raise HTTPException(
-                    status_code=502,
-                    detail=PREVIEW_FAILED_ERROR.format(shot=label, detail=record.error),
-                )
-            # One atomic rename into the cache. A reader either sees no file or sees a complete
-            # one; there is no window in which a partial preview carries a fingerprint's name.
-            #
-            # Everything from `run_tool` returning to here is synchronous, and that is what lets
-            # a joiner trust `published`: no supersede can be interleaved between reading the
-            # gate and passing through it, so `published` is only ever true of a render that was
-            # never superseded.
-            scratch.replace(clip)
-            record.finish(published=True)
-            return answer(rendered=True)
-        finally:
-            # Only if this render is still the registered one. A superseded render must not
-            # clear the entry belonging to the render that replaced it.
-            if renders.get(project_id) is record:
-                del renders[project_id]
-            # Unconditional, and idempotent: whatever happened above — a publish, a refusal, a
-            # supersede, or an exception no branch here wrote — every joiner is released with
-            # the outcome that was recorded, or with `error=None` and `published=False`, which
-            # is the abandoned case and still an answer. Nothing waits forever.
-            record.finish(error=record.error)
+        # The cache, the supersede registry and the render, all of it `preview_into_cache`'s
+        # (AD-23, AD-24, R-22). It was written inline here until 2026-08-29 and was extracted
+        # rather than copied when the boundary preview needed the identical mechanism: two
+        # supersede registries for one project would each discard work the other was serving.
+        rendered = await preview_into_cache(
+            project_id,
+            label=label,
+            fingerprint=fingerprint,
+            previews_root=previews_root,
+            scripts=stages.scripts,
+            argv=lambda scratch: trim_args(
+                source,
+                scratch,
+                frames,
+                width,
+                height,
+                offset=offset,
+                preset=PREVIEW_PRESET,
+                geometry_stages=stages.geometry,
+                treatment_stages=stages.treatment,
+            ),
+        )
+        return ShotPreviewResponse(
+            shot_id=shot.id,
+            fingerprint=fingerprint,
+            preview=relative,
+            preview_url=f"/api/projects/{project_id}/media/{relative}",
+            width=width,
+            height=height,
+            frames=frames,
+            window_seconds=frames / ASSEMBLY_FPS,
+            rendered=rendered,
+        )
 
     @app.post("/api/projects/{project_id}/assemble", response_model=AssemblyResponse)
     async def assemble_project(

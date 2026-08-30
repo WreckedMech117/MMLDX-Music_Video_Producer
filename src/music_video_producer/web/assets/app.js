@@ -3021,6 +3021,12 @@ function effectsPanel(shot) {
   // failure.
   const transitions = transitionRows(state.project, shot, transitionCatalogue, {
     error: transitionCatalogueError,
+    // `song` for the reason `shotPreviewWanted` takes one: a boundary whose legs carry a
+    // Parameter Binding is a picture of the measurement, so the key the blend is asked under
+    // carries the song's fingerprint. Left out, a re-analysed song would move the server's
+    // fingerprint and not this key, and the clip in hand would read as current against a blend
+    // nobody re-asked for -- the disagreement Epic 10 paid for once already.
+    song: state.project?.song || null,
   });
   const refusal = effectsRefusalNotice(shot.id, lastEffectsRefusal);
   // The last copy's report, in the readiness idiom the refusal above already uses. Counts for
@@ -3108,7 +3114,22 @@ function transitionRowsHtml(transitions) {
     const note = row.note
       ? `<p class="control-reason" id="${row.control}-note">${escapeHtml(row.note)}</p>`
       : "";
-    return `<div class="transition-row" data-edge="${row.edge}" data-state="${row.state}"><div class="transition-head"><label for="${row.control}">${escapeHtml(row.label)}</label>${length}</div><select id="${row.control}" data-side="${row.side}" ${row.disabled ? "disabled" : ""}>${unknown}${options}</select>${note}</div>`;
+    // **The blend, watchable** (FX-21, story 11.5). A boundary with an Overlap and a type gets a
+    // control that plays the outgoing Shot, the transition and the incoming Shot as one piece;
+    // every other boundary gets the sentence saying *which* absence it is, and gets it only where
+    // the row is not already saying it (`transitionRows`, `previewNote`).
+    //
+    // A `<video>` beside the select rather than in the Monitor. The Monitor is bound to the
+    // playhead and to one Shot, and a boundary is neither -- and this is the moment a Director is
+    // choosing a type, with the twelve names an arm's length away, which is the whole complaint
+    // the story is about.
+    const preview = row.preview?.wanted
+      ? `<div class="transition-preview" id="${row.control}-preview"><button type="button" class="ghost" id="${row.control}-watch" data-shot="${escapeHtml(row.preview.shotId)}">${escapeHtml(TRANSITION_WATCH_CONTROL)}</button><video id="${row.control}-clip" muted loop playsinline preload="none"></video></div>`
+      : "";
+    const previewNote = row.previewNote
+      ? `<p class="control-reason" id="${row.control}-preview-note">${escapeHtml(row.previewNote)}</p>`
+      : "";
+    return `<div class="transition-row" data-edge="${row.edge}" data-state="${row.state}"><div class="transition-head"><label for="${row.control}">${escapeHtml(row.label)}</label>${length}</div><select id="${row.control}" data-side="${row.side}" ${row.disabled ? "disabled" : ""}>${unknown}${options}</select>${note}${previewNote}${preview}</div>`;
   }).join("");
   return `<div class="transition-pair"><span class="effect-family">TRANSITIONS</span>${rows}</div>`;
 }
@@ -3151,6 +3172,73 @@ async function writeEffectStack(shotId, next) {
   // Either way: the clip's chip, the tab's count and every card redraw from what is stored.
   renderTimeline();
   return landed;
+}
+
+//: What the control that plays a blend is called. A verb, because it is the only thing on this
+//: row that does something rather than stating something.
+const TRANSITION_WATCH_CONTROL = "Watch blend";
+
+//: What the button says while its clip is being rendered, and after a refusal. The refusal itself
+//: is toasted whole, exactly as a Shot preview's is: an ffmpeg failure is five hundred characters
+//: and a button is three words.
+const TRANSITION_WATCHING_CONTROL = "Rendering…";
+
+// The blend, rendered and played beside the control that chose it (story 11.5).
+//
+// **The key comes from `boundaryPreviewWanted` and the fingerprint comes back from the route**,
+// which is `previewAdoption`'s division one subject over: this side decides *whether to ask* from
+// the inputs a Director just touched, and the server's fingerprint decides whether the answer is
+// a different picture. The two are one rule -- `api.BOUNDARY_KEY_INPUTS` plus
+// `api.BOUNDARY_KEY_UNSEEN` is `effects.BOUNDARY_FINGERPRINT_INPUTS`, held by a test that
+// compares the two engines' answers.
+//
+// **Asked on the gesture, never on a redraw.** A Shot preview is asked for whenever the Monitor
+// wants one, because it *is* the Monitor's picture. A boundary clip is not on screen until a
+// Director asks to watch one, so rendering every boundary in the plan on every panel repaint
+// would spend the budget on pictures nobody is looking at.
+async function watchBoundaryBlend(control, video, shotId) {
+  if (!requireProject()) return false;
+  const projectId = state.project.id;
+  const was = control.textContent;
+  control.disabled = true;
+  control.textContent = TRANSITION_WATCHING_CONTROL;
+  try {
+    const answer = await api.boundaryPreview(projectId, shotId);
+    if (state.project?.id !== projectId) return false;
+    // `previewAdoption`'s comparison, on the element that is holding the clip: an equal
+    // fingerprint is the clip already loaded, and reloading a video element to arrive at the
+    // same frames is how a swap that had nothing to swap flashes black.
+    if (video.dataset.fingerprint !== answer.fingerprint) {
+      video.dataset.fingerprint = answer.fingerprint;
+      video.src = answer.preview_url;
+      video.load();
+    }
+    video.currentTime = 0;
+    const played = video.play();
+    if (played?.catch) played.catch(() => {});
+    // **Scrolled to, because it lands below the fold.** The Effects tab is a scrolling rail and
+    // the transition rows are the bottom of it, so a full-width clip appearing there is drawn
+    // off-screen -- measured in the browser on 2026-08-29, and it is the same class as the band
+    // panel's 225px below the fold, which read as a layout fault until it was measured. `nearest`
+    // scrolls the rail by the least that makes the picture whole and moves nothing else.
+    //
+    // On `loadeddata` rather than now: the element has no height until it has decoded a frame, so
+    // scrolling here would scroll to a zero-height box and leave the picture below the fold again.
+    video.addEventListener(
+      "loadeddata", () => video.scrollIntoView({ block: "nearest" }), { once: true },
+    );
+    if (video.readyState >= 2) video.scrollIntoView({ block: "nearest" });
+    return true;
+  } catch (error) {
+    if (state.project?.id !== projectId) return false;
+    // The route's own sentence, whole and unparaphrased -- the five absences each name which
+    // absence they are, and a paraphrase here would be a second wording of one condition.
+    toast(error.message, "error");
+    return false;
+  } finally {
+    control.disabled = false;
+    control.textContent = was;
+  }
 }
 
 // One side of a Transition Pair written, through the one route that writes either field (AD-16).
@@ -3475,6 +3563,17 @@ function bindEffectsPanel(inspector, shot, model, transitions) {
     $("#" + row.control, inspector)?.addEventListener("change", (event) => {
       writeShotTransition(shotId, row.side, event.target.value);
     });
+    // The blend's own control, bound only where one was drawn. The **outgoing** Shot travels on
+    // the element rather than being re-derived here: a `Transition in` row names the seam with
+    // the Shot *before* this one, so the request is addressed to that Shot, which is AD-30's
+    // authoritative side and not the one the panel is open on.
+    const watch = $("#" + row.control + "-watch", inspector);
+    const clip = $("#" + row.control + "-clip", inspector);
+    if (watch && clip) {
+      watch.addEventListener("click", () => {
+        watchBoundaryBlend(watch, clip, watch.dataset.shot || shotId);
+      });
+    }
   }
   // Whatever the last render left the strip holding is gone: this render decides again whether
   // there is a strip at all, and a view left over from another Shot's panel would repaint one
@@ -5796,7 +5895,7 @@ const previewSpareName = () => (monitorPreviewLayer === "a" ? "b" : "a");
 // safe to ask twice" is not a reason to ask twice.
 function ensureMonitorPreview(view) {
   if (!state.project || !monitorShowsTake(view)) return;
-  const wanted = shotPreviewWanted(view.shot, state.project?.song);
+  const wanted = shotPreviewWanted(view.shot, state.project?.song, state.project?.shots);
   if (!wanted.wanted) return;
   // Already holding a clip of exactly this look, already asking for it, or already told why it
   // cannot be made. The last is what stops a deleted `.cube` from being re-asked about on every
@@ -6135,8 +6234,13 @@ function syncMonitor() {
     // A bound Shot's preview is a picture of the measurement, so the key this compares by
     // has to carry the song the same way the request's key does.
     song: state.project?.song,
+    // And the plan, for the same reason one level over: a Shot's own picture carries its
+    // one-sided transition, and whether a transition is one-sided is a fact about the
+    // *next* Shot's window rather than about this one (story 11.5).
+    shots: state.project?.shots,
     failed: previewProblem?.shotId === shotId
-      && previewProblem?.key === shotPreviewWanted(settled.shot, state.project?.song).key,
+      && previewProblem?.key === shotPreviewWanted(
+        settled.shot, state.project?.song, state.project?.shots).key,
     // What the Director is actually looking at, and only when it belongs to *this* Shot. A clip
     // left on a layer by the previous Shot is not a picture of this one at any staleness, and
     // `paintMonitorPreview` hides it for the same reason.

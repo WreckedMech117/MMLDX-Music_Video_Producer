@@ -1195,6 +1195,18 @@ dialog p { color: var(--muted); line-height: 1.5; }
 .transition-row[data-edge="blue"] .transition-length { color: var(--blue); }
 .transition-row select { width: 100%; margin-top: 5px; }
 .transition-row .control-reason { margin: 6px 0 0; }
+/* The blend, watchable beside the control that chose it (story 11.5). The video is drawn only
+   once a clip has been loaded onto it -- an empty element with a border would read as a picture
+   that failed rather than one nobody has asked for yet.
+
+   **The clip takes its own row, and that was found by looking.** Beside the button in a 236px
+   rail it left about a hundred pixels for a two-word label, which wrapped `Watch blend` onto two
+   lines and squeezed the blend into a 128px strip -- a preview too small to judge a transition
+   by, which is the one thing it is for. `flex-wrap` with a full-width basis keeps the button at
+   its natural size and gives the picture the whole rail. */
+.transition-preview { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 6px; }
+.transition-preview video { display: none; flex: 1 1 100%; width: 100%; border: 1px solid var(--line); border-radius: var(--radius); background: #000; }
+.transition-preview video[src] { display: block; }
 @media (max-width: 1180px) {
   .topbar { grid-template-columns: 220px minmax(170px, 1fr) auto; }
   .transport-mini { display: none; }

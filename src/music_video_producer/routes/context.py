@@ -28,14 +28,21 @@ chosen over the alternatives:
   `dependency_overrides` to keep those doubles apart. That is a behaviour change wearing a
   refactor's clothes.
 
-**Adding a field is the deliberate act.** Eleven of the fields below are helpers `create_app`
-builds once and shares; there is still exactly one of each, passed rather than rebuilt, which
-is the single-implementation rule this repository enforces everywhere else. A route that finds
-it needs a twelfth should ask whether the helper belongs to one resource -- in which case it
-belongs in that module, not here. The eleventh, `song_envelope_report`, is the test of that
-question: it was added when the envelope route and the timeline's snap-targets read both left
-the factory, and it is here rather than in either module because *both* of them read it and
-neither owns it.
+**Adding a field is the deliberate act.** ~~Eleven~~ **Sixteen** of the fields below are helpers
+`create_app` builds once and shares; there is still exactly one of each, passed rather than
+rebuilt, which is the single-implementation rule this repository enforces everywhere else. A
+route that finds it needs a ~~twelfth~~ **seventeenth** should ask whether the helper belongs to one
+resource -- in which case it belongs in that module, not here. The eleventh,
+`song_envelope_report`, is the test of that question: it was added when the envelope route and
+the timeline's snap-targets read both left the factory, and it is here rather than in either
+module because *both* of them read it and neither owns it.
+
+*Five added 2026-08-29 by story 11.5*, and they pass the same test: `take_measurement`,
+`preview_assembly`, `preview_envelope`, `preview_into_cache` and `preview_side`
+are read by the Shot preview, which
+`app.py` holds, and by the boundary preview, which `routes/shots.py` holds. Neither route owns
+them, and the alternative -- a second copy of AD-29's "the export's own geometry" rule in the
+second module -- is precisely the drift this file exists to make visible.
 
 Frozen, because none of it is state. The mutable state this application keeps lives on
 `app.state` -- the live-render progress map, the preview registry, the set of running exports
@@ -95,3 +102,14 @@ class RouterContext:
     song_envelope_report: Callable[..., Any]
     discovered_looks: Callable[..., Any]
     run_tool: Callable[..., Any]
+    #: The four preview helpers, shared by the Shot preview -- pinned in `app.py` by the tests
+    #: that monkeypatch its neighbours -- and the boundary preview, which is a new route and
+    #: therefore lives in `routes/shots.py`. They are here for `song_envelope_report`'s reason
+    #: and it is the same reason: **two resources read them and neither owns them**. A preview
+    #: geometry re-derived in the second module would be AD-29 stated twice, and the second copy
+    #: is the one that stops following the export.
+    take_measurement: Callable[..., Any]
+    preview_assembly: Callable[..., Any]
+    preview_envelope: Callable[..., Any]
+    preview_into_cache: Callable[..., Any]
+    preview_side: Callable[..., Any]

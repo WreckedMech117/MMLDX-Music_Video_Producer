@@ -23,7 +23,14 @@ from fastapi.responses import FileResponse
 from ..app import (
     APPROVE_IN_FLIGHT_REFUSAL,
     APPROVE_NO_TAKE_REFUSAL,
+    ASSEMBLY_EFFECTS_REFUSAL,
+    ASSEMBLY_TRANSITION_REFUSAL,
     BINDING_CARRIER_SHOT,
+    BOUNDARY_PREVIEW_NO_NEIGHBOUR_REFUSAL,
+    BOUNDARY_PREVIEW_NO_OVERLAP_REFUSAL,
+    BOUNDARY_PREVIEW_NO_TRANSITION_REFUSAL,
+    BOUNDARY_PREVIEW_REFUSED_BY_PLAN,
+    BOUNDARY_PREVIEW_TAKE_MISSING_REFUSAL,
     ENHANCE_IN_FLIGHT_REFUSAL,
     ENHANCE_MISSING_TAKE_REFUSAL,
     ENHANCE_NO_TAKE_REFUSAL,
@@ -37,6 +44,7 @@ from ..app import (
     EXPAND_PROMPTS_MESSAGE,
     EXPAND_PROMPTS_WITHOUT_SHOTS,
     H3_KEYFRAME_MODES,
+    PREVIEW_NO_GEOMETRY_REFUSAL,
     PROJECT_CHANGED_REFUSAL,
     RESTORE_AUDIO_IN_FLIGHT_REFUSAL,
     RESTORE_AUDIO_LENGTH_TOLERANCE,
@@ -73,6 +81,7 @@ from ..app import (
     TAKE_NOT_RENDERED_REFUSAL,
     UNAPPROVE_NOT_APPROVED_REFUSAL,
     AudioRestoreResponse,
+    BoundaryPreviewResponse,
     SelectTakeRequest,
     ShotBindingsRequest,
     ShotDriveBinding,
@@ -90,6 +99,7 @@ from ..app import (
     _adopt_expansion_maps,
     _adopt_shot_effects,
     _adopt_shot_transitions,
+    _boundary_is_overlapped,
     _names_an_undiscovered_look,
     _require_approval_unchanged,
     _require_in_flight_status_kept,
@@ -112,7 +122,13 @@ from ..app import (
 from ..assembly import (
     ASSEMBLY_FPS,
     BOUNDARY_TOLERANCE_SECONDS,
+    PREVIEW_PRESET,
+    TRANSITION_PREVIEW_MARGIN_FRAMES,
+    ClipWindow,
+    TransitionChoice,
+    TransitionClip,
     clip_frames_on_grid,
+    transition_segment_args,
 )
 from ..batch import PENDING_SUBMISSION_PROMPT_ID, accept_submission, prompt_is_missing, shot_label
 from ..comfy import ComfyError
@@ -122,6 +138,9 @@ from ..effects import (
     TRANSITION_CATALOGUE,
     TRANSITION_PAIR_ONLY_REFUSAL,
     EffectRefusal,
+    EffectStages,
+    boundary_fingerprint,
+    build_effect_stages,
     drive_readout,
     transition_definition,
     validate_stack,
@@ -168,6 +187,12 @@ def register(ctx: RouterContext) -> None:
     settle_unsubmitted_jobs = ctx.settle_unsubmitted_jobs
     song_envelope_report = ctx.song_envelope_report
     store = ctx.store
+    # The preview helpers this module shares with `app.py`'s pinned Shot preview. See
+    # `RouterContext` for why they are fields rather than a second copy in here.
+    preview_assembly = ctx.preview_assembly
+    preview_envelope = ctx.preview_envelope
+    preview_into_cache = ctx.preview_into_cache
+    preview_side = ctx.preview_side
 
     @app.put("/api/projects/{project_id}/shots", response_model=Project)
     def replace_shots(project_id: str, request: ShotListRequest) -> Project:
@@ -1004,6 +1029,339 @@ def register(ctx: RouterContext) -> None:
             elif side == "transition_in" and position > 0:
                 ordered[position - 1].transition_out = value
         return store.save(project)
+
+
+    def _margin_frames(plan, spot: int, shot_id: str) -> int:
+        """How many frames of one Shot's own clip sit beside a transition entry at `spot`.
+
+        The ceiling is `TRANSITION_PREVIEW_MARGIN_FRAMES` and the floor is what the Shot actually
+        has there. **Read off `plan.frames`, which is the only source that has already survived
+        `assembly_refusals`** -- so a leg is never asked for frames its take does not hold, which
+        is the negative-trim failure `take_cut_refusal` exists for and which ffmpeg answers at
+        rc 0 with a picture of the wrong seconds.
+
+        `0` for a neighbour that is not this Shot's own `ClipWindow`: a transition entry beside
+        another transition entry, or beside a third Shot's clip, has nothing of *this* Shot to
+        show. The boundary is still previewable -- the blend itself is always there -- it simply
+        has no lead or no tail on that side.
+        """
+        if spot < 0 or spot >= len(plan.clips):
+            return 0
+        entry = plan.clips[spot]
+        if not isinstance(entry, ClipWindow) or entry.shot_id != shot_id:
+            return 0
+        return max(0, min(TRANSITION_PREVIEW_MARGIN_FRAMES, plan.frames[spot]))
+
+    @app.post(
+        "/api/projects/{project_id}/shots/{shot_id}/boundary-preview",
+        response_model=BoundaryPreviewResponse,
+    )
+    async def render_boundary_preview(
+        project_id: str, shot_id: str
+    ) -> BoundaryPreviewResponse:
+        """One boundary, previewed: the outgoing Shot, the blend and the incoming Shot as **one
+        continuous piece**, at half the export's size (FX-21, story 11.5).
+
+        **Its own route and its own key, which is R-35** and is the whole shape of this story.
+        `effects.preview_fingerprint` takes one take and one window and its docstring asserts as an
+        invariant that a preview is *"never one half of a resolved overlap"* -- which this is
+        exactly two of. Widening it was rejected on a measurement rather than on taste: an input
+        added there that does not canonicalise to nothing when absent renames every cached clip in
+        every project on merge day, and Epic 10 already paid for the version of that where the
+        client's key and the server's fingerprint disagreed and the Monitor went on showing a
+        picture driven by a song the project no longer had.
+
+        **Named by the outgoing Shot**, because AD-30 makes `transition_out` on the earlier Shot
+        authoritative and the later Shot's `transition_in` a mirror that decides nothing. A route
+        addressed by the incoming side would be addressed by the field the export never reads.
+
+        **The blend is the export's own, and it is the export's own by construction rather than by
+        care.** The plan comes from `preview_assembly`, which calls `assembly_plan` -- so which
+        boundaries became a `TransitionClip` at all, how many frames the blend is, and which take
+        seconds each leg reads are the export's answers, not a second arithmetic for the same
+        question. The argv comes from `assembly.transition_segment_args`, the export's own
+        builder, with `lead_frames` and `tail_frames` that default to nothing there; and the
+        `xfade` clause is written by `assembly.xfade_stage` for both, so *"the transition previewed
+        is the export's, by name and by duration"* (FX-NFR-3) is a string comparison rather than a
+        reading of two builders.
+
+        **Both legs compose their own Shot's effects, in their own leg namespace** (R-41). Two
+        graded Shots blending ungraded pictures would not match the clips on either side of the
+        seam, and without the prefix both legs -- which each start at chain slot 0 -- would emit
+        duplicate filtergraph labels and, for two bound Shots, one `sendcmd` target driving both,
+        which is silent at rc 0.
+
+        **The absence says which absence it is.** Five states have no blend to look at and each
+        has its own sentence: nothing follows this Shot; the two Shots do not overlap, so the
+        transition is one-sided and this Shot's *own* preview is the picture of it; they overlap
+        with nothing chosen, so the boundary is a hard cut; the plan refused the geometry (R-37),
+        reported in the plan's own words; or one of the two takes could not be read.
+
+        **One manifest read, and no re-read after the probes.** `render_shot_preview` re-reads,
+        because its window and its stack are read separately and a slider moved in between would
+        name a clip after a look nobody is looking at. Here the plan *is* the read: the windows
+        the probes were taken against and the stacks the chains are composed from come out of one
+        manifest, so the name describes the picture that was rendered. A change landing during the
+        probes is answered by the next request, under a key that has moved.
+        """
+        project = get_project(project_id)
+        shot = next((item for item in project.shots if item.id == shot_id), None)
+        if not shot:
+            raise HTTPException(status_code=404, detail="Shot not found")
+        label = shot_label(project, shot)
+        ordered = ordered_shots(project)
+        position = next(
+            (spot for spot, item in enumerate(ordered) if item.id == shot.id), None
+        )
+        if position is None or position + 1 >= len(ordered):
+            raise HTTPException(
+                status_code=422,
+                detail=BOUNDARY_PREVIEW_NO_NEIGHBOUR_REFUSAL.format(shot=label),
+            )
+        after = ordered[position + 1]
+        after_label = shot_label(project, after)
+        # The one arithmetic three other places already use -- `assembly._paired_transitions`,
+        # `app._compose_one_sided_transitions` and `replace_shot_transitions` -- rather than a
+        # fourth spelling of "do these two overlap".
+        if not _boundary_is_overlapped(ordered, position):
+            raise HTTPException(
+                status_code=422,
+                detail=BOUNDARY_PREVIEW_NO_OVERLAP_REFUSAL.format(
+                    before=label, after=after_label
+                ),
+            )
+        stored = shot.transition_out.type if shot.transition_out else ""
+        if not stored:
+            raise HTTPException(
+                status_code=422,
+                detail=BOUNDARY_PREVIEW_NO_TRANSITION_REFUSAL.format(
+                    before=label, after=after_label
+                ),
+            )
+        try:
+            entry = transition_definition(stored)
+        except EffectRefusal as refusal:
+            raise HTTPException(
+                status_code=422,
+                detail=ASSEMBLY_TRANSITION_REFUSAL.format(shot=label, detail=refusal),
+            ) from refusal
+        # Every boundary the catalogue agrees to, so the plan below is the plan the export builds
+        # rather than a plan holding one transition. It matters for the frame counts: an Overlap
+        # earlier in the song splits a clip this boundary's lead is measured against.
+        #
+        # A type the catalogue does not know is **skipped here and refused above**, and the two
+        # are not the same rule read twice. The export refuses outright over an unknown type
+        # anywhere in the project (`_transition_catalogue_refusals`); refusing to *look at* a
+        # perfectly good boundary because some other Shot holds a bad value would make a Director
+        # unable to see the transition they are being asked to fix.
+        choices: dict[str, TransitionChoice] = {}
+        for item in ordered:
+            if not item.transition_out:
+                continue
+            try:
+                known = transition_definition(item.transition_out.type)
+            except EffectRefusal:
+                continue
+            choices[item.id] = TransitionChoice(
+                transition_id=known.transition_id, xfade=known.xfade
+            )
+        plan = await preview_assembly(project, choices)
+        if plan is None:
+            raise HTTPException(
+                status_code=422, detail=PREVIEW_NO_GEOMETRY_REFUSAL.format(shot=label)
+            )
+        index = next(
+            (
+                spot
+                for spot, item in enumerate(plan.clips)
+                if isinstance(item, TransitionClip) and item.before.shot_id == shot.id
+            ),
+            None,
+        )
+        if index is None:
+            # R-37's refusals, whole. The plan says why a boundary the manifest asked to blend
+            # stayed a hard cut, and that sentence is the one the export records on
+            # `ExportLook.transitions` -- reworded here it would be this application holding two
+            # opinions about one geometry. Nothing matching means the pair is not in the plan at
+            # all, which is a take that could not be read.
+            detail = next(
+                (line for line in plan.transition_refusals if label in line), ""
+            )
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    BOUNDARY_PREVIEW_REFUSED_BY_PLAN.format(
+                        before=label, after=after_label, detail=detail
+                    )
+                    if detail
+                    else BOUNDARY_PREVIEW_TAKE_MISSING_REFUSAL.format(
+                        before=label, after=after_label
+                    )
+                ),
+            )
+        segment = plan.clips[index]
+        blend_frames = plan.frames[index]
+        # The lead is clamped twice, and **the second clamp is provably redundant today**. The
+        # leg's trim starts at `round(offset * fps) - lead`, so a lead deeper than the take offset
+        # would ask for a negative start frame -- and `trim_args` discards a negative trim in
+        # silence, which is the defect measured on this route's sibling in Epic 9: three
+        # fingerprints over one byte-identical file, every one of them starting at frame 0.
+        #
+        # **Recorded as redundant rather than left implying it is load-bearing, because a mutation
+        # survived it.** `segment.before.offset` is the Shot's own offset plus the seconds from
+        # its start to the Overlap's, and `_margin_frames` is bounded by
+        # `clip_frames_on_grid(shot.start, overlap_start)` -- the same seconds on the same grid.
+        # So the first is never smaller than the second unless the Shot's own offset is
+        # **negative**, and `assembly.take_cut_refusal` has already refused every clip whose cut
+        # begins before its take. There is no state that reaches this `min`, and no test can kill
+        # it. It is kept for `_final_clip_index`'s reason -- it costs nothing, it says what the
+        # number *means*, and it is the line that stays correct if `_margin_frames` ever stops
+        # being measured against the Shot's own start.
+        lead_frames = min(
+            _margin_frames(plan, index - 1, shot.id),
+            round(segment.before.offset * ASSEMBLY_FPS),
+        )
+        tail_frames = _margin_frames(plan, index + 1, after.id)
+        width, height = preview_side(plan.width), preview_side(plan.height)
+        legs = (
+            ("A", segment.before, lead_frames, 0),
+            ("B", segment.after, 0, tail_frames),
+        )
+        by_id = {item.id: item for item in project.shots}
+        stacks = [
+            [spec.model_dump() for spec in by_id[clip.shot_id].effects]
+            for _leg, clip, _lead, _tail in legs
+        ]
+        looks = discovered_looks() if any(stacks) else ()
+        # The envelope, for a boundary either of whose Shots carries a Parameter Binding and for
+        # no other -- `render_shot_preview`'s gate, asked through the same helper so the two
+        # cannot come to different answers about one measurement.
+        driven = any(stack_is_driven(stack) for stack in stacks)
+        envelope = (
+            preview_envelope(project_id, project, label=segment.label)
+            if driven
+            else None
+        )
+        chains: list[EffectStages] = []
+        for (leg, clip, lead, tail), stack in zip(legs, stacks, strict=True):
+            try:
+                chains.append(
+                    build_effect_stages(
+                        stack,
+                        width=width,
+                        height=height,
+                        luts=looks,
+                        # The **export's** width, so the five pixel-denominated parameters know
+                        # this grid is half the one their numbers were written for. Identical to
+                        # the Shot preview's argument and for the identical reason.
+                        reference_width=plan.width,
+                        # Where this leg's first frame sits inside its own Shot. The blend's own
+                        # leg is `clip.start - clip.approved_start`, which is what the export
+                        # passes; the lead moves the outgoing leg's first frame that many frames
+                        # earlier, so a time-dependent stage carries on across the seam instead of
+                        # restarting inside the blend.
+                        clip_offset=clip.start
+                        - clip.approved_start
+                        - lead / ASSEMBLY_FPS,
+                        shot_seconds=clip.approved_duration,
+                        envelope=envelope,
+                        shot_start=clip.approved_start,
+                        # The frames ffmpeg will actually write for this leg, so a compiled
+                        # `sendcmd` cannot carry a command past the last one.
+                        clip_seconds=(lead + blend_frames + tail) / ASSEMBLY_FPS,
+                        leg=leg,
+                    )
+                )
+            except EffectRefusal as refusal:
+                raise HTTPException(
+                    status_code=422,
+                    detail=ASSEMBLY_EFFECTS_REFUSAL.format(
+                        shot=clip.label, detail=refusal
+                    ),
+                ) from refusal
+        fingerprint = boundary_fingerprint(
+            takes=[segment.before.approved_output, segment.after.approved_output],
+            window_start=segment.start,
+            lead_frames=lead_frames,
+            blend_frames=blend_frames,
+            tail_frames=tail_frames,
+            offsets=[segment.before.offset, segment.after.offset],
+            chains=chains,
+            # The **stored** binding spec of every card of both legs, in leg order and then in
+            # stack order, and `()` when nothing is driven -- `preview_fingerprint`'s fifth slot
+            # exactly, including why the empty case is `()` rather than a shape full of empties.
+            bindings=(
+                tuple(
+                    tuple(
+                        tuple(dict(binding) for binding in spec.get("bindings") or ())
+                        for spec in stack
+                    )
+                    for stack in stacks
+                )
+                if envelope is not None
+                else ()
+            ),
+            song_fingerprint=(
+                project.song.analysis.song_fingerprint
+                if driven and project.song and project.song.analysis
+                else ""
+            ),
+            transition=entry.transition_id,
+            xfade=entry.xfade,
+            width=width,
+            height=height,
+        )
+        previews_root = (store.media_dir(project_id) / "previews").resolve()
+        relative = f"previews/{fingerprint}.mp4"
+        frames = lead_frames + blend_frames + tail_frames
+        rendered = await preview_into_cache(
+            project_id,
+            label=segment.label,
+            fingerprint=fingerprint,
+            previews_root=previews_root,
+            scripts=tuple(
+                script for chain in chains for script in chain.scripts
+            ),
+            argv=lambda scratch: transition_segment_args(
+                segment.before.source,
+                segment.after.source,
+                scratch,
+                blend_frames,
+                width,
+                height,
+                entry.xfade,
+                before_offset=segment.before.offset,
+                after_offset=segment.after.offset,
+                preset=PREVIEW_PRESET,
+                before_geometry=chains[0].geometry,
+                before_treatment=chains[0].treatment,
+                after_geometry=chains[1].geometry,
+                after_treatment=chains[1].treatment,
+                lead_frames=lead_frames,
+                tail_frames=tail_frames,
+            ),
+        )
+        return BoundaryPreviewResponse(
+            shot_id=shot.id,
+            after_shot_id=after.id,
+            fingerprint=fingerprint,
+            preview=relative,
+            preview_url=f"/api/projects/{project_id}/media/{relative}",
+            width=width,
+            height=height,
+            frames=frames,
+            window_seconds=frames / ASSEMBLY_FPS,
+            lead_frames=lead_frames,
+            blend_frames=blend_frames,
+            tail_frames=tail_frames,
+            transition=entry.transition_id,
+            # The blend's own length on the assembly grid, which is the Overlap's length
+            # quantised the one way the export quantises it (`clip_frames_on_grid`). **Not a
+            # second number**: the transition row's readout and this come out of one Overlap, and
+            # a client that drags the Overlap longer moves both.
+            transition_seconds=blend_frames / ASSEMBLY_FPS,
+            rendered=rendered,
+        )
 
     @app.put(
         "/api/projects/{project_id}/shots/{shot_id}/effects/{index}/bindings",

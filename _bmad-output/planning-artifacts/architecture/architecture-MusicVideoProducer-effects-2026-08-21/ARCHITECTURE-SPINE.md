@@ -314,6 +314,55 @@ Binding, read-only. Not re-derived here.
 >
 > **The known boundary, measured rather than left to be discovered:** a LUT's *file content* is still outside the fingerprint. Rewriting a `.cube` in place leaves the cached clip served. Closing that means hashing every referenced look on every request, including cache hits, and bypassing the held listing that exists so a picker does not re-read a 44 MB folder — measured at 0.56 ms for a 33-cube and 4.24 ms for a 64-cube against a ~116 ms render. Named in `preview_fingerprint`'s docstring so the next reader inherits the measurement.
 
+> **Amended 2026-08-29 by story 11.5, on both halves of the title and by this AD's own rule.**
+>
+> **The seventh slot no longer holds nothing.** `transition` is populated for a Shot whose stored
+> transition has **no Overlap under it** — the one-sided treatment `effects.one_sided_transition_stages`
+> composes — and it holds **what that composition produced**, not the stored type. That is the
+> fourth slot's 2026-08-26 correction applied to the same question: a corrected ramp, a changed
+> clamp or a different sigma at this geometry each move the picture, so each must move the name,
+> and a stored type that composes nothing must not. Three states hash as absent and all three are
+> right: no transition; a **paired** transition, whose blend is a `TransitionClip` of its own and
+> whose outgoing Shot's clip carries no treatment at all; and a **pair-only** type left behind by
+> a dragged-apart Overlap, which composes nothing and renders untreated (FX-19, R-34). Verified
+> byte-for-byte against `3322ace` rather than argued: two digests over fixed arguments, identical
+> before and after, pinned in `test_a_shot_with_no_transition_is_named_exactly_as_it_was_at_3322ace`.
+>
+> **And there are now two fingerprint functions, which is a change to this AD's title.** R-35
+> settled it before the story started and the reason is in this AD rather than only in that
+> ruling: `preview_fingerprint` takes **one** take and one window, and its docstring asserts as an
+> invariant that a preview is *"never one half of a resolved overlap"* — which a boundary preview
+> is exactly two halves of. Widening it would have added inputs that cannot canonicalise to
+> nothing when absent (a second take, a second offset, a second chain), and this AD's whole
+> amendment history is the cost of a payload that moved: every clip in every `previews/` folder on
+> the machine renamed at once, for pictures that did not change.
+>
+> So `effects.boundary_fingerprint` is a second function over its own ordered list,
+> `BOUNDARY_FINGERPRINT_INPUTS = ("takes", "window", "offsets", "chains", "bindings", "song",
+> "transition", "geometry")`. **What this AD actually protects is unchanged and is now enforced
+> rather than asserted:** one rule per subject, enumerated, and the two engines held to it. The
+> client's `api.BOUNDARY_KEY_INPUTS` plus `api.BOUNDARY_KEY_UNSEEN` must equal that tuple in that
+> order, and `test_the_client_and_the_server_enumerate_one_boundary_key` fails otherwise — so a
+> ninth input cannot ship until the browser either keys it or writes down that it cannot see it.
+> That guard is the thing nobody had when `previewInputKey` and `preview_fingerprint` disagreed for
+> a whole epic, and it is the part of this amendment worth carrying forward.
+>
+> **One difference from `preview_fingerprint`, deliberately:** the boundary's chains arrive
+> **already composed**. That function composes the stack itself so the name cannot describe a
+> picture the route did not render; here the route composes each leg once, with its leg prefix
+> (R-41), and hands the same objects to ffmpeg and to the fingerprint. Two compositions cannot
+> disagree when there is only one.
+
+> **Extended 2026-08-29 by story 11.5.** The `previews/` folder now holds two kinds of clip — a
+> Shot's own window and a **boundary** spanning two Shots — named by two fingerprint functions
+> (AD-28's 2026-08-29 amendment) into one flat directory. Nothing else changes: a name either
+> exists on disk or it does not, a stale entry is inert, and emptying the folder costs a re-render.
+> **The supersede registry is shared and that is the correct reading of AD-24 rather than a
+> convenience** — it is keyed by *project* because what it protects is one Director looking at one
+> project, and a boundary render that let a superseded Shot render go on burning CPU beside it
+> would be the waste that decision is about. `app.preview_into_cache` is the one implementation of
+> the cache, the supersede and the join, called by both routes.
+
 ### AD-29 — Preview geometry is derived from export geometry, never from the take
 
 - **Binds:** FX-20, FX-NFR-3

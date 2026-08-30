@@ -22,10 +22,16 @@ in this codebase*, *never imports*, *may not import* — gives **135**, of which
 from that 135: each is a claim that, if it silently stopped holding, would change what the
 application does rather than only what a comment says.
 
-**The headline: of the twenty-two, ~~seven~~ eight were asserted before this pass, three are
-closed by the leaf-module guard added beside it, and ~~twelve~~ eleven remain unenforced and are
-named as such.** Nothing here tried to close the twelve — item 23 asked for the list, not the
-fixes.
+**The headline: of the ~~twenty-two~~ ~~twenty-six~~ twenty-eight, ~~seven~~ ~~eight~~ twelve were
+asserted before this pass, three are closed by the leaf-module guard added beside it, and
+~~twelve~~ ~~eleven~~ thirteen remain unenforced and are named as such.** Nothing here tried to close the twelve — item 23
+asked for the list, not the fixes.
+
+*Six rows added 2026-08-29 and 2026-08-30 by story 11.5, in the commits that stated them* — which is the standing
+practice `docs/project-context.md` records, and the only mechanism there is: nothing finds an
+unenumerated constraint and nothing will. Three of the four are asserted, and the one that is not
+is named honestly: the cache's single implementation is a claim about how many functions exist,
+which no test in this repository counts.
 
 *Amended 2026-08-28 by story 11.1, which closed one of the twelve.* `ExportLook.transitions`'
 row said *"the day Epic 11 fills it, this comment goes false with nothing to say so"*; that day
@@ -77,6 +83,14 @@ CONSTRAINTS: tuple[Constraint, ...] = (
         "the frame grid lives in `timeline`, which this module may not import",
         "test_the_leaf_module_imports_the_standard_library_and_its_one_allowance",
         "The same guard; this sentence names the specific edge AD-25 forbids in general.",
+    ),
+    Constraint(
+        "effects.py, `BOUNDARY_FINGERPRINT_INPUTS`",
+        "the client's `BOUNDARY_KEY_INPUTS` plus `BOUNDARY_KEY_UNSEEN` is this tuple, in order",
+        "test_the_client_and_the_server_enumerate_one_boundary_key",
+        "Story 11.5. Enumerated in two engines and compared, which is the guard nobody had when "
+        "`previewInputKey` and `preview_fingerprint` disagreed for a whole epic — the client "
+        "cannot gain a slot the server has not, and cannot silently lose one.",
     ),
     Constraint(
         "effects.py, `_branch_stage`",
@@ -181,6 +195,39 @@ CONSTRAINTS: tuple[Constraint, ...] = (
         "all unless the partition is total, so an unclassified new field is an import-time error "
         "and the application will not start. Enforced by the code, then pinned by a test.",
     ),
+    Constraint(
+        "assembly.py, `xfade_stage`",
+        "written once, for the export's segment and for its preview",
+        "test_the_preview_and_the_export_write_one_xfade_by_name_and_by_duration",
+        "Story 11.5, and it is what makes FX-NFR-3's *by name and by duration* a string "
+        "comparison on two composed graphs rather than a reading of two argv builders.",
+    ),
+    Constraint(
+        "api.js, `gridFrames`",
+        "rounds half to the nearer even integer, as `assembly.clip_frames_on_grid` does",
+        "test_the_rows_readout_and_the_routes_transition_seconds_are_one_number",
+        "R-42, 2026-08-30. `Math.round` goes half *up* and Python's `round` goes half to *even*, "
+        "so the two part on every boundary landing on a half-frame -- measured at 2 frames "
+        "against 1. The table that asserts it carries three such rows and the shape that "
+        "separates telescoping from subtraction; a mutation survived the table without them.",
+    ),
+    Constraint(
+        "api.js, `gridFrames`",
+        "the one place this side rounds onto the assembly grid",
+        "",
+        "The rounding *rule* is asserted (row above); its *uniqueness* is not, and a second "
+        "`Math.round(x * ASSEMBLY_FPS)` anywhere in `api.js` would pass every test in the suite "
+        "while printing a length the export will not render. Same shape as `_branch_stage`'s row, "
+        "and the same remedy would serve: something that counts the writers.",
+    ),
+    Constraint(
+        "assembly.py, `TRANSITION_PREVIEW_MARGIN_FRAMES` / api.js's copy of it",
+        "one number in two files, because the client cannot import Python",
+        "test_the_client_and_the_server_agree_on_the_boundary_margin",
+        "Story 11.5, beside `ASSEMBLY_FPS` and `BOUNDARY_TOLERANCE_SECONDS`. A duplicated "
+        "*constant* is safe exactly while something compares the two; a duplicated *rule* is not, "
+        "which is why the clamp itself is compared on answers instead.",
+    ),
     # --- app.py -------------------------------------------------------------------------------
     Constraint(
         "app.py, `MARK_READY_STATUSES`",
@@ -238,6 +285,15 @@ CONSTRAINTS: tuple[Constraint, ...] = (
         "FX-NFR-3 and standing design law 2. Asserted by comparing the composed argv rather than "
         "the picture, which is the only form of it that can be checked without a render.",
     ),
+    Constraint(
+        "app.py, `preview_into_cache`",
+        "the one implementation of the preview cache, the supersede rule and the join",
+        "",
+        "Story 11.5 extracted it so the Shot preview and the boundary preview cannot keep two "
+        "supersede registries for one project. Its *behaviour* is asserted exhaustively through "
+        "both routes; its uniqueness is not, and a second copy anywhere in the package would pass "
+        "every test in the suite. Same shape as `_branch_stage`'s row above.",
+    ),
 )
 
 
@@ -280,10 +336,10 @@ def test_the_enumeration_reports_its_own_split():
     asserted = [c for c in CONSTRAINTS if c.asserted_by]
     by_new_guards = [c for c in asserted if c.asserted_by in added_here]
 
-    assert len(CONSTRAINTS) == 22
+    assert len(CONSTRAINTS) == 28
     assert len(by_new_guards) == 3
-    assert len(asserted) - len(by_new_guards) == 8
-    assert len(CONSTRAINTS) - len(asserted) == 11
+    assert len(asserted) - len(by_new_guards) == 12
+    assert len(CONSTRAINTS) - len(asserted) == 13
 
 
 def test_no_constraint_is_listed_twice():

@@ -24,7 +24,7 @@ Sprint tracking: `_bmad-output/implementation-artifacts/sprint-status.yaml` — 
 
 | Feature | Artifacts |
 |---|---|
-| Effects | `effects-and-transitions-research-2026-08-21.md` · `effects-director-rulings-2026-08-21.md` (R-1…R-7) · **`effects-director-rulings-2026-08-24.md` (~~R-8…R-28~~ ~~R-8…R-32~~ R-8…R-41)** *(corrected 2026-08-28 twice. The first range was written by `ad67a14`, the commit that added R-29 and R-30. The correction to R-32 was written by `1933c2e`, **the commit that added R-33** — the same defect, in the pass that was fixing it. Found by `tests/test_stale_claims.py` on its first run, which is why that guard exists.)* · `prds/prd-MusicVideoProducer-effects-2026-08-21/` · `ux-designs/ux-effects-2026-08-21/` · `architecture/architecture-MusicVideoProducer-effects-2026-08-21/` (AD-16…AD-31 + `BUILD-ORDER.md`) · `epics-effects.md` |
+| Effects | `effects-and-transitions-research-2026-08-21.md` · `effects-director-rulings-2026-08-21.md` (R-1…R-7) · **`effects-director-rulings-2026-08-24.md` (~~R-8…R-28~~ ~~R-8…R-32~~ ~~R-8…R-41~~ R-8…R-42)** *(corrected 2026-08-28 twice, and again on 2026-08-30 by the commit that added R-42 — the third time, and the first where the range moved in the same pass as the ruling rather than one pass later. The first range was written by `ad67a14`, the commit that added R-29 and R-30. The correction to R-32 was written by `1933c2e`, **the commit that added R-33** — the same defect, in the pass that was fixing it. Found by `tests/test_stale_claims.py` on its first run, which is why that guard exists.)* · `prds/prd-MusicVideoProducer-effects-2026-08-21/` · `ux-designs/ux-effects-2026-08-21/` · `architecture/architecture-MusicVideoProducer-effects-2026-08-21/` (AD-16…AD-31 + `BUILD-ORDER.md`) · `epics-effects.md` |
 | Treatment | `treatment-planning-findings-and-rulings-2026-08-22.md` (F-1…F-6, R-1…R-17) · `prds/prd-MusicVideoProducer-treatment-2026-08-22/` · `ux-designs/ux-treatment-2026-08-22/` · `architecture/architecture-MusicVideoProducer-treatment-2026-08-22/` (AD-32…AD-47 + `BUILD-ORDER.md`) · `epics-treatment.md` |
 
 All paths relative to `_bmad-output/planning-artifacts/` — *corrected 2026-08-27, this said ~~`_bmad-output/`~~ and there is no `_bmad-output/prds/`, `ux-designs/` or `architecture/`; every artifact above is one level further down.* Requirement prefixes never collide: base `FR-`, effects `FX-`, treatment `TP-`. Architecture decisions are one sequence, `AD-1`…`AD-47`.
@@ -102,6 +102,20 @@ and then left in a commit subject is a number nobody will find.**
   geometry a fact about the whole project, and without the memo every preview on a twenty-shot
   project paid **538 ms** re-probing takes. This is the number that justifies the preview route
   taking no busy check — see AD-24.
+- **A boundary preview is 144.6 ms at the house delivery size, and the blend's length is free.**
+  Measured 2026-08-29 by story 11.5 through the shipped route, cold, median of five: a 1.5 s window
+  spanning a cut — twelve frames of the outgoing Shot, a twelve-frame blend, twelve frames of the
+  incoming Shot — at 1056×608 delivery, so 528×304 on screen. **2.8 ms on a cache hit.** On the
+  128×72 test fixtures the same window is **88.4 ms**, and *doubling the blend to 24 frames costs
+  0.7 ms* (89.1 ms) — the two-input graph's setup dominates, not its length, which is why the
+  margin is a fixed frame count rather than something tuned. All of it is inside FX-NFR-6's
+  one-second budget and consistent with the 143–187 ms this document already records for a 2 s
+  window around an `xfade`.
+- **A one-sided transition costs a Shot's own preview +3.2 ms, and a blur ramp +26.5 ms.** Measured
+  the same day on the same fixtures: 73.0 ms untreated, 76.2 ms with `dip_black` (one `fade`
+  filter), 99.5 ms with `blur_ramp` (a `gblur` on every frame plus a compiled `sendcmd`). The gap
+  between the two forms is worth knowing before anyone tunes `ONE_SIDED_TRANSITION_FRAMES`: the
+  fade's cost is flat and the blur's is per-frame.
 - **The band panel is 516.6px in a 626px rail, with 225px below the fold — the spectrum strip is
   36px of that, and it cost 13.** Measured in a real browser 2026-08-27, with seven numeric inputs,
   the drive control, the canvas and the panel's own notes. It was **553px** before a four-line gate
