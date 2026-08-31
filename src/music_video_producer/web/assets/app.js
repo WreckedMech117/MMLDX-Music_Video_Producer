@@ -1,4 +1,4 @@
-import { adoptedShotEffects, aiModPlan, alignLyricsKeptTranscription, api, applyRenderStatus, APPLY_DOCUMENTS_CONTROL, approvalControl, approvalNotice, assetNamePlan, assetsForTab, assetTab, assetTabEmpty, ASSET_NAME_HELP, ASSET_NAME_LABEL, ASSET_ROLE_LABELS, ASSET_TABS, assistantControl, assistantFillAllControl, assistantToast, ASSISTANT_EDIT_BLOCKED, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, batchReportToast, beatBandIdentity, beatMarkersControlPlan, characterSlotPlan, CITATION_MISSING_LABEL, clearDocumentConsent, clipEffectsChip, comfyOutputUrl, consistencyAnchorPlan, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, DOCUMENT_CONTROLS, driveReadoutPlan, driveReadoutView, driveReadoutWanted, effectBandChange, effectBandEdit, effectBandStripDrag, effectBandStripHit, effectBandStripPlan, effectBandToggle, effectBindingsBody, effectBindingsSet, effectControlKey, effectControlTarget, effectCopyBody, effectCopyReport, effectDropTarget, effectMoveOffered, effectNudgeDirection, effectNudgeTarget, effectParameterDefinition, effectParameterReadout, effectParameterValue, effectSliderFill, effectsPanelModel, effectsRefusalNotice, effectStackAdd, effectStackChanged, effectStackMove, effectStackRemove, effectStackSetParameter, effectStackToggle, effectStackWrite, EFFECT_BAND_CLOSED, EFFECT_BAND_ID, EFFECT_PARAMETER_ID, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, expansionReport, generateAllPlan, hasActiveRenderJobs, INSTRUMENTAL_NOTE, jobTarget, markReadyControl, markReadyNotice, monitorPreviewView, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, PLACEHOLDER_PROMPT, prefillControl, PREVIEW_UNPLAYABLE, previewAdoption, randomSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderSettledToast, RENDER_POLL_INTERVAL_MS, resolveShotMode, shotBoundaries, shotCitations, shotEffectStack, shotExpansionToast, shotInspectorReadiness, shotLabel, shotModeOptionLabel, shotPreviewWanted, shotPromptCell, shotSpecificationProblems, shotTab, shotTabAfterKey, shotTabStrip, shotTakeUrl, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SHOT_TABS, SINGING_STATES, snapSeconds, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songOrderRanks, songRefusalMessage, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, tagLyricLine, threadHtml, unsavedWorkPending, unsavedWorkQuestion, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, vocalTaggingPlan, vocalTypeSpec, VOCAL_TYPES, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE } from "./api.js";
+import { adoptedShotEffects, aiModPlan, alignLyricsKeptTranscription, api, applyRenderStatus, APPLY_DOCUMENTS_CONTROL, approvalControl, approvalNotice, assetNamePlan, assetsForTab, assetTab, assetTabEmpty, ASSET_NAME_HELP, ASSET_NAME_LABEL, ASSET_ROLE_LABELS, ASSET_TABS, assistantControl, assistantFillAllControl, assistantToast, ASSISTANT_EDIT_BLOCKED, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, batchReportToast, beatBandIdentity, beatMarkersControlPlan, characterSlotPlan, CITATION_MISSING_LABEL, clearDocumentConsent, clipEffectsChip, comfyOutputUrl, consistencyAnchorPlan, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, documentChangeToast, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, DOCUMENT_CONTROLS, driveReadoutPlan, driveReadoutView, driveReadoutWanted, effectBandChange, effectBandEdit, effectBandStripDrag, effectBandStripHit, effectBandStripPlan, effectBandToggle, effectBindingsBody, effectBindingsSet, effectControlKey, effectControlTarget, effectCopyBody, effectCopyReport, effectDropTarget, effectMoveOffered, effectNudgeDirection, effectNudgeTarget, effectParameterDefinition, effectParameterReadout, effectParameterValue, effectSliderFill, effectsPanelModel, effectsRefusalNotice, effectStackAdd, effectStackChanged, effectStackMove, effectStackRemove, effectStackSetParameter, effectStackToggle, effectStackWrite, EFFECT_BAND_CLOSED, EFFECT_BAND_ID, EFFECT_PARAMETER_ID, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, expansionReport, generateAllPlan, hasActiveRenderJobs, INSTRUMENTAL_NOTE, jobTarget, markReadyControl, markReadyNotice, monitorPreviewView, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, PLACEHOLDER_PROMPT, prefillControl, PREVIEW_UNPLAYABLE, previewAdoption, randomSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderAgainQuestion, renderSettledToast, RENDER_POLL_INTERVAL_MS, resolveShotMode, shotBoundaries, shotCitations, shotEffectStack, shotExpansionToast, shotInspectorReadiness, shotLabel, shotModeOptionLabel, shotPreviewWanted, shotPromptCell, shotSpecificationProblems, shotTab, shotTabAfterKey, shotTabStrip, shotTakeUrl, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SHOT_TABS, SINGING_STATES, snapSeconds, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songOrderRanks, songRefusalMessage, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, tagLyricLine, threadHtml, unsavedWorkPending, unsavedWorkQuestion, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, vocalTaggingPlan, vocalTypeSpec, VOCAL_TYPES, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE } from "./api.js";
 import { ASSEMBLE_RUNNING, EXPORT_PRESETS, EXPORT_PRESET_DEFAULT, assemblyControl, assemblyProgress, effectiveOffset, latestAssemblyExport, monitorShowsTake, monitorState, newShotFromPlan, renderProgressByTarget, renderingFlag, shotRenderState, takeAnchorControl, takeAudioControl, takesStripRows, trimNudgeControl } from "./api.js";
 import { EXPAND_ALL_PROMPTS_CONFIRM, EXPAND_ALL_PROMPTS_RUNNING, EXPAND_ALL_PROMPTS_TIMELINE_CONTROL, EXPAND_ALL_PROMPTS_TIMELINE_LABEL, NOTICE_KINDS, expansionSweepLines } from "./api.js";
 // Generate All Empty: the cuts bar's second batch door, beside Expand All Prompts. Its whole
@@ -459,6 +459,48 @@ async function loadProject(id) {
   // because it is consent for one turn; this is a standing property of the machine, and clearing
   // it on a project load would silently re-enable an eject the Director turned off.
   loadVramEject();
+}
+
+// A submission that was refused has often moved this project's revision anyway, so the tab that
+// made it re-reads exactly as it does when the submission is accepted.
+//
+// **The server writes the job record before it submits** -- the Director's 2026-08-21 ruling, and
+// `generate_h3` says why: reversed, a save race answered 409 for a graph already queued and the
+// take landed on disk with nothing recording it. So `store.save` has already run by the time
+// `comfy.submit` raises, `settle_unsubmitted_jobs` writes a second time settling the record as
+// never submitted, and the 502 that reaches this client carries neither of them. Two consequences,
+// and both were live until 2026-08-31:
+//
+// * `state.project.updated_at` is now behind the manifest, and it is the token every shots write
+//   sends. **Every later edit in this tab is refused with `PROJECT_CHANGED_REFUSAL` until
+//   something reloads** -- a typed seed, a duration, a prompt, a dragged clip. The panel keeps
+//   showing what was typed, because the refusal happens after the inspector has redrawn from the
+//   client's own copy, so the screen and the manifest disagree with only a toast between them.
+//   Found by `tests/e2e_seed_and_asset_tabs.py`, which points `MVP_COMFY_URL` at a dead port on
+//   purpose: its Render again 502s, and the hand-typed seed three steps later never landed.
+// * the settled record of the render that never happened is missing from the queue panel, so the
+//   one place that would explain the toast does not mention it.
+//
+// A reload rather than adopting a revision off the reply, and that is the load-bearing half: a
+// tab that took a fresh `updated_at` without the plan it belongs to would be declaring itself
+// current over a *foreign* write it has never seen, and its next silent save would revert that
+// work -- which is precisely the 2026-08-19 incident `saveShotsSilently`'s revision exists to
+// stop. Reading the whole project cannot do that.
+//
+// Unconditional rather than sniffing the status, and cheap enough to be: the refusals that fire
+// *before* the record -- a shot with no prompt, a stale reference map, a mode with no adapter --
+// leave the manifest untouched, so this costs them one GET and changes nothing they can see. A
+// client that tried to tell the two apart would be deciding from a status code which server-side
+// writes had happened, which is exactly the thing it cannot know.
+async function resyncAfterRefusedSubmission(projectId) {
+  // The selector stays live through the await, exactly as on the success path beside each call.
+  if (state.project?.id !== projectId) return;
+  try {
+    await loadProject(projectId);
+  } catch {
+    // Quiet on purpose: the submission's own refusal is already on screen, and a second toast
+    // about a failed refresh would replace the sentence that says what actually went wrong.
+  }
 }
 
 // Readiness for the project just loaded, fetched rather than computed: this client's copy of the
@@ -1574,7 +1616,13 @@ async function createMultiview() {
     await api.generateMultiview(projectId, asset.id, { prompt, seed: 0 });
     toast("Krea multiview job queued");
     if (state.project?.id === projectId) await loadProject(projectId);
-  } catch (error) { toast(error.message, "error"); }
+  } catch (error) {
+    toast(error.message, "error");
+    // The record is written before the submission is tried, so a refusal can already have
+    // moved this project's revision, leaving this tab behind it -- see
+    // `resyncAfterRefusedSubmission`, which is where the whole of it is written down.
+    await resyncAfterRefusedSubmission(projectId);
+  }
   finally {
     const control = $("#create-multiview");
     if (control) control.disabled = false;
@@ -1606,7 +1654,13 @@ async function aiModAsset() {
     });
     toast("AI Mod queued — a new asset will land beside the source");
     if (state.project?.id === projectId) await loadProject(projectId);
-  } catch (error) { toast(error.message, "error"); }
+  } catch (error) {
+    toast(error.message, "error");
+    // The record is written before the submission is tried, so a refusal can already have
+    // moved this project's revision, leaving this tab behind it -- see
+    // `resyncAfterRefusedSubmission`, which is where the whole of it is written down.
+    await resyncAfterRefusedSubmission(projectId);
+  }
   finally {
     const control = $("#ai-mod-asset");
     if (control) control.disabled = false;
@@ -4620,9 +4674,7 @@ export function renderShotInspector() {
     // without sampling at all, so it would not even be a render. The stride is the server's own
     // RESUBMIT_SEED_STRIDE. Cancel keeps the old contract — re-opened, seed untouched, nothing
     // queued, no GPU spent.
-    const queue = window.confirm(
-      "Queue one new take now (turbo, fresh seed)?\nCancel re-opens the shot without rendering.",
-    );
+    const queue = window.confirm(renderAgainQuestion(state.project));
     try {
       const project = await api.renderAgain(projectId, shot.id);
       if (state.project?.id !== projectId) return;
@@ -4664,7 +4716,13 @@ export function renderShotInspector() {
       await api.generateH3(projectId, shot.id, {});
       toast(`${renderAgainNotice(project, shot.id)} A new take is rendering now.`);
       if (state.project?.id === projectId) await loadProject(projectId);
-    } catch (error) { toast(error.message, "error"); }
+    } catch (error) {
+      toast(error.message, "error");
+      // The record is written before the submission is tried, so a refusal can already have
+      // moved this project's revision, leaving this tab behind it -- see
+      // `resyncAfterRefusedSubmission`, which is where the whole of it is written down.
+      await resyncAfterRefusedSubmission(projectId);
+    }
     finally { renderJobs(); }
   });
   // FR-21's two directions, through their own bodyless routes -- emphatically not the generic
@@ -6692,7 +6750,13 @@ function bindEvents() {
       }
       if (state.project?.id === projectId) await loadProject(projectId);
     }
-    catch (error) { toast(error.message, "error"); }
+    catch (error) {
+      toast(error.message, "error");
+      // The record is written before the submission is tried, so a refusal can already have
+      // moved this project's revision, leaving this tab behind it -- see
+      // `resyncAfterRefusedSubmission`, which is where the whole of it is written down.
+      await resyncAfterRefusedSubmission(projectId);
+    }
     finally { button.disabled = false; button.textContent = label; }
   });
   // Shut while its own request is in flight, like every other control that spends something.
@@ -6720,7 +6784,13 @@ function bindEvents() {
       // render poll that will land its image — the "something happened" the silence lacked.
       if (state.project?.id === projectId) await loadProject(projectId);
     }
-    catch (error) { toast(error.message, "error"); }
+    catch (error) {
+      toast(error.message, "error");
+      // The record is written before the submission is tried, so a refusal can already have
+      // moved this project's revision, leaving this tab behind it -- see
+      // `resyncAfterRefusedSubmission`, which is where the whole of it is written down.
+      await resyncAfterRefusedSubmission(projectId);
+    }
     finally { button.disabled = false; button.textContent = label; }
   });
   $("#asset-fill").addEventListener("click", async () => {

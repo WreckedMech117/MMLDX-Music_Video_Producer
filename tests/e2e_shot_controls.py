@@ -54,6 +54,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from e2e_support import (
@@ -77,6 +78,7 @@ from e2e_support import (
     wait_for_readiness,
     wait_for_toast,
 )
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
@@ -372,6 +374,37 @@ def main() -> None:
             assert status_chip(driver) == "complete", status_chip(driver)
 
             again.click()
+            # **The click asks first, and this script answers Cancel.** Since 2026-08-19 (`713d09b`)
+            # Render again is one gesture -- re-open, move the seed, queue a take -- and it puts that
+            # question up before any of it. This harness had never learned to answer it, so every run
+            # since died on the unhandled dialog rather than on anything it asserts; that is item 86,
+            # and it is the second stale claim found in this file after the `no GPU time is spent`
+            # title assertion corrected in `b217585`.
+            #
+            # Cancel rather than accept, and not for convenience: this script's whole cost contract
+            # is that nothing here reaches `/prompt`, and the cancel arm is exactly the behaviour the
+            # assertions below were written for -- re-opened, seed untouched, nothing queued. The
+            # accept arm is driven, with a seed read back from the manifest, by
+            # `tests/e2e_seed_and_asset_tabs.py`, which owns a dead ComfyUI port for the purpose.
+            question = WebDriverWait(driver, 10).until(EC.alert_is_present())
+            asked = question.text
+            # The bundle it would spend, named from the project rather than promised. The dialog said
+            # `(turbo, fresh seed)` from 2026-08-19 until 2026-08-31 while the submission had stopped
+            # sending a profile at all on 2026-08-23 (`cd5c785`) -- a 4-step bundle promised for a
+            # render that takes the project's own, which is 20 steps for a Director who has changed
+            # nothing. Asserted here because this is the sentence a Director reads last before
+            # spending GPU minutes; `renderAgainQuestion` is executed against every bundle by the
+            # frontend contract.
+            assert "fresh seed" in asked, asked
+            assert "Cancel re-opens the shot without rendering" in asked, asked
+            assert "Bundle: Default — 20 steps" in asked, (
+                ("the queue question is not naming the bundle this project actually renders on; it "
+                 "promised `turbo` for four days after the submission stopped asking for one"),
+                asked,
+            )
+            assert "turbo" not in asked.lower(), asked
+            question.dismiss()
+            result["render_again_question"] = " ".join(asked.split())
             reopened = wait_for_toast(driver, wait, "is open for another render")
             assert "is not deleted" in reopened, reopened
             # Asserted while that toast is still up. This was an observation until 2026-08-18:
@@ -380,18 +413,61 @@ def main() -> None:
             # lines tall -- so a click meant for `#compile-shot` landed on `div.toast.info`, and the
             # confirmation of what the Director had just done blocked the next thing they tried.
             #
-            # The outcome is asserted rather than the mechanism, because either answer is a fix: the
-            # region may keep its corner as long as it takes no clicks, or it may move out of the
-            # inspector's region entirely. `toasts_over` records which of the two this run saw, so a
-            # reader can tell an overlap that is harmless from a corner that is simply clear.
+            # **This assertion read `not any(covering.values())` until 2026-08-31, and the product
+            # stopped meaning it on 2026-08-19.** `9bd9447` gave `.toast` back `pointer-events:
+            # auto` and a click handler, deliberately and with its reason in `styles.css`: an error
+            # toast has no timer at all, so a dead click-shield would trap stale text over the
+            # workspace forever. The region between toasts stays transparent; a toast itself takes
+            # one click, and that click only removes it. So "nothing is on top of the control" is no
+            # longer true and is no longer the guarantee.
+            #
+            # What is still owed to the Director is that the control underneath stays *reachable*,
+            # and that is what is asserted now: only a toast may be on top of an inspector control,
+            # one click clears it, that click does nothing else, and the press then arrives. Nothing
+            # caught the change when it landed because this script had been dying on the Render
+            # again dialog since 2026-08-19 -- the same day -- which is item 86 exactly.
             standing_over = toasts_over(driver, control(driver, "#compile-shot"))
             covering = {
                 selector: covering_element(driver, control(driver, selector))
                 for selector in ("#compile-shot", "#shot-prompt", "#shot-seed")
             }
-            assert not any(covering.values()), (
-                f"a toast is intercepting clicks meant for the shot inspector's own controls: "
-                f"{covering}"
+            assert all(
+                found is None or found.startswith("div.toast")
+                for found in covering.values()
+            ), (
+                f"something that is not a toast is intercepting clicks meant for the shot "
+                f"inspector's own controls: {covering}"
+            )
+            # One click, and only to dismiss. Aimed at the compile button and answered by the toast
+            # standing over it, so what this measures is the gesture a Director actually makes.
+            absorbed = bool(covering["#compile-shot"])
+            if absorbed:
+                # Through the pointer at the button's own centre, not `element.click()`: WebDriver
+                # refuses to click an element something else would receive the click for, which is
+                # the very situation under test. `ActionChains` presses the pixel, so whatever is on
+                # top gets it -- exactly as it does for a Director aiming at the compile button.
+                ActionChains(driver).move_to_element(control(driver, "#compile-shot")).click().perform()
+                WebDriverWait(driver, 8).until(
+                    lambda browser: not browser.find_elements(
+                        By.CSS_SELECTOR, "#toast-region .toast"
+                    ),
+                    "the toast over the compile button did not go away when it was clicked",
+                )
+                # And it took nothing with it. A click that reached `#compile-shot` as well would
+                # raise "Director data ready" a moment later, so the corner is watched staying
+                # empty rather than merely being empty once.
+                time.sleep(0.6)
+                assert not driver.find_elements(By.CSS_SELECTOR, "#toast-region .toast"), (
+                    "the click that dismissed the toast also fired the control underneath it, so "
+                    "one gesture did two things"
+                )
+            after_dismiss = {
+                selector: covering_element(driver, control(driver, selector))
+                for selector in ("#compile-shot", "#shot-prompt", "#shot-seed")
+            }
+            assert not any(after_dismiss.values()), (
+                f"the shot inspector's controls are still covered after the toast was dismissed, "
+                f"so this is a shield rather than a toast: {after_dismiss}"
             )
             # And the press itself, not only the hit test. Compile is the one control here that can
             # be fired through a live toast to prove the press arrives: it is a dry run that queues
@@ -403,6 +479,8 @@ def main() -> None:
             result["toast_over_inspector_controls"] = {
                 "toasts_standing_over_compile": standing_over,
                 "covering": covering,
+                "one_click_dismissed_it": absorbed,
+                "covering_after_dismiss": after_dismiss,
                 "click_through_while_toast_up": " ".join(compiled.split())[:120],
             }
             wait.until(lambda browser: status_chip(browser) == "ready")
@@ -697,12 +775,17 @@ def main() -> None:
             # without one and have to be named anyway.
             driver.find_element(By.CSS_SELECTOR, '[data-panel="treatment"]').click()
             sweep = wait.until(EC.visibility_of_element_located((By.ID, "expand-h3-prompts")))
+            # Before the hit test, not after it. The single expansion's own toast is still up, it
+            # is a long one, and a toast has taken clicks again since 2026-08-19 (`9bd9447`) -- so
+            # `visible_and_clickable` was measuring the corner the previous step had just filled and
+            # reporting the sweep button as covered. The wait was already here; only its position
+            # was wrong, and nothing noticed because this script died three hundred lines earlier.
+            clear_toasts(driver)
             visible_and_clickable(driver, sweep, "the plan-wide H3 sweep button")
             assert sweep.is_enabled(), "a plan with shots offers a dead sweep button"
             assert "one call per shot" in (sweep.get_attribute("title") or ""), (
                 sweep.get_attribute("title")
             )
-            clear_toasts(driver)
             sweep.click()
             swept = wait_for_toast(driver, WebDriverWait(driver, 600), "H3 prompt")
             thread = driver.find_element(By.ID, "chat-thread").text

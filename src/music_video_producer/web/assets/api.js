@@ -1752,6 +1752,30 @@ export function bundleSpend(project) {
   return ` Bundle: ${bundle.label}.${costNote}`;
 }
 
+//: Render again's question, and the bundle it is actually about to spend. Here rather than inline
+//: in the handler for `bundleSpend`'s own stated reason -- one copy of the cost sentence, because a
+//: bundle named correctly in one dialog and stale in another is the drift that sentence was built
+//: to end -- and because a confirmation nothing executes is a string nothing can catch drifting.
+//:
+//: **It said `(turbo, fresh seed)` from 2026-08-19 until 2026-08-31, and the first half of that
+//: stopped being true on 2026-08-23.** `713d09b` hardcoded `{ profile: "turbo" }` on this one
+//: button and named it in the question; `cd5c785` made the bundle `Project.sampling_profile` and
+//: sent no profile at all, so the click has rendered on the project's own bundle -- 20 steps for a
+//: Director who has touched nothing -- ever since, while the dialog went on promising a 4-step
+//: one. `SAMPLING_PROFILE_TITLE` already says this setting "governs Generate All, Re-queue flagged
+//: and Render Again alike -- one setting, every path", so the dialog contradicted the control's own
+//: description. It is a claim about GPU minutes, made in the last sentence a Director reads before
+//: spending them.
+//:
+//: `fresh seed` stays and is true on both arms: `nextRenderSeed` returns a 1-99999 roll with the
+//: randomizer ticked and `previous + RESUBMIT_SEED_STRIDE` without it, so the take that follows
+//: never samples on the seed the one before it used.
+export function renderAgainQuestion(project) {
+  return "Queue one new take now (fresh seed)?"
+    + bundleSpend(project)
+    + "\nCancel re-opens the shot without rendering.";
+}
+
 //: "Generate All Empty" -- the Director's ask of 2026-08-23, beside Expand All Prompts on the cuts
 //: bar: "which would generate all shots that dont already have a video". The gesture it replaces
 //: is `Mark all drafts ready` then `Generate All`, two clicks in a panel the plan is not in.

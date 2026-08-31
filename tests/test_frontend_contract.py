@@ -1137,7 +1137,14 @@ def test_the_song_form_sends_the_headroom_it_shows_and_refuses_what_the_route_wo
       answer(true);
       await submit();
       await flush();
-      const sentPlanner = requests.map((entry) => ({ path: entry.path, body: JSON.parse(entry.body) }));
+      // The writes, not every request. A submission the harness cans no reply for is a refused
+      // one, and since 2026-08-31 a refused submission re-reads the project before it gives up --
+      // the record is written before the graph is submitted, so the revision has moved whether or
+      // not ComfyUI took it (`resyncAfterRefusedSubmission`). The payload is what this test is for.
+      const written = () => requests
+        .filter((entry) => entry.method === 'POST')
+        .map((entry) => ({ path: entry.path, body: JSON.parse(entry.body) }));
+      const sentPlanner = written();
 
       // And back to the route that has no such field.
       answer(true);
@@ -1146,7 +1153,7 @@ def test_the_song_form_sends_the_headroom_it_shows_and_refuses_what_the_route_wo
       const backToBalanced = readout();
       await submit();
       await flush();
-      const sentMusic = requests.map((entry) => ({ path: entry.path, body: JSON.parse(entry.body) }));
+      const sentMusic = written();
 
       console.log(JSON.stringify({ balanced, seeded, overCeiling, refusal, relieved, sentPlanner, backToBalanced, sentMusic }));
     """)
@@ -4271,6 +4278,190 @@ def test_the_shot_inspector_draws_and_binds_the_render_again_control_it_was_give
     assert rendered["queued"]["toasts"] == [
         f"{rendered['notice']} A new take is rendering now."
     ]
+
+
+def test_a_refused_submission_re_reads_the_project_it_has_already_moved():
+    """The tab is not left behind the revision its own click moved. Executed, both arms.
+
+    **The defect, found on 2026-08-31 by `tests/e2e_seed_and_asset_tabs.py` and reproduced in a
+    browser.** `generate_h3` saves the job record *before* it submits (the Director's 2026-08-21
+    ruling), so a submission ComfyUI refuses has still written the manifest twice -- the record,
+    then `settle_unsubmitted_jobs` closing it -- and the 502 carries neither. `state.project`
+    keeps the `updated_at` it had, and that value is the token every `saveShotsSilently` sends,
+    so **every later edit in that tab is refused 409 until something reloads**: a typed seed, a
+    duration, a prompt, a dragged clip, indefinitely. In the browser the seed box went on showing
+    4242 while the manifest kept the old number and only a toast said otherwise.
+
+    The success path already reloads. What is asserted here is that the failure path does the
+    same, and that it does it by *reading the project* rather than by lifting a revision off a
+    reply -- adopting a bare `updated_at` would declare this tab current over a foreign write it
+    has never seen, which is the 2026-08-19 incident `saveShotsSilently`'s revision exists for.
+    """
+    driven = run_workspace(
+        """
+      const project = (rev) => ({
+        id: 'p1', name: 'Refused', assets: [], jobs: [], song: null, sampling_profile: 'default',
+        updated_at: rev,
+        shots: [{ id: 'shot_a', start: 0, duration: 5, prompt: 'A singer turns toward camera',
+                  mode: 'text', asset_ids: [], reference_labels: {}, use_song_audio: false,
+                  seed: 0, status: 'complete', prompt_id: 'p-1',
+                  latest_output: 'takes/one.mp4', approved_output: '', locked: false }],
+      });
+      const open = (rev) => {
+        state.project = project(rev);
+        state.selectedShotId = 'shot_a';
+        app.renderShotInspector();
+      };
+
+      // Arm one: ComfyUI refuses the graph. The record it wrote first is already on the manifest.
+      open('rev-1');
+      answer(true);
+      await fire('#render-again:click', {});
+      await flush();
+      const refused = {
+        paths: requests.map((entry) => entry.path),
+        revision: state.project ? state.project.updated_at : null,
+      };
+
+      // Arm two: the same click, accepted. The reload was never in doubt on this arm -- it is the
+      // control the assertion above needs, so it cannot pass against a client that reloads after
+      // everything, or against one that reloads after nothing.
+      open('rev-1');
+      answer(true);
+      await fire('#render-again:click', {});
+      await flush();
+      const accepted = {
+        paths: requests.map((entry) => entry.path),
+        revision: state.project ? state.project.updated_at : null,
+      };
+      console.log(JSON.stringify({ refused, accepted, left: unconsumed() }));
+    """,
+        responses={
+            "/api/projects/p1/shots/shot_a/render-again": {
+                "body": {
+                    "id": "p1", "name": "Refused", "assets": [], "jobs": [], "song": None,
+                    "sampling_profile": "default", "updated_at": "rev-2",
+                    "shots": [{"id": "shot_a", "start": 0, "duration": 5, "seed": 0,
+                               "prompt": "A singer turns toward camera", "mode": "text",
+                               "status": "ready", "latest_output": "takes/one.mp4"}],
+                },
+            },
+            "/api/projects/p1/shots": {
+                "body": {
+                    "id": "p1", "name": "Refused", "assets": [], "jobs": [], "song": None,
+                    "sampling_profile": "default", "updated_at": "rev-3", "shots": [],
+                },
+            },
+            # The submission: refused once, then accepted. The list is answered in order, and
+            # `unconsumed()` below is what proves the second click really reached the second entry
+            # rather than the test asserting twice about the same 502.
+            "/api/projects/p1/shots/shot_a/generate/h3": [
+                {"status": 502, "body": {"detail": "Cannot reach ComfyUI at http://127.0.0.1:1"}},
+                {"body": {"id": "j1", "kind": "h3", "status": "queued", "prompt_id": "pr-1",
+                          "target_id": "shot_a", "seed": 101, "output_files": [], "error": ""}},
+            ],
+            # What the re-read answers, on either arm: the record settled as never submitted, and
+            # the revision the tab has to be holding before its next edit.
+            "/api/projects/p1": {
+                "body": {
+                    "id": "p1", "name": "Refused", "assets": [], "song": None,
+                    "sampling_profile": "default", "updated_at": "rev-4",
+                    "jobs": [{"id": "j0", "kind": "h3", "status": "error",
+                              "prompt_id": "never-submitted", "target_id": "shot_a", "seed": 101,
+                              "output_files": [], "error": "never accepted by ComfyUI"}],
+                    "shots": [{"id": "shot_a", "start": 0, "duration": 5, "seed": 101,
+                               "prompt": "A singer turns toward camera", "mode": "text",
+                               "status": "ready", "latest_output": "takes/one.mp4"}],
+                },
+            },
+        },
+    )
+
+    # Both arms were driven: the 502 was consumed and the acceptance behind it too.
+    assert driven["left"] == {}, driven["left"]
+    # The refusal re-read the project, so the tab holds the manifest's revision rather than the
+    # one its own click moved past. Without this line the next shots write is a 409, forever.
+    assert "/api/projects/p1" in driven["refused"]["paths"], driven["refused"]["paths"]
+    assert driven["refused"]["revision"] == "rev-4", driven["refused"]
+    # ...and the acceptance still does what it always did.
+    assert "/api/projects/p1" in driven["accepted"]["paths"], driven["accepted"]["paths"]
+    assert driven["accepted"]["revision"] == "rev-4", driven["accepted"]
+    # The re-read is a read, and one read. A refused submission writes nothing on its way out.
+    assert driven["refused"]["paths"].count("/api/projects/p1") == 1, driven["refused"]["paths"]
+
+
+def test_the_render_again_question_names_the_bundle_it_will_actually_spend():
+    """The last sentence a Director reads before spending GPU minutes, executed per bundle.
+
+    It read `Queue one new take now (turbo, fresh seed)?` from 2026-08-19 (`713d09b`, which did
+    hardcode `{ profile: "turbo" }` on this one button) until 2026-08-31. `cd5c785` made the
+    bundle `Project.sampling_profile` on 2026-08-23 and stopped sending a profile at all, so for
+    eight days the dialog promised a 4-step bundle for a render that took the project's own --
+    20 steps for a Director who had changed nothing. `SAMPLING_PROFILE_TITLE` says in the same
+    file that this setting "governs Generate All, Re-queue flagged and Render Again alike -- one
+    setting, every path", so the dialog contradicted the control's own description.
+
+    Nothing caught it because nothing executed the string: the only script that presses this
+    button, `tests/e2e_shot_controls.py`, had been dying on the unanswered dialog since the day
+    the dialog appeared.
+    """
+    asked = run_workspace(
+        """
+      const project = (profile) => ({
+        id: 'p1', name: 'Bundles', assets: [], jobs: [], song: null, sampling_profile: profile,
+        updated_at: 'rev-1',
+        shots: [{ id: 'shot_a', start: 0, duration: 5, prompt: 'A singer turns toward camera',
+                  mode: 'text', asset_ids: [], reference_labels: {}, use_song_audio: false,
+                  seed: 0, status: 'complete', prompt_id: 'p-1',
+                  latest_output: 'takes/one.mp4', approved_output: '', locked: false }],
+      });
+      const questions = {};
+      const bundles = ['default', 'turbo-references2v', 'turbo', 'a-bundle-this-build-forgot'];
+      for (const profile of bundles) {
+        questions[profile] = contract.renderAgainQuestion(project(profile));
+      }
+      // And the sentence the button really puts up, which is the half a pure-function assertion
+      // cannot see: a handler holding its own copy would satisfy every assertion above.
+      state.project = project('turbo-references2v');
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      answer(false);
+      await fire('#render-again:click', {});
+      await flush();
+      console.log(JSON.stringify({
+        questions,
+        put_up: asked,
+        spend: contract.bundleSpend(project('turbo-references2v')),
+      }));
+    """,
+        responses={
+            "/api/projects/p1/shots/shot_a/render-again": {
+                "body": {
+                    "id": "p1", "name": "Bundles", "assets": [], "jobs": [], "song": None,
+                    "sampling_profile": "turbo-references2v", "updated_at": "rev-2",
+                    "shots": [{"id": "shot_a", "start": 0, "duration": 5, "seed": 0,
+                               "prompt": "A singer turns toward camera", "mode": "text",
+                               "status": "ready", "latest_output": "takes/one.mp4"}],
+                },
+            },
+        },
+    )
+
+    # Every bundle names itself, out of the one list the select is drawn from.
+    assert "Bundle: Default — 20 steps" in asked["questions"]["default"]
+    assert "Turbo References2V — 8 steps" in asked["questions"]["turbo-references2v"]
+    assert "Turbo LTX LoRA — 4 steps" in asked["questions"]["turbo"]
+    # A stored bundle this build does not know draws as the default rather than as a blank or an
+    # invented name -- `samplingProfileOf`'s rule, met here rather than restated.
+    assert asked["questions"]["a-bundle-this-build-forgot"] == asked["questions"]["default"]
+    # The stale claim, gone: a default project is never told it is about to spend turbo.
+    assert "turbo" not in asked["questions"]["default"].lower(), asked["questions"]["default"]
+    # The seed half is still true and still said -- both arms of `nextRenderSeed` move it.
+    assert "fresh seed" in asked["questions"]["default"]
+    assert "Cancel re-opens the shot without rendering" in asked["questions"]["default"]
+    # And the button asks exactly that sentence rather than a second copy of it.
+    assert asked["put_up"] == [asked["questions"]["turbo-references2v"]], asked["put_up"]
+    assert asked["spend"] in asked["put_up"][0]
 
 
 def test_render_again_wordings_are_the_servers_own():
@@ -8369,7 +8560,12 @@ def test_generation_submits_are_shut_while_their_own_request_is_in_flight():
       requests.length = 0;
       await fire('#flux-form:submit', { preventDefault() {}, currentTarget: form });
       await flush();
-      const restored = { disabled: button.disabled, label: button.textContent, sent: requests.length };
+      // Submissions, not requests. Since 2026-08-31 a refused submission also *re-reads* the
+      // project (`resyncAfterRefusedSubmission`): the route writes the job record before it
+      // submits, so a refusal has still moved the revision this tab's next shot save must carry.
+      // What this test is about is the button, so it counts the thing the button sends.
+      const submissions = () => requests.filter((entry) => entry.path.endsWith('/generate/flux')).length;
+      const restored = { disabled: button.disabled, label: button.textContent, sent: submissions() };
 
       // The hanging arm holds it shut -- and a second submission fired anyway (nothing obliges
       // every event path to be a browser honouring the disabled attribute) is refused without
@@ -8382,9 +8578,9 @@ def test_generation_submits_are_shut_while_their_own_request_is_in_flight():
       };
       requests.length = 0;
       fire('#flux-form:submit', { preventDefault() {}, currentTarget: form });
-      const inFlight = { disabled: button.disabled, label: button.textContent, sent: requests.length };
+      const inFlight = { disabled: button.disabled, label: button.textContent, sent: submissions() };
       fire('#flux-form:submit', { preventDefault() {}, currentTarget: form });
-      const refused = { disabled: button.disabled, label: button.textContent, sent: requests.length };
+      const refused = { disabled: button.disabled, label: button.textContent, sent: submissions() };
 
       const musicHandlerBound = Boolean(listeners.get('#music-form:submit'));
       console.log(JSON.stringify({ restored, inFlight, refused, musicHandlerBound }));

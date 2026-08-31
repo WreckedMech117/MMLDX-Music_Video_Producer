@@ -84,6 +84,7 @@ from typing import get_args
 
 from e2e_support import (
     ManagedServer,
+    artifact_dir,
     clipped,
     console_gate,
     edge_driver,
@@ -103,7 +104,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from music_video_producer.app import RESUBMIT_SEED_STRIDE
+from music_video_producer.app import JOB_NEVER_SUBMITTED, RESUBMIT_SEED_STRIDE
 from music_video_producer.models import AssetKind
 
 NAME = "seed-and-asset-tabs"
@@ -321,6 +322,41 @@ def seed_held(base_url: str, project_id: str, expected: int, seconds: float = 2.
             return seen
         time.sleep(0.2)
     return seen
+
+
+def wait_for_refused_submissions(
+    base_url: str, project_id: str, wanted: int, timeout: float = 25.0
+) -> list[dict]:
+    """The settled records of the submissions this run's dead ComfyUI turned away.
+
+    **A Render again is not over when the seed lands.** The gesture re-opens the shot, writes the
+    plan, and *then* submits -- and `MVP_COMFY_URL` is a dead port this run chose, so that POST
+    spends a couple of seconds failing before `generate_h3` settles the record it had already
+    written as never submitted. `wait_for_seed_change` returns one request earlier than any of
+    that, so a script that used it as the end of the gesture went on typing into an inspector
+    whose tab was mid-gesture.
+
+    That matters because the record is written *before* the graph is submitted (the Director's
+    2026-08-21 ruling), so the manifest's revision has already moved by the time the submission
+    fails -- and a shot edit made in that window is refused with `PROJECT_CHANGED_REFUSAL` and
+    lost. Section 5 is about a typed number, not about that race, so the gesture is waited out
+    here by its own evidence rather than by a sleep.
+
+    Returns the settled records so the caller can say what they settled *as*: a submission that
+    never left the machine must leave a closed record and not a phantom queued one, which is
+    what stops the poll asking about it forever and the next render being refused as in-flight.
+    """
+    deadline = time.monotonic() + timeout
+    settled: list[dict] = []
+    while time.monotonic() < deadline:
+        settled = [
+            job for job in get_json(f"{base_url}/api/projects/{project_id}")["jobs"]
+            if job.get("error") == JOB_NEVER_SUBMITTED
+        ]
+        if len(settled) >= wanted:
+            return settled
+        time.sleep(0.15)
+    return settled
 
 
 def select_clip(driver, wait, shot_id: str) -> None:
@@ -561,7 +597,25 @@ def main() -> None:
             result["unarmed_shot_strides"] = {
                 "from": other_before, "to": other_after, "stride": RESUBMIT_SEED_STRIDE
             }
+            # The gesture is not over yet, and section 5 must not start inside it. The
+            # submission is still failing against this run's dead port; when it does, the record
+            # it wrote before submitting is settled and the browser re-reads the project whose
+            # revision that write moved. Waited out by the record itself -- see
+            # `wait_for_refused_submissions`, which is where the whole of it is written down.
+            refused = wait_for_refused_submissions(server.base_url, project_id, 1)
+            assert len(refused) == 1 and refused[0]["target_id"] == OTHER, (
+                ("a Render again that never reached ComfyUI left no settled record: the job it "
+                 "wrote before submitting is still open, which keeps the poll asking about a "
+                 "graph nobody queued and refuses the next render as in-flight"),
+                refused,
+            )
+            assert refused[0]["status"] == "error", refused
+            result["refused_submission_settles"] = {
+                "target": refused[0]["target_id"], "status": refused[0]["status"],
+                "error": refused[0]["error"],
+            }
             select_clip(driver, wait, SHOT)
+            settle(driver, "#shot-inspector")
 
             # === 5. A hand-typed seed clears the toggle =======================================
             seed_input = driver.find_element(By.ID, "shot-seed")
@@ -584,6 +638,11 @@ def main() -> None:
                 after_typing,
             )
             result["hand_typed"] = {"seed": typed, "toggle_cleared": True}
+            # The seed row as a Director sees it, kept because this is the half of this script that
+            # a number cannot show: the shortened box, the toggle beside it on the same line, and
+            # the panel around them. Every defect this repository has caught by looking was caught
+            # in a picture nobody had to ask for.
+            driver.save_screenshot(str(artifact_dir() / f"{NAME}-seed-row.png"))
 
             # === 6. Render again re-rolls -- and by exactly one rule ==========================
             #
@@ -604,6 +663,7 @@ def main() -> None:
             )
             result["render_again_fixed"] = {"from": fixed_before, "to": fixed_after,
                                             "stride": RESUBMIT_SEED_STRIDE, "question": asked}
+            wait_for_refused_submissions(server.base_url, project_id, 2)
 
             # Now with it ticked. The shot was re-opened by the click above, so it is put back to
             # a settled state through the same routes a Director would use -- the render never
@@ -659,6 +719,9 @@ def main() -> None:
                 f"drifting under a value the Director asked to own: {tick_two} -> {random_after}"
             )
             result["render_again_random"] = {"from": tick_two, "to": random_after}
+            # Same wait as the two arms before it, and here it is also what keeps section 7's
+            # click off a button the re-read is about to replace.
+            wait_for_refused_submissions(server.base_url, project_id, 3)
 
             # === 7. Mark ready does not re-roll ==============================================
             #
@@ -854,6 +917,10 @@ def main() -> None:
 
             # --- 11. The clips library is unchanged by the move ------------------------------
             click_tab(driver, "clips")
+            # The other half of the Director's ask, in a picture: seven tabs, the clips on their
+            # own one, and the sorted sections no longer pushed off the screen by them. The
+            # geometry is measured below; this is what a reader can check the measurement against.
+            driver.save_screenshot(str(artifact_dir() / f"{NAME}-clips-tab.png"))
             facts = panes(driver)
             # Three takes, three cards, three ways back to the shot -- and with ComfyUI at a dead
             # port, two of them can still be shown: each shot's *current* take, which this
@@ -911,6 +978,7 @@ def main() -> None:
             assert jumped["shot"] in (SHOT, OTHER), jumped
             result["open_shot"] = jumped
 
+            driver.save_screenshot(str(artifact_dir() / f"{NAME}.png"))
             console_gate(
                 driver, NAME, result,
                 expected=[*EXPECTED_CONSOLE, unreachable.removeprefix("http://")],

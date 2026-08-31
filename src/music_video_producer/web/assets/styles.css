@@ -823,8 +823,15 @@ dialog p { color: var(--muted); line-height: 1.5; }
    a control in some workspace -- the inspectors bottom-right, "Import song" and "Generate with
    Flux" bottom-left, the waveform actions top-right, the rail top-left -- so relocating trades one
    collision for another, while passing the click through fixes it in every workspace and at every
-   width. Set on `.toast` as well as the region so a toast that later gains its own background,
-   border or handler still cannot swallow a click aimed at what is underneath it. */
+   width.
+   **The second half of this paragraph was true until 2026-08-19 and is not.** It read: set on
+   `.toast` as well as the region, so a toast that later gains a handler still cannot swallow a
+   click aimed at what is underneath it. `9bd9447` gave `.toast` its own handler and its
+   pointer events back on purpose -- see the next comment -- so the guarantee is now the
+   weaker one that rule describes: the region between toasts passes clicks through, and a
+   toast takes exactly one, to remove itself. `tests/e2e_shot_controls.py` asserts that pair.
+   Corrected 2026-08-31, having stated the opposite of the rule eight lines below it for
+   twelve days. */
 .toast-region { position: fixed; right: 18px; bottom: 18px; z-index: 50; display: grid; gap: 8px; pointer-events: none; }
 /* The toast itself takes clicks again — but ONLY to dismiss itself (2026-08-20): errors
    stay until clicked and long reports linger, so a dead click-shield would trap stale
