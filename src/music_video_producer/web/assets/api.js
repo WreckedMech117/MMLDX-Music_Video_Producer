@@ -9481,6 +9481,24 @@ export function clipEffectsChip(shot) {
 //: actually is.
 export const TRANSITION_UNTYPED_LABEL = "CUT";
 
+//: What a band says over an Overlap with a type set that the export **will not blend**, and
+//: it says the outcome rather than the type: `DISSOLVE` over a boundary that hard-cuts is the
+//: precise sentence this slice exists to stop the timeline saying. The type itself is in the
+//: band's own note, at every width, so nothing is lost and nothing is promised.
+export const TRANSITION_BAND_REFUSED_LABEL = "NO BLEND";
+
+//: The refused band's sentence -- the third of three, beside `TRANSITION_BAND_TYPED_NOTE` and
+//: `TRANSITION_BAND_UNTYPED_NOTE`, and carried on `title` and the accessible name at every
+//: width for UX-DR15's reason: a state a band is too narrow to letter is still a state.
+//:
+//: It names the type, because the type really is stored and a Director who set it needs to
+//: recognise the boundary they are being told about, and it points at the row rather than
+//: restating the numbers: a band is 8 px wide at a working zoom and a tooltip is not where
+//: three frame counts are read.
+export const TRANSITION_BAND_REFUSED_NOTE =
+  "{label} is set across a {seconds}s overlap between {before} and {after}, and the export "
+  + "will not blend it — this boundary cuts. The Transitions tab says why.";
+
 //: The width a band is never drawn narrower than. `BOUNDARY_TOLERANCE_SECONDS` is what makes an
 //: overlap an overlap, and 1/48 s is **0.35 px at the default 16.6 px/s** -- an overlap the
 //: assembler really will blend across, at a width that rounds to nothing. `.vocal-span`'s
@@ -9549,6 +9567,25 @@ export const TRANSITION_NONE_LABEL = "No transition — hard cut";
 //: What a row says when there is no Overlap under it and there is a Shot on the other side of the
 //: boundary: the transition treats the **outgoing** Shot's own last frames and then cuts (FX-18,
 //: story 11.4). Verbatim from EXPERIENCE.md.
+//: What a paired row says when the export refuses that boundary's geometry (story 11.f7).
+//:
+//: **The three numbers, because which of them is empty is the finding** -- the same reason
+//: `assembly.TRANSITION_EMPTY_SPLIT_REFUSAL` states all three rather than the empty one. A
+//: Director who can see 24 frames of blend between 72 and \u2212240 can see which end of
+//: their timeline to go and look at.
+//:
+//: **The row's own voice, not the server's sentence**, and that is a decision rather than an
+//: oversight. The server's wording is a *refusal*, addressed to a Director who asked to render
+//: and naming Shots the way a refusal does; this is a row explaining a control, in the register
+//: `TRANSITION_ONE_SIDED_NOTE` beside it already uses. What that costs is a third copy of the
+//: measurement, and it is paid for the way the rule itself is: every number in this sentence
+//: is `boundaryBlendVerdicts`' answer, and that answer is held to the server's over a shared
+//: table by `test_the_client_and_the_server_answer_one_split_rule`. The **remedy** is left to
+//: the server, which is the one thing this side must not invent a second wording of.
+export const TRANSITION_REFUSED_NOTE =
+  "Will not blend — on the assembly grid this boundary is {outgoing} frames of {before}, "
+  + "a {blend}-frame blend, then {incoming} frames of {after}, so the export cuts here.";
+
 export const TRANSITION_ONE_SIDED_NOTE =
   "No overlap — this treats {shot}'s last frames, then cuts.";
 
@@ -9684,6 +9721,175 @@ export function transitionBandLabel(catalogue, transitionId) {
   return text.toUpperCase();
 }
 
+// ------------------------------------------------------------------------------------------
+// **Whether a boundary really blends** (story 11.f7). Until this section existed the timeline
+// answered that question with `overlap > BOUNDARY_TOLERANCE_SECONDS` and nothing else, so it drew
+// a live blue blend and a `paired` row over every geometry `assembly._paired_transitions` refuses
+// by name: a Director set a Dissolve, saw a blend, read a paired row, and exported a hard cut.
+//
+// The server's rule is three things, and this is a port of all three -- the resolution loop, the
+// position search, and `_split_frames` -- held to the server's own answers over a shared geometry
+// table by `test_the_client_and_the_server_answer_one_split_rule`. **Where the two disagree the
+// server wins**: nothing here is consulted by an export, and nothing in this section may become a
+// second opinion about what renders. It decides what is *drawn*, which is the whole of its job.
+//
+// Cost, measured: 0.729 ms for a 150-shot track against a 16.7 ms frame, so the loop runs once
+// per render rather than once per boundary for legibility rather than for speed.
+// ------------------------------------------------------------------------------------------
+
+//: `assembly_plan`'s resolution loop: overlaps resolve as **layers, later on top** (the Director's
+//: ruling, 2026-08-20). A clip's visible ranges are its window minus every later-*starting*
+//: clip's window, so an overlaid head is cut, a nested overlay splits the clip around itself and
+//: the underneath resumes when the overlay ends, and a clip completely covered contributes
+//: nothing. A segment no longer than `BOUNDARY_TOLERANCE_SECONDS` is discarded whole, which is
+//: what makes "the same boundary written twice" one boundary here as everywhere else.
+//:
+//: **The windows are what lie**, which is why the rule below reads these entries and never a
+//: Shot's own `start`/`duration`: the three degenerate geometries the server was corrected for on
+//: 2026-08-30 all came of asking a question of one object and reading the answer off another.
+//:
+//: Each entry is `{ shotId, start, end, blend }`. `blend` marks the entry `assembly.TransitionClip`
+//: is -- never produced here, spliced in by `boundaryBlendVerdicts` -- and it is what the Python
+//: `isinstance(entry, ClipWindow)` tests become on this side.
+export function resolvedPlanWindows(shots) {
+  const ordered = [...(shots || [])].filter(Boolean)
+    .map((shot) => ({
+      shotId: String(shot.id ?? ""),
+      start: Number(shot.start) || 0,
+      end: (Number(shot.start) || 0) + (Number(shot.duration) || 0),
+    }))
+    .sort((a, b) => a.start - b.start);
+  const resolved = [];
+  for (let index = 0; index < ordered.length; index += 1) {
+    const clip = ordered[index];
+    let segments = [[clip.start, clip.end]];
+    for (let other = index + 1; other < ordered.length; other += 1) {
+      const later = ordered[other];
+      if (later.start >= clip.end) break;
+      const remaining = [];
+      for (const [segStart, segEnd] of segments) {
+        if (later.end <= segStart || later.start >= segEnd) {
+          remaining.push([segStart, segEnd]);
+          continue;
+        }
+        if (later.start - segStart > BOUNDARY_TOLERANCE_SECONDS) {
+          remaining.push([segStart, later.start]);
+        }
+        if (segEnd - later.end > BOUNDARY_TOLERANCE_SECONDS) {
+          remaining.push([later.end, segEnd]);
+        }
+      }
+      segments = remaining;
+    }
+    for (const [segStart, segEnd] of segments) {
+      if (segEnd - segStart <= BOUNDARY_TOLERANCE_SECONDS) continue;
+      resolved.push({ shotId: clip.shotId, start: segStart, end: segEnd, blend: false });
+    }
+  }
+  // Back into song order, exactly as `assembly_plan` sorts `resolved` before splitting it.
+  return resolved.sort((a, b) => a.start - b.start);
+}
+
+//: `assembly._split_frames`: the three stretches the split would lay, in the order they play, as
+//: frames on the assembly grid.
+//:
+//: **Each is read off the entry it decides about**, which is the correction the server made on
+//: 2026-08-31 after measuring the outgoing stretch against something other than the entry the plan
+//: emits. A stretch that is not in the plan at all is `0`, because that is how many frames it
+//: contributes: `position` is `-1` when the incoming Shot has no entry beginning at the Overlap,
+//: and the entry before that head is not the outgoing Shot when the outgoing Shot has no surviving
+//: frames before the blend.
+export function splitStretchFrames(entries, beforeShotId, position, overlapStart, overlapEnd) {
+  const blend = gridFrames(overlapStart, overlapEnd);
+  if (position < 0) return { outgoing: 0, blend, incoming: 0 };
+  const head = entries[position];
+  const lead = position > 0 ? entries[position - 1] : null;
+  const outgoing = lead && !lead.blend && lead.shotId === beforeShotId
+    ? gridFrames(lead.start, lead.end)
+    : 0;
+  return { outgoing, blend, incoming: gridFrames(overlapEnd, head.end) };
+}
+
+//: Every boundary the manifest asks to blend, and whether it will -- keyed `before|after`.
+//:
+//: One pass over the plan, in song order, and **the entries are mutated as it goes**, because
+//: `_paired_transitions` mutates them: a boundary that blends replaces the incoming Shot's entry
+//: with the blend plus what is left of that Shot after it, and the *next* boundary's outgoing
+//: stretch is measured off that remainder. Where the earlier blend consumed the middle Shot
+//: entirely the remainder is 0 frames and the next boundary has no frames of its own before its
+//: blend, so it is refused -- executed against the real engine on `A[0,4] B[3,6] C[4,8]` with a
+//: type on both `A` and `B`, which composes `A into B` and refuses `B into C`, and composes
+//: `B into C` when `A` carries no type at all. A port that recomputed the entries per boundary
+//: answers that pair wrong, which is why this is one pass and not a function of one boundary.
+//:
+//: **Keyed only where a type is stored on the outgoing Shot** (AD-30), because that is the only
+//: boundary the server is asked about: `assembly_plan` receives a mapping keyed by the outgoing
+//: Shot's id and every boundary absent from it is left as the hard cut it already is. An untyped
+//: Overlap is therefore not in this Map at all and keeps the state it has always had.
+//:
+//: **The catalogue is not consulted, deliberately.** A stored type this build cannot name is
+//: already its own state on the row (`unknown`) and on the band (the id, spaced out), and the
+//: export refuses the whole project over one rather than blending anything -- so there is no
+//: geometry here for a catalogue lookup to be a second opinion about.
+export function boundaryBlendVerdicts(shots) {
+  const ordered = [...(shots || [])].filter(Boolean)
+    .sort((a, b) => (Number(a.start) || 0) - (Number(b.start) || 0));
+  const verdicts = new Map();
+  // `_paired_transitions`' own first line: with nothing asked for, nothing is decided.
+  if (!ordered.some((shot) => String(shot?.transition_out?.type || ""))) return verdicts;
+  const entries = resolvedPlanWindows(ordered);
+  for (let index = 0; index < ordered.length - 1; index += 1) {
+    const before = ordered[index];
+    if (!String(before?.transition_out?.type || "")) continue;
+    const after = ordered[index + 1];
+    const overlapStart = Number(after.start) || 0;
+    const overlapEnd = (Number(before.start) || 0) + (Number(before.duration) || 0);
+    // A boundary with no Overlap is a one-sided treatment (AD-19, R-44) and is not this rule's
+    // subject at all -- it composes elsewhere, refuses nothing, and already has its own row state.
+    // Asked in **seconds**, as the server asks it, so the two cannot come to different answers
+    // about which of the two treatments a boundary gets.
+    if (!(overlapEnd - overlapStart > BOUNDARY_TOLERANCE_SECONDS)) continue;
+    // The later Shot's resolved range beginning at the Overlap: the only entry the split touches.
+    let position = -1;
+    for (let spot = 0; spot < entries.length; spot += 1) {
+      const entry = entries[spot];
+      if (!entry.blend && entry.shotId === String(after.id ?? "")
+          && Math.abs(entry.start - overlapStart) <= BOUNDARY_TOLERANCE_SECONDS) {
+        position = spot;
+        break;
+      }
+    }
+    const stretches = splitStretchFrames(
+      entries, String(before.id ?? ""), position, overlapStart, overlapEnd);
+    // **The one rule** (R-43). Frames of the outgoing Shot before the blend, frames in the blend,
+    // and an incoming stretch that may be empty but may not run backwards -- the Director's ruling
+    // of 2026-08-31. A negative third stretch is `-frames:v -1`, which ffmpeg ignores at rc 0.
+    const blends = stretches.outgoing > 0 && stretches.blend > 0 && stretches.incoming >= 0;
+    verdicts.set(`${before.id}|${after.id}`, {
+      before: String(before.id ?? ""),
+      after: String(after.id ?? ""),
+      blends,
+      outgoing: stretches.outgoing,
+      blend: stretches.blend,
+      incoming: stretches.incoming,
+    });
+    if (!blends) continue;
+    const head = entries[position];
+    entries.splice(
+      position, 1,
+      { shotId: head.shotId, start: overlapStart, end: overlapEnd, blend: true },
+      { shotId: head.shotId, start: overlapEnd, end: head.end, blend: false },
+    );
+  }
+  return verdicts;
+}
+
+//: One boundary's verdict, or `null` where none was asked for. The one way to read the Map, so a
+//: caller cannot come to its own spelling of the key.
+export function blendVerdict(verdicts, beforeShotId, afterShotId) {
+  return (verdicts && verdicts.get(`${beforeShotId}|${afterShotId}`)) || null;
+}
+
 //: Every Overlap on the plan, as a region on the shots track with its label and its sentence.
 //:
 //: Built on the **same predicate the server blends by** -- `earlier.end - later.start` against
@@ -9698,6 +9904,10 @@ export function transitionBandLabel(catalogue, transitionId) {
 export function overlapBands(shots, { pixelsPerSecond = 1, catalogue = null } = {}) {
   const ordered = [...(shots || [])].filter(Boolean).sort((a, b) => a.start - b.start);
   const ranks = songOrderRanks(shots);
+  // Once for the whole track, not once per boundary: the rule needs the resolution loop and the
+  // loop needs every Shot. `transitionRowState` asks the identical Map for the identical reason,
+  // which is what stops the band and the row coming to two answers about one boundary.
+  const verdicts = boundaryBlendVerdicts(ordered);
   const named = (id) => {
     const rank = ranks.get(id);
     return rank ? `shot ${String(rank).padStart(2, "0")}` : String(id ?? "");
@@ -9709,16 +9919,23 @@ export function overlapBands(shots, { pixelsPerSecond = 1, catalogue = null } = 
     const overlap = exactSeconds((before.start + before.duration) - after.start);
     if (!(overlap > BOUNDARY_TOLERANCE_SECONDS)) continue;
     const type = String(before.transition_out?.type || "");
+    // **The geometry the export refuses, drawn as what it is.** Only a typed boundary can be
+    // refused: an untyped Overlap was never asked to blend, so it keeps the state it had.
+    const verdict = blendVerdict(verdicts, before.id, after.id);
+    const refused = Boolean(verdict) && !verdict.blends;
     const width = Math.max(TRANSITION_BAND_MIN_PX, overlap * pixelsPerSecond);
-    const label = type ? transitionBandLabel(catalogue, type) : TRANSITION_UNTYPED_LABEL;
+    const typeLabel = type ? transitionBandLabel(catalogue, type) : TRANSITION_UNTYPED_LABEL;
+    const label = refused ? TRANSITION_BAND_REFUSED_LABEL : typeLabel;
     // How many chips the **earlier** clip carries, because the band's right edge is that clip's
     // right edge and the chip column is anchored there. `clipEffectsChip` decides whether one is
     // drawn; this asks the same question of the same field so the two cannot disagree.
     const chips = clipEffectsChip(before).shown ? 1 : 0;
     const needed = label.length * TRANSITION_BAND_LABEL_CHAR_PX + TRANSITION_BAND_LABEL_PAD_PX
       + chips * TRANSITION_BAND_CHIP_INSET_PX;
-    const note = (type ? TRANSITION_BAND_TYPED_NOTE : TRANSITION_BAND_UNTYPED_NOTE)
-      .replace("{label}", label)
+    const note = (refused
+      ? TRANSITION_BAND_REFUSED_NOTE
+      : type ? TRANSITION_BAND_TYPED_NOTE : TRANSITION_BAND_UNTYPED_NOTE)
+      .replace("{label}", typeLabel)
       .replace("{seconds}", overlap.toFixed(2))
       .replace("{before}", named(before.id))
       .replace("{after}", named(after.id));
@@ -9726,6 +9943,15 @@ export function overlapBands(shots, { pixelsPerSecond = 1, catalogue = null } = 
       before: before.id,
       after: after.id,
       typed: Boolean(type),
+      // Whether the export will actually blend this Overlap. `typed` says a type is stored and
+      // `refused` says the geometry will not carry it -- two facts, named apart, because a band
+      // that conflated them is the whole of this slice's defect.
+      refused,
+      // The three stretches the split would lay, or `null` where nothing was asked. The row states
+      // them; the band carries them so a drawing never re-derives a number it was handed.
+      stretches: verdict
+        ? { outgoing: verdict.outgoing, blend: verdict.blend, incoming: verdict.incoming }
+        : null,
       type,
       seconds: overlap,
       label,
@@ -9740,7 +9966,9 @@ export function overlapBands(shots, { pixelsPerSecond = 1, catalogue = null } = 
       // read back, and `0.5 * 16.6` is `8.299999999999999` in this arithmetic.
       left: Math.round(after.start * pixelsPerSecond * 1000) / 1000,
       width: Math.round(width * 1000) / 1000,
-      className: type ? "overlap-band typed" : "overlap-band untyped",
+      className: refused
+        ? "overlap-band refused"
+        : type ? "overlap-band typed" : "overlap-band untyped",
       note,
     });
   }
@@ -9757,6 +9985,11 @@ export function overlapBands(shots, { pixelsPerSecond = 1, catalogue = null } = 
 //:   unoverlapped boundary, which is a fade at the end of the video.
 //: * `headless` -- a `Transition in` on the first Shot in song order. Nothing precedes it, so
 //:   there is no outgoing field for the write route to mirror onto and nothing composes.
+//: * `refused` -- an Overlap with a type set whose **geometry the export will not blend** (story
+//:   11.f7). It is not `paired`: a paired row promises a blend, takes `--blue` and offers to play
+//:   it, and all three of those were false here. It is not `one-sided` either, and folding the two
+//:   was refused deliberately -- an unoverlapped boundary really does treat its own frames, and
+//:   this one composes nothing at all.
 //: **`seconds` is the Overlap the Director dragged; `blendSeconds` is what will render.** Two
 //: fields because they are two facts, named apart so nothing can reach for the wrong one: the
 //: Overlap is a float on the timeline and the blend is that float on the 24 fps grid, and they
@@ -9764,8 +9997,10 @@ export function overlapBands(shots, { pixelsPerSecond = 1, catalogue = null } = 
 //: project's most-repeated defect, a number that says one thing while another ships. Dragging to
 //: 0.51 s and reading `0.50s` is the cost, and it is paid knowingly: the band and the clip both
 //: follow the drag visibly and immediately, and the number is the only thing that quantises.
-export function transitionRowState(ordered, position, side) {
-  const nothing = { outgoing: null, incoming: null, seconds: 0, blendSeconds: 0 };
+export function transitionRowState(ordered, position, side, verdicts = null) {
+  const nothing = {
+    outgoing: null, incoming: null, seconds: 0, blendSeconds: 0, stretches: null,
+  };
   if (position < 0) return { ...nothing, state: "headless" };
   const outgoing = side === "transition_out" ? ordered[position] : ordered[position - 1];
   const incoming = side === "transition_out" ? ordered[position + 1] : ordered[position];
@@ -9776,8 +10011,19 @@ export function transitionRowState(ordered, position, side) {
     ? exactSeconds((outgoing.start + outgoing.duration) - incoming.start)
     : 0;
   if (incoming && overlap > BOUNDARY_TOLERANCE_SECONDS) {
+    // **The same Map `overlapBands` reads, and the same key.** Computed here when a caller has not
+    // already done it, so a row asked about on its own is asked the whole question -- the cost is
+    // one pass over the plan, measured at 0.729 ms for 150 shots.
+    const verdict = blendVerdict(
+      verdicts || boundaryBlendVerdicts(ordered), outgoing.id, incoming.id);
+    const refused = Boolean(verdict) && !verdict.blends;
     return {
-      state: "paired",
+      state: refused ? "refused" : "paired",
+      // The three stretches the split would lay, for the sentence that states them. `null` on an
+      // untyped Overlap, which was never asked to blend and so has no verdict at all.
+      stretches: verdict
+        ? { outgoing: verdict.outgoing, blend: verdict.blend, incoming: verdict.incoming }
+        : null,
       outgoing,
       incoming,
       seconds: overlap,
@@ -9827,15 +10073,17 @@ export function transitionRows(project, shot, catalogue, { error = "", song = nu
       label: String(entry?.label || ""),
       pairOnly: Boolean(entry?.pair_only),
     })));
+  // One pass for both rows, so the two sides of one boundary cannot come to two verdicts.
+  const verdicts = boundaryBlendVerdicts(ordered);
   const rows = TRANSITION_ROWS.map((row) => {
-    const place = transitionRowState(ordered, position, row.side);
+    const place = transitionRowState(ordered, position, row.side, verdicts);
     // Which boundary this row names, as a position in song order: `Transition out` is the seam
     // with the Shot that follows, `Transition in` the seam with the one before. The preview is a
     // fact about the **boundary**, so both rows offer the same clip where they name the same seam
     // -- which is what stops a Director seeing "watch this blend" on one row and nothing on the
     // other for one transition.
     const seam = row.side === "transition_out" ? position : position - 1;
-    const preview = boundaryPreviewWanted(ordered, seam, catalogue, song);
+    const preview = boundaryPreviewWanted(ordered, seam, catalogue, song, verdicts);
     const stored = String(shot?.[row.side]?.type || "");
     const entry = transitionEntry(catalogue, stored);
     const treated = place.state === "one-sided" && stored
@@ -9845,7 +10093,18 @@ export function transitionRows(project, shot, catalogue, { error = "", song = nu
       ? TRANSITION_ONE_SIDED_NOTE.replace("{shot}", shotOrdinalName(project, place.outgoing?.id))
       : place.state === "headless"
         ? TRANSITION_HEADLESS_NOTE.replace("{shot}", shotOrdinalName(project, shot?.id))
-        : "";
+        : place.state === "refused"
+          // Both rows either side of one boundary say the identical sentence about it, because it
+          // is one boundary: `place.outgoing` and `place.incoming` are the pair, whichever row is
+          // asking. Naming the addressed Shot instead would give a Director two accounts of one
+          // geometry, which is the shape of the defect this whole slice closes.
+          ? TRANSITION_REFUSED_NOTE
+            .replace("{outgoing}", String(place.stretches?.outgoing ?? 0))
+            .replace("{blend}", String(place.stretches?.blend ?? 0))
+            .replace("{incoming}", String(place.stretches?.incoming ?? 0))
+            .replace("{before}", shotOrdinalName(project, place.outgoing?.id))
+            .replace("{after}", shotOrdinalName(project, place.incoming?.id))
+          : "";
     const length = place.state === "paired"
       // **What renders, not what was dragged** (ruled 2026-08-30). `blendSeconds` is the Overlap
       // on the assembly grid, which is the number the route serves as `transition_seconds` and the
@@ -9949,6 +10208,15 @@ export const BOUNDARY_PREVIEW_ONE_SIDED =
   "No overlap, so there is no blend to watch — {shot}'s own preview shows this transition.";
 export const BOUNDARY_PREVIEW_UNTYPED =
   "This overlap has no transition set, so it cuts. Choose one to watch it.";
+//: The absence story 11.f7 adds, and it is `shotPreviewWanted`'s rule applied to a request the
+//: route already refuses by name (`app.BOUNDARY_PREVIEW_REFUSED_BY_PLAN`): a control that offers
+//: to play a blend the export will not compose is the promise this slice exists to stop making.
+//:
+//: Rarely drawn, and deliberately so -- the row is already saying why in `TRANSITION_REFUSED_NOTE`
+//: and `previewNote` withholds a second sentence where the row carries one. It exists for the
+//: `wanted: false`, which is what removes the button.
+export const BOUNDARY_PREVIEW_REFUSED =
+  "This overlap will not blend, so there is no blend to watch.";
 export const BOUNDARY_PREVIEW_WITHOUT_TAKE =
   "A blend needs an approved take on both shots, and one of these two has none.";
 
@@ -10022,7 +10290,9 @@ export function boundaryPreviewInputKey(before, after, catalogue, song = null) {
 //: `position` is the outgoing Shot's place in song order. The five absences are the route's five,
 //: judged here so a control is not offered for a request that would be refused -- `shotPreviewWanted`'s
 //: rule, and the reason a preview refusal is worth *saying* once and never worth sending.
-export function boundaryPreviewWanted(ordered, position, catalogue, song = null) {
+export function boundaryPreviewWanted(
+  ordered, position, catalogue, song = null, verdicts = null,
+) {
   const list = ordered || [];
   const before = list[position];
   const after = list[position + 1];
@@ -10036,6 +10306,12 @@ export function boundaryPreviewWanted(ordered, position, catalogue, song = null)
     return absent(BOUNDARY_PREVIEW_ONE_SIDED.replace("{shot}", shotName(list, before.id)));
   }
   if (!String(before?.transition_out?.type || "")) return absent(BOUNDARY_PREVIEW_UNTYPED);
+  // After the type and before the takes, which is the order the route's own five absences run in:
+  // a boundary with no type was never refused by the plan, and a geometry the plan refuses is
+  // refused whether or not both takes are approved.
+  const verdict = blendVerdict(
+    verdicts || boundaryBlendVerdicts(list), before.id, after.id);
+  if (verdict && !verdict.blends) return absent(BOUNDARY_PREVIEW_REFUSED);
   if (!before.approved_output || !after.approved_output) {
     return absent(BOUNDARY_PREVIEW_WITHOUT_TAKE);
   }

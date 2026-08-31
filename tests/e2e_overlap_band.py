@@ -100,12 +100,19 @@ SONG_SECONDS = 60.0
 #:   therefore a real blend, at a width that rounds to under a pixel at the default zoom. This is
 #:   the band that must not draw as nothing;
 #: * `shot_03`/`shot_04` **meet exactly** -- no band at all, which is what proves the ones above
-#:   are not being drawn on every boundary.
+#:   are not being drawn on every boundary;
+#: * `shot_04`/`shot_05` overlap by **15 s**, with `shot_05` sitting *wholly inside* `shot_04` --
+#:   the geometry `assembly._paired_transitions` refuses (story 11.f7). On the assembly grid that
+#:   boundary is 120 frames of `shot_04`, a 360-frame blend and then **-240** frames of `shot_05`:
+#:   a window that runs backwards, which is `-frames:v -1` and which ffmpeg ignores at rc 0. Until
+#:   this slice the timeline drew it as a live blue blend with a `paired` row, which is the whole
+#:   defect. It is reached here the way a Director reaches it -- one clip dragged over another.
 SHOTS = [
     ("shot_01", 0.0, 12.0),
     ("shot_02", 10.5, 14.55),   # overlaps shot_01 by 1.5
     ("shot_03", 25.0, 15.0),    # overlaps shot_02 by 0.05
     ("shot_04", 40.0, 20.0),    # meets shot_03 exactly
+    ("shot_05", 45.0, 5.0),     # sits wholly inside shot_04: the export refuses this boundary
 ]
 
 #: Every painted pixel in one element's box, counted by colour family. A canvas that threw halfway
@@ -127,6 +134,12 @@ return {
   borderBottom: style.borderBottomColor,
   borderTopWidth: style.borderTopWidth,
   borderBottomWidth: style.borderBottomWidth,
+  // The third band state is a dashed box and a cross-hatch rather than a seventh accent, so the
+  // style and the number of gradients are what tell it from the other two without hue.
+  borderTopStyle: style.borderTopStyle,
+  borderLeftStyle: style.borderLeftStyle,
+  borderLeftWidth: style.borderLeftWidth,
+  className: band.className,
   pointerEvents: style.pointerEvents,
   zIndex: getComputedStyle(band.parentElement).zIndex,
   box: { left: box.left, top: box.top, width: box.width, height: box.height,
@@ -303,6 +316,10 @@ return {
   state: row.dataset.state,
   borderLeftColor: style.borderLeftColor,
   borderLeftWidth: style.borderLeftWidth,
+  // A refused row and an unoverlapped one are both inert and both take `--dim`, so the edge alone
+  // cannot tell them apart; the style is the second signal that agrees with the note.
+  borderLeftStyle: style.borderLeftStyle,
+  preview: Boolean(row.querySelector('.transition-preview, [id$="-preview"]')),
   note: note ? note.textContent : '',
   noteHeight: note ? note.getBoundingClientRect().height : 0,
   noteOverflow: note ? note.getBoundingClientRect().right - box.right : null,
@@ -500,7 +517,7 @@ def main() -> None:
             drawn = driver.execute_script(
                 "return [...document.querySelectorAll('.overlap-band')]"
                 ".map((band) => band.dataset.before + '|' + band.dataset.after);")
-            assert drawn == ["shot_01|shot_02", "shot_02|shot_03"], (
+            assert drawn == ["shot_01|shot_02", "shot_02|shot_03", "shot_04|shot_05"], (
                 ("the bands on the track are not the overlaps in the plan -- either a boundary "
                  "that merely meets is being drawn, or a real overlap is missing"),
                 drawn,
@@ -940,6 +957,136 @@ def main() -> None:
                 converted)
             result["converted_row"] = converted
             driver.save_screenshot(str(artifact_dir() / f"{NAME}-06-row-converted.png"))
+
+            # === 9. A geometry the export refuses says so, and does not read as a blend =======
+            #
+            # `shot_05` sits wholly inside `shot_04`, so the incoming Shot's own stretch after the
+            # blend runs **backwards** by 240 frames and `assembly._paired_transitions` refuses the
+            # boundary. Before this slice the band drew the ordinary `--blue` fill and the row read
+            # `paired`: a Director set a Dissolve, saw a blend, and exported a hard cut.
+            select_clip(driver, wait, "shot_04")
+            open_effects_tab(driver, wait)
+            clear_toasts(driver)
+            # Untyped first, so the change is a change: nobody has asked this boundary to blend.
+            before_typing = driver.execute_script(
+                PAINT_CENSUS, '.overlap-band[data-before="shot_04"]')
+            assert before_typing["className"] == "overlap-band untyped", (
+                ("an overlap with no type stored is being drawn as refused, which would make "
+                 "the state below prove nothing"), before_typing)
+
+            chooser = driver.find_element(By.ID, "transition-out")
+            visible_and_clickable(driver, chooser, "shot_04's Transition out select")
+            driver.execute_script(
+                "arguments[0].value = arguments[1];"
+                "arguments[0].dispatchEvent(new Event('change', { bubbles: true }));",
+                chooser, blend["transition_id"])
+            wait_for_toast(driver, wait, "to match")
+            deadline = time.monotonic() + 12
+            stored = transitions(server, project_id)
+            while time.monotonic() < deadline and not stored["shot_04"]["out"]:
+                time.sleep(0.15)
+                stored = transitions(server, project_id)
+            assert stored["shot_04"]["out"] == blend["transition_id"], stored
+            settle(driver, "#shots-track", quiet_ms=600)
+
+            refused = driver.execute_script(
+                PAINT_CENSUS, '.overlap-band[data-before="shot_04"]')
+            assert refused, "the band over the refused boundary is not on the track at all"
+            assert refused["className"] == "overlap-band refused", refused
+
+            # **It does not read as a live blend.** No fill at all, and no `--blue` on any edge --
+            # the two things the typed band is, measured rather than inferred from the class.
+            assert refused["background"] in ("transparent", "rgba(0, 0, 0, 0)"), (
+                ("a boundary the export refuses is painting the transition's fill, so the "
+                 "timeline is still promising a blend"),
+                refused["background"],
+            )
+            for edge in ("borderTop", "borderBottom"):
+                assert channels(refused[edge])[:3] != (0x5b, 0x9b, 0xd5), (
+                    "a refused boundary has taken `--blue`, which means a transition will run",
+                    edge, refused[edge])
+
+            # **And it is told from the untyped hatch without hue** (UX-DR15, standing law 7): a
+            # cross-hatch rather than a one-way one, inside a dashed box on all four sides. Both
+            # are measured against the untyped band drawn on the same track at the same moment,
+            # so this cannot pass on two bands that merely both exist.
+            untyped_now = driver.execute_script(
+                PAINT_CENSUS, '.overlap-band[data-before="shot_02"]')
+            assert refused["image"].count("repeating-linear-gradient") == 2, (
+                "the refused band is not drawing its cross-hatch", refused["image"])
+            assert untyped_now["image"].count("repeating-linear-gradient") == 1, (
+                "the untyped band has changed, so the two are no longer distinguishable",
+                untyped_now["image"])
+            assert refused["image"] != untyped_now["image"], (refused["image"],
+                                                              untyped_now["image"])
+            # A **closed** box against the untyped band's open one, and solid rather than dashed.
+            # The clip's own border is already drawn through this hatch as a dotted `--amber` or
+            # `--acid` line one pixel inside the band's edge -- R-40's "readable through" working
+            # as designed -- and a dashed band edge put a second broken line immediately above it,
+            # which read as one noisy multicoloured stripe. Found by looking at
+            # `overlap-band-08-band-refused.png`, and invisible to every computed-style assertion
+            # because the band's own colour is `--line-strong` either way; what is asserted here is
+            # the part that *is* executable, which is that the edge is neutral, continuous and on
+            # all four sides.
+            assert refused["borderTopStyle"] == "solid", refused
+            assert refused["borderLeftWidth"] == "1px", (
+                "the refused band has no side edges, so its box is not closed", refused)
+            assert channels(refused["borderTop"])[:3] == channels(
+                untyped_now["borderTop"])[:3], (
+                ("the refused band's edge is not the neutral the untyped band's is, so it has "
+                 "spent an accent on a state that is not an error"), refused, untyped_now)
+            assert untyped_now["borderLeftWidth"] == "0px", (
+                ("the untyped band has grown side edges, so the closed box no longer tells the "
+                 "two apart"), untyped_now)
+
+            # The band is a real region and it letters: 15 s at the default zoom is 249 px, which
+            # is five times what `NO BLEND` needs. The label says the **outcome**, because
+            # `DISSOLVE` over a boundary that hard-cuts is the sentence this slice exists to stop.
+            assert refused["box"]["width"] > 200, refused["box"]
+            assert refused["label"] and refused["label"]["text"] == "NO BLEND", refused["label"]
+            assert refused["label"]["width"] <= refused["box"]["width"], refused
+            # And it says which type was set, and that it will not run, at every width.
+            assert refused["title"] == refused["ariaLabel"], refused
+            assert blend["label"].upper() in refused["title"], refused["title"]
+            assert "will not blend it" in refused["title"], refused["title"]
+            assert "15.00s overlap between shot 04 and shot 05" in refused["title"], refused
+            result["refused_band"] = refused
+            driver.save_screenshot(str(artifact_dir() / f"{NAME}-08-band-refused.png"))
+
+            # The row says why, with the numbers, and offers nothing to watch.
+            select_clip(driver, wait, "shot_04")
+            open_effects_tab(driver, wait)
+            refused_row = driver.execute_script(ROW_FACTS, "transition-out")
+            assert refused_row["state"] == "refused", refused_row
+            assert refused_row["edge"] == "dim", refused_row
+            assert channels(refused_row["borderLeftColor"])[:3] != (0x5b, 0x9b, 0xd5), refused_row
+            assert refused_row["borderLeftStyle"] == "dashed", (
+                ("the refused row is drawn exactly like an unoverlapped one, so the edge says "
+                 "nothing the note does not"), refused_row)
+            assert refused_row["note"] == (
+                "Will not blend — on the assembly grid this boundary is 120 frames of shot 04, a "
+                "360-frame blend, then -240 frames of shot 05, so the export cuts here."
+            ), refused_row["note"]
+            assert refused_row["length"] == "", (
+                "a boundary that will not blend is stating a blend length", refused_row)
+            assert refused_row["value"] == blend["transition_id"], (
+                "the row forgot the stored type", refused_row)
+            assert refused_row["preview"] is False, (
+                "the row offers to play a blend the export will not compose", refused_row)
+            result["refused_row"] = refused_row
+
+            # The sentence really fits its own box at this width and at the narrowest one the rest
+            # of this script sweeps -- it is the longest note either row can carry.
+            for width in (1600, 820):
+                driver.set_window_size(width, 1000)
+                settle(driver, "#shot-panel-effects", quiet_ms=250)
+                fit = driver.execute_script(OVERFLOWS, "#transition-out-note")
+                assert fit and fit["visible"], (width, fit)
+                assert fit["clippedRight"] <= 1 and fit["scrollOverflow"] <= 1, (width, fit)
+                result[f"fit_refused_note_{width}"] = fit
+            driver.set_window_size(1600, 1100)
+            settle(driver, "#shot-panel-effects", quiet_ms=300)
+            driver.save_screenshot(str(artifact_dir() / f"{NAME}-09-row-refused.png"))
 
             driver.save_screenshot(str(artifact_dir() / f"{NAME}-workspace.png"))
             # One deliberate 422, declared by name: section 7 drives the route into refusing a

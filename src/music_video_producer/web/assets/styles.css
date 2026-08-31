@@ -1129,6 +1129,44 @@ dialog p { color: var(--muted); line-height: 1.5; }
    `--blue` anywhere in this rule. A `--line-strong` hatch at 6px, which reads as texture rather
    than as a second colour and is therefore not a state carried by hue. */
 .overlap-band.untyped { background: repeating-linear-gradient(135deg, transparent 0 3px, #454a498c 3px 6px); background: repeating-linear-gradient(135deg, transparent 0 3px, color-mix(in srgb, var(--line-strong) 55%, transparent) 3px 6px); border-top: 1px solid var(--line-strong); border-bottom: 1px solid var(--line-strong); }
+/* An Overlap with a type set that the export **will not blend** (story 11.f7) -- the third band
+   state, and it must be told from both of the others without hue.
+
+   **No `--red`, and that is a judgement rather than an omission.** Standing design law 7 says
+   `--red` means error, and this is not one: the Director arranged these windows deliberately, the
+   export succeeds, and `assembly_plan` records a *sentence* on `ExportLook.transitions` rather
+   than refusing the render. The outcome here is a hard cut -- which is exactly what the `untyped`
+   band above is, and painting one of the two hard cuts red while the other takes no accent would
+   say the export had failed. `.effect-band-note`'s own comment is the precedent: a state of the
+   song is not a fault in the stack, so it takes no --red and no --red-edge. `--amber` was the
+   other candidate and means *running*; a static band claiming it is in flight is worse.
+
+   So: no accent at all, and three textures. Typed is a soft `--blue` fill with solid edges;
+   untyped is a one-way `--line-strong` hatch with solid top and bottom and **no side edges**; this
+   is a **cross**-hatch at half the period inside a closed box on all four sides. The label changes
+   with it, from the type's name to `NO BLEND`, and the sentence on `title` and the accessible name
+   says which type was set and that it will not run -- so at the 8px widths a working zoom
+   produces, where no band letters at all, the state is still text (UX-DR15).
+
+   **The box is solid, and it was dashed until a screenshot was looked at** (2026-08-31). Dashed
+   is `.shot-clip.no-prompt`'s idiom for a thing declared and absent, which is exactly this state,
+   and it was the obvious choice. What a screenshot shows and no computed style can is what is
+   *already* broken up under this band: the clip's own border sits one pixel inside the band's
+   (`top: 12px; height: 82px` is `.shot-clip`'s geometry, and its border-box starts a pixel in),
+   and the hatch above it is half transparent, so that border is drawn through the texture as a
+   dotted `--amber` or `--acid` line. That is R-40 working as designed -- the band is *readable
+   through* -- but a dashed band edge puts a second broken line immediately above a broken one,
+   and the pair reads as one noisy multicoloured stripe rather than as an edge. Measured on the
+   band this state ships over: with a solid edge the band's own row is 220 of 220 pixels at
+   `--line-strong` and the clip's colour never reaches it.
+
+   So the *closed box* is what tells this state from the untyped one -- that band has no side edges
+   at all -- and the edge itself is the same neutral, continuous line the other two states draw.
+
+   The 8-digit hex first and the `color-mix` behind it, `.overlap-band.typed`'s rule: a browser
+   that cannot resolve the mix must still paint something, because a measured band that draws as
+   nothing is the defect this whole gate exists after. */
+.overlap-band.refused { background: repeating-linear-gradient(45deg, transparent 0 2px, #454a498c 2px 4px), repeating-linear-gradient(135deg, transparent 0 2px, #454a498c 2px 4px); background: repeating-linear-gradient(45deg, transparent 0 2px, color-mix(in srgb, var(--line-strong) 55%, transparent) 2px 4px), repeating-linear-gradient(135deg, transparent 0 2px, color-mix(in srgb, var(--line-strong) 55%, transparent) 2px 4px); border: 1px solid var(--line-strong); }
 /* The type as text, in the Consolas micro-label idiom every other index and id on this timeline
    uses. `--ink` on the fill rather than `--blue` on `--bg`: DESIGN 1's contrast note says `--blue`
    labels but is never body text. `overlapBands` decides whether this element is drawn at all --
@@ -1172,6 +1210,8 @@ dialog p { color: var(--muted); line-height: 1.5; }
 .overlap-band[data-chips] .overlap-label { margin-right: 33px; }
 .overlap-band .overlap-label { margin-bottom: 5px; padding: 1px 3px; border-radius: 2px; background: #0c0d0dd9; background: color-mix(in srgb, var(--bg) 85%, transparent); color: var(--ink); font: 9px Consolas, monospace; letter-spacing: .08em; white-space: nowrap; }
 .overlap-band.untyped .overlap-label { color: var(--muted); }
+/* `--muted` on the refused band too: `--ink` is the label colour of a band whose type will run. */
+.overlap-band.refused .overlap-label { color: var(--muted); }
 
 /* ---- The transition pair in the Effects tab (stories 11.3 and 11.4, DESIGN 4.8) -------------
 
@@ -1187,6 +1227,11 @@ dialog p { color: var(--muted); line-height: 1.5; }
 .transition-row { margin: 6px 0 0; padding: 7px 9px; border: 1px solid var(--line); border-left: 2px solid var(--line-strong); border-radius: var(--radius); background: var(--surface-1); }
 .transition-row[data-edge="blue"] { border-left-color: var(--blue); }
 .transition-row[data-edge="dim"] { border-left-color: var(--dim); }
+/* A refused boundary and an unoverlapped one are both inert and both take `--dim`, so the edge
+   alone cannot tell them apart -- the note under the select is what says which, and this makes the
+   edge agree with it. Dashed rather than a seventh accent, matching the band drawn over the same
+   boundary and `.shot-clip.no-prompt`'s "declared and absent" idiom. */
+.transition-row[data-state="refused"] { border-left-style: dashed; }
 .transition-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .transition-head label { color: var(--muted); font-size: 12px; }
 /* The Overlap's length, or a one-sided treatment's. Consolas because it is a measurement, and

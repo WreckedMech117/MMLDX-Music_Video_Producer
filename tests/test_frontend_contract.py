@@ -27893,3 +27893,428 @@ def test_the_transition_rows_survive_a_catalogue_that_never_arrived_for_the_othe
     assert 'id="effects-problem"' in without_effects["html"]
     assert 'id="transition-out"' in without_effects["html"]
     assert "Dissolve" in without_effects["html"]
+
+
+# ------------------------------------------------------------------------------------------
+# The split rule, in two engines (story 11.f7). `assembly._paired_transitions` decides whether a
+# boundary blends; `api.boundaryBlendVerdicts` decides whether the timeline draws one. They are
+# one rule ported, and the tests below hold them together on **answers** over a shared geometry
+# table -- `stackIsDriven`'s shape, for the defect that shape exists to catch.
+# ------------------------------------------------------------------------------------------
+
+#: One table of geometries, asked of both engines. Each row is a plan: `(shot id, start, duration,
+#: the type stored on `transition_out`)`, and a type of `""` is a boundary nobody asked to blend.
+#:
+#: **Four of these rows are the defect this slice closes**: the client drew them as a live blue
+#: blend and a `paired` row, and the export refuses every one of them by name. They are named in
+#: `test_the_split_table_contains_what_the_two_engines_disagreed_about`, which fails if the table
+#: is ever reduced to cases that agree -- a fixture that makes its own defect impossible is this
+#: epic's signature failure, and it has roughly twenty-two instances.
+#:
+#: Windows come from `assembly.py`'s own docstrings wherever one names a geometry, so the numbers
+#: here are the numbers that were measured rather than a second set invented for a test.
+SPLIT_RULE_TABLE = [
+    # The ordinary boundary, and the one every other row has to be told apart from.
+    ("an overlap the export composes", [
+        ("shot_a", 0.0, 4.0, "dissolve"), ("shot_b", 3.5, 4.5, ""),
+    ]),
+    # A type on a boundary with no Overlap at all: a one-sided treatment (AD-19, R-44), which this
+    # rule is not asked about on either side. Neither engine answers, and that is the answer.
+    ("a boundary with no overlap", [
+        ("shot_a", 0.0, 4.0, "dissolve"), ("shot_b", 4.0, 4.0, ""),
+    ]),
+    # `_paired_transitions`' own example of the Director's 2026-08-31 ruling: the incoming Shot has
+    # no frames of its own after the blend, and a **zero** third stretch composes. Flipping the
+    # ported rule to `incoming > 0` refuses this and nothing else.
+    ("the zero third stretch, which composes", [
+        ("shot_a", 0.0, 4.0, "dissolve"), ("shot_b", 3.0, 3.0, ""), ("shot_c", 4.0, 4.0, ""),
+    ]),
+    # The same windows with a type on the **middle** Shot as well. `A into B` composes and consumes
+    # the whole of `B`, so the entry left for `B into C` is 0 frames long and that boundary is
+    # refused -- executed against `assembly_plan` on 2026-08-31. A port that rebuilt the resolved
+    # entries per boundary instead of splicing them answers `B into C` wrong, and the prototype
+    # this slice was specified from did exactly that.
+    ("a blend that empties the next boundary's outgoing shot", [
+        ("shot_a", 0.0, 4.0, "dissolve"), ("shot_b", 3.0, 3.0, "dissolve"),
+        ("shot_c", 4.0, 4.0, ""),
+    ]),
+    # The incoming Shot nested wholly inside the outgoing one: the third stretch runs **backwards**
+    # by 360 frames. The most ordinary way a Director reaches a refused boundary -- one clip
+    # dragged over another -- and the geometry `e2e_overlap_band.py` now draws.
+    ("the incoming shot nested inside the outgoing one", [
+        ("shot_a", 25.0, 20.0, "dissolve"), ("shot_b", 26.0, 4.0, ""),
+    ]),
+    # The mirror nesting, which the server's older one-directional check could not see: the
+    # outgoing Shot's own pre-Overlap segment is shorter than half a frame, so the resolution loop
+    # discards it whole and there is no entry before the head at all (`position` is 0).
+    ("the outgoing shot nested inside the incoming one", [
+        ("shot_a", 0.0, 4.0, "dissolve"), ("shot_b", 0.0104, 10.0, ""),
+    ]),
+    # `TRANSITION_EMPTY_SPLIT_REFUSAL`'s own measured geometry: a third clip inside the half-frame
+    # band below the Overlap's end truncates the incoming head, so the third stretch is **-1** --
+    # `-frames:v -1`, which ffmpeg ignores at rc 0 by encoding the whole rest of the take.
+    ("a third clip in the half-frame band, giving -1 frames", [
+        ("shot_a", 0.0, 4.0625, "dissolve"), ("shot_b", 3.0, 3.0, ""),
+        ("shot_c", 4.05, 3.95, ""),
+    ]),
+    # The incoming Shot has no entry beginning at the Overlap at all, because a third clip covers
+    # its head down to less than half a frame: `position` is `None` on the server and `-1` here.
+    ("an incoming shot with no entry at the overlap", [
+        ("shot_a", 0.0, 4.0, "dissolve"), ("shot_b", 3.0, 3.0, ""), ("shot_c", 3.01, 4.0, ""),
+    ]),
+    # A boundary landing on an exact half-frame, which is the only place Python's half-to-even and
+    # JavaScript's half-up part company: 3.9375 s is 94.5 frames, and `Math.round` would answer 95
+    # here and print one frame of blend where the export writes two.
+    ("a boundary on an exact half-frame", [
+        ("shot_a", 0.0, 4.0, "dissolve"), ("shot_b", 3.9375, 4.0, ""),
+    ]),
+    # An Overlap longer than half a frame whose two ends land on the same grid frame: a real
+    # Overlap by the seconds test and a zero-frame blend by the arithmetic that renders it.
+    ("an overlap that rounds to no frames at all", [
+        ("shot_a", 0.0, 4.0166667, "dissolve"), ("shot_b", 3.9833333, 4.0, ""),
+    ]),
+]
+
+
+def split_rule_windows(row: list[tuple[str, float, float, str]]) -> list[dict]:
+    """One row of `SPLIT_RULE_TABLE` as the workspace holds it: Shots with a stored type."""
+    return [
+        {"id": shot_id, "start": start, "duration": duration,
+         "transition_out": {"type": stored} if stored else None}
+        for shot_id, start, duration, stored in row
+    ]
+
+
+def split_rule_pairs(row: list[tuple[str, float, float, str]]) -> list[tuple[str, str]]:
+    """The boundaries a type was stored on, as `(before, after)` in song order.
+
+    Adjacency is not the rule under test -- both engines take the boundary to be a Shot and the
+    Shot that starts next, and neither derives it from the other -- so it is computed once here
+    rather than answered twice.
+    """
+    ordered = sorted(row, key=lambda item: item[1])
+    return [
+        (ordered[index][0], ordered[index + 1][0])
+        for index in range(len(ordered) - 1)
+        if ordered[index][3]
+    ]
+
+
+def server_split_answers(row: list[tuple[str, float, float, str]]) -> dict[str, dict]:
+    """What `assembly_plan` decides about every boundary a type was stored on, keyed `before|after`.
+
+    **The plan's own run, not a transcription of one.** `blends` is read off the returned entries --
+    a `TransitionClip` for the pair is the whole of what "it blended" means -- and the three
+    stretches are recorded from `_split_frames` as `_paired_transitions` calls it, so the numbers
+    compared below are the numbers the export measured rather than numbers a test computed beside
+    it. A boundary the rule was never asked about (no Overlap) records nothing, which is its own
+    answer and is compared as one.
+    """
+    from unittest.mock import patch
+
+    from music_video_producer import assembly as assembly_module
+    from music_video_producer.assembly import ClipWindow, TransitionChoice, TransitionClip
+
+    clips = [
+        ClipWindow(
+            shot_id=shot_id, label=shot_id.upper(), start=start, duration=duration,
+            approved_output=f"{shot_id}.mp4", approved_start=start, approved_duration=duration,
+            source=Path(f"{shot_id}.mp4"),
+        )
+        for shot_id, start, duration, _stored in row
+    ]
+    dimensions = {clip.shot_id: (640, 384) for clip in clips}
+    choices = {
+        shot_id: TransitionChoice(transition_id=stored, xfade=stored)
+        for shot_id, _start, _duration, stored in row
+        if stored
+    }
+    song = max(clip.end for clip in clips)
+
+    measured: dict[str, tuple[int, int, int]] = {}
+    real = assembly_module._split_frames
+
+    def recording(before, entries, position, overlap_start, overlap_end):
+        answer = real(before, entries, position, overlap_start, overlap_end)
+        measured[before.shot_id] = answer
+        return answer
+
+    with patch.object(assembly_module, "_split_frames", recording):
+        plan = assembly_module.assembly_plan(clips, song, dimensions, choices)
+
+    blended = {
+        (entry.before.shot_id, entry.after.shot_id)
+        for entry in plan.clips
+        if isinstance(entry, TransitionClip)
+    }
+    answers: dict[str, dict] = {}
+    for before, after in split_rule_pairs(row):
+        if before not in measured:
+            continue
+        outgoing, blend, incoming = measured[before]
+        answers[f"{before}|{after}"] = {
+            "before": before, "after": after, "blends": (before, after) in blended,
+            "outgoing": outgoing, "blend": blend, "incoming": incoming,
+        }
+    return answers
+
+
+def client_split_answers() -> list[dict[str, dict]]:
+    """`boundaryBlendVerdicts` over the whole table, one Map per row, as plain objects."""
+    return run_module(
+        "import { boundaryBlendVerdicts }"
+        " from './src/music_video_producer/web/assets/api.js';\n"
+        "const TABLE = " + json.dumps(
+            [split_rule_windows(row) for _label, row in SPLIT_RULE_TABLE]) + ";\n"
+        "console.log(JSON.stringify(TABLE.map((shots) =>\n"
+        "  Object.fromEntries([...boundaryBlendVerdicts(shots)]))));\n"
+    )
+
+
+def test_the_client_and_the_server_answer_one_split_rule():
+    """Whether a boundary blends, asked of both engines over one table, compared as answers.
+
+    **The defect this closes is two answers to one question.** `overlapBands` and
+    `transitionRowState` decided it with `overlap > BOUNDARY_TOLERANCE_SECONDS` and nothing else,
+    so a Director setting a Dissolve over a geometry the export refuses saw a blue band, read a
+    `paired` row, and exported a hard cut.
+
+    The rule cannot be a shared function across a Python module and an ES module, so it is a port --
+    and a port is only honest while something asks both sides the same question and compares the
+    *answers*. A test that would still pass if the JavaScript drifted is worth nothing here, which
+    is why the numbers are compared as well as the verdict: the three stretches are the measurement
+    the rule is, and two engines agreeing on `False` for different reasons is two engines.
+    """
+    client = client_split_answers()
+    assert len(client) == len(SPLIT_RULE_TABLE)
+
+    disagreed = []
+    for (label, row), answered in zip(SPLIT_RULE_TABLE, client, strict=True):
+        served = server_split_answers(row)
+        if served != answered:
+            disagreed.append((label, served, answered))
+    assert not disagreed, (
+        ("the client and the server disagree about whether a boundary blends, so the timeline is "
+         "drawing a blend the export will not compose"),
+        disagreed,
+    )
+
+
+def test_the_ported_split_reads_no_blend_entry_as_the_outgoing_shots_own():
+    """`splitStretchFrames`' `!lead.blend` guard, pinned at the function's own boundary.
+
+    **It survives every plan the rule can be asked about, and that is the point.** Removing
+    `!lead.blend` was mutated against the parity table and against a sweep of 12,127 plans /
+    18,418 transition-carrying boundaries with up to four simultaneous transitions, and produced
+    **zero** disagreements with `assembly_plan`. `boundaryBlendVerdicts` always splices a blend
+    *and* its remainder in one go, so the entry in front of a later boundary's head is the
+    remainder -- a plain window -- and never the blend.
+
+    So the guard has no geometry, and this is where that is recorded rather than left for someone
+    to discover by deleting it and watching the suite stay green. It is the same shape as
+    `assembly._split_frames`' own two `lead` guards, which `test_the_split_reads_no_entry_but_the_outgoing_shots_own`
+    pins for the same reason: the function is handed `entries` and an index by a caller that may
+    one day compute either differently, and reading a **blend's** frames as the outgoing Shot's is
+    the precise defect the port exists to prevent -- it would count the blend twice, once as
+    itself and once as the frames leading into it.
+
+    Asked directly, because `boundaryBlendVerdicts` cannot construct the state.
+    """
+    answered = run_module("""
+      import { splitStretchFrames } from './src/music_video_producer/web/assets/api.js';
+      // A lead entry that IS the blend and carries the outgoing Shot's id -- the one shape the
+      // guard is against, which no caller in this repository builds.
+      const withBlendLead = [
+        { shotId: 'shot_a', start: 0.0, end: 3.0, blend: true },
+        { shotId: 'shot_b', start: 3.0, end: 6.0, blend: false },
+      ];
+      // The same entries with the lead a real window, which is what a caller does build.
+      const withWindowLead = [
+        { shotId: 'shot_a', start: 0.0, end: 3.0, blend: false },
+        { shotId: 'shot_b', start: 3.0, end: 6.0, blend: false },
+      ];
+      console.log(JSON.stringify({
+        blendLead: splitStretchFrames(withBlendLead, 'shot_a', 1, 3.0, 4.0),
+        windowLead: splitStretchFrames(withWindowLead, 'shot_a', 1, 3.0, 4.0),
+      }));
+    """)
+
+    # A blend contributes no frames of the outgoing Shot's own picture, so the stretch is 0 and
+    # the boundary refuses -- `outgoing > 0` is the rule's first term.
+    assert answered["blendLead"] == {"outgoing": 0, "blend": 24, "incoming": 48}
+    # The identical entries with a real window in front answer 72, which is what makes the
+    # assertion above about the guard rather than about the arithmetic.
+    assert answered["windowLead"] == {"outgoing": 72, "blend": 24, "incoming": 48}
+
+
+def test_the_split_table_contains_what_the_two_engines_disagreed_about():
+    """The table holds geometries the client drew as `paired` and the server refuses.
+
+    **A parity test whose table is all agreeing cases is a fixture that makes its own defect
+    impossible**, which is this epic's signature failure with roughly twenty-two instances. The
+    predicate below is the client's *old* one, verbatim -- an Overlap longer than half a frame --
+    so this asserts that at least one row of the table would have been drawn as a live blend, and
+    names them all rather than counting them.
+
+    It also asserts the table exercises the rule in both directions, and that it reaches every
+    branch of the measurement: a zero stretch, a negative one, and a blend that rounds to nothing.
+    """
+    drew_a_blend_but_will_not = []
+    verdicts = []
+    for label, row in SPLIT_RULE_TABLE:
+        served = server_split_answers(row)
+        ordered = sorted(row, key=lambda item: item[1])
+        for index in range(len(ordered) - 1):
+            before, after = ordered[index], ordered[index + 1]
+            if not before[3]:
+                continue
+            overlap = (before[1] + before[2]) - after[1]
+            answer = served.get(f"{before[0]}|{after[0]}")
+            if answer is not None:
+                verdicts.append(answer["blends"])
+            if overlap > BOUNDARY_TOLERANCE_SECONDS and answer is not None and not answer["blends"]:
+                drew_a_blend_but_will_not.append((label, answer))
+
+    assert drew_a_blend_but_will_not, (
+        "the parity table holds no geometry the two engines would have disagreed about, so it "
+        "cannot fail for the reason it exists")
+    # Named rather than counted: a row deleted from the table has to fail here loudly.
+    assert {label for label, _answer in drew_a_blend_but_will_not} == {
+        "a blend that empties the next boundary's outgoing shot",
+        "the incoming shot nested inside the outgoing one",
+        "the outgoing shot nested inside the incoming one",
+        "a third clip in the half-frame band, giving -1 frames",
+        "an incoming shot with no entry at the overlap",
+        "an overlap that rounds to no frames at all",
+    }, drew_a_blend_but_will_not
+    assert set(verdicts) == {True, False}, verdicts
+    # Every branch of the measurement is reached: an empty outgoing stretch, an empty blend, a zero
+    # third stretch that composes, and a negative one that does not.
+    reached = [answer for _label, answer in drew_a_blend_but_will_not]
+    assert any(answer["outgoing"] == 0 for answer in reached), reached
+    assert any(answer["blend"] == 0 for answer in reached), reached
+    assert any(answer["incoming"] < 0 for answer in reached), reached
+
+
+def test_the_band_and_the_row_give_one_answer_about_one_boundary():
+    """`overlapBands` and `transitionRowState` are two functions asking one question.
+
+    Both were wrong in the same way and fixing one would have left a Director reading a refusal in
+    the Effects tab under a blue band on the timeline. They take their answer from the same Map,
+    and this is what says so over the same table the parity test uses.
+    """
+    table = [split_rule_windows(row) for _label, row in SPLIT_RULE_TABLE]
+    seen = run_module(
+        "import { overlapBands, transitionRowState }"
+        " from './src/music_video_producer/web/assets/api.js';\n"
+        "const TABLE = " + json.dumps(table) + ";\n"
+        "console.log(JSON.stringify(TABLE.map((shots) => {\n"
+        "  const ordered = [...shots].sort((a, b) => a.start - b.start);\n"
+        "  return {\n"
+        "    bands: overlapBands(shots, { pixelsPerSecond: 16.6 })\n"
+        "      .map((band) => [band.before, band.after, band.refused, band.className]),\n"
+        "    rows: ordered.slice(0, -1).map((shot, index) => [\n"
+        "      shot.id, ordered[index + 1].id,\n"
+        "      transitionRowState(ordered, index, 'transition_out').state,\n"
+        "      transitionRowState(ordered, index + 1, 'transition_in').state,\n"
+        "    ]),\n"
+        "  };\n"
+        "})));\n"
+    )
+
+    disagreed = []
+    for (label, _row), answered in zip(SPLIT_RULE_TABLE, seen, strict=True):
+        refused_bands = {
+            (before, after) for before, after, refused, _class in answered["bands"] if refused}
+        classes = {
+            (before, after): css for before, after, _refused, css in answered["bands"]}
+        for before, after, out_state, in_state in answered["rows"]:
+            # The two rows either side of one boundary say the same thing about it: a `Transition
+            # out` and the `Transition in` it mirrors are one boundary, not two.
+            assert out_state == in_state, (label, before, after, out_state, in_state)
+            if (out_state == "refused") != ((before, after) in refused_bands):
+                disagreed.append((label, before, after, out_state, classes.get((before, after))))
+            if out_state == "refused":
+                assert classes[(before, after)] == "overlap-band refused", (label, classes)
+    assert not disagreed, (
+        ("the band and the row disagree about whether a boundary blends -- one of them is drawing "
+         "a promise the other is withdrawing"),
+        disagreed,
+    )
+
+
+def test_a_refused_overlap_is_drawn_as_a_cut_and_the_row_says_why_with_the_numbers():
+    """The acceptance, on the geometry a Director reaches by dragging one clip over another.
+
+    `shot_b` sits wholly inside `shot_a` with a Dissolve stored on `shot_a`: the export lays 24
+    frames of `shot_a`, a 456-frame blend and then **-360** frames of `shot_b`, which is a window
+    that runs backwards, so it refuses the boundary and hard-cuts it.
+    """
+    plan = ", ".join(
+        json.dumps(shot) for shot in split_rule_windows([
+            ("shot_a", 25.0, 20.0, "dissolve"), ("shot_b", 26.0, 4.0, ""),
+        ]))
+    drawn = bands(plan)
+    assert len(drawn) == 1, drawn
+    band = drawn[0]
+
+    # It does not read as a live blend: no `typed` class, no `--blue` anywhere in what it takes,
+    # and the label says the outcome rather than the type.
+    assert band["className"] == "overlap-band refused", band
+    assert band["refused"] is True and band["typed"] is True, band
+    assert band["label"] == "NO BLEND", band
+    assert band["stretches"] == {"outgoing": 24, "blend": 456, "incoming": -360}, band
+    # UX-DR15: the state is text at every width, including the widths too narrow to letter.
+    assert band["note"] == (
+        "DISSOLVE is set across a 19.00s overlap between shot 01 and shot 02, and the export will "
+        "not blend it — this boundary cuts. The Transitions tab says why."), band["note"]
+
+    # And the row states all three numbers, because which of them is empty is the finding.
+    row = transition_rows(plan, shot_id="shot_a")["rows"][1]
+    assert row["state"] == "refused" and row["paired"] is False, row
+    # `--blue` means transitions and reactive bindings (standing design law 7); a boundary that
+    # will not blend does not take it.
+    assert row["edge"] == "dim", row
+    assert row["note"] == (
+        "Will not blend — on the assembly grid this boundary is 24 frames of shot 01, a "
+        "456-frame blend, then -360 frames of shot 02, so the export cuts here."), row["note"]
+    # No blend length is stated, because there is no blend to state one for.
+    assert row["length"] == "", row
+    # And nothing offers to play it: the route refuses that request by name
+    # (`app.BOUNDARY_PREVIEW_REFUSED_BY_PLAN`), so the control is not drawn.
+    assert row["preview"]["wanted"] is False, row["preview"]
+    assert row["preview"]["note"] == "This overlap will not blend, so there is no blend to watch."
+
+    # The incoming Shot's own row names the same boundary and says the same sentence.
+    mirror = transition_rows(plan, shot_id="shot_b")["rows"][0]
+    assert mirror["state"] == "refused" and mirror["note"] == row["note"], mirror
+
+
+def test_an_overlap_the_export_composes_is_drawn_exactly_as_it_was():
+    """The other half of the acceptance: nothing changes for a boundary that really blends, and
+    nothing changes for a boundary with no Overlap.
+
+    A slice that made every typed band cautious would be the same defect pointing the other way.
+    """
+    composing = bands(transition_plan(
+        windows={"shot_b": (3.5, 4.5)},
+        fields={"shot_a": {"transition_out": {"type": "dissolve"}}},
+    ))[0]
+    assert composing["className"] == "overlap-band typed", composing
+    assert composing["refused"] is False and composing["label"] == "DISSOLVE", composing
+    assert composing["note"] == (
+        "DISSOLVE across a 0.50s overlap between shot 01 and shot 02."), composing["note"]
+
+    row = transition_rows(transition_plan(
+        windows={"shot_b": (3.5, 4.5)},
+        fields={"shot_a": {"transition_out": {"type": "dissolve"}}},
+    ), shot_id="shot_a")["rows"][1]
+    assert row["state"] == "paired" and row["edge"] == "blue", row
+    assert row["length"] == "0.50s · from overlap", row
+
+    # A boundary with no Overlap is untouched: it is a one-sided treatment (AD-19, R-44) and has
+    # its own row state, which this slice may not fold into the refused one.
+    one_sided = transition_rows(transition_plan(
+        fields={"shot_a": {"transition_out": {"type": "dissolve"}}}), shot_id="shot_a")["rows"][1]
+    assert one_sided["state"] == "one-sided", one_sided
+    assert one_sided["note"] == "No overlap — this treats shot 01's last frames, then cuts."
