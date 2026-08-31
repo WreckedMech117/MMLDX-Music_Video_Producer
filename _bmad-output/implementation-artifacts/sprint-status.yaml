@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 08-16-2026 21:31
-last_updated: 08-31-2026 15:33
+last_updated: 08-31-2026 15:52
 project: MusicVideoProducer
 project_key: NOKEY
 tracking_system: file-system
@@ -772,7 +772,7 @@ action_items:
       repair for Epic 11's critical defect was reviewed by nothing and introduced
       two regressions plus six unkillable mutations."
     owner: "Amelia"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
   - id: "epic-11-retro-item-81-process-label-every-claim-in-a-spec-that"
     epic: 11
@@ -784,7 +784,7 @@ action_items:
       for 2729, 2761 for 2762, and 2780 for 2782 in docs/ROADMAP.md, the last written
       inside the paragraph correcting the one before it."
     owner: "Amelia"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
   - id: "epic-11-retro-item-82-process-when-amending-a-record-grep-for"
     epic: 11
@@ -794,7 +794,7 @@ action_items:
       api.js comment contradicting the code eight lines below it -- one of them inside
       the pass whose subject was that failure."
     owner: "Amelia"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
   - id: "epic-11-retro-item-83-test-treat-the-record-guards-declared-bl"
     epic: 11
@@ -804,7 +804,7 @@ action_items:
       caught none of the thirty false records this epic, and every one sat in a blind
       spot their own docstrings enumerate honestly; nothing reads those enumerations."
     owner: "Dev"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
   - id: "epic-11-retro-item-84-fix-routes-shots-register-is-at-complexi"
     epic: 11
@@ -813,7 +813,7 @@ action_items:
       has ever bound on it. Decide whether the ceiling means anything or drop the
       gate and say so."
     owner: "Dev"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
   - id: "epic-11-retro-item-85-build-fx-18-s-incoming-one-sided-half-is"
     epic: 11

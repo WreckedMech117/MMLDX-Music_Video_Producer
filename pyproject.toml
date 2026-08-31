@@ -70,11 +70,36 @@ extend-select = ["C901"]
 max-complexity = 300
 # Corrected 2026-08-28: the prose above argues for 400 and the value is 300.
 # 300 is what `e6f6b23` set and what has held since; the argument was not updated with it.
-# Re-measured 2026-08-30, so the next reader does not re-derive it: the closest thing in the
-# repository to this gate is `create_app` at 273 -- it was 264 on 2026-08-28, and a measured
-# number in a comment goes stale every time a route is added, which is why it carries a date.
-# Second is `routes/shots.register` at 141, which Epics 10 and 11 roughly doubled.
-# `effects.py`'s worst function is still 14 (`validate_stack`).
+# **This gate is a slow fuse, not an inert backstop, and that is the answer to Epic 11's
+# retrospective item 84** (decided 2026-08-31). It was recorded twice as "nothing in the
+# repository has ever bound on it", which is true and misleading: one function is walking
+# towards it at a steady rate and nothing made that visible.
+#
+# Measured across 1,659 functions in `src/` and `tests/` on 2026-08-31:
+#
+#   above 300: 0      above 100: 2      above 30: 10
+#   above 200: 1      above  50: 4      above 20: 16
+#
+# The whole distribution is two functions and a long tail. `create_app` is **275**;
+# `routes/shots.register` is **141**; third is 83. Nothing else is close to either.
+#
+# `create_app`'s trend, measured off the tree at each commit rather than remembered:
+#
+#   257  0b0bb96  2026-08-27  before Epic 10
+#   264  5e0c1f4  2026-08-28  before Epic 11
+#   275  96ab0fc  2026-08-31  after Epic 11
+#
+# About +9 an epic, so **this gate fires on its own in roughly three epics**. When it does,
+# the intended response is to split `create_app`, not to raise this number — raising it
+# is one line and splitting is the thing the ceiling exists to force. The router split was
+# already meant to be the answer to `create_app` and it has grown 18 points since.
+#
+# The number stays at 300 rather than being lowered to bind today: any binding value is below
+# 275 and needs a per-file carve-out for the one function it is about, which the prose above
+# calls the theatrical version of this rule and is right to.
+#
+# `effects.py`'s worst function is still 14 (`validate_stack`). A measured number in a comment
+# goes stale every time a route is added, which is why each one here carries its own date.
 # **Nothing here constrains length at all** -- a 4,081-line module and a 25,000-line test
 # file are invisible to every gate, which is what Epic 10's retrospective found when it went
 # looking for a second god-class.
