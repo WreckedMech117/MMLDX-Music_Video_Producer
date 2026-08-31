@@ -1211,3 +1211,44 @@ application has a standing rule against — so "skip it" is a toast change, not 
 question about the Overlap at all, so **locking any Shot made its predecessor un-fadeable**, with a
 sentence claiming *"a transition between SHOT 01 and SHOT 02 is written on both of them"* about two
 clips that do not touch.
+
+
+## R-45 — One boundary, one treatment: `transition_in` composes only where nothing owns the cut
+
+*Ruled 2026-08-31, closing Epic 11's retrospective item 85.*
+
+FX-18 says a one-sided transition treats a Shot's *"own final **or opening** frames"*. Only the
+final ones ship, and the retrospective amended the FR and its two coverage claims to say so. This
+ruling decides what the opening half means before anything is built.
+
+**The rule.** A boundary with no Overlap is owned by its **outgoing** Shot, always. `transition_in`
+composes a treatment on a Shot's **opening** frames in exactly one place: the **first Shot of the
+plan in song order**, where there is no predecessor and nothing owns the cut. Everywhere else a
+stored `transition_in` composes nothing and the outgoing Shot's tail is the treatment, as today.
+
+**Why not both halves, which is what R-36 originally ruled.** AD-30's mirror writes
+`transition_in` on the neighbour whenever `transition_out` is set — verified through the shipped
+route on 2026-08-31: two Shots that do not touch, a `fade_black` on the earlier one, and the later
+one comes back holding `transition_in: fade_black`. So "compose both halves" is not a choice about
+two fields a Director set; it is what **one** gesture would produce. A Dissolve on a hard cut would
+then fade A out *and* fade B in, and that picture is what `Fade through black` is called — the
+substitution FX-18 exists to forbid, and the exact distinction R-34 spent a measurement keeping
+(`fade` never arrives at black; `fadeblack` reaches it at the midpoint and holds).
+
+**What this costs, stated rather than discovered later.** A Director who wants a dip across a hard
+cut chooses `Fade through black`, which already is one. There is no gesture that produces a
+fade-out and a fade-in from a single Dissolve, and that is deliberate.
+
+**What it buys.** The first Shot's `transition_in` stops being inert. Story 11.3's F3 pass found it
+so and gave it a row state saying nothing happens; a video that opens by fading up is an ordinary
+thing to want, and this is the only boundary in a plan where the opening half is unambiguous.
+
+**Four new forms are needed** and they are the mirrors of the four that exist —
+`ONE_SIDED_FORMS` is `("fade_out", "dip_black", "dip_white", "blur_ramp")`, every one of them a
+shape that ramps *away*. The opening half needs the same four ramping *towards*. A pair-only type
+still has no one-sided form in either direction (R-34), and is still refused by name with nothing
+substituted.
+
+**On a hand-edited manifest whose pair disagrees, AD-30 is unchanged:** `transition_out` is
+authoritative and the divergence is reported once. This ruling adds no second authority — it
+names the one boundary where there is no outgoing field to be authoritative *with*.
