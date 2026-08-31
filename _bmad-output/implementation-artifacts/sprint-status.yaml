@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 08-16-2026 21:31
-last_updated: 08-28-2026 17:02
+last_updated: 08-31-2026 14:00
 project: MusicVideoProducer
 project_key: NOKEY
 tracking_system: file-system
@@ -102,13 +102,13 @@ development_status:
   10-4-bindings-survive-a-song-change: done
   epic-10-retrospective: done
 
-  epic-11: in-progress
-  11-1-an-overlap-becomes-a-transition: review
-  11-2-the-overlap-on-the-timeline: review
-  11-3-the-transition-pair: review
-  11-4-one-sided-transitions: review
-  11-5-preview-a-transition: review
-  epic-11-retrospective: optional
+  epic-11: done
+  11-1-an-overlap-becomes-a-transition: done
+  11-2-the-overlap-on-the-timeline: done
+  11-3-the-transition-pair: done
+  11-4-one-sided-transitions: done
+  11-5-preview-a-transition: done
+  epic-11-retrospective: done
 
   epic-12: backlog
   12-1-lock-recover-and-restore-the-brief: backlog
@@ -632,3 +632,203 @@ action_items:
     owner: "Director"
     status: done
     ref: "_bmad-output/implementation-artifacts/epic-10-retro-2026-08-28.md"
+  - id: "epic-11-retro-item-66-fix-the-blend-rule-becomes-outgoing-0-an"
+    epic: 11
+    action: "FIX: the blend rule becomes outgoing > 0 and blend > 0 and incoming >=
+      0 (Director-ruled 2026-08-31). A zero third stretch composes and the zero-length
+      entry falls through to the existing drop; a negative one still refuses. Prove
+      all(count > 0 for count in plan.frames) still holds by fuzz, not by argument.
+      Regression: A[0,4] B[3,7] C[4,5] composed at 7ef2b82 and refuses at 66c90d8."
+    owner: "Dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
+  - id: "epic-11-retro-item-67-fix-the-mirror-lock-in-replace_shot_tran"
+    epic: 11
+    action: "FIX: the mirror lock in replace_shot_transitions must gate on the boundary
+      actually being overlapped. With no Overlap a transition_out is a one-sided treatment
+      of the addressed Shot's own last frames (AD-19), so a lock on the neighbour
+      must not hold it -- and the refusal currently claims a blend that does not exist."
+    owner: "Dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
+  - id: "epic-11-retro-item-68-test-six-tests-one-per-mutation-that-sur"
+    epic: 11
+    action: "TEST: six tests, one per mutation that survives the whole 2782-test suite
+      -- _split_frames' position-is-None return, the two mutually redundant lead guards,
+      the second nested branch's geometry term, covering's end-side tolerance, render_boundary_preview's
+      before.shot_id term, and the ledger guard's heading predicate. Re-run all six
+      and show each now fails."
+    owner: "Dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
+  - id: "epic-11-retro-item-69-fix-transition_nested_refusal-prints-raw"
+    epic: 11
+    action: "FIX: TRANSITION_NESTED_REFUSAL prints raw window numbers while deciding
+      with half-frame slack, so the sentence contradicts its own figures (6 of 206
+      in a 150k fuzz). Clamp or round the printed window to the values the decision
+      was made on."
+    owner: "Dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
+  - id: "epic-11-retro-item-70-fix-transition_empty_split_refusal-s-rem"
+    epic: 11
+    action: "FIX: TRANSITION_EMPTY_SPLIT_REFUSAL's remedy says 'move whatever else
+      covers this stretch' and is emitted only when the two legs are the sole clips
+      over it. Split the remedy by which of the three stretches is actually empty."
+    owner: "Dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
+  - id: "epic-11-retro-item-71-fix-_degenerate_refusal-tests-the-crowdi"
+    epic: 11
+    action: "FIX: _degenerate_refusal tests the crowding count before the blend, so
+      a zero-frame blend with a third clip present sends the Director to move clips
+      and leaves the blend at zero. Test blend <= 0 first."
+    owner: "Dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
+  - id: "epic-11-retro-item-72-fix-render_boundary_preview-selects-its"
+    epic: 11
+    action: "FIX: render_boundary_preview selects its refusal sentence by substring
+      on one Shot's label, and every refusal names both Shots -- so it can quote the
+      neighbouring boundary's reason. Select by the pair, and correct assembly.py's
+      docstring, which states the substring rule as a design fact."
+    owner: "Dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
+  - id: "epic-11-retro-item-73-fix-api-js-overlapremovaltoasts-comment"
+    epic: 11
+    action: "FIX: api.js overlapRemovalToasts' comment says an absent catalogue makes
+      it say nothing, the code pushes the sentence that is false for eight of twelve
+      types, and the test asserts the code. Make all three agree. Also retry the transitionCatalogue
+      read after a failure, and guard the .replace chain against dollar-sign patterns
+      in substituted text."
+    owner: "Dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
+  - id: "epic-11-retro-item-74-fix-assembly_negative_frames_error-is-ra"
+    epic: 11
+    action: "FIX: ASSEMBLY_NEGATIVE_FRAMES_ERROR is raised as a bare ValueError and
+      neither assembly_plan call site catches it, so a Director-facing sentence arrives
+      as a 500. Raise a module-local exception and catch it at both sites. Fix the
+      pre-existing max() on an empty resolved list in the same pass -- confirmed identical
+      at 7ef2b82, so not a regression."
+    owner: "Dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
+  - id: "epic-11-retro-item-75-fix-the-deferred-work-ledger-guard-s-sel"
+    epic: 11
+    action: "FIX: the deferred-work ledger guard's self-check is a substring test
+      while its scan uses exact line equality, so renaming the heading to '## Resolved
+      work' silences it with the suite green. Use the scan's own predicate, stop at
+      the next '## ' heading, accept tab indentation, and require a non-empty value
+      after 'resolved:'."
+    owner: "Dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
+  - id: "epic-11-retro-item-76-build-port-the-split-rule-to-api-js-so-t"
+    epic: 11
+    action: "BUILD: port the split rule to api.js so the timeline stops drawing refused
+      geometries as live blends and every overlap as a paired row. Director ruled
+      the approach on 2026-08-30: a JS splitFrames (sort windows, subtract later-starting
+      ones, three gridFrames calls) with a cross-engine test comparing ANSWERS over
+      a shared geometry table, the shape gridFrames/clip_frames_on_grid already uses.
+      Its own slice."
+    owner: "Dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
+  - id: "epic-11-retro-item-77-fix-_split_frames-measures-outgoing-as-c"
+    epic: 11
+    action: "FIX: _split_frames measures outgoing as clip_frames_on_grid(lead.start,
+      overlap_start) while the entry actually emitted is lead unchanged. Equal only
+      while the plan is gapless at that seam. It is the last number in the new rule
+      not read off the entry it decides about, which is the fault pattern the rule
+      was written to remove."
+    owner: "Dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
+  - id: "epic-11-retro-item-78-record-a-dropped-zero-frame-entry-remove"
+    epic: 11
+    action: "RECORD: a dropped zero-frame entry removes its Shot from job.inputs --
+      FR-24's 'the exact takes this export was built from' -- and from _final_clip_index,
+      so a stored one-sided transition on it is skipped in silence. Record the drop
+      on ExportLook rather than leaving the provenance quietly incomplete."
+    owner: "Dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
+  - id: "epic-11-retro-item-79-decide-then-fix-preview_fingerprint-stil"
+    epic: 11
+    action: "DECIDE then FIX: preview_fingerprint still recomposes the chain internally
+      while its sibling boundary_fingerprint, built this epic, takes already-composed
+      chains for the reason AD-28 states in terms. Both reasons Epic 9's retro gave
+      for deferring are now spent. One cross-language contract test moves with it."
+    owner: "Dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
+  - id: "epic-11-retro-item-80-process-make-the-review-pass-non-discret"
+    epic: 11
+    action: "PROCESS: make the review pass non-discretionary for any change touching
+      assembly_plan or the cumulative frame grid, INCLUDING a repair to one. BUILD-HANDOFF
+      section 2 says such work merges alone; it does not say it is reviewed, and the
+      repair for Epic 11's critical defect was reviewed by nothing and introduced
+      two regressions plus six unkillable mutations."
+    owner: "Amelia"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
+  - id: "epic-11-retro-item-81-process-label-every-claim-in-a-spec-that"
+    epic: 11
+    action: "PROCESS: label every claim in a spec that was not executed. Across Epics
+      9, 10 and 11 every wrong claim was reasoned and every right one was run: zero
+      wrong diagnoses against roughly twenty wrong remedies; AD-19 cited where AD-18
+      was meant, at both of its occurrences in spec-11-f5-the-frame-rule-and-what-it-let-through.md;
+      and four consecutive baseline suite counts miscounted -- 2698 for 2699, 2728
+      for 2729, 2761 for 2762, and 2780 for 2782 in docs/ROADMAP.md, the last written
+      inside the paragraph correcting the one before it."
+    owner: "Amelia"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
+  - id: "epic-11-retro-item-82-process-when-amending-a-record-grep-for"
+    epic: 11
+    action: "PROCESS: when amending a record, grep for the sentence's siblings before
+      committing. Three instances this epic -- Story 11.2's And clause left contradicting
+      its own Then clause, AD-28 announcing a title change and making none, and an
+      api.js comment contradicting the code eight lines below it -- one of them inside
+      the pass whose subject was that failure."
+    owner: "Amelia"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
+  - id: "epic-11-retro-item-83-test-treat-the-record-guards-declared-bl"
+    epic: 11
+    action: "TEST: treat the record guards' declared blind spots as a backlog rather
+      than as documentation. tests/test_stale_claims.py, tests/test_spec_frontmatter.py,
+      tests/test_sprint_tracker.py, tests/test_line_citations.py and tests/test_enumeration_claims.py
+      caught none of the thirty false records this epic, and every one sat in a blind
+      spot their own docstrings enumerate honestly; nothing reads those enumerations."
+    owner: "Dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
+  - id: "epic-11-retro-item-84-fix-routes-shots-register-is-at-complexi"
+    epic: 11
+    action: "FIX: routes/shots.register is at complexity 141 and create_app at 273,
+      both invisible because the mccabe ceiling is 300 and nothing in the repository
+      has ever bound on it. Decide whether the ceiling means anything or drop the
+      gate and say so."
+    owner: "Dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
+  - id: "epic-11-retro-item-85-build-fx-18-s-incoming-one-sided-half-is"
+    epic: 11
+    action: "BUILD: FX-18's incoming one-sided half is unbuilt -- only transition_out
+      composes, so a stored transition_in on a boundary with no Overlap renders untreated.
+      The requirement and its two coverage claims now say so. Build it or renegotiate
+      the FR."
+    owner: "Dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
+  - id: "epic-11-retro-item-86-fix-two-browser-harnesses-e2e_seed_and_a"
+    epic: 11
+    action: "FIX: two browser harnesses (e2e_seed_and_asset_tabs.py, e2e_shot_controls.py)
+      have failed since before Epic 10 and sit outside 'uv run pytest -q', so no gate
+      reports them."
+    owner: "Dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
