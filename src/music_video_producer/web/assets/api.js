@@ -9629,6 +9629,25 @@ export const TRANSITION_OVERLAP_REMOVED_PAIR_ONLY_TOAST =
   "{before} and {after} no longer overlap — {label} needs two pictures, so this boundary is "
   + "a hard cut. Overlap them again, or choose another transition on {before}.";
 
+//: The same announcement where the stored type **cannot be classified** -- no catalogue was read,
+//: or the catalogue does not hold this type (2026-08-31).
+//:
+//: **The third option, and the one neither of the two sentences above could be.** The comment on
+//: `overlapRemovalToasts` said that with no catalogue it *"says nothing at all rather than
+//: guessing"*; the code fell through to `TRANSITION_OVERLAP_REMOVED_TOAST` -- the exact sentence
+//: whose commit exists because it is false for eight of the twelve types -- and the test asserted
+//: the fall-through, so the test proved the comment false. Three things said three things.
+//:
+//: Silence was the other candidate and was rejected: the Overlap really did go away, the stored
+//: type really is now one-sided, and nothing on the timeline shows a stored type with no Overlap
+//: under it. So this names the removal, promises no treatment, and points at the one place that
+//: can say what the type does -- which is what an honest sentence looks like when the thing that
+//: knows the answer is missing.
+export const TRANSITION_OVERLAP_REMOVED_UNCLASSIFIED_TOAST =
+  "{before} and {after} no longer overlap, so this boundary is a hard cut. {before}'s stored "
+  + "transition is kept and this workspace cannot say what it does on its own — open {before}'s "
+  + "Transitions tab, or overlap them again.";
+
 //: The catalogue never arrived. `EFFECTS_CATALOGUE_UNAVAILABLE`'s shape and its reason: the rows
 //: cannot say what any transition is, so they say that instead of offering twelve unlabelled ids.
 export const TRANSITIONS_CATALOGUE_UNAVAILABLE =
@@ -10076,9 +10095,15 @@ export function transitionMirrorToast(project, shot, side, transitionId, catalog
 //: A pure comparison of two plans rather than a hook inside the drag, so "which overlaps went
 //: away" is executable without a pointer. The Shot numbers come from the plan **after** the edit:
 //: the numbers a Director is looking at on the clips are the numbers the sentence has to use.
-//: `catalogue` is optional and its absence is the safe direction: with no catalogue this
-//: cannot tell a pair-only type from a one-sided one, so it says nothing at all rather than
-//: guessing -- the same rule `overlapWatch === null` already follows one line up.
+//:
+//: **Three sentences, because the type is one of three things** (2026-08-31): pair-only, one-sided,
+//: or not classifiable at all. `catalogue` is optional, and this comment used to say that with no
+//: catalogue it *"says nothing at all rather than guessing"* -- while the code fell through to
+//: `TRANSITION_OVERLAP_REMOVED_TOAST`, the sentence that is false for eight of twelve types, and
+//: the test asserted the fall-through. Code, comment and test now say one thing:
+//: `TRANSITION_OVERLAP_REMOVED_UNCLASSIFIED_TOAST` names the removal without promising a
+//: treatment, and it is used whenever the catalogue cannot classify the stored type -- absent,
+//: or present without this id in it.
 export function overlapRemovalToasts(before, after, catalogue = null) {
   const overlappingPairs = (shots) => {
     const ordered = [...(shots || [])].filter(Boolean).sort((a, b) => a.start - b.start);
@@ -10105,23 +10130,32 @@ export function overlapRemovalToasts(before, after, catalogue = null) {
     const stored = String(earlier.transition_out.type);
     const entry = (catalogue || []).find(
       (item) => String(item?.transition_id || "") === stored);
-    // Only a type the catalogue names as pair-only takes the second sentence. A type
-    // the catalogue does not hold at all is not silently assumed to be either: it keeps the
-    // original sentence, which is what a Director saw before this existed.
-    if (catalogue && entry?.pair_only) {
-      lines.push(TRANSITION_OVERLAP_REMOVED_PAIR_ONLY_TOAST
-        .replace("{before}", shotOrdinalName({ shots: after }, earlierId, true))
-        .replace("{after}", shotOrdinalName({ shots: after }, laterId, true))
-        .replace("{label}", String(entry?.label || stored))
-        .replace("{before}", shotOrdinalName({ shots: after }, earlierId, true)));
-      continue;
-    }
-    lines.push(TRANSITION_OVERLAP_REMOVED_TOAST
-      .replace("{before}", shotOrdinalName({ shots: after }, earlierId, true))
-      .replace("{after}", shotOrdinalName({ shots: after }, laterId, true))
-      .replace("{before}", shotOrdinalName({ shots: after }, earlierId, true)));
+    const names = {
+      before: shotOrdinalName({ shots: after }, earlierId, true),
+      after: shotOrdinalName({ shots: after }, laterId, true),
+      label: String(entry?.label || stored),
+    };
+    // Which of the three the boundary gets, and the third is the one that says nothing it cannot
+    // support: a type the catalogue does not name -- because no catalogue was read, or because it
+    // does not hold this id -- is not assumed to be either kind.
+    if (entry?.pair_only) lines.push(fillWording(TRANSITION_OVERLAP_REMOVED_PAIR_ONLY_TOAST, names));
+    else if (entry) lines.push(fillWording(TRANSITION_OVERLAP_REMOVED_TOAST, names));
+    else lines.push(fillWording(TRANSITION_OVERLAP_REMOVED_UNCLASSIFIED_TOAST, names));
   }
   return lines;
+}
+
+//: One wording and its values, filled. **A function replacement, which `String.replace` does not
+//: scan for `$` patterns** (2026-08-31): a string replacement is read for `$&`, `` $` ``, `$'` and
+//: `$n` and substitutes match text for them, so a value carrying any of those is rewritten rather
+//: than inserted. `replaceAll` also lands every occurrence of a placeholder in one call, which is
+//: what the four-call `.replace("{before}", ...)` chain above was doing by repeating itself -- a
+//: wording that named a Shot a third time would have been filled twice and printed `{before}`.
+function fillWording(wording, values) {
+  return Object.entries(values).reduce(
+    (text, [key, value]) => text.replaceAll(`{${key}}`, () => String(value)),
+    wording,
+  );
 }
 
 // FastAPI reports handler failures as a plain `detail` string but validation

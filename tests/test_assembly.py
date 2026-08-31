@@ -6,6 +6,7 @@ mutation-testable at the speed a mutation pass needs.
 """
 
 import itertools
+import re
 from dataclasses import replace
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from music_video_producer.assembly import (
     ASSEMBLY_LEGACY_APPROVAL_REFUSAL,
     ASSEMBLY_NEGATIVE_FRAMES_ERROR,
     ASSEMBLY_NO_AUDIO_TO_MIX_REFUSAL,
+    ASSEMBLY_NO_GEOMETRY_ERROR,
     ASSEMBLY_NO_SHOTS_REFUSAL,
     ASSEMBLY_OFFSET_NEGATIVE_REFUSAL,
     ASSEMBLY_OFFSET_OVERRUN_REFUSAL,
@@ -35,16 +37,22 @@ from music_video_producer.assembly import (
     MASTER_SAMPLE_RATE,
     SONG_END_LABEL,
     SONG_START_LABEL,
+    TRANSITION_BACKWARDS_INCOMING_REMEDY,
     TRANSITION_CROWDED_REFUSAL,
+    TRANSITION_EMPTY_BLEND_REMEDY,
+    TRANSITION_EMPTY_OUTGOING_REMEDY,
     TRANSITION_EMPTY_SPLIT_REFUSAL,
     TRANSITION_NESTED_REFUSAL,
     TRIM_SHARE,
+    AssemblyGeometryError,
     AudioOverlay,
     ClipWindow,
     ExportPreset,
     ExportProgress,
     TransitionChoice,
     TransitionClip,
+    TransitionRefusal,
+    _split_frames,
     assembly_plan,
     assembly_refusals,
     clip_frames_on_grid,
@@ -780,6 +788,25 @@ def plan_of(clips, song_seconds, transitions=None):
     return assembly_plan(clips, song_seconds, transitioning(*clips), transitions)
 
 
+def empty_split(before, after, *, start, end, outgoing, blend, incoming, remedy):
+    """`TRANSITION_EMPTY_SPLIT_REFUSAL` with its remedy already substituted.
+
+    The remedy is chosen by which of the three numbers is empty and is a template of its own, so
+    the two are filled here once rather than at every assertion -- and every caller still writes
+    out *which* remedy it expects, because that is the thing under test.
+    """
+    return TRANSITION_EMPTY_SPLIT_REFUSAL.format(
+        before=before.label,
+        after=after.label,
+        start=start,
+        end=end,
+        outgoing=outgoing,
+        blend=blend,
+        incoming=incoming,
+        remedy=remedy.format(before=before.label, after=after.label),
+    )
+
+
 def test_an_overlap_with_a_transition_emits_three_entries_and_the_middle_is_the_overlaps_frames():
     """AD-18's Rule, and R-39's correction to how it reads.
 
@@ -894,8 +921,12 @@ def test_more_than_two_clips_over_one_instant_refuses_the_transition_and_still_a
     plan = plan_of([a, b, c], 8.0, {"a": DISSOLVE})
 
     assert plan.transition_refusals == [
-        TRANSITION_CROWDED_REFUSAL.format(
-            before=a.label, after=b.label, start=3.0, end=4.0, count=3
+        TransitionRefusal(
+            before_shot_id="a",
+            after_shot_id="b",
+            sentence=TRANSITION_CROWDED_REFUSAL.format(
+                before=a.label, after=b.label, start=3.0, end=4.0, count=3
+            ),
         )
     ]
     assert not any(isinstance(entry, TransitionClip) for entry in plan.clips)
@@ -919,8 +950,13 @@ def test_a_shot_swallowed_whole_refuses_the_transition_by_the_same_sentence():
     b = clip("b", 2.0, 2.0)
     plan = plan_of([a, b], 8.0, {"a": DISSOLVE})
     assert plan.transition_refusals == [
-        TRANSITION_NESTED_REFUSAL.format(
-            before=a.label, after=b.label, start=0.0, end=8.0, inner_start=2.0, inner_end=4.0
+        TransitionRefusal(
+            before_shot_id="a",
+            after_shot_id="b",
+            sentence=TRANSITION_NESTED_REFUSAL.format(
+                before=a.label, after=b.label, start=0.0, end=8.0,
+                inner_start=2.0, inner_end=4.0,
+            ),
         )
     ]
     assert not any(isinstance(entry, TransitionClip) for entry in plan.clips)
@@ -931,53 +967,108 @@ def test_a_shot_swallowed_whole_refuses_the_transition_by_the_same_sentence():
     assert sum(plan.frames) == round(8.0 * ASSEMBLY_FPS)
 
 
-def test_a_split_that_would_lay_no_frames_is_refused_with_all_three_numbers_in_it():
-    """**The defect this remediation exists for, in the two shapes that reached HTTP 200.**
+def test_a_split_whose_incoming_stretch_runs_backwards_is_refused_with_all_three_numbers():
+    """**The defect the 2026-08-30 rule exists for, in the shape that reached HTTP 200.**
 
-    Both satisfy `sum(plan.frames) == round(song * 24)` exactly, and both were wrong, because a
-    window that runs backwards cancels against itself. Neither is caught by any count of clips or
-    any description of a nesting: the third clip lands in the half-frame band below the Overlap's
-    end, so `covering` -- which applies `BOUNDARY_TOLERANCE_SECONDS` inwards, deliberately, because
-    a boundary written twice is one boundary -- does not see it, while the resolution loop truncates
-    the incoming Shot's head against it all the same.
+    `A[0,4.0625] B[3,6] C[4.05,8]` gave `[72, 26, -1, 95]`, which satisfies
+    `sum(plan.frames) == round(song * 24)` exactly and is wrong, because a window that runs
+    backwards cancels against itself. It is caught by no count of clips and no description of a
+    nesting: the third clip lands in the half-frame band below the Overlap's end, so `covering` --
+    which applies `BOUNDARY_TOLERANCE_SECONDS` inwards, deliberately, because a boundary written
+    twice is one boundary -- does not see it, while the resolution loop truncates the incoming
+    Shot's head against it all the same. Downstream `-1` is `-frames:v -1`, which ffmpeg **ignores
+    at rc 0 with no warning** (measured 2026-08-30: asked -1, encoded the whole rest of the take),
+    `concat` joins the over-long segment, `-shortest` trims back to the song,
+    `verification_problems` returns `[]` and half the running time is the wrong Shot.
 
-    * `A[0,4.0625] B[3,6] C[4.05,8]` gave `[72, 26, -1, 95]`. Downstream that is `-frames:v -1`,
-      which ffmpeg **ignores at rc 0 with no warning** (measured 2026-08-30: asked -1, encoded the
-      whole rest of the take), `concat` joins the over-long segment, `-shortest` trims back to the
-      song, `verification_problems` returns `[]` and half the running time is the wrong Shot.
-    * `A[0,4] B[3,6] C[4,8]` gave `[72, 24, 0, 96]`, **needs no off-grid arithmetic at all**, and
-      is the snapper's preferred outcome: a clip whose start snaps to the previous clip's end.
+    **Its sibling `A[0,4] B[3,6] C[4,8]` is no longer here, and that is the Director's ruling of
+    2026-08-31.** That geometry gave `[72, 24, 0, 96]` -- a *zero* third stretch, not a negative
+    one -- and this test asserted it refused. It composes now, and
+    `test_a_zero_third_stretch_composes_and_the_zero_length_entry_is_dropped` is where it lives.
 
     The sentence states all three numbers rather than the empty one, because which of the three is
-    empty is the finding, and it names both Shots -- which `render_boundary_preview` relies on,
-    since that route picks this plan's sentence out by the outgoing Shot's label.
+    empty is the finding. Its **remedy** is the one that names a third clip, and here that remedy
+    is the true one: `C` really is over this stretch, in the band the crowding count excludes,
+    which is exactly why the count cannot say so and this sentence has to.
     """
-    for windows, blend, incoming in (
-        ([("a", 0.0, 4.0625), ("b", 3.0, 3.0), ("c", 4.05, 3.95)], 26, -1),
-        ([("a", 0.0, 4.0), ("b", 3.0, 3.0), ("c", 4.0, 4.0)], 24, 0),
-    ):
-        clips = [clip(shot_id, start, duration) for shot_id, start, duration in windows]
-        plan = plan_of(clips, 8.0, {"a": DISSOLVE})
-        assert plan.transition_refusals == [
-            TRANSITION_EMPTY_SPLIT_REFUSAL.format(
-                before=clips[0].label,
-                after=clips[1].label,
-                start=clips[1].start,
-                end=clips[0].end,
-                outgoing=72,
-                blend=blend,
-                incoming=incoming,
-            )
-        ], windows
-        assert not any(isinstance(entry, TransitionClip) for entry in plan.clips), windows
-        # The boundary is the hard cut it already was, and the plan is the plan with no
-        # transition in it at all -- which is what "refuse the transition, never the export"
-        # means (R-37).
-        assert [(entry.start, entry.end) for entry in plan.clips] == [
-            (entry.start, entry.end) for entry in plan_of(clips, 8.0, {}).clips
-        ], windows
-        assert sum(plan.frames) == round(8.0 * ASSEMBLY_FPS), windows
-        assert all(count > 0 for count in plan.frames), windows
+    clips = [clip("a", 0.0, 4.0625), clip("b", 3.0, 3.0), clip("c", 4.05, 3.95)]
+    plan = plan_of(clips, 8.0, {"a": DISSOLVE})
+    assert plan.transition_refusals == [
+        TransitionRefusal(
+            before_shot_id="a",
+            after_shot_id="b",
+            sentence=empty_split(
+                clips[0], clips[1], start=clips[1].start, end=clips[0].end,
+                outgoing=72, blend=26, incoming=-1,
+                remedy=TRANSITION_BACKWARDS_INCOMING_REMEDY,
+            ),
+        )
+    ]
+    assert not any(isinstance(entry, TransitionClip) for entry in plan.clips)
+    # The boundary is the hard cut it already was, and the plan is the plan with no
+    # transition in it at all -- which is what "refuse the transition, never the export"
+    # means (R-37).
+    assert [(entry.start, entry.end) for entry in plan.clips] == [
+        (entry.start, entry.end) for entry in plan_of(clips, 8.0, {}).clips
+    ]
+    assert sum(plan.frames) == round(8.0 * ASSEMBLY_FPS)
+    assert all(count > 0 for count in plan.frames)
+
+
+def test_a_zero_third_stretch_composes_and_the_zero_length_entry_is_dropped():
+    """**The Director's ruling of 2026-08-31, and the regression it repairs.**
+
+    The rule shipped on 2026-08-30 as `min(outgoing, blend, incoming) > 0`, and a blend the module
+    had composed the day before stopped composing. `A[0,4] B[3,7] C[4,5]` gave
+    `[72, 24, 0, 24, 48]` at `7ef2b82` **with** a `TransitionClip` in it, and `[72, 24, 24, 48]`
+    with none and a refusal afterwards -- while `B` resumes at 5.0 for 48 frames and the geometry
+    is entirely legal. The Director authored a dissolve and it was dropped with nothing on the
+    timeline to say so. **The two halves of one commit disagreed**: `assembly_plan`'s own comment
+    says a zero-frame entry *"can happen without any transition at all, and is not a defect: it is
+    dropped"*.
+
+    The rule is `outgoing > 0 and blend > 0 and incoming >= 0`, and the Director accepted the
+    second geometry it admits explicitly, having been shown it: `A[0,4] B[3,6] C[4,8]`, where `B`
+    is consumed entirely by the Overlap and by `C` so that **`B` appears only inside the blend**,
+    composes as `[72, 24, 96]`. Both are edits a Director laid down deliberately.
+
+    The invariant is untouched and holds a different way: the zero-length remainder is dropped by
+    `assembly_plan`'s own drop rather than refused by the split. Both halves are asserted, because
+    "it composes" and "no entry lays a non-positive count" are two claims and the frame rule is
+    the one this epic may not get wrong.
+    """
+    resumes = [clip("a", 0.0, 4.0), clip("b", 3.0, 4.0), clip("c", 4.0, 1.0)]
+    plan = plan_of(resumes, 7.0, {"a": DISSOLVE})
+    assert plan.transition_refusals == []
+    assert [type(entry).__name__ for entry in plan.clips] == [
+        "ClipWindow", "TransitionClip", "ClipWindow", "ClipWindow"
+    ]
+    # `b`'s own head after the blend is zero frames long and is dropped; `c` and `b`'s resumption
+    # are what follow. The counts are the ones `7ef2b82` laid, minus the entry that lays nothing.
+    assert plan.frames == [72, 24, 24, 48]
+    assert [entry.shot_id for entry in plan.clips if isinstance(entry, ClipWindow)] == [
+        "a", "c", "b"
+    ]
+    assert all(count > 0 for count in plan.frames)
+    assert sum(plan.frames) == round(7.0 * ASSEMBLY_FPS)
+
+    # The geometry the ruling was taken on, where the incoming Shot appears **only** inside the
+    # blend: `b` has no entry of its own anywhere in the plan afterwards.
+    inside = [clip("a", 0.0, 4.0), clip("b", 3.0, 3.0), clip("c", 4.0, 4.0)]
+    only_in_the_blend = plan_of(inside, 8.0, {"a": DISSOLVE})
+    assert only_in_the_blend.transition_refusals == []
+    assert only_in_the_blend.frames == [72, 24, 96]
+    assert [type(entry).__name__ for entry in only_in_the_blend.clips] == [
+        "ClipWindow", "TransitionClip", "ClipWindow"
+    ]
+    blend = only_in_the_blend.clips[1]
+    assert isinstance(blend, TransitionClip)
+    assert (blend.before.shot_id, blend.after.shot_id) == ("a", "b")
+    assert [
+        entry.shot_id for entry in only_in_the_blend.clips if isinstance(entry, ClipWindow)
+    ] == ["a", "c"]
+    assert all(count > 0 for count in only_in_the_blend.frames)
+    assert sum(only_in_the_blend.frames) == round(8.0 * ASSEMBLY_FPS)
 
 
 def test_the_outgoing_shot_buried_under_the_incoming_one_is_nested_the_other_way():
@@ -997,8 +1088,13 @@ def test_the_outgoing_shot_buried_under_the_incoming_one_is_nested_the_other_way
     b = clip("b", 0.0, 10.0)
     plan = plan_of([a, b], 10.0, {"a": DISSOLVE})
     assert plan.transition_refusals == [
-        TRANSITION_NESTED_REFUSAL.format(
-            before=b.label, after=a.label, start=0.0, end=10.0, inner_start=0.0, inner_end=4.0
+        TransitionRefusal(
+            before_shot_id="a",
+            after_shot_id="b",
+            sentence=TRANSITION_NESTED_REFUSAL.format(
+                before=b.label, after=a.label, start=0.0, end=10.0,
+                inner_start=0.0, inner_end=4.0,
+            ),
         )
     ]
     assert not any(isinstance(entry, TransitionClip) for entry in plan.clips)
@@ -1026,13 +1122,362 @@ def test_an_overlap_longer_than_the_tolerance_that_lays_no_frames_is_refused_too
     assert clip_frames_on_grid(b.start, a.end) == 0
     plan = plan_of([a, b], 8.0, {"a": DISSOLVE})
     assert plan.transition_refusals == [
-        TRANSITION_EMPTY_SPLIT_REFUSAL.format(
-            before=a.label, after=b.label, start=b.start, end=a.end,
-            outgoing=12, blend=0, incoming=180,
+        TransitionRefusal(
+            before_shot_id="a",
+            after_shot_id="b",
+            # **The blend's own remedy, and it is decided before the crowding count** (2026-08-31).
+            # A Director told to move clips out from under a boundary can do it to completion and
+            # still have a zero-frame blend, because the clips were never what made it zero. Here
+            # there are only two clips anyway; the ordering is pinned where it matters by
+            # `test_a_zero_frame_blend_under_a_third_clip_is_told_to_lengthen_the_overlap`.
+            sentence=empty_split(
+                a, b, start=b.start, end=a.end, outgoing=12, blend=0, incoming=180,
+                remedy=TRANSITION_EMPTY_BLEND_REMEDY,
+            ),
         )
     ]
     assert all(count > 0 for count in plan.frames)
     assert sum(plan.frames) == round(8.0 * ASSEMBLY_FPS)
+
+
+def test_an_incoming_shot_with_no_entry_at_the_overlap_lays_no_frames_on_either_side():
+    """`_split_frames`' `position is None` branch, reached and pinned.
+
+    **It was reached by nothing.** Instrumented on 2026-08-30 across five test files: 0 hits,
+    against 613 for the `position == 0` branch beside it. Mutating `return 0, blend, 0` to
+    `return 1, blend, 1` survived all 2783 tests -- and it is no longer the silent `continue` it
+    was at `7ef2b82`, it now records a Director-facing sentence, so nothing said which one.
+
+    `None` is *nothing of the incoming Shot at this boundary*. `c` starts one hundredth of a
+    second inside `b`, which leaves `b` a head shorter than `BOUNDARY_TOLERANCE_SECONDS` -- the
+    resolution loop discards it whole -- and `b` ends before `c` does, so `b` has no entry
+    anywhere. Both stretches are the zero frames they are, the boundary is refused, and the
+    sentence is the crowding one because three windows really do cover that stretch.
+
+    Asserted at both altitudes on purpose: through `assembly_plan`, which is where the state
+    occurs, and on the function itself, because the returned tuple is the whole contract and a
+    plan-level assertion alone would let a future `1, blend, 1` fail as an `AssertionError` from
+    the composition below rather than as a wrong number.
+    """
+    clips = [clip("a", 0.0, 4.0), clip("b", 3.0, 4.0), clip("c", 3.01, 4.99)]
+    plan = plan_of(clips, 8.0, {"a": DISSOLVE})
+
+    assert plan.transition_refusals == [
+        TransitionRefusal(
+            before_shot_id="a",
+            after_shot_id="b",
+            sentence=TRANSITION_CROWDED_REFUSAL.format(
+                before=clips[0].label, after=clips[1].label, start=3.0, end=4.0, count=3
+            ),
+        )
+    ]
+    assert not any(isinstance(entry, TransitionClip) for entry in plan.clips)
+    assert [entry.shot_id for entry in plan.clips] == ["a", "c"]
+    assert all(count > 0 for count in plan.frames)
+
+    # The tuple itself. `blend` is still measured -- it is the one of the three that does not
+    # depend on an entry -- and both stretches that do are zero.
+    assert _split_frames(clips[0], list(plan.clips), None, 3.0, 4.0) == (0, 24, 0)
+
+
+def test_the_split_reads_no_entry_but_the_outgoing_shots_own():
+    """`_split_frames`' two guards on `lead`, each pinned by the state only it answers.
+
+    Both survived the whole suite on 2026-08-30 -- `lead = entries[position - 1] if position else
+    None` with the guard dropped, and `lead.shot_id == before.shot_id` with the identity term
+    dropped -- because the docstring credited the identity term with the mirror-nesting fix and
+    the test reaching that case goes through `position == 0` instead.
+
+    **The identity term has a geometry, and it is the first half of this test.** `b`'s own head
+    before the Overlap with `c` is 0.010s long, which is shorter than
+    `BOUNDARY_TOLERANCE_SECONDS`, so the resolution loop discards it whole and the entry in front
+    of `c`'s head is **`a`'s** tail. Reading that entry's frames as `b`'s says the outgoing Shot
+    has 24 frames before the blend when it has none, and the boundary composes a transition out
+    of a Shot that contributes no picture to it: measured, `(24, 120)` with one refusal becomes
+    `(24, 72, 48)` with a `TransitionClip` in it and no refusal at all.
+
+    **The `position == 0` guard has no geometry, and this is where that is recorded rather than
+    implied.** Swept 2026-08-31 over 47 736 arrangements -- every three-window layout on a
+    quarter-frame lattice and 3 300 random three- and four-window layouts, each with every subset
+    of its boundaries carrying a blend -- dropping it changes nothing `assembly_plan` answers, and
+    it cannot: `position == 0` means no entry of the outgoing Shot survives before the Overlap,
+    which makes `entries[-1]` either another Shot's window (the identity term refuses it) or a
+    *later* entry of the outgoing Shot itself, which can only exist when the outgoing Shot
+    outlasts the incoming one -- and that is a negative incoming stretch, refused anyway.
+
+    So it is pinned here, at the function's own boundary, which is the only place the state
+    exists. `render_boundary_preview`'s `lead_frames` clamp is the precedent: a term that costs
+    nothing, says what the number means, and is the line that stays correct if the caller's
+    arithmetic ever changes is kept -- and recorded as unreachable rather than left implying it is
+    load-bearing.
+    """
+    clips = [clip("a", 0.0, 2.0), clip("b", 1.0, 3.0), clip("c", 1.01, 5.0)]
+    plan = plan_of(clips, 6.01, {"b": DISSOLVE})
+
+    assert [(entry.shot_id, entry.start) for entry in plan.clips] == [("a", 0.0), ("c", 1.01)]
+    assert plan.transition_refusals == [
+        TransitionRefusal(
+            before_shot_id="b",
+            after_shot_id="c",
+            sentence=TRANSITION_NESTED_REFUSAL.format(
+                before=clips[2].label, after=clips[1].label,
+                start=1.01, end=6.01, inner_start=1.01, inner_end=4.0,
+            ),
+        )
+    ]
+    assert not any(isinstance(entry, TransitionClip) for entry in plan.clips)
+    assert plan.frames == [24, 120]
+
+    # The two states, at the function's own boundary. `entries` here is a plan in which the
+    # outgoing Shot's window sits both **before** and **after** the incoming Shot's head, which is
+    # the only shape in which either guard has anything to refuse.
+    before, elsewhere = clip("b", 1.0, 3.0), clip("a", 0.0, 1.0)
+    head = clip("c", 1.01, 5.0)
+    entries = [head, replace(before, start=4.0, duration=2.0)]
+    # `position == 0`: there is no entry before the head, and `entries[-1]` is not it.
+    assert _split_frames(before, entries, 0, 1.01, 4.0) == (0, 72, 48)
+    # `position > 0` with another Shot's window in front of the head: not the outgoing Shot's
+    # frames, so not the outgoing Shot's stretch.
+    assert _split_frames(before, [elsewhere, head], 1, 1.01, 4.0) == (0, 72, 48)
+    # And the state both guards exist to let through, so this test cannot pass by refusing
+    # everything: the outgoing Shot's own entry, measured as its own frames.
+    assert _split_frames(before, [replace(before, start=0.5, duration=0.51), head], 1, 1.01, 4.0)[
+        0
+    ] == clip_frames_on_grid(0.5, 1.01)
+
+
+def test_an_outgoing_shot_with_no_surviving_tail_is_not_called_nested():
+    """`_degenerate_refusal`'s second nested branch keeps its geometry test (2026-08-31).
+
+    Dropping `and overlap_start - before.start <= BOUNDARY_TOLERANCE_SECONDS` -- leaving
+    `elif outgoing <= 0:` -- survived the whole suite, while its mirror one line above **is**
+    pinned. Inverted, a Shot with no surviving tail is told it *"sits entirely inside"* the Shot
+    that follows it and given `SNAP_NESTED`'s remedy, which is a statement about a geometry that
+    is not this one.
+
+    `a` starts 0.021s before `b`, which is longer than `BOUNDARY_TOLERANCE_SECONDS`, so `a` is
+    **not** nested inside `b` by any reading -- and its surviving tail is 0.021s of a 24 fps grid
+    whose two ends round to the same frame, so it lays no frames. Those are two different facts
+    about one boundary, and only one of them is what the sentence is allowed to say.
+    """
+    a, b = clip("a", 0.023, 0.977), clip("b", 0.044, 1.956)
+    assert b.start - a.start > BOUNDARY_TOLERANCE_SECONDS
+    assert clip_frames_on_grid(a.start, b.start) == 0
+
+    plan = plan_of([a, b], 2.0, {"a": DISSOLVE})
+    assert plan.transition_refusals == [
+        TransitionRefusal(
+            before_shot_id="a",
+            after_shot_id="b",
+            sentence=empty_split(
+                a, b, start=b.start, end=a.end, outgoing=0, blend=23, incoming=24,
+                remedy=TRANSITION_EMPTY_OUTGOING_REMEDY,
+            ),
+        )
+    ]
+    assert "sits entirely inside" not in plan.transition_refusals[0].sentence
+    assert all(count > 0 for count in plan.frames)
+
+
+def test_a_clip_ending_where_the_overlap_starts_is_not_a_third_picture():
+    """`covering`'s **end-side** tolerance, which nothing pinned (2026-08-31).
+
+    Only the start side was held, by `A[0,4.0625] B[3,6] C[4.05,8]`. Flipping
+    `clip.end > overlap_start + BOUNDARY_TOLERANCE_SECONDS` to `- BOUNDARY_TOLERANCE_SECONDS`
+    counts an ordinary adjacent clip -- one that ends exactly where the Overlap begins, which is
+    what a tiled timeline is made of -- as a third picture over the stretch, and a Director on a
+    normally tiled plan is told *"3 clips cover part of that stretch"* about two.
+
+    The tolerance is applied **inwards** on both sides for one reason: a boundary written twice
+    within half a frame is one boundary. `z` ends where `b` begins, so it is not over the stretch
+    at all, and the sentence is the one about the empty stretch rather than about a crowd.
+    """
+    z, a, b = clip("z", 0.0, 0.044), clip("a", 0.023, 0.977), clip("b", 0.044, 1.956)
+    assert z.end == b.start
+
+    plan = plan_of([z, a, b], 2.0, {"a": DISSOLVE})
+    assert plan.transition_refusals == [
+        TransitionRefusal(
+            before_shot_id="a",
+            after_shot_id="b",
+            sentence=empty_split(
+                a, b, start=b.start, end=a.end, outgoing=0, blend=23, incoming=24,
+                remedy=TRANSITION_EMPTY_OUTGOING_REMEDY,
+            ),
+        )
+    ]
+    assert "clips cover part of that stretch" not in plan.transition_refusals[0].sentence
+    assert all(count > 0 for count in plan.frames)
+
+
+def test_a_zero_frame_blend_under_a_third_clip_is_told_to_lengthen_the_overlap():
+    """Branch order: the blend is judged **before** the crowding count (2026-08-31).
+
+    With `blend <= 0` and a third clip also over the stretch, the crowding sentence came first and
+    told the Director to move the others out from under it -- a remedy they can follow to
+    completion and still have a zero-frame blend afterwards, because the clips were never what
+    made it zero. `c` starts 0.007s inside `b`, which is inside the half-frame band `covering`
+    excludes on the *end* side and not on the start side, so it counts: three clips, a blend of
+    nothing.
+
+    The crowding sentence is still the right one wherever there is a blend to crowd, which is
+    what `test_more_than_two_clips_over_one_instant_...` holds; this is the case where it is not.
+    """
+    a = clip("a", 0.0, 0.516667)
+    b = clip("b", 0.483333, 1.516667)
+    c = clip("c", 0.49, 2.51)
+    assert a.end - b.start > BOUNDARY_TOLERANCE_SECONDS
+    assert clip_frames_on_grid(b.start, a.end) == 0
+
+    plan = plan_of([a, b, c], 3.0, {"a": DISSOLVE})
+    assert plan.transition_refusals == [
+        TransitionRefusal(
+            before_shot_id="a",
+            after_shot_id="b",
+            sentence=empty_split(
+                a, b, start=b.start, end=a.end, outgoing=0, blend=0, incoming=0,
+                remedy=TRANSITION_EMPTY_BLEND_REMEDY,
+            ),
+        )
+    ]
+    assert "clips cover part of that stretch" not in plan.transition_refusals[0].sentence
+    assert all(count > 0 for count in plan.frames)
+
+
+def test_a_nested_refusal_prints_a_window_its_own_numbers_are_inside():
+    """The nested sentence stopped contradicting itself (2026-08-31).
+
+    Both branches decide nesting with `BOUNDARY_TOLERANCE_SECONDS` of slack and printed the
+    **raw** windows, so the sentence could state numbers that fail the containment it asserts --
+    *"SHOT 01 runs 0.000s to 4.000s and SHOT 02's 1.000s to 4.019s is within it"*. A 150 000-trial
+    fuzz found 6 of 206 nested refusals doing it. It is the same fault as the one the rule itself
+    was corrected for: a condition asked of one object and an answer read off another.
+
+    `a` begins 0.010s before `b` -- inside the slack, so this is nesting by the rule's own reading
+    -- and printing `a`'s own start would put the inner window outside the outer one it is said to
+    be inside. The clamp can move a printed end by at most half a frame, which is exactly the
+    slack the decision was made with.
+
+    The sweep underneath is the general claim: **every** nested refusal this module produces over
+    the lattice prints numbers that satisfy its own containment.
+    """
+    a, b = clip("a", 0.0, 4.0), clip("b", 0.01, 10.0)
+    assert b.start - a.start <= BOUNDARY_TOLERANCE_SECONDS
+
+    plan = plan_of([a, b], 10.01, {"a": DISSOLVE})
+    assert plan.transition_refusals == [
+        TransitionRefusal(
+            before_shot_id="a",
+            after_shot_id="b",
+            sentence=TRANSITION_NESTED_REFUSAL.format(
+                before=b.label, after=a.label,
+                start=0.01, end=10.01, inner_start=0.01, inner_end=4.0,
+            ),
+        )
+    ]
+
+    pattern = re.compile(
+        r"runs ([\d.]+)s to ([\d.]+)s and .*'s ([\d.]+)s to ([\d.]+)s is within it"
+    )
+    inspected = 0
+    lattice = [round(step / 96, 6) for step in range(1, 25)]
+    for a_end in lattice[6:]:
+        for b_start in lattice:
+            for b_end in lattice:
+                if not (b_start < a_end < b_end):
+                    continue
+                windows = [
+                    clip("a", 0.0, a_end),
+                    clip("b", b_start, round(b_end - b_start, 6)),
+                    clip("c", b_end, 1.0),
+                ]
+                for transitions in ({"a": DISSOLVE}, {"b": DISSOLVE},
+                                    {"a": DISSOLVE, "b": DISSOLVE}):
+                    swept = plan_of(windows, round(b_end + 1.0, 6), transitions)
+                    for refusal in swept.transition_refusals:
+                        found = pattern.search(refusal.sentence)
+                        if not found:
+                            continue
+                        inspected += 1
+                        outer_start, outer_end, inner_start, inner_end = (
+                            float(value) for value in found.groups()
+                        )
+                        assert outer_start <= inner_start <= inner_end <= outer_end, (
+                            refusal.sentence
+                        )
+    assert inspected > 100, inspected
+
+
+def test_the_frame_rule_holds_over_every_geometry_the_ruling_admits():
+    """**The invariant, over the rule the Director ruled on** (2026-08-31), fuzzed not argued.
+
+    A zero third stretch composes now, so `all(count > 0 for count in plan.frames)` holds through
+    `assembly_plan`'s own drop rather than through the split's refusal -- a different mechanism
+    for the same guarantee, and the guarantee is FX-NFR-1, the one thing this epic may not get
+    wrong. `test_no_plan_this_module_returns_holds_a_non_positive_frame_count` sweeps the shapes a
+    Director drags; this sweeps the shapes the *ruling* newly admits, which is every arrangement
+    where the incoming Shot's head is consumed exactly.
+
+    Three claims, and the second is what makes the first safe to enforce: every count is positive,
+    every count is the grid's own answer for its own entry, and a composed blend is never itself
+    the entry that lays nothing.
+
+    The full sweep behind this is `scratchpad/f6/fuzz.py`: 33 336 plans, 15 086 of them with a
+    composed blend, 2 634 nested refusals inspected, zero problems. What is executed here is the
+    part that runs in a test's time budget.
+    """
+    lattice = [round(step / 48, 6) for step in range(1, 17)]
+    plans = composed = 0
+    for a_end in lattice[3:]:
+        for b_start in lattice:
+            for b_end in lattice:
+                if not (b_start < a_end < b_end):
+                    continue
+                windows = [
+                    clip("a", 0.0, a_end),
+                    clip("b", b_start, round(b_end - b_start, 6)),
+                    clip("c", b_end, 1.0),
+                ]
+                for names in ((), ("a",), ("b",), ("a", "b")):
+                    plan = plan_of(
+                        windows,
+                        round(b_end + 1.0, 6),
+                        {name: DISSOLVE for name in names},
+                    )
+                    plans += 1
+                    case = (a_end, b_start, b_end, names)
+                    assert all(count > 0 for count in plan.frames), (case, plan.frames)
+                    assert plan.frames == [
+                        clip_frames_on_grid(entry.start, entry.end) for entry in plan.clips
+                    ], case
+                    for entry, count in zip(plan.clips, plan.frames, strict=True):
+                        if isinstance(entry, TransitionClip):
+                            composed += 1
+                            assert count > 0, (case, count)
+    # The sweep is worth nothing if it never reaches a blend: both numbers are asserted so a
+    # future change that quietly stops composing anything fails here rather than passing.
+    assert plans > 1000 and composed > 100, (plans, composed)
+
+
+def test_a_plan_whose_every_window_is_shorter_than_a_frame_is_refused_by_name():
+    """The `max()` on an empty `resolved`, which answered with a Python message (2026-08-31).
+
+    **Pre-existing**, and confirmed so: built and run in a worktree at `7ef2b82`, an all-sub-frame
+    plan raised `ValueError: max() arg is an empty sequence` there identically. `Shot.duration` is
+    `ge=0` and the resolution loop discards every window no longer than
+    `BOUNDARY_TOLERANCE_SECONDS` whole, so one sub-frame Shot is a whole plan that resolves to
+    nothing at all. It was found while giving `ASSEMBLY_NEGATIVE_FRAMES_ERROR` a type that its two
+    call sites could catch, and it proves the path unguarded, which is why it is closed in the
+    same pass.
+
+    `AssemblyGeometryError` subclasses `ValueError` deliberately, so nothing that already caught
+    the broader type changes behaviour; only the narrowing is new.
+    """
+    sliver = [clip("a", 0.0, 0.01)]
+    with pytest.raises(AssemblyGeometryError) as raised:
+        plan_of(sliver, 0.01)
+    assert str(raised.value) == ASSEMBLY_NO_GEOMETRY_ERROR.format(count=1, fps=ASSEMBLY_FPS)
+    assert isinstance(raised.value, ValueError)
 
 
 def test_no_plan_this_module_returns_holds_a_non_positive_frame_count():

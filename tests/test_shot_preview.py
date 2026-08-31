@@ -1062,6 +1062,152 @@ def test_a_boundary_preview_blends_the_pair_it_names_or_refuses_to_blend_at_all(
     assert paired.json()["tail_frames"] > 0
 
 
+def test_a_boundary_preview_refuses_a_blend_whose_outgoing_leg_is_another_shot(tmp_path: Path):
+    """The **mirror** of the defect `66c90d8` fixed, and the half it proved in one direction only.
+
+    That commit widened the index lookup from `item.before.shot_id == shot.id` to both fields, and
+    the sibling test above kills the deletion of the `after` term. Deleting the `before` term
+    survived the whole suite: the case it answers is the one where the **addressed** Shot is the
+    one the plan drops, so matching on `after` alone binds this route to the
+    predecessor-into-successor blend and answers 200 naming a Shot that contributes no frames to
+    the picture at all.
+
+    `shot_b`'s take is gone, so the plan pairs `shot_a` with `shot_c` -- and a request about
+    `shot_b`'s own boundary, which is `shot_b` into `shot_c`, matches that entry on its `after`
+    end. It must not: `shot_b` is not in this plan, and
+    `BOUNDARY_PREVIEW_TAKE_MISSING_REFUSAL` is exactly that sentence.
+    """
+    from music_video_producer.app import BOUNDARY_PREVIEW_TAKE_MISSING_REFUSAL
+
+    client, _store, _comfy, _app = make_client(tmp_path)
+    project_id = client.post("/api/projects", json={"name": "Dropped"}).json()["id"]
+    assert client.post(
+        f"/api/projects/{project_id}/songs/upload",
+        data={"title": "Dropped Song", "duration": "0"},
+        files={"file": ("song.wav", wav_bytes(8.0), "audio/wav")},
+    ).status_code == 200
+    shots_dir = tmp_path / "comfy" / "output" / "music-video-producer" / project_id / "shots"
+    prefix = f"music-video-producer/{project_id}/shots"
+    windows = (("shot_a", 0.0, 4.0, "red"), ("shot_b", 3.5, 4.5, "green"),
+               ("shot_c", 3.6, 4.4, "blue"))
+    for shot_id, _start, duration, colour in windows:
+        synthesize_take(
+            shots_dir / f"{shot_id}-h3_00001-audio.mp4", duration + 0.5, "128x72", colour
+        )
+    assert client.put(
+        f"/api/projects/{project_id}/shots",
+        json={
+            "shots": [
+                {
+                    "id": shot_id, "start": start, "duration": duration,
+                    "prompt": f"Room {shot_id}", "status": "complete",
+                    "latest_output": f"{prefix}/{shot_id}-h3_00001-audio.mp4",
+                }
+                for shot_id, start, duration, _colour in windows
+            ]
+        },
+    ).status_code == 200
+    for shot_id, *_rest in windows:
+        assert client.post(
+            f"/api/projects/{project_id}/shots/{shot_id}/approve"
+        ).status_code == 200
+    for shot_id in ("shot_a", "shot_b"):
+        assert set_transition(client, project_id, shot_id, "dissolve").status_code == 200
+
+    # The plan drops `shot_b` and blends `shot_a` into `shot_c` -- asserted, so the refusal below
+    # is a refusal of a blend that is really there rather than of nothing.
+    (shots_dir / "shot_b-h3_00001-audio.mp4").unlink()
+    orphaned = client.post(f"/api/projects/{project_id}/shots/shot_b/boundary-preview")
+    assert orphaned.status_code == 422, orphaned.text
+    assert orphaned.json()["detail"] == BOUNDARY_PREVIEW_TAKE_MISSING_REFUSAL.format(
+        before="SHOT 02 (shot_b)", after="SHOT 03 (shot_c)"
+    )
+
+    # The blend the response above must not have served: with `shot_b` out of the manifest as
+    # well, the same geometry answers 200 as `shot_a` into `shot_c`.
+    remaining = [
+        shot
+        for shot in client.get(f"/api/projects/{project_id}").json()["shots"]
+        if shot["id"] != "shot_b"
+    ]
+    assert client.put(
+        f"/api/projects/{project_id}/shots", json={"shots": remaining}
+    ).status_code == 200
+    paired = client.post(f"/api/projects/{project_id}/shots/shot_a/boundary-preview")
+    assert paired.status_code == 200, paired.text
+    assert paired.json()["after_shot_id"] == "shot_c"
+
+
+def test_a_boundary_preview_quotes_its_own_boundarys_refusal_and_no_other(tmp_path: Path):
+    """The refusal is selected by the **pair**, not by looking for a label in a sentence.
+
+    `detail = next((line for line in plan.transition_refusals if label in line), "")` -- and every
+    refusal names **both** Shots (R-37 requires it: a boundary is two Shots). So a Shot that is
+    the incoming side of one refused boundary and the outgoing side of another matched both, and
+    the first in plan order won. Reproduced with the geometry below: asking about `shot_b`'s
+    boundary with `shot_c` answered with the sentence about `shot_a` sitting inside `shot_b`,
+    which is a different boundary, a different remedy, and a Shot the request did not mention.
+
+    It is the same correction `66c90d8` made to the index lookup twelve lines above this one and
+    did not make here, and `assembly.py`'s own docstring recorded the substring reliance as a
+    design fact. Both are corrected.
+
+    Both boundaries really are refused, and for different reasons -- `shot_a` is laid wholly
+    inside `shot_b`, while `shot_b` into `shot_c` is crowded by `shot_d` -- so the two sentences
+    are distinguishable and the assertion is not a tautology.
+    """
+    client, _store, _comfy, _app = make_client(tmp_path)
+    project_id = client.post("/api/projects", json={"name": "Two refusals"}).json()["id"]
+    assert client.post(
+        f"/api/projects/{project_id}/songs/upload",
+        data={"title": "Two Song", "duration": "0"},
+        files={"file": ("song.wav", wav_bytes(12.0), "audio/wav")},
+    ).status_code == 200
+    shots_dir = tmp_path / "comfy" / "output" / "music-video-producer" / project_id / "shots"
+    prefix = f"music-video-producer/{project_id}/shots"
+    windows = (("shot_a", 0.0, 4.0, "red"), ("shot_b", 0.0, 10.0, "green"),
+               ("shot_c", 9.0, 3.0, "blue"), ("shot_d", 9.2, 2.7, "white"))
+    for shot_id, _start, duration, colour in windows:
+        synthesize_take(
+            shots_dir / f"{shot_id}-h3_00001-audio.mp4", duration + 0.5, "128x72", colour
+        )
+    assert client.put(
+        f"/api/projects/{project_id}/shots",
+        json={
+            "shots": [
+                {
+                    "id": shot_id, "start": start, "duration": duration,
+                    "prompt": f"Room {shot_id}", "status": "complete",
+                    "latest_output": f"{prefix}/{shot_id}-h3_00001-audio.mp4",
+                }
+                for shot_id, start, duration, _colour in windows
+            ]
+        },
+    ).status_code == 200
+    for shot_id, *_rest in windows:
+        assert client.post(
+            f"/api/projects/{project_id}/shots/{shot_id}/approve"
+        ).status_code == 200
+    for shot_id in ("shot_a", "shot_b"):
+        assert set_transition(client, project_id, shot_id, "dissolve").status_code == 200
+
+    asked = client.post(f"/api/projects/{project_id}/shots/shot_b/boundary-preview")
+    assert asked.status_code == 422, asked.text
+    detail = asked.json()["detail"]
+    # Its own boundary: crowded by `shot_d`, which starts inside the `shot_b`/`shot_c` Overlap.
+    assert "SHOT 02 (shot_b) and SHOT 03 (shot_c) overlap" in detail
+    assert "clips cover part of that stretch" in detail
+    # And not the other boundary's, which is the sentence it used to answer with.
+    assert "sits entirely inside" not in detail
+    assert "SHOT 01 (shot_a)" not in detail
+
+    # The other boundary is refused too, in its own words, when it is the one asked about --
+    # so this is a test about *which* sentence rather than about one of them being absent.
+    other = client.post(f"/api/projects/{project_id}/shots/shot_a/boundary-preview")
+    assert other.status_code == 422, other.text
+    assert "SHOT 01 (shot_a) sits entirely inside SHOT 02 (shot_b)" in other.json()["detail"]
+
+
 def test_the_boundary_preview_composes_both_legs_against_the_exports_own_width(
     tmp_path: Path, monkeypatch
 ):

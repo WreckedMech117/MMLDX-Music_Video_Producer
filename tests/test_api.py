@@ -26434,6 +26434,77 @@ def test_a_locked_shot_cannot_be_given_a_blend_through_the_shot_beside_it(tmp_pa
     assert pair(open_project) == [("dissolve", None), (None, "dissolve")]
 
 
+def test_a_lock_holds_a_blend_and_not_a_shots_treatment_of_its_own_frames(tmp_path: Path):
+    """The mirror lock asks whether the two Shots **overlap** (2026-08-31).
+
+    The loop the test above pins shipped without that question, so a lock anywhere in the plan
+    made the Shot in front of it un-fadeable. On a boundary with no Overlap a `transition_out` is
+    a **one-sided** treatment of the addressed Shot's own last frames (AD-19, FX-16, story 11.4):
+    nothing crosses the boundary, the export composes it onto that Shot's own chain, and the only
+    thing the mirror writes on the neighbour is a `transition_in` the export never reads.
+
+    Reproduced through the route before the fix: `shot_one[0, 4.0] shot_two[4.0, 8.0]`,
+    `shot_two` locked, `transition_out: fade_black` on `shot_one` answered 422 with *"a transition
+    between SHOT 01 and SHOT 02 is written on both of them, so nothing was changed"* -- **a
+    sentence that states a falsehood**, because there is no transition between them.
+
+    Both directions, because `transition_in` mirrors backwards and the gate is written per side.
+    And the lock is still held where there *is* a blend: the four refusals in the test above are
+    on the overlapping geometry, and this is the same route on the same bodies with the clips
+    apart, which is what makes this a statement about the boundary rather than about the lock.
+    """
+    from music_video_producer.app import SHOT_TRANSITION_MIRROR_LOCKED_REFUSAL
+
+    client, _store, _ = make_client(tmp_path)
+
+    def with_lock_on(index: int) -> str:
+        project_id = project_with_two_shots(client, name="Apart")
+        stored = ProjectStore(tmp_path).get(project_id)
+        stored.shots[index].locked = True
+        ProjectStore(tmp_path).save(stored)
+        return project_id
+
+    def pair(project_id: str) -> list[tuple[str | None, str | None]]:
+        return [
+            (
+                shot.transition_out.type if shot.transition_out else None,
+                shot.transition_in.type if shot.transition_in else None,
+            )
+            for shot in ProjectStore(tmp_path).get(project_id).shots
+        ]
+
+    forwards = with_lock_on(1)
+    written = client.put(
+        transitions_url(forwards, "shot_one"), json={"transition_out": {"type": "fade_black"}}
+    )
+    assert written.status_code == 200, written.text
+    assert pair(forwards) == [("fade_black", None), (None, "fade_black")]
+
+    backwards = with_lock_on(0)
+    mirrored = client.put(
+        transitions_url(backwards, "shot_two"), json={"transition_in": {"type": "fade_black"}}
+    )
+    assert mirrored.status_code == 200, mirrored.text
+    assert pair(backwards) == [("fade_black", None), (None, "fade_black")]
+
+    # And the lock is untouched where the boundary really is a blend: the identical body on the
+    # overlapping plan is still refused, in the sentence that is true there.
+    overlapped = overlapping_project(client)
+    stored = ProjectStore(tmp_path).get(overlapped)
+    stored.shots[1].locked = True
+    ProjectStore(tmp_path).save(stored)
+    held = client.put(
+        transitions_url(overlapped, "shot_one"), json={"transition_out": {"type": "fade_black"}}
+    )
+    assert held.status_code == 422, held.text
+    assert held.json()["detail"] == SHOT_TRANSITION_MIRROR_LOCKED_REFUSAL.format(
+        shot="SHOT 02 (shot_two)",
+        before="SHOT 01 (shot_one)",
+        after="SHOT 02 (shot_two)",
+    )
+    assert pair(overlapped) == [(None, None), (None, None)]
+
+
 def test_a_new_shot_never_inherits_a_transition_from_the_one_it_was_made_from(tmp_path: Path):
     """`SHOT_UNINHERITED_DECISION_FIELDS`, executed at the door a copy actually arrives through.
 

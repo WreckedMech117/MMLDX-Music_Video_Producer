@@ -27548,16 +27548,21 @@ def test_an_overlap_dragged_away_is_announced_once_naming_both_shots():
       import { overlapRemovalToasts } from './src/music_video_producer/web/assets/api.js';
       const before = __BEFORE__;
       const apart = __APART__;
+      const catalogue = __CATALOGUE__;
       console.log(JSON.stringify({
-        removed: overlapRemovalToasts(before, apart),
-        unmoved: overlapRemovalToasts(before, before),
-        again: overlapRemovalToasts(apart, apart),
+        removed: overlapRemovalToasts(before, apart, catalogue),
+        unmoved: overlapRemovalToasts(before, before, catalogue),
+        again: overlapRemovalToasts(apart, apart, catalogue),
         untyped: overlapRemovalToasts(
-          before, apart.map((shot) => ({ ...shot, transition_out: null }))),
-        deleted: overlapRemovalToasts(before, apart.filter((shot) => shot.id !== 'shot_b')),
-        unread: overlapRemovalToasts(null, apart),
+          before, apart.map((shot) => ({ ...shot, transition_out: null })), catalogue),
+        deleted: overlapRemovalToasts(
+          before, apart.filter((shot) => shot.id !== 'shot_b'), catalogue),
+        unread: overlapRemovalToasts(null, apart, catalogue),
       }));
-    """.replace("__BEFORE__", json.dumps(before)).replace("__APART__", json.dumps(apart)))
+    """
+        .replace("__BEFORE__", json.dumps(before))
+        .replace("__APART__", json.dumps(apart))
+        .replace("__CATALOGUE__", json.dumps(transition_catalogue_wire())))
 
     assert said["removed"] == [(
         "Shot 01 and Shot 02 no longer overlap — Shot 01's transition now treats its own "
@@ -27638,12 +27643,142 @@ def test_a_pair_only_type_dragged_apart_is_not_promised_a_treatment_it_has_no_fo
         "Shot 01 and Shot 02 no longer overlap — Shot 01's transition now treats its own "
         "last frames, then cuts."
     )]
-    # With no catalogue this cannot tell the two apart, so it says what it always said rather
-    # than inventing a refusal -- and a type the catalogue does not hold is treated the same way.
+    # **With no catalogue this says neither of the two, and that is 2026-08-31's correction.**
+    # It used to fall through to the sentence above -- the one that commit exists because it is
+    # false for eight of twelve types -- while the function's own comment said it *"says nothing
+    # at all rather than guessing"* and this assertion proved the comment false. The third option
+    # neither had considered is a sentence that names the removal and promises no treatment, and
+    # a type the catalogue does not hold gets it for the same reason: it cannot be classified.
     assert said["noCatalogue"] == said["unknownType"] == [(
-        "Shot 01 and Shot 02 no longer overlap — Shot 01's transition now treats its own "
-        "last frames, then cuts."
+        "Shot 01 and Shot 02 no longer overlap, so this boundary is a hard cut. Shot 01's "
+        "stored transition is kept and this workspace cannot say what it does on its own — "
+        "open Shot 01's Transitions tab, or overlap them again."
     )]
+    # And it is one of the three rather than a fourth: the same pair, classified, takes a
+    # sentence that does say what happens.
+    assert said["noCatalogue"] != said["pairOnly"] != said["oneSided"]
+
+
+def test_a_shot_name_or_a_label_carrying_a_dollar_pattern_is_inserted_not_expanded():
+    """`String.prototype.replace` reads its replacement **string** for `$` patterns.
+
+    `$&` is the whole match, `` $` `` and `$'` the text either side of it, `$1`..`$9` the capture
+    groups -- so a value carrying any of them is rewritten rather than inserted, and the wording a
+    Director reads is not the wording anybody authored. The four-call `.replace("{before}", name)`
+    chain in `overlapRemovalToasts` was unguarded against all of them.
+
+    A catalogue label is the reachable value: it is server data rendered into a sentence, and
+    `{label}` falls back to the **stored type id** off the manifest when the catalogue does not
+    name it. A function replacement is not scanned at all, which is the fix.
+
+    Every pattern is driven, because they are separate substitutions in the engine and a guard
+    that caught only `$&` would be a guard that catches one of five.
+    """
+    plan = transition_plan(
+        windows={"shot_b": (3.5, 4.5)},
+        fields={"shot_a": {"transition_out": {"type": "wipe_$&_left"}}})
+    before = json.loads(f"[{plan}]")
+    apart = [{**shot, "start": 4.0, "duration": 4.0} if shot["id"] == "shot_b" else shot
+             for shot in before]
+    label = "Wipe $& and $` and $' and $1 left"
+    catalogue = [{"transition_id": "wipe_$&_left", "label": label,
+                  "xfade": "wipeleft", "pair_only": True, "one_sided_frames": None}]
+
+    said = run_module("""
+      import { overlapRemovalToasts } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        named: overlapRemovalToasts(__BEFORE__, __APART__, __CATALOGUE__),
+        unnamed: overlapRemovalToasts(__BEFORE__, __APART__, []),
+      }));
+    """
+        .replace("__BEFORE__", json.dumps(before))
+        .replace("__APART__", json.dumps(apart))
+        .replace("__CATALOGUE__", json.dumps(catalogue)))
+
+    assert said["named"] == [(
+        f"Shot 01 and Shot 02 no longer overlap — {label} needs two pictures, so this boundary "
+        "is a hard cut. Overlap them again, or choose another transition on Shot 01."
+    )]
+    # Nothing of the wording leaked into the value and nothing of the value was expanded.
+    assert "{label}" not in said["named"][0] and "{before}" not in said["named"][0]
+    # And the unclassified sentence, which names the two Shots twice over, fills every occurrence:
+    # a chained `.replace` fills one per call, so a wording naming a Shot three times printed the
+    # placeholder for the third.
+    assert said["unnamed"] == [(
+        "Shot 01 and Shot 02 no longer overlap, so this boundary is a hard cut. Shot 01's "
+        "stored transition is kept and this workspace cannot say what it does on its own — "
+        "open Shot 01's Transitions tab, or overlap them again."
+    )]
+
+
+def test_a_transition_catalogue_that_could_not_be_read_is_asked_for_again_on_the_next_plan():
+    """A failed catalogue read is retried, and the retry is a plan landing (2026-08-31).
+
+    `loadEffectCatalogue`'s posture -- *"a failure is remembered rather than retried"* -- was
+    copied onto this catalogue, and it costs more here: the read is lazy, per-Shot and off the
+    boot path, so a workspace that lost it once had **no label for any transition for the rest of
+    the session** and no gesture a Director can perform asked again. The two rows said so, which
+    is honest and is not a recovery.
+
+    `loadProject` clears the flag while the catalogue is still missing, which makes the retry
+    bounded by construction: one request per plan that lands, set synchronously before the await,
+    so the drag path -- `renderTimeline` on every `pointermove` -- still sends exactly one.
+
+    Driven through the real refresh: the first read is refused, the rows say so, `#refresh-jobs`
+    loads the plan again, and the second read lands and labels the select.
+    """
+    plan = transition_plan(
+        windows={"shot_b": (3.5, 4.5)},
+        fields={"shot_a": {"transition_out": {"type": "dissolve"}}})
+    project = json.loads(f"[{plan}]")
+
+    drawn = run_effects_workspace(f"""
+      state.project = {effects_project(plan)};
+      state.selectedShotId = 'shot_a';
+      app.renderShotInspector();
+      await flush();
+      app.renderShotInspector();
+      const refused = at('#shot-inspector').innerHTML;
+      const firstRead = requests.filter((item) => item.path === {json.dumps(TRANSITIONS_CATALOGUE_READ)}).length;
+      // Every further render on the same plan asks nothing: this is the drag path.
+      app.renderShotInspector();
+      app.renderShotInspector();
+      await flush();
+      const duringOneplan = requests.filter((item) => item.path === {json.dumps(TRANSITIONS_CATALOGUE_READ)}).length;
+      await fire('#refresh-jobs:click', {{}});
+      await flush();
+      app.renderShotInspector();
+      await flush();
+      console.log(JSON.stringify({{
+        refused,
+        firstRead,
+        duringOneplan,
+        retried: requests.filter((item) => item.path === {json.dumps(TRANSITIONS_CATALOGUE_READ)}).length,
+        html: at('#shot-inspector').innerHTML,
+      }}));
+    """, responses={
+        TRANSITIONS_CATALOGUE_READ: [
+            {"status": 503, "body": {"detail": "the catalogue is not there"}},
+            {"body": {"shot_id": "shot_a", "transition_out": None, "transition_in": None,
+                      "catalogue": transition_catalogue_wire()}},
+        ],
+        "/api/projects/p1/render-status": {"body": {"comfy_online": True, "shots": [],
+                                                    "jobs": [], "problems": []}},
+        "/api/projects/p1": {"body": {"id": "p1", "name": "Effects", "shots": project,
+                                      "jobs": [], "sections": [], "shot_sections": {},
+                                      "assets": [], "messages": []}},
+    })
+
+    # One request for the plan on screen, however many times it is drawn.
+    assert drawn["firstRead"] == 1
+    assert drawn["duringOneplan"] == 1
+    unavailable = "The transition catalogue could not be read"
+    assert unavailable in html_unescape(drawn["refused"])
+    # The plan lands again and the read is made again -- and this time it answers.
+    assert drawn["retried"] == 2
+    labelled = html_unescape(drawn["html"])
+    assert TRANSITION_CATALOGUE["dissolve"].label in labelled
+    assert unavailable not in labelled
 
 
 def test_the_announcement_rides_the_write_so_every_path_that_stores_a_plan_carries_it():

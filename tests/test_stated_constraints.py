@@ -22,12 +22,12 @@ in this codebase*, *never imports*, *may not import* — gives **135**, of which
 from that 135: each is a claim that, if it silently stopped holding, would change what the
 application does rather than only what a comment says.
 
-**The headline: of the ~~twenty-two~~ ~~twenty-six~~ ~~twenty-eight~~ thirty-one, ~~seven~~ ~~eight~~
-~~twelve~~ fifteen were asserted before this pass, three are closed by the leaf-module guard added
+**The headline: of the ~~twenty-two~~ ~~twenty-six~~ ~~twenty-eight~~ ~~thirty-one~~ thirty-three, ~~seven~~ ~~eight~~
+~~twelve~~ ~~fifteen~~ seventeen were asserted before this pass, three are closed by the leaf-module guard added
 beside it, and ~~twelve~~ ~~eleven~~ thirteen remain unenforced and are named as such.** Nothing here tried to close the twelve — item 23
 asked for the list, not the fixes.
 
-*Six rows added 2026-08-29 and 2026-08-30 by story 11.5, and three more by the Slice F remediation of 2026-08-30, in the commits that stated them* — which is the standing
+*Six rows added 2026-08-29 and 2026-08-30 by story 11.5, three more by the Slice F remediation of 2026-08-30, and two by the remediation of that remediation on 2026-08-31, in the commits that stated them* — which is the standing
 practice `docs/project-context.md` records, and the only mechanism there is: nothing finds an
 unenumerated constraint and nothing will. Three of the four are asserted, and the one that is not
 is named honestly: the cache's single implementation is a claim about how many functions exist,
@@ -240,14 +240,38 @@ CONSTRAINTS: tuple[Constraint, ...] = (
     ),
     Constraint(
         "assembly.py, `_paired_transitions`",
-        "one rule decides whether a boundary blends, and it measures the split it would make",
-        "test_a_split_that_would_lay_no_frames_is_refused_with_all_three_numbers_in_it",
-        "2026-08-30. The two conditions it replaces each described a geometry somebody had "
-        "enumerated and each asked its question of a different object than the split used. "
-        "`TRANSITION_NESTED_REFUSAL` and `TRANSITION_CROWDED_REFUSAL` are now names for what the "
-        "measurement found rather than tests of their own.",
+        "one rule decides whether a boundary blends, and it measures the split it would make: "
+        "`outgoing > 0 and blend > 0 and incoming >= 0`",
+        "test_a_split_whose_incoming_stretch_runs_backwards_is_refused_with_all_three_numbers",
+        "2026-08-30, amended by the Director on 2026-08-31. The two conditions it replaces each "
+        "described a geometry somebody had enumerated and each asked its question of a different "
+        "object than the split used. `TRANSITION_NESTED_REFUSAL` and `TRANSITION_CROWDED_REFUSAL` "
+        "are now names for what the measurement found rather than tests of their own. The rule "
+        "shipped as `min(...) > 0`, which refused a blend the module had composed the day before; "
+        "a **zero** third stretch composes and its zero-length entry falls through to the drop "
+        "`assembly_plan` already makes, a **negative** one still refuses.",
+    ),
+    Constraint(
+        "assembly.py, `AssemblyPlan.transition_refusals`",
+        "a refusal is selected by the pair it is about, never by looking for a label in it",
+        "test_a_boundary_preview_quotes_its_own_boundarys_refusal_and_no_other",
+        "2026-08-31. Every refusal names **both** Shots, so `render_boundary_preview`'s "
+        "`if label in line` matched a Shot that is the incoming side of one refused boundary and "
+        "the outgoing side of another on both -- and answered about the wrong one. It is the same "
+        "correction `66c90d8` made to the index lookup twelve lines above and did not make here.",
     ),
     # --- app.py -------------------------------------------------------------------------------
+    Constraint(
+        "routes/shots.py, `replace_shot_transitions`'s mirror-lock loop",
+        "the lock on the other end holds a **blend**, so the boundary has to be overlapped",
+        "test_a_lock_holds_a_blend_and_not_a_shots_treatment_of_its_own_frames",
+        "2026-08-31. The loop shipped without asking whether the two Shots overlap, so a lock "
+        "anywhere made the Shot in front of it un-fadeable and said so in a sentence that states "
+        "a falsehood -- *a transition between SHOT 01 and SHOT 02 is written on both of them* "
+        "where there is no transition between them. On a boundary with no Overlap a "
+        "`transition_out` is a one-sided treatment of the addressed Shot's own last frames "
+        "(AD-19, story 11.4).",
+    ),
     Constraint(
         "app.py, `SHOT_TRANSITION_MIRROR_LOCKED_REFUSAL`",
         "a lock holds both ends of one blend, not only the Shot the request names",
@@ -352,7 +376,8 @@ def test_the_enumeration_reports_its_own_split():
     """The count in the module docstring, so the headline cannot drift from the table.
 
     ~~Seven~~ **eight** asserted before this pass, three by the guard it added, ~~twelve~~
-    **eleven** unenforced. If a later change closes one of the remaining eleven, this fails and
+    **eleven** unenforced -- the numbers as first written; the module docstring above carries them
+    as they stand. If a later change closes one of the remaining thirteen, this fails and
     the docstring is corrected with it — which is item 21's rule applied to the document item 23
     asked for, and it has already fired once: story 11.1 closed `ExportLook.transitions`' row on
     2026-08-28, exactly as that row predicted, and this test is what made the correction land in
@@ -364,9 +389,9 @@ def test_the_enumeration_reports_its_own_split():
     asserted = [c for c in CONSTRAINTS if c.asserted_by]
     by_new_guards = [c for c in asserted if c.asserted_by in added_here]
 
-    assert len(CONSTRAINTS) == 31
+    assert len(CONSTRAINTS) == 33
     assert len(by_new_guards) == 3
-    assert len(asserted) - len(by_new_guards) == 15
+    assert len(asserted) - len(by_new_guards) == 17
     assert len(CONSTRAINTS) - len(asserted) == 13
 
 

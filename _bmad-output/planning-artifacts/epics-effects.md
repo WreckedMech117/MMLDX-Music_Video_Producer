@@ -715,7 +715,7 @@ So that its length is something I set by hand and can see.
 **Given** two clips dragged until they overlap, with a Transition type set
 **When** the timeline is drawn
 **Then** the overlapping region shows a `--blue` fill at 22% **above the clips** with 1px `--blue` top and bottom edges and a centred Consolas type label **wherever the band is wide enough to carry one** (FX-16, UX-DR8, R-40) *(amended 2026-08-30; see UX-DR8's own line, which carries the measurements)*
-**And** the band draws **behind** clip content, so state borders and the corner chips stay fully legible on top of it
+**And** ~~the band draws **behind** clip content~~ **the band draws above the clip content at 22 % alpha with `pointer-events: none`**, so state borders and the corner chips stay fully legible on top of it *(amended 2026-08-30 on R-40, and it is the **second** half of one correction: the `Then` clause directly above was amended earlier the same day and this `And` was left saying the opposite, one line below it. `EXPERIENCE.md` carried the same sentence and was amended on 2026-08-29 by story 11.2, so this line disagreed with the design document it was written from for a day. The properties the original sentence was protecting are both preserved and that is why the wording survives at all.)*
 **And** the band is not a drag target, so the existing clip edges remain the only handles.
 
 **Given** an Overlap with no Transition type set
@@ -747,7 +747,7 @@ So that the two Shots describing one transition can never disagree.
 **When** the Director sets A's `Transition out`
 **Then** B's `Transition in` is set to match, and the interface says so in the existing toast idiom, in the past tense, naming both Shots (FX-17, UX-DR12)
 **And** the reverse holds when B's `Transition in` is set first
-**And** a Transition Pair across an Overlap can never hold two different types.
+**And** ~~a Transition Pair across an Overlap can never hold two different types~~ **no write through this application's own routes can leave a Pair holding two different types** *(corrected 2026-08-30 by Epic 11's retrospective: as written this criterion is contradicted by the very next one in this same story, which specifies what an export does with `a manifest whose pair disagrees — hand-edited, or a partially applied write`. Only one of the two can be true and it is the second: AD-30 makes `transition_out` authoritative and `_report_transition_divergence` names the disagreement, precisely because a manifest is an editable file and nothing can stop one holding a disagreeing pair. What the mirror guarantees is a property of the **routes**, not of the data, and stating it as a property of the data is how an invariant gets believed without being held — which is AD-18's `asserted at the split now` in another document, one day earlier.)*
 
 **Given** a manifest whose pair disagrees — hand-edited, or a partially applied write
 **When** the project is exported

@@ -3409,6 +3409,102 @@ def test_the_export_with_a_transition_matches_the_song_and_records_what_it_blend
     assert comfy.prompts == []
 
 
+def test_a_blend_whose_incoming_shot_is_used_up_by_it_renders_and_the_empty_entry_costs_nothing(
+    tmp_path: Path
+):
+    """**The Director's ruling of 2026-08-31, on the written file rather than on the plan.**
+
+    `A[0,4] B[3,6] C[4,8]` is the geometry the ruling was taken on: `B` is truncated at `C`'s
+    start, so after the blend it has no frames of its own and appears **only inside the blend**.
+    The rule that shipped on 2026-08-30 refused it; it composes now, and the zero-length entry the
+    split leaves falls through to the drop `assembly_plan` already makes.
+
+    **Decoded, because in this pipeline ffmpeg's exit code is evidence of nothing** -- seven wrong
+    outputs at rc 0 across three epics, `-frames:v -1` silently ignored and `-frames:v 0` writing
+    a 261-byte file with no video stream among them. So the claims are made against pixels and a
+    probed duration:
+
+    * three entries and 192 frames for an 8 s song, with the empty one gone rather than written
+      as a stream-less intermediate;
+    * at 1.0 s the picture is `A`'s;
+    * at 3.5 s -- the middle of the Overlap -- it is **neither** `A` nor `B` but a mixture of the
+      two, which is the blend actually running. Refuse the geometry again and this second is pure
+      `B`, because the plan is then a hard cut at 3.0 s;
+    * at 6.0 s it is `C`'s, so `B` really does end inside the blend and nothing of it was written
+      afterwards.
+
+    `job.inputs` names both legs' takes, and `ExportLook.transitions` records the blend rather
+    than a refusal -- the record and the picture agreeing is the whole of FX-25.
+    """
+    client, _store, comfy, _app = make_client(tmp_path)
+    project_id = client.post("/api/projects", json={"name": "Used up"}).json()["id"]
+    assert client.post(
+        f"/api/projects/{project_id}/songs/upload",
+        data={"title": "Used Up Song", "duration": "0"},
+        files={"file": ("song.wav", wav_bytes(8.0), "audio/wav")},
+    ).status_code == 200
+
+    shots_dir = tmp_path / "comfy" / "output" / "music-video-producer" / project_id / "shots"
+    prefix = f"music-video-producer/{project_id}/shots"
+    windows = (("shot_a", 0.0, 4.0, "red"), ("shot_b", 3.0, 3.0, "green"),
+               ("shot_c", 4.0, 4.0, "blue"))
+    for shot_id, _start, duration, colour in windows:
+        synthesize_take(
+            shots_dir / f"{shot_id}-h3_00001-audio.mp4", duration + 0.458, colour=colour
+        )
+    assert client.put(
+        f"/api/projects/{project_id}/shots",
+        json={
+            "shots": [
+                {
+                    "id": shot_id, "start": start, "duration": duration,
+                    "prompt": f"Room {shot_id}", "status": "complete",
+                    "latest_output": f"{prefix}/{shot_id}-h3_00001-audio.mp4",
+                }
+                for shot_id, start, duration, _colour in windows
+            ]
+        },
+    ).status_code == 200
+    for shot_id, *_rest in windows:
+        assert client.post(
+            f"/api/projects/{project_id}/shots/{shot_id}/approve"
+        ).status_code == 200
+    assert set_transition(client, project_id, "shot_a", "dissolve").status_code == 200
+
+    response = client.post(f"/api/projects/{project_id}/assemble")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    export = tmp_path / "projects" / project_id / "media" / body["export"]
+
+    # The plan: three entries, not four. The fourth is `shot_b`'s own head after the blend, which
+    # is zero frames long and is dropped -- and the drop is sum-neutral by construction.
+    assert body["clip_count"] == 3
+    assert body["total_frames"] == 192
+    assert body["job"]["look"]["transitions"] == ["shot_a=dissolve"]
+    assert body["job"]["inputs"].count(
+        f"shot_b=music-video-producer/{project_id}/shots/shot_b-h3_00001-audio.mp4"
+    ) == 1
+
+    # The artefact. `ffprobe` reports both streams and the duration the song has -- an
+    # intermediate written at `-frames:v 0` carries no video stream at all and `concat` accepts
+    # it, so this is the check that says the file is a video rather than that ffmpeg was happy.
+    assert probe(export, "stream=codec_type").splitlines() == ["video", "audio"]
+    assert abs(float(probe(export, "format=duration")) - 8.0) <= 1 / 24
+
+    opening = first_pixel(export, 1.0)
+    assert opening[0] > 150 and opening[1] < 90, opening
+    # The middle of the Overlap: both pictures are on screen at once, which is the blend. A plan
+    # that refused this geometry cuts hard at 3.0 s and answers pure green here.
+    blended = first_pixel(export, 3.5)
+    assert blended[0] > 60 and blended[1] > 60, ("not a mixture of the two legs", blended)
+    assert blended[0] < 200 and blended[1] < 200, ("one leg alone, not a blend", blended)
+    # And after it, `C` -- `shot_b` contributes nothing outside the blend, which is what "used up"
+    # means and what the dropped entry was.
+    tail = first_pixel(export, 6.0)
+    assert tail[2] > 150 and tail[1] < 90, tail
+    assert comfy.prompts == []
+
+
 def test_a_shot_with_no_transition_exports_exactly_what_it_exported_before(
     tmp_path: Path, monkeypatch
 ):

@@ -1028,13 +1028,26 @@ def register(ctx: RouterContext) -> None:
         # It covers a clear as well as a set: `null` on `transition_out` un-authors the locked
         # successor's `transition_in` exactly as a type authors it, and a lock that held the
         # writing but not the erasing would be no lock.
+        #
+        # **And it holds a blend, not a Shot's treatment of its own frames** (2026-08-31). It
+        # shipped without asking whether the two Shots overlap at all, so a lock anywhere made the
+        # Shot in front of it un-fadeable: `shot_one[0, 4.0] shot_two[4.0, 8.5]`, `shot_two`
+        # locked, `transition_out: fade_black` on `shot_one` answered 422 saying *"a transition
+        # between SHOT 01 and SHOT 02 is written on both of them"* -- and there is no transition
+        # between them. On a boundary with no Overlap a `transition_out` is a **one-sided**
+        # treatment of the addressed Shot's own last frames (AD-19, story 11.4); the only thing
+        # written on the locked Shot is a `transition_in` the export never reads. So the gate asks
+        # `_boundary_is_overlapped`, which is `assembly._paired_transitions`' own arithmetic and
+        # the same question the pair-only check above asks: a lock on the neighbour holds a blend.
         for side in said:
             if position is None:
                 continue
             mirrored = None
-            if side == "transition_out" and position + 1 < len(ordered):
+            if side == "transition_out" and _boundary_is_overlapped(ordered, position):
                 mirrored = ordered[position + 1]
-            elif side == "transition_in" and position > 0:
+            elif side == "transition_in" and position > 0 and _boundary_is_overlapped(
+                ordered, position - 1
+            ):
                 mirrored = ordered[position - 1]
             if mirrored is None or not mirrored.locked:
                 continue
@@ -1214,6 +1227,13 @@ def register(ctx: RouterContext) -> None:
         # with something other than its own successor is a plan the successor's take never reached.
         # `BOUNDARY_PREVIEW_TAKE_MISSING_REFUSAL` below says that, and it is the fifth of the five
         # absences this route's docstring enumerates rather than a sixth.
+        #
+        # **That claim was true of the design and false of the code until 2026-08-31.** The
+        # refusal lookup below matched a *substring*, so this route reached that sentence only
+        # when no refused boundary in the whole plan happened to name this Shot -- and the case
+        # this comment is about, a Shot the plan drops, is exactly the case where a neighbouring
+        # boundary's refusal does name it. Selecting by the pair is what makes the sentence
+        # reachable, which is what makes this paragraph true.
         index = next(
             (
                 spot
@@ -1230,9 +1250,17 @@ def register(ctx: RouterContext) -> None:
             # `ExportLook.transitions` -- reworded here it would be this application holding two
             # opinions about one geometry. Nothing matching means the pair is not in the plan at
             # all, which is a take that could not be read.
-            detail = next(
-                (line for line in plan.transition_refusals if label in line), ""
-            )
+            #
+            # **Selected by the pair, which is the same correction `66c90d8` made to the index
+            # lookup twelve lines above and did not make here** (2026-08-31). This read
+            # `next((line for line in plan.transition_refusals if label in line), "")`, and every
+            # refusal names **both** Shots -- so a Shot that is the incoming side of one refused
+            # boundary and the outgoing side of another matched both, and the first one won.
+            # Executed with `[a(0,4), b(0,10), c(9,3), d(9.2,2.7)]` and dissolves on `a` and `b`:
+            # asking about `b`'s boundary answered with the sentence about `a` nested inside `b`.
+            # `assembly.AssemblyPlan.refusal_for` is now the one way to ask, and it takes the two
+            # shot ids rather than a label to look for.
+            detail = plan.refusal_for(shot.id, after.id)
             raise HTTPException(
                 status_code=422,
                 detail=(

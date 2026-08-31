@@ -350,6 +350,41 @@ def test_the_range_scan_fires_on_the_citation_ad67a14_wrote(text, fires):
 #: claim. Everything under `## Resolved` asserts, by sitting there, that it shipped.
 LEDGER = REPO / "_bmad-output" / "implementation-artifacts" / "deferred-work.md"
 
+#: The heading whose position is the claim. **One constant, read by the scan and by the
+#: self-check**, because they disagreed: the self-check was a *substring* test while the scan's
+#: predicate is exact line equality, so renaming the heading to `## Resolved work` left the guard
+#: asserting it was watching something and scanning nothing. Mutating the heading that way
+#: survived all 2783 tests on 2026-08-30, and the failure message below promises the opposite --
+#: *"this guard moves with it rather than being deleted"*.
+LEDGER_RESOLVED_HEADING = "## Resolved"
+
+
+def ledger_resolved_section(text: str) -> list[str] | None:
+    """The lines the `## Resolved` heading owns, or `None` where there is no such heading.
+
+    **Exact line equality**, which is the predicate the scan has always used and the one the
+    self-check now uses too. And it **stops at the next `## ` heading**: a section added after
+    this one is not under it, and reading to the end of the file would have made every later
+    section's contents into claims this heading never made.
+    """
+    lines = text.splitlines()
+    start = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if line.strip() == LEDGER_RESOLVED_HEADING
+        ),
+        None,
+    )
+    if start is None:
+        return None
+    body: list[str] = []
+    for line in lines[start + 1 :]:
+        if line.startswith("## "):
+            break
+        body.append(line)
+    return body
+
 
 def misfiled_ledger_entries(ledger: Path | None = None) -> list[str]:
     """Every entry under `## Resolved` that carries no `resolved:` line, by its summary.
@@ -361,25 +396,42 @@ def misfiled_ledger_entries(ledger: Path | None = None) -> list[str]:
     **One-directional, deliberately.** A shipped entry annotated in place *above* the heading is
     not scanned: it over-reports open work, which costs a reader a re-read and misleads nobody.
     The failure this exists for is the other one.
+
+    Three corrections to the parser, 2026-08-31, each of them a way an entry could sit here and
+    be invisible to the scan that is about it:
+
+    * **an indented bullet is still a bullet.** `  - source_spec:` was read as a continuation
+      line of the entry above it, so a nested or re-indented entry inherited its neighbour's
+      `resolved:` line and went unreported.
+    * **indentation may be a tab.** The continuation test was `startswith("  ")`, so a
+      tab-indented `resolved:` line was not part of its own entry and the entry read as misfiled
+      -- the guard's *other* failure direction, a false report, which is how a guard gets
+      switched off.
+    * **`resolved:` needs a value.** A bare `resolved:` with nothing after it is the shape a
+      truncated append leaves, and it satisfied the claim by existing.
     """
-    lines = (ledger or LEDGER).read_text(encoding="utf-8").splitlines()
-    start = next(
-        (index for index, line in enumerate(lines) if line.strip() == "## Resolved"), None
-    )
-    if start is None:  # pragma: no cover - the heading's presence is asserted by the test
+    body = ledger_resolved_section((ledger or LEDGER).read_text(encoding="utf-8"))
+    if body is None:  # pragma: no cover - the heading's presence is asserted by the test
         return []
+
+    def says_where_it_shipped(item: str) -> bool:
+        stripped = item.strip()
+        return bool(
+            stripped.startswith("resolved:") and stripped[len("resolved:") :].strip()
+        )
+
     misfiled: list[str] = []
     entry: list[str] = []
-    for line in [*lines[start + 1 :], "- source_spec: sentinel"]:
-        if line.startswith("- source_spec:"):
-            if entry and not any(item.strip().startswith("resolved:") for item in entry):
+    for line in [*body, "- source_spec: sentinel"]:
+        if line.lstrip().startswith("- source_spec:"):
+            if entry and not any(says_where_it_shipped(item) for item in entry):
                 summary = next(
                     (item.strip()[9:] for item in entry if item.strip().startswith("summary:")),
                     entry[0].strip(),
                 )
                 misfiled.append(summary[:120])
             entry = [line]
-        elif entry and line.startswith("  "):
+        elif entry and line[:1].isspace():
             entry.append(line)
     return misfiled
 
@@ -400,9 +452,15 @@ def test_the_deferred_ledgers_resolved_section_holds_only_resolved_work():
     that no amount of care while writing the entry could have prevented it.
     """
     assert LEDGER.exists(), f"{where(LEDGER)} is the ledger this scan is about"
-    assert "## Resolved" in LEDGER.read_text(encoding="utf-8"), (
-        f"{where(LEDGER)} has no `## Resolved` heading, so this scan is watching nothing. If the "
-        "ledger was restructured, this guard moves with it rather than being deleted."
+    # **The self-check asks the scan's own question** (2026-08-31). It was
+    # `"## Resolved" in LEDGER.read_text(...)` -- a substring, where the scan matches a whole
+    # line -- so renaming the heading to `## Resolved work` satisfied the check and left the scan
+    # reading nothing, silently, while this test went on passing. That mutation survived all 2783
+    # tests, which is precisely what the sentence below promises it would not.
+    assert ledger_resolved_section(LEDGER.read_text(encoding="utf-8")) is not None, (
+        f"{where(LEDGER)} has no line reading exactly `{LEDGER_RESOLVED_HEADING}`, so this scan "
+        "is watching nothing. If the ledger was restructured, this guard moves with it rather "
+        "than being deleted."
     )
     misfiled = misfiled_ledger_entries()
     assert not misfiled, (
@@ -419,6 +477,24 @@ def test_the_deferred_ledgers_resolved_section_holds_only_resolved_work():
         ("- source_spec: x", True),
         ("- source_spec: x\n  summary: s", True),
         ("- source_spec: x\n  summary: s\n  resolved: abc1234 -- shipped", False),
+        # A tab is indentation. Before 2026-08-31 the continuation test was `startswith("  ")`,
+        # so this entry's `resolved:` line belonged to no entry and the entry read as misfiled --
+        # the guard's false-report direction, which is how a guard gets switched off.
+        ("- source_spec: x\n\tsummary: s\n\tresolved: abc1234 -- shipped", False),
+        # A `resolved:` line with nothing after it says where nothing shipped. It is the shape a
+        # truncated append leaves, and it used to satisfy the claim by existing.
+        ("- source_spec: x\n  summary: s\n  resolved:", True),
+        ("- source_spec: x\n  summary: s\n  resolved:   ", True),
+        # An indented bullet is still a bullet. Read as a continuation line it inherited the
+        # entry above it -- so a re-indented entry with no `resolved:` line of its own was
+        # invisible to the scan that exists for it.
+        (
+            (
+                "- source_spec: x\n  summary: s\n  resolved: abc1234 -- shipped\n"
+                "  - source_spec: y\n    summary: nested and open"
+            ),
+            True,
+        ),
     ],
 )
 def test_the_ledger_scan_fires_on_an_entry_with_no_resolved_line(tmp_path, entry, misfiled):
@@ -428,9 +504,11 @@ def test_the_ledger_scan_fires_on_an_entry_with_no_resolved_line(tmp_path, entry
     thing under observation bills its own maintenance to whoever does the work the guard exists to
     protect. This one says the same thing on both sides of any future correction to the ledger.
 
-    The rows are the two shapes that occur and the one that must not fire. A bare `- source_spec:`
+    The rows are the shapes that occur and the ones that must not fire. A bare `- source_spec:`
     with nothing under it is included because that is what a truncated append leaves behind, and a
-    scan that needed a `summary:` line to notice would go quiet on exactly the worst case.
+    scan that needed a `summary:` line to notice would go quiet on exactly the worst case. The
+    last four rows are 2026-08-31's, one per way an entry could sit under that heading and be
+    invisible to the scan.
     """
     probe = tmp_path / "deferred-work.md"
     probe.write_text(
@@ -439,3 +517,41 @@ def test_the_ledger_scan_fires_on_an_entry_with_no_resolved_line(tmp_path, entry
         encoding="utf-8",
     )
     assert bool(misfiled_ledger_entries(probe)) is misfiled
+
+
+def test_the_ledger_scan_reads_its_own_heading_and_stops_at_the_next_one(tmp_path):
+    """The two ends of the section, which nothing held.
+
+    **The heading**: the scan matches a whole line and the self-check matched a *substring*, so
+    `## Resolved work` passed the check and scanned nothing -- a guard reporting that it is
+    watching while it watches nothing, which is the exact failure mode this module exists for.
+
+    **The end of the section**: everything to the end of the file used to be under this heading,
+    so an entry filed under a later `## ` heading was reported as a lie told by *this* one.
+    """
+    def probe(text: str) -> Path:
+        written = tmp_path / f"ledger-{abs(hash(text))}.md"
+        written.write_text(text, encoding="utf-8")
+        return written
+
+    open_entry = "- source_spec: x\n  summary: still open\n"
+    shipped = "- source_spec: y\n  summary: done\n  resolved: abc1234 -- shipped\n"
+
+    # Renamed: there is no `## Resolved` line, so the scan is watching nothing -- and the
+    # self-check above is what has to notice, which is why this asserts the section is `None`
+    # rather than asserting the scan stays quiet.
+    renamed = "# Deferred Work\n\n## Resolved work\n\n" + open_entry
+    assert ledger_resolved_section(renamed) is None
+    assert misfiled_ledger_entries(probe(renamed)) == []
+
+    # And under the right heading the same entry is reported.
+    exact = "# Deferred Work\n\n## Resolved\n\n" + open_entry
+    assert ledger_resolved_section(exact) is not None
+    assert misfiled_ledger_entries(probe(exact)) == ["still open"]
+
+    # A later section is not this heading's claim: the open entry under `## Notes` is somebody
+    # else's business, and the shipped one above it keeps the section honest.
+    followed = (
+        "# Deferred Work\n\n## Resolved\n\n" + shipped + "\n## Notes\n\n" + open_entry
+    )
+    assert misfiled_ledger_entries(probe(followed)) == []

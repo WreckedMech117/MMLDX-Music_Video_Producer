@@ -358,6 +358,12 @@ async function loadProject(id) {
     // Director ticked a second ago.
     randomizeSeedShots.clear();
   }
+  // The transition catalogue is asked again if this workspace still has not got one. A plan
+  // landing is this application's retry for it: bounded to one request per load by the flag the
+  // loader sets synchronously, off the drag path entirely, and it is the only gesture that asks
+  // the server for anything on a workspace whose read failed. The error sentence is kept until
+  // the retry answers, so the two rows do not blank between attempts.
+  if (transitionCatalogue === null) transitionCatalogueAsked = false;
   // Whatever readiness this client held belongs to the project being left, and the revision bump
   // discards an answer still in flight for it. A readiness report drawn under another project's
   // name would name Shots that are not on screen and count a plan nobody is looking at.
@@ -2580,9 +2586,17 @@ let transitionCatalogue = null;
 //: empty is "read, and here it is", anything else is what the two rows say instead of offering
 //: twelve unlabelled ids. A band still draws without it, spelling the stored type out of the id.
 let transitionCatalogueError = "";
-//: Whether the one read has been started. Set **synchronously**, before the await, because
-//: `renderTimeline` runs on every `pointermove` of a clip drag and a flag set after the reply
-//: would send sixty requests during one gesture.
+//: Whether the read has been started **for the plan on screen now**. Set *synchronously*, before
+//: the await, because `renderTimeline` runs on every `pointermove` of a clip drag and a flag set
+//: after the reply would send sixty requests during one gesture.
+//:
+//: **Cleared by `loadProject` while the catalogue is still missing** (2026-08-31), which is the
+//: whole of the retry. `loadEffectCatalogue`'s posture -- *"a failure is remembered rather than
+//: retried"* -- was copied here, and it costs more on this catalogue than on that one: a
+//: workspace that lost this read once had no label for any transition for the rest of its
+//: session, and no gesture a Director can perform asked again. A plan landing is the natural
+//: retry: it is a moment the workspace already re-reads the server, it is bounded to one request
+//: per load by the flag above, and it is not on the drag path at all.
 let transitionCatalogueAsked = false;
 
 //: The plan as this browser last saw it at rest: `{id, start, duration, transition_out}` per Shot,
@@ -2683,11 +2697,12 @@ async function loadEffectCatalogue() {
 // story 11.1 shipped; any Shot answers with the same twelve, so the first one this project holds
 // is the one asked.
 //
-// `loadEffectCatalogue`'s posture exactly: a failure is remembered rather than retried, because
-// the two rows need it to say what any transition is and there is nothing useful to draw in the
-// meantime. The band is the one thing that survives without it, spelling a stored type out of its
-// own id rather than falling back to `CUT` -- which would say a hard cut is what the export will
-// do, and it is not.
+// A failure is **retried on the next plan that lands** rather than remembered for the session --
+// `loadEffectCatalogue`'s posture, corrected here on 2026-08-31 (see `transitionCatalogueAsked`).
+// The error is kept until the retry answers, so the two rows go on saying why they cannot label
+// anything instead of blanking between attempts. The band is the one thing that survives without
+// it, spelling a stored type out of its own id rather than falling back to `CUT` -- which would
+// say a hard cut is what the export will do, and it is not.
 //
 // The redraw at the end is the point: everything drawn from the catalogue was drawn before it
 // arrived, so nothing would show the twelve until the next unrelated render.
@@ -4133,7 +4148,11 @@ export function renderShotInspector() {
   // Guarded by a flag the loader sets **synchronously**, before its await. This function is called
   // from `renderTimeline`, which runs on every `pointermove` of a clip drag, and a flag set on the
   // reply would send sixty requests during one gesture.
-  if (transitionCatalogue === null && !transitionCatalogueAsked && !transitionCatalogueError) {
+  //
+  // **`transitionCatalogueError` is no longer part of the gate** (2026-08-31). It was, and it made
+  // a single failed read permanent for the session; the flag alone now bounds this to one request
+  // per plan, and `loadProject` clears the flag while the catalogue is still missing.
+  if (transitionCatalogue === null && !transitionCatalogueAsked) {
     loadTransitionCatalogue();
   }
   // A selected section owns the panel: this is where its shared prompt is written, the

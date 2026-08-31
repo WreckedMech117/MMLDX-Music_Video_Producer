@@ -1154,3 +1154,60 @@ Recorded because they governed how the work was done, not what was built.
   **469 KB on a real 202-second master**, and nothing found on 2026-08-27 supports 0.51 MB or the
   3-minute framing. Restated in the figure the rest of the record agrees on; if 0.51 MB was a
   separate reading it has no surviving source.)*
+
+
+## R-43 — A zero-frame third stretch composes; only a negative one refuses
+
+*Ruled 2026-08-31, on slice F6, after the 2026-08-30 rule was found to refuse a blend that had
+composed the day before.*
+
+`assembly._paired_transitions` composes a blend when
+**`outgoing > 0 and blend > 0 and incoming >= 0`**.
+
+**Why it had to change.** The rule shipped on 2026-08-30 as `min(outgoing, blend, incoming) > 0`,
+and the two halves of that same commit disagreed: `assembly_plan`'s comment says a zero-frame entry
+*"can happen without any transition at all, and is not a defect: it is dropped"*, while the split
+treated a zero third stretch as grounds to refuse. Verified against a worktree at `7ef2b82`:
+
+```
+A[0,4] B[3,7] C[4,5]   dissolve on A
+  7ef2b82 : [72, 24, 0, 24, 48]   WITH the blend
+  66c90d8 : [72, 24,    24, 48]   refused
+```
+
+B resumes at 5.0 s for 48 frames. The geometry is legal, the Director authored the dissolve, and it
+was dropped with nothing on the timeline to say so.
+
+**What the Director was shown before ruling, because it is the part that is not obvious.** The same
+change also composes `A[0,4] B[3,6] C[4,8]`, where B is consumed entirely by the Overlap and by C —
+so **B appears only inside the blend**, and the plan is `[72, 24, 96]`. A later reader will meet
+that as an odd-looking accepted case; it is accepted deliberately. Both are edits a Director laid
+down by hand.
+
+**What did not change.** A **negative** third stretch still refuses: `A[0,4.0625] B[3,6] C[4.05,8]`
+gives −1 and is the defect the whole rule exists for. Both nested directions still refuse.
+`all(count > 0 for count in plan.frames)` still holds on every plan `assembly_plan` returns — now
+through the drop rather than through the refusal, proved over 33,336 swept plans of which 15,086
+composed a blend.
+
+## R-44 — A lock guards the picture, not the record
+
+*Ruled 2026-08-31, on the question slice F6 declined to settle on its own.*
+
+AD-30 mirrors a Transition onto the neighbouring Shot. On a boundary **with an Overlap**, a lock on
+either Shot refuses the write: a blend is a fact about both, and the earlier Shot's `transition_out`
+is the side the export reads. **On a boundary with no Overlap there is no blend** — a
+`transition_out` is a one-sided treatment of the addressed Shot's *own* last frames (AD-19, FX-16) —
+so the write is accepted and **the mirror still records `transition_in` on the locked neighbour**.
+
+**The reasoning, recorded because the alternative is defensible and somebody will re-open it.**
+`transition_in` on an un-overlapped boundary is a field the export never reads
+(`_compose_one_sided_transitions` reads `transition_out` alone), so the locked Shot's rendered
+picture provably cannot change. Skipping the mirror instead would leave `api.transitionMirrorToast`
+announcing in the past tense that both sides were set when one was not — the one idiom this
+application has a standing rule against — so "skip it" is a toast change, not a one-line change.
+
+**This corrects a regression, not a design.** Between `66c90d8` and F6 the mirror lock asked no
+question about the Overlap at all, so **locking any Shot made its predecessor un-fadeable**, with a
+sentence claiming *"a transition between SHOT 01 and SHOT 02 is written on both of them"* about two
+clips that do not touch.

@@ -32,6 +32,7 @@ from .assembly import (
     DEFAULT_EXPORT_PRESET,
     EXPORT_PRESETS,
     PREVIEW_PRESET,
+    AssemblyGeometryError,
     AssemblyPlan,
     AudioOverlay,
     ClipWindow,
@@ -9059,7 +9060,8 @@ def _compose_transitions(
     if plan is None:
         return []
     composition.look.transitions.extend(
-        TRANSITION_REFUSED_RECORD.format(shot=line) for line in plan.transition_refusals
+        TRANSITION_REFUSED_RECORD.format(shot=item.sentence)
+        for item in plan.transition_refusals
     )
     refusals: list[str] = []
     luts_read: list[Sequence[LutEntry]] = []
@@ -11066,7 +11068,17 @@ def create_app(
             )
         if not clips:
             return None
-        return assembly_plan(clips, 0.0, dimensions, transitions)
+        # **`None` for a geometry `assembly_plan` cannot answer, which is this function's own
+        # idiom** (2026-08-31). `AssemblyGeometryError` is addressed to a Director, and it reached
+        # both of this module's call sites as a bare `ValueError` that neither caught -- an HTTP
+        # 500 and a stack trace where a sentence was meant. Here there is already a `None` for
+        # "no approved take in this project can be measured", every caller handles it, and a plan
+        # that lays no frame at all is the same absence arriving a step later. The export says the
+        # sentence out loud instead; a preview is a picture, and there is no picture.
+        try:
+            return assembly_plan(clips, 0.0, dimensions, transitions)
+        except AssemblyGeometryError:
+            return None
 
     async def export_geometry(project: Project) -> tuple[int, int] | None:
         """The dimensions the export would normalize **this project** to, or `None` if no
@@ -12904,17 +12916,27 @@ def create_app(
         # so `transition_definition` cannot raise here. `assembly.py` is handed the `xfade` name
         # the way `trim_args` is handed finished stage strings: it goes on importing nothing from
         # `effects.py`, and the frame arithmetic cannot be reached by a catalogue at all.
-        plan = assembly_plan(
-            clips,
-            song_seconds,
-            dimensions,
-            {
-                shot_id: TransitionChoice(
-                    stored, transition_definition(stored).xfade
-                )
-                for shot_id, stored in subject.transitions.items()
-            },
-        )
+        # **Caught, because the sentence inside it is addressed to a Director** (2026-08-31).
+        # `AssemblyGeometryError` carries `ASSEMBLY_NEGATIVE_FRAMES_ERROR` or
+        # `ASSEMBLY_NO_GEOMETRY_ERROR`, both written to be read; raised as a bare `ValueError` and
+        # caught by nobody, they reached this route as an HTTP 500 with a stack trace. It becomes
+        # the same 422 every other stage of this route builds -- the plan refusals above and the
+        # composition refusals below -- so a Director gets one shape of answer whichever stage
+        # found the problem, and nothing has been half-started behind it.
+        try:
+            plan = assembly_plan(
+                clips,
+                song_seconds,
+                dimensions,
+                {
+                    shot_id: TransitionChoice(
+                        stored, transition_definition(stored).xfade
+                    )
+                    for shot_id, stored in subject.transitions.items()
+                },
+            )
+        except AssemblyGeometryError as geometry:
+            raise HTTPException(status_code=422, detail=str(geometry)) from geometry
         # The composition stage: the checks that need the export's own delivery geometry, which
         # is why they could not run above. They build what the export is driven with as well as
         # reporting on it — `build_effect_stages` is the only thing that can see a look whose
