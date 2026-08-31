@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 08-16-2026 21:31
-last_updated: 08-31-2026 14:00
+last_updated: 08-31-2026 14:09
 project: MusicVideoProducer
 project_key: NOKEY
 tracking_system: file-system
@@ -640,7 +640,7 @@ action_items:
       all(count > 0 for count in plan.frames) still holds by fuzz, not by argument.
       Regression: A[0,4] B[3,7] C[4,5] composed at 7ef2b82 and refuses at 66c90d8."
     owner: "Dev"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
   - id: "epic-11-retro-item-67-fix-the-mirror-lock-in-replace_shot_tran"
     epic: 11
@@ -649,7 +649,7 @@ action_items:
       of the addressed Shot's own last frames (AD-19), so a lock on the neighbour
       must not hold it -- and the refusal currently claims a blend that does not exist."
     owner: "Dev"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
   - id: "epic-11-retro-item-68-test-six-tests-one-per-mutation-that-sur"
     epic: 11
@@ -659,7 +659,7 @@ action_items:
       before.shot_id term, and the ledger guard's heading predicate. Re-run all six
       and show each now fails."
     owner: "Dev"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
   - id: "epic-11-retro-item-69-fix-transition_nested_refusal-prints-raw"
     epic: 11
@@ -668,7 +668,7 @@ action_items:
       in a 150k fuzz). Clamp or round the printed window to the values the decision
       was made on."
     owner: "Dev"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
   - id: "epic-11-retro-item-70-fix-transition_empty_split_refusal-s-rem"
     epic: 11
@@ -676,7 +676,7 @@ action_items:
       covers this stretch' and is emitted only when the two legs are the sole clips
       over it. Split the remedy by which of the three stretches is actually empty."
     owner: "Dev"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
   - id: "epic-11-retro-item-71-fix-_degenerate_refusal-tests-the-crowdi"
     epic: 11
@@ -684,7 +684,7 @@ action_items:
       a zero-frame blend with a third clip present sends the Director to move clips
       and leaves the blend at zero. Test blend <= 0 first."
     owner: "Dev"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
   - id: "epic-11-retro-item-72-fix-render_boundary_preview-selects-its"
     epic: 11
@@ -693,7 +693,7 @@ action_items:
       neighbouring boundary's reason. Select by the pair, and correct assembly.py's
       docstring, which states the substring rule as a design fact."
     owner: "Dev"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
   - id: "epic-11-retro-item-73-fix-api-js-overlapremovaltoasts-comment"
     epic: 11
@@ -703,7 +703,7 @@ action_items:
       read after a failure, and guard the .replace chain against dollar-sign patterns
       in substituted text."
     owner: "Dev"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
   - id: "epic-11-retro-item-74-fix-assembly_negative_frames_error-is-ra"
     epic: 11
@@ -713,7 +713,7 @@ action_items:
       pre-existing max() on an empty resolved list in the same pass -- confirmed identical
       at 7ef2b82, so not a regression."
     owner: "Dev"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
   - id: "epic-11-retro-item-75-fix-the-deferred-work-ledger-guard-s-sel"
     epic: 11
@@ -723,7 +723,7 @@ action_items:
       the next '## ' heading, accept tab indentation, and require a non-empty value
       after 'resolved:'."
     owner: "Dev"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
   - id: "epic-11-retro-item-76-build-port-the-split-rule-to-api-js-so-t"
     epic: 11
@@ -744,7 +744,7 @@ action_items:
       not read off the entry it decides about, which is the fault pattern the rule
       was written to remove."
     owner: "Dev"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
   - id: "epic-11-retro-item-78-record-a-dropped-zero-frame-entry-remove"
     epic: 11
