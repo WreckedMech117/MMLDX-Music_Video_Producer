@@ -27574,6 +27574,78 @@ def test_an_overlap_dragged_away_is_announced_once_naming_both_shots():
     assert said["unread"] == []
 
 
+def test_a_pair_only_type_dragged_apart_is_not_promised_a_treatment_it_has_no_form_for():
+    """Eight of the twelve catalogue entries have no one-sided form, and all twelve were promised
+    one (2026-08-30).
+
+    `TRANSITION_OVERLAP_REMOVED_TOAST` says *"{before}'s transition now treats its own last
+    frames, then cuts"* -- true for the four types that compose something one-sided, and false for
+    every wipe and slide, which `pair_only` marks precisely because there is no such composition.
+    Dragging a Wipe left apart leaves a stored type that renders **identically to no transition at
+    all**, announced in the present tense as a treatment that happened.
+
+    **It is R-36's own fault, one boundary further out.** That ruling was amended on 2026-08-29
+    because its premise -- *"A's tail fades, B's head fades"* -- was false and only the outgoing
+    half composes; the amendment corrected the *paired* promise and left this sentence making the
+    same kind of promise for a type that never had the form. The test above is the amendment; this
+    one is what it missed.
+
+    The catalogue decides, and its absence says nothing rather than guessing -- the same direction
+    `unread` already takes above.
+    """
+    plan = transition_plan(
+        windows={"shot_b": (3.5, 4.5)},
+        fields={"shot_a": {"transition_out": {"type": PAIR_ONLY_ID}}})
+    before = json.loads(f"[{plan}]")
+    apart = [{**shot, "start": 4.0, "duration": 4.0} if shot["id"] == "shot_b" else shot
+             for shot in before]
+    one_sided = [{**shot, "transition_out": {"type": ONE_SIDED_ID}}
+                 if shot["id"] == "shot_a" else shot for shot in before]
+    one_sided_apart = [{**shot, "start": 4.0, "duration": 4.0} if shot["id"] == "shot_b" else shot
+                       for shot in one_sided]
+
+    said = run_module("""
+      import { overlapRemovalToasts } from './src/music_video_producer/web/assets/api.js';
+      const before = __BEFORE__;
+      const apart = __APART__;
+      console.log(JSON.stringify({
+        pairOnly: overlapRemovalToasts(before, apart, __CATALOGUE__),
+        oneSided: overlapRemovalToasts(__ONE_SIDED__, __ONE_SIDED_APART__, __CATALOGUE__),
+        noCatalogue: overlapRemovalToasts(before, apart),
+        unknownType: overlapRemovalToasts(
+          before.map((shot) => (shot.id === 'shot_a'
+            ? { ...shot, transition_out: { type: 'not_in_the_catalogue' } } : shot)),
+          apart.map((shot) => (shot.id === 'shot_a'
+            ? { ...shot, transition_out: { type: 'not_in_the_catalogue' } } : shot)),
+          __CATALOGUE__),
+      }));
+    """
+        .replace("__BEFORE__", json.dumps(before))
+        .replace("__APART__", json.dumps(apart))
+        .replace("__ONE_SIDED_APART__", json.dumps(one_sided_apart))
+        .replace("__ONE_SIDED__", json.dumps(one_sided))
+        .replace("__CATALOGUE__", json.dumps(transition_catalogue_wire())))
+
+    label = TRANSITION_CATALOGUE[PAIR_ONLY_ID].label
+    # It names the type, says what the boundary actually is, and names both ways out -- because
+    # nothing on the timeline shows a stored type with no Overlap under it.
+    assert said["pairOnly"] == [(
+        f"Shot 01 and Shot 02 no longer overlap — {label} needs two pictures, so this boundary "
+        "is a hard cut. Overlap them again, or choose another transition on Shot 01."
+    )]
+    # A type that does have a one-sided form still gets the original sentence, unchanged.
+    assert said["oneSided"] == [(
+        "Shot 01 and Shot 02 no longer overlap — Shot 01's transition now treats its own "
+        "last frames, then cuts."
+    )]
+    # With no catalogue this cannot tell the two apart, so it says what it always said rather
+    # than inventing a refusal -- and a type the catalogue does not hold is treated the same way.
+    assert said["noCatalogue"] == said["unknownType"] == [(
+        "Shot 01 and Shot 02 no longer overlap — Shot 01's transition now treats its own "
+        "last frames, then cuts."
+    )]
+
+
 def test_the_announcement_rides_the_write_so_every_path_that_stores_a_plan_carries_it():
     """The gesture R-36 names is a drag, and it is not the only way an Overlap goes away: the
     Start and Duration boxes, the gap fill, a snapped cut and an undo all store a plan too. So the
@@ -27600,6 +27672,41 @@ def test_the_announcement_rides_the_write_so_every_path_that_stores_a_plan_carri
     )]
     # The stored types are retained: nothing about removing an Overlap clears a field (FX-16).
     assert '"transition_out":{"type":"dissolve"}' in "".join(
+        item["body"] or "" for item in moved["requests"])
+    # And the band is gone from the track, rather than drawn over clips that no longer touch.
+    assert "overlap-band" not in moved["track"]
+
+
+def test_the_browser_hands_the_catalogue_to_the_removal_announcement():
+    """The wiring, driven through the real panel rather than through the pure function.
+
+    `overlapRemovalToasts` reads the catalogue and the browser has to give it one; a call that
+    forgets falls back to the sentence that is true for four types out of twelve, silently and
+    for exactly the eight where it is false. So this drives a **pair-only** type apart through
+    the numeric path -- the same gesture the test above uses -- with the catalogue actually
+    loaded, and asserts the sentence the boundary really gets.
+    """
+    plan = transition_plan(
+        windows={"shot_b": (3.5, 4.5)},
+        fields={"shot_a": {"transition_out": {"type": PAIR_ONLY_ID}}})
+
+    moved = transitions_panel(
+        plan,
+        responses={"/api/projects/p1/shots": {"body": {"updated_at": "later"}}},
+        extra="""
+          at('#shot-duration').value = '3.5';
+          await fire('#shot-duration:change', { target: at('#shot-duration') });
+          await flush();
+        """,
+    )
+
+    label = TRANSITION_CATALOGUE[PAIR_ONLY_ID].label
+    assert moved["toasts"] == [(
+        f"Shot 01 and Shot 02 no longer overlap — {label} needs two pictures, so this boundary "
+        "is a hard cut. Overlap them again, or choose another transition on Shot 01."
+    )]
+    # The stored types are retained: nothing about removing an Overlap clears a field (FX-16).
+    assert f'"transition_out":{{"type":"{PAIR_ONLY_ID}"}}' in "".join(
         item["body"] or "" for item in moved["requests"])
     # And the band is gone from the track, rather than drawn over clips that no longer touch.
     assert "overlap-band" not in moved["track"]

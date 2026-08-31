@@ -2724,7 +2724,10 @@ function overlapGeometry(shots) {
 // stored, and only where the outgoing Shot really carries a type. The snapshot is advanced here
 // whether or not anything was said, so a second save cannot re-announce the first one's change.
 function announceOverlapRemovals(shots) {
-  for (const line of overlapRemovalToasts(overlapWatch, shots)) toast(line);
+  // The catalogue decides which of the two sentences a removed Overlap gets, and passing it
+  // is the whole of the client half: eight of twelve types have no one-sided form, and the
+  // single sentence this used to send promised one for all twelve.
+  for (const line of overlapRemovalToasts(overlapWatch, shots, transitionCatalogue)) toast(line);
   overlapWatch = overlapGeometry(shots);
 }
 

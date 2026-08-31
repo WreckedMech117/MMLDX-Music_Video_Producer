@@ -9609,6 +9609,26 @@ export const TRANSITION_OVERLAP_REMOVED_TOAST =
   "{before} and {after} no longer overlap — {before}'s transition now treats its own last "
   + "frames, then cuts.";
 
+//: The same announcement for a **pair-only** type, and it exists because the sentence above
+//: was false for eight of the twelve catalogue entries (2026-08-30).
+//:
+//: A wipe or a slide moves one picture across another and has no one-sided form at all --
+//: `pair_only`, which `effects.py` states as the same fact twice over, once as a permission and
+//: once as the absence of a composition. So dragging a Wipe left apart leaves a type stored on a
+//: boundary that composes **nothing**, and the clip renders exactly as it would with no
+//: transition at all. The old sentence announced a treatment that does not happen, in the
+//: present tense, which is the one idiom this application has a standing rule about --
+//: R-36 was amended for the same fault on the same feature nine days earlier, and this is that
+//: amendment's own blind spot: it corrected the *paired* promise and left the removal toast
+//: making the promise for a type that never had the form.
+//:
+//: It names the remedy because the state is recoverable and invisible: nothing on the timeline
+//: shows a stored type with no Overlap under it, so a Director who does not want a hard cut has
+//: to be told where to go.
+export const TRANSITION_OVERLAP_REMOVED_PAIR_ONLY_TOAST =
+  "{before} and {after} no longer overlap — {label} needs two pictures, so this boundary is "
+  + "a hard cut. Overlap them again, or choose another transition on {before}.";
+
 //: The catalogue never arrived. `EFFECTS_CATALOGUE_UNAVAILABLE`'s shape and its reason: the rows
 //: cannot say what any transition is, so they say that instead of offering twelve unlabelled ids.
 export const TRANSITIONS_CATALOGUE_UNAVAILABLE =
@@ -10056,7 +10076,10 @@ export function transitionMirrorToast(project, shot, side, transitionId, catalog
 //: A pure comparison of two plans rather than a hook inside the drag, so "which overlaps went
 //: away" is executable without a pointer. The Shot numbers come from the plan **after** the edit:
 //: the numbers a Director is looking at on the clips are the numbers the sentence has to use.
-export function overlapRemovalToasts(before, after) {
+//: `catalogue` is optional and its absence is the safe direction: with no catalogue this
+//: cannot tell a pair-only type from a one-sided one, so it says nothing at all rather than
+//: guessing -- the same rule `overlapWatch === null` already follows one line up.
+export function overlapRemovalToasts(before, after, catalogue = null) {
   const overlappingPairs = (shots) => {
     const ordered = [...(shots || [])].filter(Boolean).sort((a, b) => a.start - b.start);
     const found = new Set();
@@ -10079,6 +10102,20 @@ export function overlapRemovalToasts(before, after) {
     // A pair gone from the plan entirely -- a delete, or a re-plan -- is not "no longer overlap",
     // and a pair with nothing stored has nothing to say.
     if (!earlier || !held.has(laterId) || !earlier.transition_out?.type) continue;
+    const stored = String(earlier.transition_out.type);
+    const entry = (catalogue || []).find(
+      (item) => String(item?.transition_id || "") === stored);
+    // Only a type the catalogue names as pair-only takes the second sentence. A type
+    // the catalogue does not hold at all is not silently assumed to be either: it keeps the
+    // original sentence, which is what a Director saw before this existed.
+    if (catalogue && entry?.pair_only) {
+      lines.push(TRANSITION_OVERLAP_REMOVED_PAIR_ONLY_TOAST
+        .replace("{before}", shotOrdinalName({ shots: after }, earlierId, true))
+        .replace("{after}", shotOrdinalName({ shots: after }, laterId, true))
+        .replace("{label}", String(entry?.label || stored))
+        .replace("{before}", shotOrdinalName({ shots: after }, earlierId, true)));
+      continue;
+    }
     lines.push(TRANSITION_OVERLAP_REMOVED_TOAST
       .replace("{before}", shotOrdinalName({ shots: after }, earlierId, true))
       .replace("{after}", shotOrdinalName({ shots: after }, laterId, true))
