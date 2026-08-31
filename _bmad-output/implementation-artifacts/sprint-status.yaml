@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 08-16-2026 21:31
-last_updated: 08-31-2026 15:52
+last_updated: 08-31-2026 17:11
 project: MusicVideoProducer
 project_key: NOKEY
 tracking_system: file-system
@@ -830,5 +830,5 @@ action_items:
       have failed since before Epic 10 and sit outside 'uv run pytest -q', so no gate
       reports them."
     owner: "Dev"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
