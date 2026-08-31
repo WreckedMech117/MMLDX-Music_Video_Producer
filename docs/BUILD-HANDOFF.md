@@ -50,7 +50,7 @@ All paths relative to `_bmad-output/planning-artifacts/` — *corrected 2026-08-
 - Treatment **Story 16.1** — plain proceed-to-next-step buttons, without their offers.
 - ~~Effects **Epic 8** — song analysis, beat markers, beat-snapping.~~ **Shipped 2026-08-24.**
 
-~~**Merge alone:** effects **Epic 11** (transitions).~~ **Shipped 2026-08-29.** It was the only work touching `assembly_plan` and the cumulative frame grid, it did get its own verification pass against `FX-NFR-1`, and **that pass is the reason this instruction was worth following**: the frame rule held on every plan while three geometries shipped a non-positive frame count, because a window that runs backwards cancels against itself. See AD-18's 2026-08-30 amendment. Anything else that touches the frame grid still merges alone.
+~~**Merge alone:** effects **Epic 11** (transitions).~~ **Shipped 2026-08-29.** It was the only work touching `assembly_plan` and the cumulative frame grid, it did get its own verification pass against `FX-NFR-1`, and **that pass is the reason this instruction was worth following**: the frame rule held on every plan while three geometries shipped a non-positive frame count, because a window that runs backwards cancels against itself. See AD-18's 2026-08-30 amendment. Anything else that touches the frame grid still merges alone — **and is reviewed, which that instruction did not say and now does. See §4.**
 
 ---
 
@@ -333,6 +333,75 @@ and then left in a commit subject is a number nobody will find.**
 3. Structure analysis was described as Timeline-only. **`Analyze structure` is already on the Song page**, beside `Build treatment →`, and `align-lyrics` already proposes section boxes from timed `[Tag]` blocks.
 
 An eight-day-old constraint was stale in all three cases. **Re-run any constraint before planning around it.** The `Deferred` sections of both architecture spines name several that still need re-verifying — in particular whether the Krea reference sheet still runs one of three sampling stages.
+
+### A repair to the frame grid is reviewed, not just merged alone
+
+*Item 80, from Epic 11's retrospective.* §2 has always said that work touching `assembly_plan` and
+the cumulative frame grid merges alone. It said nothing about reviewing it, and I read "merges
+alone" as sufficient.
+
+**Epic 11's story diff got four review lenses, which is what found a defect that shipped the wrong
+Shot in a delivered video at HTTP 200 with every gate green** — 2761 tests, ruff, both JS
+parsers, six mutation passes, four browser harnesses, and real ffmpeg on the artefact in three
+separate slices. **The repair for that defect got no review at all**, and introduced two
+regressions plus six mutations that survived the entire suite: a blend that composed the day before
+silently refused, a lock that made every Shot's predecessor un-fadeable, and two guards mutually
+redundant across every fixture so the suite could not say which did the work.
+
+**The rule:** a change to code a review pass just found a defect in gets its own review pass before
+it merges, scoped to the *fix* commits rather than to the story diff again — re-reviewing
+the story diff only re-derives known findings. Run the lenses blind to each other; in Epic 11 the
+adversarial and edge-case lenses independently reached the same boundary-preview defect and that
+agreement was worth more than either report.
+
+**And verify every subagent finding against the primary source before acting on it.** Two of ten
+edge-case findings changed under checking — one was pre-existing rather than a regression
+(proved by running the same geometry against a worktree at the pre-fix commit), one could not be
+reproduced at all.
+
+### A claim in a spec that was not executed is a hypothesis, and must say so
+
+*Item 81.* Across Epics 9, 10 and 11 **every wrong claim was reasoned and every right one was
+run.** Diagnoses come from opening the code and none has been wrong. Remedies, citations and counts
+come from a mental model: roughly twenty wrong remedies, `AD-19` cited where `AD-18` was meant at
+both of its occurrences in one spec, and **five consecutive baseline suite counts miscounted**
+(2698 for 2699, 2728 for 2729, 2761 for 2762, 2780 for 2783, and 2805-passing quoted as
+2806-collected), two of them written *inside the paragraph correcting the one before*.
+
+Three epics of "prescribe less" moved the errors rather than stopping them: Epic 9 said state
+defects and decline to prescribe, Epic 10 found that relocated them, Epic 11's F5 spec named only
+the invariant and the implementer corrected three of that spec's own **evidence** claims.
+
+**So: run the command and paste its output, or write "not re-derived" beside the number.** Applies
+to a baseline count, a complexity figure, a line count, a range of ruling ids, and any citation of
+an AD or a ruling by number.
+
+**Running it is necessary and not sufficient, and this is the sharper half.** For Epic 11's `api.js`
+port I built a prototype, swept it against the real engine over 5,675 boundaries, found zero
+disagreements, and put that in the spec as measured fact. The prototype was wrong:
+`_paired_transitions` mutates its entry list as it goes, so a blended boundary changes what the
+next one is measured against, and **both harnesses set exactly one transition per plan** —
+structurally incapable of producing the disagreement. That is a fixture that makes its own defect
+impossible, in the evidence section. **A measured claim is worse than a reasoned one in one
+specific way: reasoning announces itself and a number does not.** Before quoting a sweep, state
+what the harness could not vary and check that list against the mechanism under test. A sweep that
+has never produced a single disagreement has not been shown to be capable of one.
+
+### When you amend a record, grep for the sentence's siblings
+
+*Item 82.* Three instances in Epic 11, and one of them was committed inside the pass whose subject
+was this failure:
+
+- **Story 11.2's `Then` clause** about the Overlap band was amended and the **`And` clause one line
+  below it** was left saying the opposite — in the fix pass whose subject was sibling
+  copies. Found by the retrospective.
+- **AD-28's 2026-08-29 amendment** announced a change to its own title and Rule and made neither,
+  so the heading and the first sentence stated the opposite of what shipped for a day.
+- **`api.js`'s `overlapRemovalToasts` comment** contradicted the code eight lines below it, with a
+  test in the same commit asserting the code — so the commit contained its own disproof.
+
+In every case the amendment was written; what was missed was the copy beside it. `grep` the phrase,
+not the file.
 
 ### Other agents work in this repo concurrently
 
