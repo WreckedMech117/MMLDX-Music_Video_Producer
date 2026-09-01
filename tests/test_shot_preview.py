@@ -1615,6 +1615,145 @@ def test_a_one_sided_transition_moves_the_shots_preview_fingerprint_and_nothing_
     )
 
 
+def set_transition_in(client, project_id: str, shot_id: str, kind: str | None):
+    """`set_transition`'s mirror: the incoming half, which is what R-45 reads at one boundary."""
+    return client.put(
+        f"/api/projects/{project_id}/shots/{shot_id}/transitions",
+        json={"transition_in": {"type": kind} if kind else None},
+    )
+
+
+def test_an_opening_transition_previews_the_treated_frames_the_export_will_ship(tmp_path: Path):
+    """FX-NFR-3 in the direction R-45 opened (story 11.f8): **the preview is the export's chain.**
+
+    Story 11.5 closed the gap for the tail -- a one-sided transition was the one thing an export
+    did that a preview did not -- and an opening treatment that the export composed and the
+    preview did not would be that gap re-opened in the mirror.
+
+    `rise_black` is the measurement `OPENING_FORMS` records, read on the decoded picture: the
+    colour is **held** from the video's own first frame to the midpoint of the treatment, the
+    picture arrives over the second half, and everything after the treatment is the Shot's own.
+    Held is the whole distinction between a rise and a plain fade in, and it is the mirror of the
+    distinction R-34 spent a measurement keeping at the other end.
+    """
+    from music_video_producer.effects import ONE_SIDED_TRANSITION_FRAMES
+
+    client, _store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots = project_with_two_approved_takes(client, tmp_path)
+    # `shot_a` starts the song, so nothing plays before it: the one boundary R-45 composes at.
+    assert set_transition_in(client, project_id, "shot_a", "fade_black").status_code == 200
+
+    answer = client.post(f"/api/projects/{project_id}/shots/shot_a/preview")
+    assert answer.status_code == 200, answer.text
+    body = answer.json()
+    clip = tmp_path / "projects" / project_id / "media" / body["preview"]
+    frames = body["frames"]
+    assert counted_frames(clip) == frames, (
+        "a treatment must consume no timeline length and change no frame count (FX-NFR-1)"
+    )
+    opening = frame_pixel(clip, 0)
+    midpoint = frame_pixel(clip, ONE_SIDED_TRANSITION_FRAMES // 2 - 1)
+    after = frame_pixel(clip, ONE_SIDED_TRANSITION_FRAMES + 1)
+    assert max(opening) < 20, ("the video's first frame is the colour it rises out of", opening)
+    assert max(midpoint) < 20, ("and it is held to the midpoint, which is what a rise is", midpoint)
+    assert after[0] > 200, ("and the frames after the treatment are the Shot's own", after)
+
+
+def test_an_opening_transition_moves_only_the_opening_shots_preview_fingerprint(tmp_path: Path):
+    """The seventh slot's other half, and R-45's rule keyed rather than described.
+
+    Four states of one Shot, and the divisions are the claim. **No transition in** and **a
+    `transition_in` on a Shot that is not the plan's first** are one picture, because nothing is
+    composed for the second -- and they must therefore be one clip, or every Shot in every project
+    carrying AD-30's mirror would be renamed and re-rendered for a picture that did not change.
+    **A `transition_in` on the Shot that opens** is a different picture and a different name.
+
+    And the tail's slot is untouched by all of it: a Shot carrying only a one-sided
+    `transition_out` is named exactly as it was, which is the R-20 constraint story 11.5 shipped
+    under and which this slice may not spend a second time.
+    """
+    client, _store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots = project_with_two_approved_takes(client, tmp_path)
+
+    def named(shot_id: str) -> str:
+        answer = client.post(f"/api/projects/{project_id}/shots/{shot_id}/preview")
+        assert answer.status_code == 200, answer.text
+        return answer.json()["fingerprint"]
+
+    plain_a, plain_b = named("shot_a"), named("shot_b")
+    # The mirror, on the Shot that is second in song order: nothing composes for it (R-45).
+    assert set_transition(client, project_id, "shot_a", "dissolve").status_code == 200
+    assert named("shot_b") == plain_b, (
+        "AD-30's mirror composes nothing on a Shot with a predecessor, so it names no new clip"
+    )
+    assert set_transition(client, project_id, "shot_a", None).status_code == 200
+
+    # The same field on the Shot that opens the plan: a different picture, a different name.
+    assert set_transition_in(client, project_id, "shot_a", "fade_black").status_code == 200
+    opened = named("shot_a")
+    assert opened != plain_a, (
+        "a treatment that changes the picture must change the name, or the cache serves the old one"
+    )
+    # And clearing it names the clip it named before, which is what makes the line above about
+    # this field rather than about any write at all.
+    assert set_transition_in(client, project_id, "shot_a", None).status_code == 200
+    assert named("shot_a") == plain_a
+
+
+def test_the_preview_clamps_an_opening_to_the_frames_the_plan_opens_with(tmp_path: Path):
+    """**The clamp is the plan's first entry, not the Shot's own window**, and they differ.
+
+    `_opening_clip_frames` is what the preview asks, because the export clamps against
+    `plan.frames[0]` -- and when the first Shot has an Overlap under its outgoing boundary, that
+    entry is only the frames *before* the Overlap. A preview that clamped to the Shot's whole
+    window would draw a longer treatment than the export writes, which is the row-says-one-thing,
+    export-ships-another defect this project has paid for five times.
+
+    Measured on the composition rather than on the picture: the two are three frames apart here,
+    which no eye and no pixel probe would separate but every subsequent frame of the ramp depends
+    on.
+    """
+    from music_video_producer.app import _opening_clip_frames
+    from music_video_producer.effects import (
+        ONE_SIDED_TRANSITION_FRAMES,
+        opening_transition_stages,
+    )
+    from music_video_producer.timeline import ordered_shots
+
+    client, store, _comfy, _app = make_client(tmp_path)
+    project_id, _shots = project_with_an_overlapping_pair(client, tmp_path, overlap=3.875)
+    project = store.get(project_id)
+    ordered = ordered_shots(project)
+    opening = _opening_clip_frames(ordered)
+    whole = round(ordered[0].duration * ASSEMBLY_FPS)
+    assert 0 < opening < whole, (opening, whole)
+    assert opening < ONE_SIDED_TRANSITION_FRAMES, (
+        "the fixture has to make the clamp observable: an opening longer than the ceiling would "
+        "give the same answer either way and this test would pass without measuring anything"
+    )
+    assert opening_transition_stages(
+        "fade_black", clip_frames=opening, fps=ASSEMBLY_FPS
+    ).frames == opening
+
+    # **And the route really composes that number**, read off the decoded picture rather than off
+    # the composition -- a clamp asserted only against the function that computes it is a fixture
+    # agreeing with itself. A dissolve spends its whole treatment arriving, so with the plan's
+    # three frames the picture is the Shot's own from frame three on, and with the Shot's whole
+    # window it would still be a third of the way up at frame five.
+    assert set_transition_in(client, project_id, "shot_a", "dissolve").status_code == 200
+    answer = client.post(f"/api/projects/{project_id}/shots/shot_a/preview")
+    assert answer.status_code == 200, answer.text
+    clip = tmp_path / "projects" / project_id / "media" / answer.json()["preview"]
+    assert max(frame_pixel(clip, 0)) < 40, "the first frame is the black it rises out of"
+    for index in range(opening, opening + 4):
+        arrived = frame_pixel(clip, index)
+        assert arrived[0] > 180, (
+            ("the treatment is over by the frames the plan opens with, and clamping to the "
+             "Shot's own window would still be ramping here"),
+            index, arrived,
+        )
+
+
 def test_a_shot_with_no_transition_is_named_exactly_as_it_was_at_3322ace():
     """Story 11.5's third constraint, on the function rather than on the route.
 

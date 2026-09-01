@@ -137,6 +137,7 @@ from ..director import DirectorError, DirectorUnavailable
 from ..effects import (
     ONE_SIDED_TRANSITION_FRAMES,
     TRANSITION_CATALOGUE,
+    TRANSITION_PAIR_ONLY_OPENING_REFUSAL,
     TRANSITION_PAIR_ONLY_REFUSAL,
     EffectRefusal,
     EffectStages,
@@ -931,9 +932,10 @@ def register(ctx: RouterContext) -> None:
         whole of what story 11.1 needs, with no interface at all.
 
         **The mirror is kept in step here** (AD-30). `transition_out` on the earlier Shot is
-        authoritative and is the only side the export reads; writing it also writes the *following*
-        Shot's `transition_in`, so a panel drawn on either Shot shows one blend rather than two
-        halves that can disagree. Following in **song order**, `timeline.ordered_shots`', because
+        authoritative and is the only side the export builds a boundary's picture from -- R-45
+        reads the incoming field at the plan's first frame and nowhere else. Writing it also
+        writes the *following* Shot's `transition_in`, so a panel drawn on either Shot shows one
+        blend rather than two halves that can disagree. Following in **song order**, `timeline.ordered_shots`', because
         that is the order `assembly_plan` resolves and a mirror written to the neighbour in list
         order would name a different Shot than the export blends. Writing `transition_in` directly
         mirrors backwards the same way, so a client may write either end.
@@ -946,8 +948,11 @@ def register(ctx: RouterContext) -> None:
 
         **A pair-only type is refused where there is no Overlap to move two pictures across**
         (FX-19, R-34) — the reason such an entry is in the catalogue at all rather than absent
-        from it. Judged against the geometry as it stands at the write, which is when the Director
-        is choosing; it is necessary and not sufficient, because dragging the clip apart afterwards
+        from it. **In two sentences since 2026-08-31**, because the ordinary one names a remedy
+        that does not exist at the one boundary with no Shot on the other side of it: a
+        `transition_in` on the Shot nothing plays before is the video's own opening, and no drag
+        can put a picture there (`TRANSITION_PAIR_ONLY_OPENING_REFUSAL`, R-45). Judged against
+        the geometry as it stands at the write, which is when the Director is choosing; it is necessary and not sufficient, because dragging the clip apart afterwards
         is FX-16's own case and story 11.4's, and nothing here pretends otherwise. What it does
         buy is that a Director who picks "Wipe left" on a boundary with no Overlap is told why, at
         the moment they pick it, instead of watching an export do nothing.
@@ -1005,11 +1010,28 @@ def register(ctx: RouterContext) -> None:
                 and neighbour[0].end - neighbour[1].start > BOUNDARY_TOLERANCE_SECONDS
             )
             if entry.pair_only and not overlapping:
+                # **Which of the two refusals, and it is one condition** (R-45, story 11.f8). The
+                # sentence above tells a Director to drag the two clips across each other, and at
+                # the one boundary with no Shot on the other side of it there is nothing to drag:
+                # a `transition_in` on the Shot with nothing before it is the video's own opening,
+                # which no edit of this timeline can give a second picture. The export says the
+                # same sentence at the same boundary (`_compose_opening_transition`), because two
+                # wordings for one condition teach a Director the application holds two opinions.
+                wording = (
+                    TRANSITION_PAIR_ONLY_OPENING_REFUSAL
+                    if side == "transition_in" and neighbour is None
+                    else TRANSITION_PAIR_ONLY_REFUSAL
+                )
                 raise HTTPException(
                     status_code=422,
-                    detail=TRANSITION_PAIR_ONLY_REFUSAL.format(
+                    detail=wording.format(
                         label=entry.label,
                         shot=shot_label(project, shot),
+                        # The side the addressed boundary is on: a `transition_in`'s
+                        # boundary is the seam *before* its Shot. The opening wording
+                        # names no neighbour and ignores this (`str.format` drops an
+                        # unused key), which is why one call serves both sentences.
+                        neighbour="before" if side == "transition_in" else "after",
                         alternatives=", ".join(
                             sorted(
                                 item.label
@@ -1036,7 +1058,9 @@ def register(ctx: RouterContext) -> None:
         # between SHOT 01 and SHOT 02 is written on both of them"* -- and there is no transition
         # between them. On a boundary with no Overlap a `transition_out` is a **one-sided**
         # treatment of the addressed Shot's own last frames (AD-19, story 11.4); the only thing
-        # written on the locked Shot is a `transition_in` the export never reads. So the gate asks
+        # written on the locked Shot is a `transition_in` the export reads at no boundary but
+        # the plan's own first frame (R-45), which is not this one: the Shot the mirror writes
+        # has the addressed Shot in front of it, so it never opens. So the gate asks
         # `_boundary_is_overlapped`, which is `assembly._paired_transitions`' own arithmetic and
         # the same question the pair-only check above asks: a lock on the neighbour holds a blend.
         for side in said:
@@ -1116,8 +1140,11 @@ def register(ctx: RouterContext) -> None:
         picture driven by a song the project no longer had.
 
         **Named by the outgoing Shot**, because AD-30 makes `transition_out` on the earlier Shot
-        authoritative and the later Shot's `transition_in` a mirror that decides nothing. A route
-        addressed by the incoming side would be addressed by the field the export never reads.
+        authoritative and the later Shot's `transition_in` a mirror that decides nothing *at a
+        boundary between two Shots*. A route addressed by the incoming side would be addressed by
+        the field this boundary's picture is never built from -- R-45 reads that field at the
+        plan's first entry and nowhere else, and this route refuses that end by name for having no
+        neighbour at all (`BOUNDARY_PREVIEW_NO_NEIGHBOUR_REFUSAL`).
 
         **The blend is the export's own, and it is the export's own by construction rather than by
         care.** The plan comes from `preview_assembly`, which calls `assembly_plan` -- so which

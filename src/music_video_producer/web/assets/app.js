@@ -3158,8 +3158,10 @@ function effectsPanel(shot) {
 //
 // **The state is a sentence, never the edge colour alone** (UX-DR15). A paired row states the
 // Overlap's length in Consolas; a one-sided one states whose frames get treated and that it then
-// cuts; the first Shot's `Transition in` states that nothing renders from it at all. The edge is a
-// second signal, and the `.control-reason` under the select is the first.
+// cuts; the `Transition in` of the Shot that opens the plan states that it treats its own opening
+// frames as the video begins (R-45), and one whose head another Shot covers states that nothing
+// opens with it. The edge is a second signal, and the `.control-reason` under the select is the
+// first.
 //
 // **Nothing is drawn disabled for want of an Overlap.** A one-sided transition is a real editorial
 // choice (FX-18) and a greyed control would state that it is impossible without saying why. The

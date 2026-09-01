@@ -27472,8 +27472,69 @@ def test_an_untyped_overlap_borrows_nothing_from_the_transitions_treatment():
         "`color-mix` drops that declaration and would draw a band with no fill at all")
 
 
+def test_no_row_promises_a_treatment_a_pair_only_type_has_no_form_for():
+    """Both one-sided rows, over every type the catalogue holds. **Not one row, both.**
+
+    The eight `pair_only` entries have no one-sided form in either direction (R-34): the export
+    composes nothing for them and refuses by name. A row saying *"this treats {shot}'s last
+    frames, then cuts"* over one is the same false promise
+    `TRANSITION_OVERLAP_REMOVED_PAIR_ONLY_TOAST` was added for on 2026-08-30 -- and that correction
+    fixed the toast and left the row beside it saying it, for a day.
+
+    **Story 11.f8 then gated its own new `opening` row and not the `one-sided` branch three lines
+    above it**, which is the sibling-copy failure this epic has three recorded instances of. So
+    this asserts the property over *both* states and *every* catalogue entry rather than over the
+    one that was broken: a test written against the instance would have passed the whole time the
+    other branch was wrong, which is exactly how the first one survived.
+
+    The plans below put the addressed Shot at each end, because which row is `one-sided` and which
+    is `opening` is decided by whether anything plays before it.
+    """
+    catalogue = transition_catalogue_wire()
+    pair_only = [entry["transition_id"] for entry in catalogue if entry["pair_only"]]
+    one_sided = [entry["transition_id"] for entry in catalogue if not entry["pair_only"]]
+    assert pair_only and one_sided, "the catalogue must hold both kinds for this to mean anything"
+
+    promised = []
+    for transition_id in pair_only:
+        # `shot_a` opens the plan, so its `transition_in` is the opening row and its
+        # `transition_out` is one-sided against a `shot_b` it does not overlap.
+        rows = transition_rows(
+            transition_plan(fields={
+                "shot_a": {"transition_out": {"type": transition_id},
+                           "transition_in": {"type": transition_id}}}),
+            shot_id="shot_a")["rows"]
+        for row in rows:
+            note = str(row.get("note") or "")
+            if "treats" in note and "frames" in note and "needs two pictures" not in note:
+                promised.append((transition_id, row.get("state"), note))
+
+    assert not promised, (
+        ("a row promised a treatment for a type that has no one-sided form, so the export "
+         "will compose nothing and refuse it by name while the row says otherwise:"),
+        promised,
+    )
+
+    # And the four that DO have a form still say what happens, so the gate above is a gate rather
+    # than a blanket silence -- the mutation that makes every row say "needs two pictures" has to
+    # fail somewhere.
+    said = []
+    for transition_id in one_sided:
+        rows = transition_rows(
+            transition_plan(fields={
+                "shot_a": {"transition_out": {"type": transition_id},
+                           "transition_in": {"type": transition_id}}}),
+            shot_id="shot_a")["rows"]
+        said.extend(str(row.get("note") or "") for row in rows)
+    assert any("treats" in note for note in said), (
+        ("no row promised a treatment for any type that has one, so the pair-only gate "
+         "above is vacuous"),
+        said,
+    )
+
+
 def test_the_transition_rows_state_every_case_they_can_be_in():
-    """Paired, one-sided and headless, each with its edge, its readout and its sentence.
+    """Paired, one-sided, opening and headless, each with its edge, its readout and its sentence.
 
     **The sentence is the state and the edge is the second signal** (UX-DR15). A row that carried
     only a `--blue` or `--dim` border would be a state in colour alone, which this application says
@@ -27506,14 +27567,35 @@ def test_the_transition_rows_state_every_case_they_can_be_in():
         transitions_panel(transition_plan(), shot_id="shot_b")["html"], "transition-in")
     assert into_b["note"] == "No overlap — this treats shot 01's last frames, then cuts."
 
-    # Headless: the first Shot's `Transition in`. Nothing precedes it, so the field stores and
-    # nothing renders from it -- a state no artifact in this epic describes, and it says so.
-    assert into_a["state"] == "headless"
+    # Opening: the first Shot's `Transition in`, and it is the one boundary in a plan where an
+    # incoming field composes -- nothing precedes it, so no outgoing Shot owns the cut (R-45).
+    # *This row read `headless` and said nothing renders from it until story 11.f8.*
+    assert into_a["state"] == "opening"
     assert into_a["edge"] == "dim"
     assert into_a["note"] == (
-        "Nothing plays before shot 01 — this transition in has no frames to treat, and the "
-        "export renders nothing from it.")
+        "Nothing plays before shot 01 — this treats its opening frames as the video begins.")
     assert into_a["disabled"] is False
+
+    # Headless: what is left of that state, and it is a **different geometry** rather than a
+    # renaming. `shot_b` starts within half a frame of `shot_a`, so the resolution loop drops
+    # `shot_a`'s head whole and `shot_a` lays no opening frames at all; and `shot_b`, which does
+    # lay them, has a predecessor whose `transition_out` owns that cut. Neither may be treated,
+    # and the row says so of the Shot it is drawn on.
+    covered = transition_plan(windows={"shot_a": (0.0, 4.0), "shot_b": (0.01, 4.0)})
+    into_covered = transition_row_markup(transitions_panel(covered)["html"], "transition-in")
+    assert into_covered["state"] == "headless"
+    assert into_covered["edge"] == "dim"
+    assert into_covered["note"] == (
+        "shot 01 does not open the video — another shot covers its first frames — so this "
+        "transition in has nothing to treat and the export renders nothing from it.")
+    assert into_covered["disabled"] is False
+    # And the Shot that buried it is not offered the opening either: it is `paired`, because the
+    # two overlap, which is the state that says the boundary between them is what is decided here.
+    into_burier = transition_row_markup(
+        transitions_panel(covered, shot_id="shot_b")["html"], "transition-in")
+    assert into_burier["state"] == "paired", (
+        "the Shot that lays the first frame has a predecessor, so R-45 gives that cut to the "
+        "outgoing Shot and its own incoming field composes nothing")
 
     # A `Transition out` on the **last** Shot is one-sided rather than headless, and that is the
     # export's own reading: `_compose_one_sided_transitions` treats an unoverlapped final boundary
@@ -27702,6 +27784,7 @@ def test_the_routes_own_refusal_reaches_the_panel_whole():
     sentence = TRANSITION_PAIR_ONLY_REFUSAL.format(
         label=entry.label,
         shot="SHOT 01 (shot_a)",
+        neighbour="after",
         alternatives=", ".join(sorted(
             item.label for item in TRANSITION_CATALOGUE.values() if not item.pair_only)),
     )
@@ -27761,7 +27844,7 @@ def test_an_overlap_dragged_away_is_announced_once_naming_both_shots():
         .replace("__CATALOGUE__", json.dumps(transition_catalogue_wire())))
 
     assert said["removed"] == [(
-        "Shot 01 and Shot 02 no longer overlap — Shot 01's transition now treats its own "
+        "Shot 01 and Shot 02 no longer overlap — Shot 01's transition out now treats its own "
         "last frames, then cuts."
     )]
     # Once per pair, and only for a change: an unmoved plan and a plan that was already apart both
@@ -27779,7 +27862,7 @@ def test_a_pair_only_type_dragged_apart_is_not_promised_a_treatment_it_has_no_fo
     """Eight of the twelve catalogue entries have no one-sided form, and all twelve were promised
     one (2026-08-30).
 
-    `TRANSITION_OVERLAP_REMOVED_TOAST` says *"{before}'s transition now treats its own last
+    `TRANSITION_OVERLAP_REMOVED_TOAST` says *"{before}'s transition out now treats its own last
     frames, then cuts"* -- true for the four types that compose something one-sided, and false for
     every wipe and slide, which `pair_only` marks precisely because there is no such composition.
     Dragging a Wipe left apart leaves a stored type that renders **identically to no transition at
@@ -27832,11 +27915,11 @@ def test_a_pair_only_type_dragged_apart_is_not_promised_a_treatment_it_has_no_fo
     # nothing on the timeline shows a stored type with no Overlap under it.
     assert said["pairOnly"] == [(
         f"Shot 01 and Shot 02 no longer overlap — {label} needs two pictures, so this boundary "
-        "is a hard cut. Overlap them again, or choose another transition on Shot 01."
+        "is a hard cut. Overlap them again, or choose another transition out on Shot 01."
     )]
     # A type that does have a one-sided form still gets the original sentence, unchanged.
     assert said["oneSided"] == [(
-        "Shot 01 and Shot 02 no longer overlap — Shot 01's transition now treats its own "
+        "Shot 01 and Shot 02 no longer overlap — Shot 01's transition out now treats its own "
         "last frames, then cuts."
     )]
     # **With no catalogue this says neither of the two, and that is 2026-08-31's correction.**
@@ -27847,7 +27930,7 @@ def test_a_pair_only_type_dragged_apart_is_not_promised_a_treatment_it_has_no_fo
     # a type the catalogue does not hold gets it for the same reason: it cannot be classified.
     assert said["noCatalogue"] == said["unknownType"] == [(
         "Shot 01 and Shot 02 no longer overlap, so this boundary is a hard cut. Shot 01's "
-        "stored transition is kept and this workspace cannot say what it does on its own — "
+        "stored transition out is kept and this workspace cannot say what it does on its own — "
         "open Shot 01's Transitions tab, or overlap them again."
     )]
     # And it is one of the three rather than a fourth: the same pair, classified, takes a
@@ -27893,7 +27976,7 @@ def test_a_shot_name_or_a_label_carrying_a_dollar_pattern_is_inserted_not_expand
 
     assert said["named"] == [(
         f"Shot 01 and Shot 02 no longer overlap — {label} needs two pictures, so this boundary "
-        "is a hard cut. Overlap them again, or choose another transition on Shot 01."
+        "is a hard cut. Overlap them again, or choose another transition out on Shot 01."
     )]
     # Nothing of the wording leaked into the value and nothing of the value was expanded.
     assert "{label}" not in said["named"][0] and "{before}" not in said["named"][0]
@@ -27902,7 +27985,7 @@ def test_a_shot_name_or_a_label_carrying_a_dollar_pattern_is_inserted_not_expand
     # placeholder for the third.
     assert said["unnamed"] == [(
         "Shot 01 and Shot 02 no longer overlap, so this boundary is a hard cut. Shot 01's "
-        "stored transition is kept and this workspace cannot say what it does on its own — "
+        "stored transition out is kept and this workspace cannot say what it does on its own — "
         "open Shot 01's Transitions tab, or overlap them again."
     )]
 
@@ -27998,7 +28081,7 @@ def test_the_announcement_rides_the_write_so_every_path_that_stores_a_plan_carri
     )
 
     assert moved["toasts"] == [(
-        "Shot 01 and Shot 02 no longer overlap — Shot 01's transition now treats its own "
+        "Shot 01 and Shot 02 no longer overlap — Shot 01's transition out now treats its own "
         "last frames, then cuts."
     )]
     # The stored types are retained: nothing about removing an Overlap clears a field (FX-16).
@@ -28034,7 +28117,7 @@ def test_the_browser_hands_the_catalogue_to_the_removal_announcement():
     label = TRANSITION_CATALOGUE[PAIR_ONLY_ID].label
     assert moved["toasts"] == [(
         f"Shot 01 and Shot 02 no longer overlap — {label} needs two pictures, so this boundary "
-        "is a hard cut. Overlap them again, or choose another transition on Shot 01."
+        "is a hard cut. Overlap them again, or choose another transition out on Shot 01."
     )]
     # The stored types are retained: nothing about removing an Overlap clears a field (FX-16).
     assert f'"transition_out":{{"type":"{PAIR_ONLY_ID}"}}' in "".join(
@@ -28390,6 +28473,292 @@ def test_the_split_table_contains_what_the_two_engines_disagreed_about():
     assert any(answer["outgoing"] == 0 for answer in reached), reached
     assert any(answer["blend"] == 0 for answer in reached), reached
     assert any(answer["incoming"] < 0 for answer in reached), reached
+
+
+#: The geometries the **opening** rule is asked over, in `SPLIT_RULE_TABLE`'s shape so the two
+#: tables can be run through one harness and concatenated (R-45, story 11.f8).
+#:
+#: **Every row is a shape where the two readings of *"the first Shot of the plan in song order"*
+#: might part**, because a table of pleasant contiguous plans would agree on every one and prove
+#: nothing. The stored types are here because a blend changes what the plan's entries are.
+OPENING_RULE_TABLE = [
+    # The ordinary case, and the one every other row has to be told apart from.
+    ("the first shot opens the video", [
+        ("shot_a", 0.0, 4.0, ""), ("shot_b", 4.0, 4.0, ""),
+    ]),
+    # One Shot alone: there is nothing that could cover its head.
+    ("a single shot", [("shot_a", 0.0, 4.0, "")]),
+    # A later Shot inside the half-frame band at the first Shot's start: the resolution loop drops
+    # the head whole, so the plan opens with a Shot that has a predecessor and nothing is treated.
+    ("a later shot covers the first shot's head", [
+        ("shot_a", 0.0, 4.0, ""), ("shot_b", 0.01, 4.0, ""),
+    ]),
+    # Two Shots starting on the same instant, later on top: the first by `start` lays nothing.
+    ("two shots that start together", [
+        ("shot_a", 0.0, 4.0, ""), ("shot_b", 0.0, 8.0, ""),
+    ]),
+    # **A head inside the half-frame band that still rounds to a frame.** `0.01875 s` to
+    # `0.0375 s` is 0.45 to 0.9 frames, so `round(end) - round(start)` is 1 while the span is
+    # under the tolerance the resolution loop discards on. A rule that asked only the grid would
+    # answer 1 here and the plan answers 0.
+    ("a head inside the tolerance that still rounds to a frame", [
+        ("shot_a", 0.01875, 4.0, ""), ("shot_b", 0.0375, 4.0, ""),
+    ]),
+    # **A head longer than half a frame that lays no frames at all.** `0.02125 s` to `0.062083 s`
+    # is 0.51 to 1.49 frames: both round to 1, so the entry is 0 frames long and `assembly_plan`
+    # drops it. A rule that asked only the seconds would answer "it opens" and the plan does not.
+    ("a head over the tolerance that lays no frames", [
+        ("shot_a", 0.02125, 4.0, ""), ("shot_b", 0.062083, 4.0, ""),
+    ]),
+    # The first Shot blending into its own Overlap: the plan opens with the frames *before* the
+    # blend, so the answer is that entry's length and not the Shot's window.
+    ("the first shot blends into the overlap after it", [
+        ("shot_a", 0.0, 4.0, "dissolve"), ("shot_b", 3.5, 4.5, ""),
+    ]),
+    # A blend that begins inside the first half-second, so the entry the plan opens with is
+    # shorter than the treatment's own ceiling and the clamp is the entry.
+    ("a blend a quarter of a second in", [
+        ("shot_a", 0.0, 4.0, "dissolve"), ("shot_b", 0.25, 7.75, ""),
+    ]),
+    # A Shot nested inside the first one: the first Shot resolves into two entries and the plan
+    # opens with the first of them, which is its own opening frames.
+    ("a shot nested inside the first one", [
+        ("shot_a", 0.0, 10.0, ""), ("shot_b", 3.0, 2.0, ""),
+    ]),
+]
+
+
+def server_opening_answer(row: list[tuple[str, float, float, str]]) -> int:
+    """How many frames `assembly_plan` opens with, when the first Shot in song order lays them.
+
+    **The plan's own run**, exactly as `_compose_opening_transition` reads it: the first entry, its
+    Shot compared against the first in song order, and that entry's own frame count. `0` is R-45's
+    *"nothing may be treated here"* and is the answer the two ports have to reach as well.
+    """
+    from music_video_producer.assembly import (
+        ClipWindow,
+        TransitionChoice,
+        assembly_plan,
+    )
+
+    clips = [
+        ClipWindow(
+            shot_id=shot_id, label=shot_id.upper(), start=start, duration=duration,
+            approved_output=f"{shot_id}.mp4", approved_start=start,
+            approved_duration=duration, source=Path(f"{shot_id}.mp4"),
+        )
+        for shot_id, start, duration, _stored in row
+    ]
+    plan = assembly_plan(
+        clips,
+        max(clip.end for clip in clips),
+        {clip.shot_id: (640, 384) for clip in clips},
+        {
+            shot_id: TransitionChoice(transition_id=stored, xfade=stored)
+            for shot_id, _start, _duration, stored in row
+            if stored
+        },
+    )
+    ordered = sorted(clips, key=lambda clip: clip.start)
+    opening = plan.clips[0]
+    if isinstance(opening, ClipWindow) and opening.shot_id == ordered[0].shot_id:
+        return plan.frames[0]
+    return 0
+
+
+def client_opening_answers(table) -> list[int]:
+    """`openingClipFrames` over the whole table, one number per row."""
+    return run_module(
+        "import { openingClipFrames }"
+        " from './src/music_video_producer/web/assets/api.js';\n"
+        "const TABLE = " + json.dumps([split_rule_windows(row) for _label, row in table]) + ";\n"
+        "console.log(JSON.stringify(TABLE.map((shots) => openingClipFrames(shots))));\n"
+    )
+
+
+def test_the_client_and_the_server_answer_one_opening_rule():
+    """Three engines, one question: **how many frames does the plan open with, if any.**
+
+    The export reads `plan.clips[0]` and compares its Shot against the first in song order. The
+    Shot preview has no plan and reads `app._opening_clip_frames`. The browser has no plan either
+    and reads `api.openingClipFrames`, which draws the row that says whether a `Transition in`
+    composes anything at all. Two of those are ports, and **a port is only honest while something
+    asks all three the same question and compares the answers**.
+
+    The **number** is compared and not the verdict, for `test_the_client_and_the_server_answer_one_split_rule`'s
+    reason: the number is the clamp the treatment is bounded by, and two engines agreeing on `0`
+    for different reasons is two engines.
+
+    The table is run against `SPLIT_RULE_TABLE` as well as its own, because the geometries that
+    break a split are the geometries that bury a head -- and one of those rows, *"the outgoing shot
+    nested inside the incoming one"*, is exactly this rule's hard case with a different name on it.
+    """
+    from music_video_producer.app import _opening_clip_frames
+    from music_video_producer.assembly import ClipWindow
+
+    table = OPENING_RULE_TABLE + SPLIT_RULE_TABLE
+    answered = client_opening_answers(table)
+    assert len(answered) == len(table)
+
+    disagreed = []
+    served = []
+    for (label, row), client in zip(table, answered, strict=True):
+        plan = server_opening_answer(row)
+        windows = sorted(
+            (
+                ClipWindow(
+                    shot_id=shot_id, label=shot_id.upper(), start=start, duration=duration,
+                    approved_output="", approved_start=start, approved_duration=duration,
+                    source=Path("x.mp4"),
+                )
+                for shot_id, start, duration, _stored in row
+            ),
+            key=lambda clip: clip.start,
+        )
+        preview = _opening_clip_frames(windows)
+        served.append((label, plan))
+        if not (plan == preview == client):
+            disagreed.append((label, plan, preview, client))
+    assert not disagreed, (
+        ("the plan, the preview and the browser disagree about what opens the video, so a row is "
+         "promising a treatment the export will not compose"),
+        disagreed,
+    )
+
+    # The table reaches both answers, and the rows that answer `0` are named rather than counted:
+    # a table where the first Shot always opens would never ask the rule to say no, which is the
+    # fixture-that-cannot-fail this epic has roughly twenty-two instances of.
+    assert {label for label, frames in served if not frames} == {
+        "a later shot covers the first shot's head",
+        "two shots that start together",
+        "a head inside the tolerance that still rounds to a frame",
+        "a head over the tolerance that lays no frames",
+        "the outgoing shot nested inside the incoming one",
+    }, served
+    # And it reaches a clamp shorter than the treatment's ceiling, which is what makes the row's
+    # readout a measurement rather than a constant printed out.
+    assert any(0 < frames < ONE_SIDED_TRANSITION_FRAMES for _label, frames in served), served
+
+
+def test_the_opening_row_states_the_length_the_plan_opens_with():
+    """R-45's readout: **the frames the plan opens with**, clamped by the server's own ceiling.
+
+    `one_sided_frames` is the same constant in both directions and is on the wire precisely so a
+    row need not hard-code it (`TransitionCatalogueEntry`). The clamp is the thing that differs
+    from the tail's: it is the plan's **first entry**, never the Shot's own window, because the
+    export clamps against `plan.frames[0]` and a first Shot with an Overlap a quarter of a second
+    in opens with six frames of a four-second Shot.
+
+    **The fixture carries that geometry**, which is what makes the clamp observable: a row that
+    printed the catalogue's twelve frames flat would pass on the roomy plan and be wrong by four
+    times on the cramped one.
+    """
+    ceiling = ONE_SIDED_TRANSITION_FRAMES / 24
+    roomy = transition_rows(transition_plan(
+        fields={"shot_a": {"transition_in": {"type": ONE_SIDED_ID}}}))
+    cramped = transition_rows(transition_plan(
+        windows={"shot_a": (0.0, 4.0), "shot_b": (0.25, 3.75), "shot_c": (4.0, 4.0)},
+        fields={"shot_a": {"transition_in": {"type": ONE_SIDED_ID}}}))
+    into = lambda read: next(row for row in read["rows"] if row["side"] == "transition_in")
+
+    assert into(roomy)["state"] == "opening"
+    assert into(roomy)["length"] == f"{ceiling:.2f}s · opening frames"
+    assert into(cramped)["state"] == "opening"
+    assert into(cramped)["length"] == "0.25s · opening frames"
+    # And it is not the tail's readout: they are two facts about two ends and a Director reading
+    # "own frames" at the head of the video could not tell which one they were being shown.
+    assert "own frames" not in into(roomy)["length"]
+
+
+def test_the_opening_row_promises_nothing_for_a_type_with_no_form_in_either_direction():
+    """FX-19 on the row, in the direction R-45 opened.
+
+    A wipe has no one-sided form at all (R-34), so the export composes nothing and records the
+    refusal. A row saying *"this treats its opening frames as the video begins"* over it would be
+    the present-tense promise `TRANSITION_OVERLAP_REMOVED_PAIR_ONLY_TOAST` exists because its
+    sibling made, one boundary further out — the same defect, on the row instead of on the toast.
+
+    It names no remedy, because there is none: nothing can be put in front of the first Shot.
+    """
+    read = transition_rows(transition_plan(
+        fields={"shot_a": {"transition_in": {"type": PAIR_ONLY_ID}}}))
+    into = next(row for row in read["rows"] if row["side"] == "transition_in")
+    assert into["state"] == "opening"
+    assert into["length"] == "", "there is no length, because nothing is composed"
+    assert into["note"] == (
+        "Wipe left needs two pictures and nothing plays before shot 01, so nothing is composed "
+        "here and the video opens on shot 01's own first frame.")
+    assert "overlap" not in into["note"].lower(), (
+        "the tail's refusal offers a drag that cannot be performed at this boundary")
+    assert into["disabled"] is False
+
+
+def test_the_preview_key_carries_the_opening_treatment_and_only_where_it_composes():
+    """The seventh fingerprint slot's counterpart on this side (R-45, story 11.f8).
+
+    The route composes an opening treatment into the Shot that lays the plan's first frame, so
+    that Shot's picture is not its take and a key that ignored it would leave the Monitor playing
+    the untreated head while the export fades the video up — the same shape story 11.5 closed for
+    the tail, which is the one this repository has now paid for seven times.
+
+    **And only where it composes.** AD-30's mirror puts a `transition_in` on the Shot after every
+    `transition_out`, so a key that moved for any stored value would re-render every Shot in every
+    project that carries a transition at all, for pictures that did not change (R-20).
+
+    A Shot with **no stack and an opening** is previewed, which is the same widening story 11.5
+    made for the tail: with no effects its picture is still not its take.
+    """
+    answered = run_module("""
+      import { previewInputKey, shotPreviewWanted, shotOpeningTransition }
+        from './src/music_video_producer/web/assets/api.js';
+      const plan = (fields) => [
+        { id: 'shot_a', start: 0, duration: 4, approved_output: 'a.mp4', ...fields },
+        { id: 'shot_b', start: 4, duration: 4, approved_output: 'b.mp4' },
+      ];
+      const bare = plan({});
+      const opened = plan({ transition_in: { type: 'fade_black' } });
+      const mirrored = [
+        { id: 'shot_a', start: 0, duration: 4, approved_output: 'a.mp4' },
+        { id: 'shot_b', start: 4, duration: 4, approved_output: 'b.mp4',
+          transition_in: { type: 'fade_black' } },
+      ];
+      const buried = [
+        { id: 'shot_a', start: 0, duration: 4, approved_output: 'a.mp4',
+          transition_in: { type: 'fade_black' } },
+        { id: 'shot_b', start: 0.01, duration: 4, approved_output: 'b.mp4' },
+      ];
+      console.log(JSON.stringify({
+        bare: previewInputKey(bare[0], null, bare),
+        opened: previewInputKey(opened[0], null, opened),
+        mirrored: previewInputKey(mirrored[1], null, mirrored),
+        mirroredBare: previewInputKey(bare[1], null, bare),
+        buried: previewInputKey(buried[0], null, buried),
+        buriedBare: previewInputKey(bare[0], null, bare),
+        opening: shotOpeningTransition(opened[0], opened),
+        mirroredOpening: shotOpeningTransition(mirrored[1], mirrored),
+        buriedOpening: shotOpeningTransition(buried[0], buried),
+        unplanned: shotOpeningTransition(opened[0], null),
+        wantedBare: shotPreviewWanted(bare[0], null, bare).wanted,
+        wantedOpened: shotPreviewWanted(opened[0], null, opened).wanted,
+      }));
+    """)
+
+    assert answered["opening"] == "fade_black"
+    assert answered["opened"] != answered["bare"], (
+        "the Shot that opens the plan has a different picture, so it must have a different key")
+    # AD-30's mirror on the Shot after the first: nothing composes, so nothing is re-asked for.
+    assert answered["mirroredOpening"] == ""
+    assert answered["mirrored"] == answered["mirroredBare"]
+    # And the first Shot by `start` whose own head a later Shot covers: also nothing.
+    assert answered["buriedOpening"] == ""
+    assert answered["buried"] == answered["buriedBare"]
+    # With no plan handed over the key moves rather than not moving, which is
+    # `shotOneSidedTransition`'s own choice for its own unanswerable case: the cheap failure is a
+    # request whose answer is the fingerprint already in hand.
+    assert answered["unplanned"] == "fade_black"
+    # A Shot with no stack and an opening is previewed; without one it is the take with extra steps.
+    assert answered["wantedBare"] is False
+    assert answered["wantedOpened"] is True
 
 
 def test_the_band_and_the_row_give_one_answer_about_one_boundary():

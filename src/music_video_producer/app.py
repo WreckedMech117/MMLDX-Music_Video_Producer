@@ -94,6 +94,7 @@ from .effects import (
     FAMILY_ORDER,
     NOT_A_NUMBER,
     TRANSITION_CATALOGUE,
+    TRANSITION_PAIR_ONLY_OPENING_REFUSAL,
     TRANSITION_PAIR_ONLY_REFUSAL,
     ChoiceParameter,
     DriveScript,
@@ -110,6 +111,7 @@ from .effects import (
     exported_look,
     fingerprint_size,
     one_sided_transition_stages,
+    opening_transition_stages,
     preview_fingerprint,
     song_fingerprint,
     song_fingerprints_match,
@@ -7209,8 +7211,10 @@ SHOT_TRANSITION_LOCKED_REFUSAL = (
 #: *neighbour* Shot's field, and until this constant existed it did so with no lock check at all --
 #: so a Director who had locked a Shot could still author a blend on it by naming the unlocked end.
 #: It is not a cosmetic hole: `transition_in` mirrors **backwards** onto the predecessor's
-#: `transition_out`, which is the only side the export reads, so writing the unlocked later Shot's
-#: incoming field is how you set the locked earlier Shot's outgoing blend. The mirror sets both
+#: `transition_out`, which is the only side the export reads at a boundary, so writing the later
+#: unlocked Shot's incoming field is how you set the locked earlier Shot's outgoing blend, and it
+#: is that blend and not R-45's opening -- a Shot with something in front of it never opens the
+#: plan. The mirror sets both
 #: sides, so `_report_transition_divergence` saw nothing to say either.
 #:
 #: **It refuses rather than skipping the mirror**, and the reason is the shape of the alternative.
@@ -7242,7 +7246,9 @@ class ShotTransitionsRequest(BaseModel):
     **This route writes the pair together and keeps the mirror in step** (AD-30). Writing
     `transition_out` on a Shot also writes `transition_in` on the Shot that follows it in song
     order, so the later Shot's own panel can draw its half of one blend; the outgoing field stays
-    the authoritative one and is the only side the export reads.
+    the authoritative one and is the only side a boundary's picture is built from. `transition_in`
+    is read at exactly one place, which is not a boundary between two Shots: the opening frames of
+    the Shot that lays the plan's own first frame (R-45, `app._compose_opening_transition`).
     """
 
     #: The sentinel: a value no client can send, because JSON has no way to spell it. `Any` rather
@@ -8481,6 +8487,16 @@ TRANSITION_REFUSED_RECORD = "refused: {shot}"
 #: records would be indistinguishable and the length would be visible nowhere at all.
 TRANSITION_ONE_SIDED_RECORD = "{shot}={transition} one-sided over {frames} frames"
 
+#: How the **opening** Transition is written into `ExportLook.transitions` (R-45, story 11.f8).
+#:
+#: `TRANSITION_ONE_SIDED_RECORD`'s shape and its reason, for the one boundary that is not a cut:
+#: it keeps the slot's `"<shot_id>=<value>"` form and spends the value saying that this treated a
+#: Shot's own **opening** frames and how many of them ran after the clamp. A separate word from
+#: `one-sided` because the two are separate boundaries and the Shot that opens the plan can carry
+#: both -- a record that called them one thing would leave a reader of a delivered export unable
+#: to say which end of a Shot the number belonged to.
+TRANSITION_OPENING_RECORD = "{shot}={transition} opening over {frames} frames"
+
 #: How a Transition Pair that **disagrees across an Overlap** is written into the same slot
 #: (story 11.3's third criterion, AD-30).
 #:
@@ -8496,6 +8512,10 @@ TRANSITION_ONE_SIDED_RECORD = "{shot}={transition} one-sided over {frames} frame
 #: **An unset mirror is not a divergence.** A Shot whose `transition_in` is simply absent is the
 #: ordinary state of a one-sided transition, and reporting it would make this line fire on nearly
 #: every export that carries a transition at all. See `_report_transition_divergence`.
+#:
+#: **And a `transition_in` that composed an opening is not one** (R-45, 2026-08-31). It is read at
+#: the plan's first entry, where there is no earlier Shot and therefore no `transition_out` for it
+#: to disagree with; this record needs both halves of a pair and there is no pair there.
 TRANSITION_DIVERGED_RECORD = (
     "diverged: {before} sets {out} and {after} sets {incoming}. The export used {out}, which is "
     "the outgoing shot's own field."
@@ -8633,13 +8653,24 @@ class ExportSubject:
     #: subject.transitions` is "this project blends nothing".
     transitions: Mapping[str, str] = dataclass_field(default_factory=dict)
     #: Shot id -> the stored `transition_in.type` of the Shots that carry one: **the mirror, and
-    #: it decides nothing.**
+    #: at every boundary between two Shots it decides nothing.**
     #:
     #: AD-30 is unchanged by its presence -- `transition_out` on the earlier Shot is authoritative
-    #: and the field above is still the only one the picture is built from. This one exists for
-    #: exactly one job: `_report_transition_divergence` compares the two so that a pair which
-    #: disagrees is *said* rather than silently resolved. Nothing else may read it, and a composer
-    #: that did would be re-opening the question AD-30 closed.
+    #: and the field above is the only one a boundary's picture is built from. This one is read by
+    #: `_report_transition_divergence`, which compares the two so that a pair which disagrees is
+    #: *said* rather than silently resolved.
+    #:
+    #: ~~Nothing else may read it, and a composer that did would be re-opening the question AD-30
+    #: closed.~~ **Narrowed by R-45 on 2026-08-31, and amended here in the same commit as the
+    #: composer that narrows it.** `_compose_opening_transition` reads this mapping at **exactly
+    #: one** boundary: the first entry of the plan, where the Shot laying the video's first frame
+    #: has no predecessor in song order. That is not re-opening AD-30 -- it is naming the one
+    #: place AD-30 does not reach, because there is no outgoing field there to be authoritative
+    #: *with*. Everywhere else a stored value in here composes nothing, which is what keeps one
+    #: boundary to one treatment: AD-30's mirror writes this field on the neighbour whenever
+    #: `transition_out` is set, so a composer that read it at any second boundary would be
+    #: fading one Shot out and the next one in from a single gesture -- the picture `Fade through
+    #: black` is already called, and the substitution FX-18 exists to forbid.
     #:
     #: Kept as a second mapping rather than folded into `transitions` because the two are read by
     #: different questions and one of them must not be answerable by the other: a single mapping
@@ -9003,22 +9034,35 @@ def _transition_catalogue_refusals(subject: ExportSubject) -> list[str]:
     turns a type into an `xfade` name, so a plan holding one cannot be built at all. R-37 is about
     *geometry*, where a perfectly good hard cut is already available and refusing the whole export
     would be stricter than `assembly_plan` itself. See `assembly.TRANSITION_CROWDED_REFUSAL`.
+
+    **The first Shot's *incoming* field is asked too, and only that one** (R-45, story 11.f8).
+    `_compose_opening_transition` builds a picture from `transition_in` at the plan's first entry,
+    so a stored value the catalogue cannot name is the same fault there as anywhere else and gets
+    the same sentence -- and asking it here is what keeps that composer's own claim true, that
+    every type reaching it has already been agreed to. Asked of the first Shot **in song order**,
+    which is a superset of the Shots that can open a plan: the opening entry's Shot is always that
+    one, and `assembly_plan` is not built yet at this stage to narrow it further. Every other
+    Shot's `transition_in` composes nothing, so a value stored there is not something this export
+    builds from and is not refused over -- it is the ordinary mirror AD-30 writes.
     """
-    if not subject.transitions:
+    if not subject.transitions and not subject.transitions_in:
         return []
     refusals: list[str] = []
-    seen: set[str] = set()
-    for clip in sorted(subject.clips, key=lambda item: item.start):
-        stored = subject.transitions.get(clip.shot_id)
-        if stored is None or clip.shot_id in seen:
-            continue
-        seen.add(clip.shot_id)
-        try:
-            transition_definition(stored)
-        except EffectRefusal as refusal:
-            refusals.append(
-                ASSEMBLY_TRANSITION_REFUSAL.format(shot=clip.label, detail=refusal)
-            )
+    seen: set[tuple[str, str]] = set()
+    for position, clip in enumerate(sorted(subject.clips, key=lambda item: item.start)):
+        for stored in (
+            subject.transitions.get(clip.shot_id),
+            subject.transitions_in.get(clip.shot_id) if position == 0 else None,
+        ):
+            if stored is None or (stored, clip.shot_id) in seen:
+                continue
+            seen.add((stored, clip.shot_id))
+            try:
+                transition_definition(stored)
+            except EffectRefusal as refusal:
+                refusals.append(
+                    ASSEMBLY_TRANSITION_REFUSAL.format(shot=clip.label, detail=refusal)
+                )
     return refusals
 
 
@@ -9182,11 +9226,15 @@ def _compose_one_sided_transitions(
     on its report, so every stored type reaching this function has already been agreed to. Same
     proof, same shape, as the resolution `assembly_plan` is handed.
 
-    **Two things this deliberately does not do, both owned by later stories rather than missing.**
-    `transition_in` is not read at all: AD-30 makes it the mirror, `ExportSubject.transitions`
-    carries only the outgoing field, and a one-sided *fade in* on the very first Shot -- the one
-    boundary where an incoming field has no pair to mirror -- is described by no acceptance
-    criterion in Epic 11 and would need that mapping widened.
+    **`transition_in` is not read here, and that stayed true when the opening half shipped.**
+    AD-30 makes it the mirror and `subject.transitions` carries only the outgoing field, so every
+    boundary this function walks is decided by the outgoing Shot -- which is R-45's rule and the
+    whole of why one cut cannot collect two treatments. ~~A one-sided *fade in* on the very first
+    Shot -- the one boundary where an incoming field has no pair to mirror -- is described by no
+    acceptance criterion in Epic 11 and would need that mapping widened.~~ **Ruled by R-45 and
+    shipped 2026-08-31 by story 11.f8**, in `_compose_opening_transition` beside this one rather
+    than by widening this walk: that boundary is not a cut between two Shots, it is the plan's
+    first frame, and the two are separated here so that neither can reach the other's.
 
     ~~And the **preview** does not show this: `preview_fingerprint`'s seventh input is still
     hashed empty, which R-35 reserved for exactly *"a transition on a Shot's own preview"* and
@@ -9220,6 +9268,9 @@ def _compose_one_sided_transitions(
                     shot=TRANSITION_PAIR_ONLY_REFUSAL.format(
                         label=entry.label,
                         shot=clip.label,
+                        # Always the seam after: this composer reads
+                        # `subject.transitions`, which is `transition_out` alone (AD-30).
+                        neighbour="after",
                         alternatives=", ".join(
                             sorted(
                                 item.label
@@ -9276,6 +9327,206 @@ def _final_clip_index(plan: AssemblyPlan, shot_id: str) -> int | None:
     return max(spots, key=lambda spot: plan.clips[spot].end)
 
 
+def _opening_clip_frames(ordered: Sequence[ClipWindow | Shot]) -> int:
+    """How many frames the plan opens with, when the first Shot in song order is what lays them.
+
+    `0` means nothing may be treated there, which is a state and not a failure. A positive answer
+    is both facts at once: that this Shot opens the video, and how many frames of it the export
+    will write before anything else -- which is the clamp an opening treatment is bounded by.
+    Answering the two together is deliberate: a caller that asked *whether* and then computed
+    *how long* from the Shot's own window would name a treatment longer than the frames that
+    exist, which is the untreated-picture-at-rc-0 failure this whole family is written against.
+
+    R-45 composes an opening treatment *"on the first Shot of the plan in song order, where there
+    is no predecessor and nothing owns the cut"*, and those are two conditions rather than one.
+    They part on a geometry the export meets: a Shot laid over another one's head. `A` at
+    `[0, 10]` under `B` at `[0.01, 4.01]` resolves to `B[0.01, 4.01]` and then `A[4.01, 10]`,
+    because `assembly_plan` cuts an overlaid head at the later Shot's start and discards what is
+    left of it when that is no longer than `BOUNDARY_TOLERANCE_SECONDS`. `A` is first by `start`;
+    `B` lays the first frame. Executed, not reasoned:
+    `test_the_shot_that_lays_the_first_frame_is_not_always_the_first_shot_by_start` builds it.
+
+    **Neither Shot may be treated there, and that is what this predicate says.** `A`'s own opening
+    frames are not in the export at all, so treating its first *clip* would treat frames four
+    seconds into the video -- at a cut `B`'s `transition_out` already owns, which is exactly the
+    two-treatments-for-one-boundary this slice exists to make impossible. And `B` has a
+    predecessor: R-45's own clause excludes it, AD-30's mirror wrote `B.transition_in` the moment
+    a Director set anything on `A`, and composing there would make one gesture fade `A` out and
+    `B` in -- the picture `Fade through black` is already called.
+
+    So the opening treatment composes exactly where the two definitions **agree**, which is what
+    this returns. The export does not ask this question: it reads `plan.clips[0]` and compares the
+    Shot, which is the resolution's own answer rather than a description of it
+    (`_opening_clip_index`). This is the port for the two places that have no plan to read -- the
+    Shot preview, and `api.openingClipFrames` in the browser -- and
+    `test_the_window_rule_and_the_plan_agree_about_what_opens` sweeps all three against each
+    other over the geometries that separate them, comparing the **number** and not only the
+    verdict: two engines agreeing on `0` for different reasons is two engines. **Where they
+    disagree the plan wins**, exactly as `boundaryBlendVerdicts` is subordinate to
+    `_paired_transitions`.
+
+    **The grid is asked as well as the seconds**, and it is not decoration. A head longer than
+    half a frame can still round to *no* frames -- `round(end * 24) == round(start * 24)` holds
+    across a span of up to 0.98 of a frame -- and `assembly_plan` drops a zero-frame entry, so the
+    seconds question alone answers `True` for a Shot the plan does not open with. It is the same
+    correction the split rule was given on 2026-08-30: ask the grid the question the grid decides.
+    """
+    if not ordered:
+        return 0
+    first = ordered[0]
+    # What cuts the head, if anything does: the resolution loop subtracts every later-*starting*
+    # window, and `ordered` is in song order, so the earliest of them is the only one that can
+    # move this edge. A later Shot starting at or before this one within half a frame removes the
+    # head whole, which this reads as an edge no longer than the tolerance.
+    edge = first.end
+    if len(ordered) > 1 and ordered[1].start < first.end:
+        edge = ordered[1].start
+    if edge - first.start <= BOUNDARY_TOLERANCE_SECONDS:
+        return 0
+    return max(0, clip_frames_on_grid(first.start, edge))
+
+
+def _opening_clip_index(subject: ExportSubject) -> int | None:
+    """Where the plan's opening treatment goes, or `None` when nothing may be treated there.
+
+    **The plan's own answer, not a reading of the windows.** `plan.clips[0]` is the entry that
+    lays the video's first frame -- `assembly_plan` sorts its resolved entries by `start` and
+    `_paired_transitions` only ever splices a blend *behind* the outgoing Shot's own surviving
+    frames, which its `outgoing > 0` term guarantees -- so the answer is one index rather than a
+    search. It is checked for its type anyway; see below.
+
+    **And the Shot that entry belongs to must be the first Shot in song order**, which is R-45's
+    other half: *"where there is no predecessor"*. The two part exactly when a later Shot covers
+    the first one's head, and `_opening_clip_frames` records that geometry and why neither Shot may
+    treated in it. Reading only `plan.clips[0]` would treat the burier -- a Shot whose opening cut
+    its predecessor already owns.
+
+    **`None` is four states and every one of them is correctly nothing**: no plan, an empty plan,
+    an opening entry that is not a plain window, and the two definitions disagreeing. The third is
+    not reachable through `assemble_project` today -- a `TransitionClip` at index 0 would need a
+    blend with no frames of the outgoing Shot in front of it, which `_paired_transitions` refuses
+    by name -- and it is written because this function is handed a plan by a caller that may one
+    day build one differently, which is `assembly._split_frames`' own reason for its two `lead`
+    guards. `test_an_opening_treatment_is_refused_when_the_plan_opens_with_a_blend` pins it at
+    this function's own boundary, which is the only place that state exists.
+    """
+    plan = subject.plan
+    if plan is None or not plan.clips or not subject.clips:
+        return None
+    opening = plan.clips[0]
+    if not isinstance(opening, ClipWindow):
+        return None
+    # `min` and not `sorted(...)[0]`: both answer the first minimal element, and two Shots
+    # starting at the same instant are a tie `assembly_plan`'s own stable sort breaks the
+    # same way -- whichever wins, it is the Shot the resolution loop treats as the earlier.
+    first = min(subject.clips, key=lambda item: item.start)
+    if opening.shot_id != first.shot_id:
+        return None
+    return 0
+
+
+def _compose_opening_transition(
+    subject: ExportSubject, composition: ExportComposition
+) -> list[str]:
+    """The `transition_in` of the Shot that opens the plan, as stages on that clip's own head.
+
+    R-45 and story 11.f8, and FX-18's other half: *"a one-sided transition treats a Shot's own
+    final **or opening** frames"*. Only the final ones shipped. This is the opening ones, at the
+    **one** boundary where an incoming field has nothing to disagree with -- the plan's first
+    frame, where there is no predecessor and no `transition_out` to be authoritative with.
+
+    **Everything structural about `_compose_one_sided_transitions` is true here** and is not
+    restated: the stages ride `treatment_stages` after the Shot's whole look, the `sendcmd` a blur
+    needs rides the end of `geometry`, the clamp is against `plan.frames[index]` rather than
+    against seconds because a treatment past the last frame written composes cleanly and renders
+    nothing at rc 0, and `assembly_plan` is not touched at all. What differs is the two things
+    this docstring is about: which entry, and which field.
+
+    **Which entry: `_opening_clip_index`**, which is the plan's own first entry qualified by
+    R-45's *"where there is no predecessor"*. Never a search for a Shot's clips: an opening
+    treatment is a fact about the video's first frame, not about a Shot, and a Shot whose head a
+    later one covers contributes no opening frames to treat.
+
+    **Which field: `subject.transitions_in`, and only at that entry.** AD-30's mirror writes it on
+    the neighbour whenever a `transition_out` is set, so reading it at any second boundary would
+    make one gesture compose two treatments for one cut -- a Dissolve faded out and then faded in,
+    which is the picture `Fade through black` is named for and the substitution FX-18 forbids.
+    That is why this is a separate walk over exactly one index rather than a widening of the walk
+    beside it: neither can reach the other's boundary.
+
+    **A first Shot with an Overlap after it is unaffected in both directions.** The blend is a
+    `TransitionClip` of its own and the entry treated here is the outgoing Shot's frames *before*
+    the Overlap, which `_paired_transitions` guarantees exists. So the head is treated, the blend
+    is the blend, and the two are different entries of the plan.
+
+    **The two treatments a single Shot may carry are two boundaries, not two answers to one.** The
+    Shot that opens the plan can hold a `transition_in` treating its first frames and a
+    `transition_out` with no Overlap treating its last, and on an unsplit Shot those land on one
+    chain. They are the video's opening and the cut into the next Shot; the labels are distinct
+    (`effects.OPENING_TRANSITION_LABEL`) so the two `gblur` ramps cannot be driven by one
+    `sendcmd`, and on a Shot shorter than twice `ONE_SIDED_TRANSITION_FRAMES` they overlap in
+    frames, which is a picture that fades up and back down over a half-second Shot and is what was
+    asked for.
+
+    **A pair-only type is refused by name with nothing substituted**, in its own sentence: the
+    tail's refusal offers *"drag the two clips across each other"* and there is nothing before the
+    first Shot to drag. Recorded rather than raised, for `_compose_one_sided_transitions`' reason
+    -- the boundary is a perfectly good opening cut and refusing the export over one geometry
+    would cost a Director a render. It is reachable without a hand-edited manifest: the write
+    route refuses a pair-only `transition_in` on a Shot with no predecessor, but a Shot that
+    acquired one across an Overlap keeps it when the Shot in front of it is deleted.
+
+    **The catalogue cannot refuse a type here**, which is why nothing below catches an
+    `EffectRefusal`: `_transition_catalogue_refusals` asks the first Shot's incoming field at the
+    plan stage and the route raises on its report, exactly as it already does for every stored
+    `transition_out`.
+    """
+    plan = subject.plan
+    if plan is None or not subject.transitions_in:
+        return []
+    index = _opening_clip_index(subject)
+    if index is None:
+        return []
+    clip = plan.clips[index]
+    assert isinstance(clip, ClipWindow)
+    stored = subject.transitions_in.get(clip.shot_id)
+    if stored is None:
+        return []
+    composed = opening_transition_stages(
+        stored, clip_frames=plan.frames[index], fps=ASSEMBLY_FPS
+    )
+    if composed is None:
+        entry = TRANSITION_CATALOGUE[stored]
+        composition.look.transitions.append(
+            TRANSITION_REFUSED_RECORD.format(
+                shot=TRANSITION_PAIR_ONLY_OPENING_REFUSAL.format(
+                    label=entry.label,
+                    shot=clip.label,
+                    alternatives=", ".join(
+                        sorted(
+                            item.label
+                            for item in TRANSITION_CATALOGUE.values()
+                            if not item.pair_only
+                        )
+                    ),
+                )
+            )
+        )
+        return []
+    already = composition.effect_stages.get(index, EffectStages())
+    composition.effect_stages[index] = EffectStages(
+        geometry=(*already.geometry, *composed.geometry),
+        treatment=(*already.treatment, *composed.treatment),
+        scripts=(*already.scripts, *composed.scripts),
+    )
+    composition.look.transitions.append(
+        TRANSITION_OPENING_RECORD.format(
+            shot=clip.shot_id, transition=stored, frames=composed.frames
+        )
+    )
+    return []
+
+
 def _report_transition_divergence(
     subject: ExportSubject, composition: ExportComposition
 ) -> list[str]:
@@ -9292,7 +9543,9 @@ def _report_transition_divergence(
     a one-sided transition, or a pair whose mirror a client never wrote, and reporting it would
     make this fire on the ordinary state of nearly every project that carries a transition at all.
     No Overlap is not a divergence either: there is no pair there to disagree, only the outgoing
-    Shot's own one-sided treatment and an incoming field nothing reads.
+    Shot's own one-sided treatment and an incoming field nothing reads **at that boundary**.
+    R-45 does not add one: the opening treatment is composed where there is no outgoing field at
+    all, so there is nothing there for the mirror to disagree with either.
 
     **Once per diverging pair**, which is the load-bearing word in the criterion. The walk is over
     consecutive Shots in song order, so a pair is visited exactly once however many clips either
@@ -9360,15 +9613,26 @@ EXPORT_PLAN_CHECKS: tuple[Callable[[ExportSubject], list[str]], ...] = (
 #: has none, and a pair that disagrees, are recorded rather than refused (R-37, AD-30). The two
 #: entries that *can* refuse an export are still the two above.
 #:
+#: *Appended to once more on 2026-08-31, by R-45 and story 11.f8, with nothing else edited.*
+#: `_compose_opening_transition` treats the opening frames of the Shot that lays the plan's first
+#: frame, and returns `[]` always for the same reason its neighbour does.
+#:
 #: **Order is read order.** A reader of the slot gets, per boundary: what the plan refused, what it
 #: blended, what a Shot treated on its own, and finally what the manifest could not agree with
 #: itself about.
+#:
+#: **The opening is registered after the three that walk boundaries**, because it is the only one
+#: that is not about a boundary between two Shots and because it appends to a chain the walk
+#: before it may already have added a tail to. A reader of the slot therefore gets every cut and
+#: then the video's own first frame, which is one entry and cannot be confused for a cut: its
+#: record says `opening`.
 EXPORT_COMPOSITION_CHECKS: tuple[
     Callable[[ExportSubject, ExportComposition], list[str]], ...
 ] = (
     _compose_effect_chains,
     _compose_transitions,
     _compose_one_sided_transitions,
+    _compose_opening_transition,
     _report_transition_divergence,
 )
 
@@ -12572,14 +12836,53 @@ def create_app(
                     status_code=422,
                     detail=ASSEMBLY_TRANSITION_REFUSAL.format(shot=label, detail=refusal),
                 ) from refusal
-        if one_sided is not None:
-            # Appended **after** the Shot's whole look, on both groups, exactly as the export
-            # splices it: a transition treats the finished picture, and the `sendcmd` a blur ramp
-            # needs rides the end of `geometry` so it stays upstream of the filter it drives.
+        # **The opening treatment, which is the same slot's other half** (R-45, story 11.f8).
+        # The Shot that lays the plan's first frame treats its own **opening** frames from its
+        # `transition_in`, and FX-NFR-3 is why this is here rather than left to the export: a
+        # preview that showed the untreated head while the export shipped a fade up would be
+        # exactly the gap story 11.5 closed for the tail, re-opened in the mirror.
+        #
+        # **The same clamp as the export's, by construction.** `_opening_clip_frames` is the
+        # frames of the plan's own first entry read off the windows, which is `plan.frames[0]`
+        # over every geometry the sweep in `test_the_window_rule_and_the_plan_agree_about_what_opens`
+        # can build -- so this is not `frames`, the whole Shot. They part exactly where the first
+        # Shot has an Overlap or a nested Shot inside the first half-second, and taking the Shot's
+        # own length there would preview a treatment longer than the frames the export writes.
+        #
+        # **`boundary == 0` as well as the frames**, because both halves of R-45 have to hold: the
+        # Shot must be first in song order *and* lay the first frame. A Shot the plan opens with
+        # that is not first has a predecessor, and its `transition_in` is the mirror AD-30 wrote.
+        opening = None
+        opening_frames = _opening_clip_frames(ordered_for_boundary)
+        stored_opening = shot.transition_in.type if shot.transition_in else None
+        if stored_opening is not None and boundary == 0 and opening_frames > 0:
+            try:
+                opening = opening_transition_stages(
+                    stored_opening,
+                    clip_frames=opening_frames,
+                    fps=ASSEMBLY_FPS,
+                    # The preview's grid and the export's, for `one_sided`'s reason above.
+                    width=width,
+                    reference_width=delivery[0],
+                )
+            except EffectRefusal as refusal:
+                raise HTTPException(
+                    status_code=422,
+                    detail=ASSEMBLY_TRANSITION_REFUSAL.format(shot=label, detail=refusal),
+                ) from refusal
+        # Appended **after** the Shot's whole look, on both groups, exactly as the export splices
+        # them: a transition treats the finished picture, and the `sendcmd` a blur ramp needs
+        # rides the end of `geometry` so it stays upstream of the filter it drives. The tail then
+        # the head, which is `EXPORT_COMPOSITION_CHECKS`' own order -- two `fade` filters commute
+        # and the two blurs carry different instance labels, so the order is a fact about the
+        # bytes rather than about the picture, and it is one order so the two can be compared.
+        for composed_transition in (one_sided, opening):
+            if composed_transition is None:
+                continue
             stages = EffectStages(
-                geometry=(*stages.geometry, *one_sided.geometry),
-                treatment=(*stages.treatment, *one_sided.treatment),
-                scripts=(*stages.scripts, *one_sided.scripts),
+                geometry=(*stages.geometry, *composed_transition.geometry),
+                treatment=(*stages.treatment, *composed_transition.treatment),
+                scripts=(*stages.scripts, *composed_transition.scripts),
             )
         # The name of the clip, taken over the chain composed above rather than over the
         # stack it was composed from. The stack is stored sparsely, so a corrected catalogue
@@ -12631,10 +12934,28 @@ def create_app(
             # The scripts are absent for `boundary_fingerprint`'s reason: a `sendcmd` stage
             # carries its script's filename and that filename carries a digest of the script's
             # own text, so the ramp is already in `geometry` by name.
+            # **Both treatments, in the order they were spliced** (R-45 widened this on
+            # 2026-08-31). `None` for a Shot carrying neither, and for a Shot carrying only a
+            # tail the value is byte-for-byte the list this slot has hashed since story 11.5 --
+            # which is what keeps every clip cached before today still named by its own picture
+            # (R-20). A Shot that opens the video renames, because its picture changed.
             transition=(
                 None
-                if one_sided is None
-                else [list(one_sided.geometry), list(one_sided.treatment)]
+                if one_sided is None and opening is None
+                else [
+                    [
+                        stage
+                        for composed_transition in (one_sided, opening)
+                        if composed_transition is not None
+                        for stage in composed_transition.geometry
+                    ],
+                    [
+                        stage
+                        for composed_transition in (one_sided, opening)
+                        if composed_transition is not None
+                        for stage in composed_transition.treatment
+                    ],
+                ]
             ),
             # **Gated on `driven`, and that gate is the whole of this slot's meaning.** The song
             # is part of this picture's identity exactly when the picture asks the song a
@@ -12899,10 +13220,12 @@ def create_app(
                 for shot in project.shots
                 if shot.transition_out
             },
-            # The mirror, carried **only** so a pair that disagrees can be said out loud
-            # (`_report_transition_divergence`, story 11.3). AD-30 is untouched: nothing composes a
-            # picture from this mapping, and the line above is still the whole of what the export
-            # reads to decide one.
+            # The mirror. Carried so a pair that disagrees can be said out loud
+            # (`_report_transition_divergence`, story 11.3) and -- since R-45, 2026-08-31 -- so
+            # that the Shot laying the plan's first frame can open the video
+            # (`_compose_opening_transition`). AD-30 is untouched: at every boundary between two
+            # Shots the line above is still the whole of what the export reads to decide a
+            # picture, and this one is read only where there is no earlier Shot to have one.
             transitions_in={
                 shot.id: shot.transition_in.type
                 for shot in project.shots

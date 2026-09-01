@@ -5723,6 +5723,28 @@ export function shotOneSidedTransition(shot, shots = null) {
   return overlap > BOUNDARY_TOLERANCE_SECONDS ? "" : type;
 }
 
+// The stored `transition_in` this Shot's own preview will be **opened** by, or `""` (R-45, story
+// 11.f8). `shotOneSidedTransition`'s mirror, and every rule in that comment holds here: it is part
+// of this Shot's picture because `render_shot_preview` composes exactly this into the clip, a
+// pair-only type is deliberately not excluded (the cheap failure is one wasted request; the
+// expensive one is a key that does not move when the picture does), and both functions below have
+// to know about it.
+//
+// `""` for every Shot but the one that lays the plan's first frame, which is the whole of R-45: a
+// stored `transition_in` anywhere else is AD-30's mirror and composes nothing at all.
+//
+// **With no plan handed over it answers the type**, which is `shotOneSidedTransition`'s own choice
+// for its own unanswerable case and is made here for the same reason: a caller that cannot say
+// where this Shot sits gets the key that moves.
+export function shotOpeningTransition(shot, shots = null) {
+  const type = String(shot?.transition_in?.type || "");
+  if (!type) return "";
+  const ordered = [...(shots || [])].filter(Boolean).sort((a, b) => a.start - b.start);
+  if (!ordered.length) return type;
+  if (ordered[0]?.id !== shot?.id) return "";
+  return openingClipFrames(ordered) > 0 ? type : "";
+}
+
 export function previewInputKey(shot, song = null, shots = null) {
   // The Shot's id is deliberately **not** in here. This names a picture, and two Shots sharing a
   // take, a window and a look are a picture of the same thing -- which is exactly the case the
@@ -5762,6 +5784,11 @@ export function previewInputKey(shot, song = null, shots = null) {
     // the export shipped the fade. That is the same shape as the song slot two lines up, which is
     // the one this repository has now paid for six times.
     shotOneSidedTransition(shot, shots),
+    // **The same slot's other half** (R-45, story 11.f8). The Shot that opens the plan has its
+    // first frames treated too, and the route hashes both into the seventh fingerprint input in
+    // this order -- so a key that carried only the tail would leave the Monitor playing an
+    // untreated head while the export fades the video up.
+    shotOpeningTransition(shot, shots),
   ]);
 }
 
@@ -5778,7 +5805,9 @@ export function shotPreviewWanted(shot, song = null, shots = null) {
   // one-sided transition has a *different picture* from its take — the treated frames and the cut
   // — and the route renders it. Left as it was, the Monitor would show the untreated take and say
   // nothing, which is the "control that appears to do nothing" this repository keeps rediscovering.
-  if (!shotEffectStack(shot).length && !shotOneSidedTransition(shot, shots)) {
+  if (!shotEffectStack(shot).length
+      && !shotOneSidedTransition(shot, shots)
+      && !shotOpeningTransition(shot, shots)) {
     return { wanted: false, key: "", note: "" };
   }
   // The route refuses this by name (`PREVIEW_NO_TAKE_REFUSAL`), so asking would be asking for a
@@ -9492,11 +9521,13 @@ export function clipEffectsChip(shot) {
 //: those states says are all executable without a browser, and a template that decided any of
 //: them would be checkable only by looking.
 //:
-//: **`transition_out` on the earlier Shot is the only field the picture is drawn from** (AD-30).
-//: The export reads that field and no other -- `assembly._paired_transitions` for a blend,
+//: **`transition_out` on the earlier Shot is the only field a *band* is drawn from** (AD-30).
+//: A band is a picture of an Overlap between two Shots, and the export reads that field and no
+//: other for one -- `assembly._paired_transitions` for a blend,
 //: `app._compose_one_sided_transitions` for a one-sided treatment -- so a band drawn from the
 //: later Shot's `transition_in` would name a blend the render does not perform the moment a
-//: hand-edited manifest diverges. The *rows* still show each Shot its own field, because that is
+//: hand-edited manifest diverges. R-45 changes nothing here: the one place `transition_in`
+//: composes is the plan's first frame, where there is no Overlap and therefore no band. The *rows* still show each Shot its own field, because that is
 //: what makes a divergence visible at all; the *band* is always the outgoing side's.
 //: ------------------------------------------------------------------------------------------
 
@@ -9613,21 +9644,61 @@ export const TRANSITION_REFUSED_NOTE =
 export const TRANSITION_ONE_SIDED_NOTE =
   "No overlap — this treats {shot}'s last frames, then cuts.";
 
-//: What a `Transition in` says on the **first** Shot in song order, where there is no boundary at
-//: all.
+//: What a `Transition in` says on the Shot that **opens** the plan (R-45, story 11.f8).
 //:
-//: **No artifact in this epic describes this state**, and it is not the one above. With no earlier
-//: Shot there is nothing for the write route to mirror onto, and the export reads `transition_out`
-//: and only that -- `app._compose_one_sided_transitions`' own docstring names this as the one
-//: boundary *"where an incoming field has no pair to mirror"* and leaves it to a later story. So
-//: the field stores and nothing renders from it, and the row says so.
+//: ~~No artifact in this epic describes this state~~ -- R-45 does, and it is the one boundary
+//: where an incoming field has no pair to disagree with: nothing plays before it, so there is no
+//: outgoing Shot to own the cut and no mirror for the write route to have written this value. Its
+//: own opening frames are treated and the video begins.
+//:
+//: Present tense and naming the Shot, `TRANSITION_ONE_SIDED_NOTE`'s register, because this is a
+//: row explaining a control rather than the server's refusal repeated.
+export const TRANSITION_OPENING_NOTE =
+  "Nothing plays before {shot} — this treats its opening frames as the video begins.";
+
+//: The same row where the stored type has **no one-sided form in either direction** -- a wipe or a
+//: slide, which needs two pictures (FX-19, R-34). It promises nothing, because nothing is composed
+//: and the export records that refusal rather than substituting a shape the Director did not ask
+//: for. It names no remedy for the reason `TRANSITION_PAIR_ONLY_OPENING_REFUSAL` names none:
+//: nothing can be put in front of the first Shot.
+//: What a `Transition out` says where the stored type has **no one-sided form** and there is
+//: no Overlap to blend across.
+//:
+//: *Added 2026-08-31.* `TRANSITION_ONE_SIDED_NOTE` beside it promised *"this treats {shot}'s
+//: last frames, then cuts"* for **every** stored type, including the eight the catalogue marks
+//: `pair_only` -- which have no one-sided form in either direction (R-34), compose nothing, and
+//: are refused by name at the export. This is exactly the defect
+//: `TRANSITION_OVERLAP_REMOVED_PAIR_ONLY_TOAST` was added for on 2026-08-30, one surface over:
+//: the toast was corrected and **the row saying the same false thing was not**. Story 11.f8
+//: then gated its own new `opening` row on `pair_only` while this branch, three lines above
+//: it, still fired unconditionally.
+//:
+//: It names the remedy, because the state is recoverable and invisible: nothing on the
+//: timeline shows a stored type with no Overlap under it.
+export const TRANSITION_ONE_SIDED_PAIR_ONLY_NOTE =
+  "{label} needs two pictures, so nothing is composed here and this boundary is a hard cut. "
+  + "Overlap {shot} with the shot after it, or choose a transition that treats one shot's own "
+  + "frames.";
+
+export const TRANSITION_OPENING_PAIR_ONLY_NOTE =
+  "{label} needs two pictures and nothing plays before {shot}, so nothing is composed here and "
+  + "the video opens on {shot}'s own first frame.";
+
+//: What a `Transition in` says where there are **no opening frames to treat**.
+//:
+//: *Narrowed by R-45 on 2026-08-31.* It read ~~"Nothing plays before {shot} — this transition in
+//: has no frames to treat, and the export renders nothing from it"~~ and was the state of every
+//: first Shot; that Shot now opens the video, and this is what is left: a first Shot by `start`
+//: whose own head a later Shot covers, which lays no opening frames at all. The Shot that buried
+//: it is not treated either -- it has a predecessor, and R-45 gives that cut to the outgoing Shot
+//: -- so the honest sentence is that nothing opens with this one.
 //:
 //: **The control stays live**, on `effectCopySectionHtml`'s rule: a greyed control states that
-//: something is impossible without stating why, and this one becomes meaningful the moment a Shot
-//: is added ahead of this one. What is refused is the *silence*, not the gesture.
+//: something is impossible without stating why, and this one becomes meaningful the moment the
+//: Shot in front of it is moved off. What is refused is the *silence*, not the gesture.
 export const TRANSITION_HEADLESS_NOTE =
-  "Nothing plays before {shot} — this transition in has no frames to treat, and the export "
-  + "renders nothing from it.";
+  "{shot} does not open the video — another shot covers its first frames — so this transition in "
+  + "has nothing to treat and the export renders nothing from it.";
 
 //: The blend's length beside a paired row, and the treated length beside a one-sided one. Two
 //: readouts because they are two different facts: the first is the Overlap on the assembly grid
@@ -9643,6 +9714,11 @@ export const TRANSITION_HEADLESS_NOTE =
 //: `BoundaryPreviewResponse` is the same number from the same subtraction on the server.
 export const TRANSITION_PAIRED_LENGTH = "{seconds}s · from overlap";
 export const TRANSITION_ONE_SIDED_LENGTH = "{seconds}s · own frames";
+//: The opening treatment's length, in its own words for the same reason the two above are two:
+//: it is the third fact -- the frames the plan *opens* with, clamped by the server's ceiling --
+//: and a Director reading `own frames` at the head of the video would have no way to tell it from
+//: the tail. See `openingTransitionSeconds`.
+export const TRANSITION_OPENING_LENGTH = "{seconds}s · opening frames";
 
 //: The mirror's announcement (FX-17, UX-DR12, story 11.3). Past tense, at the moment it happens,
 //: **naming both Shots** -- which is story 11.3's own acceptance criterion and this slice's spec.
@@ -9662,12 +9738,21 @@ export const TRANSITION_MIRROR_CLEARED_TOAST =
 //:
 //: **Not R-36's own sentence, and the difference is a correction.** That ruling says *"both
 //: transitions now treat their own frames"*, on its own premise that *"A's tail fades, B's head
-//: fades"*. Neither is what shipped: the export reads `transition_out` and no other field, so
-//: **only the outgoing Shot's tail is treated** and the incoming Shot's `transition_in` renders
-//: nothing at all. Announcing two treatments where one happens is exactly the kind of statement
-//: this application's voice rules bar. R-36 is amended in place with this measurement.
+//: fades"*. Neither is what shipped: at a boundary between two Shots the export reads
+//: `transition_out` and no other field, so **only the outgoing Shot's tail is treated** and the
+//: incoming Shot's `transition_in` renders nothing at all. Announcing two treatments where one
+//: happens is exactly the kind of statement this application's voice rules bar. R-36 is amended
+//: in place with this measurement, and **R-45 confirms rather than reopens it**: a boundary with
+//: no Overlap is owned by its outgoing Shot always, and the one place an incoming field composes
+//: is the plan's first frame, which is not a boundary between two Shots and is not a pair that
+//: can stop overlapping.
+//:
+//: **It names the side** (2026-08-31). It said ~~"{before}'s transition"~~, which was unambiguous
+//: while `transition_out` was the only field that ever composed and stopped being so the day
+//: R-45 landed: the Shot that opens the plan can carry a `transition_in` treating its first
+//: frames and a `transition_out` treating its last, and this sentence is about one of them.
 export const TRANSITION_OVERLAP_REMOVED_TOAST =
-  "{before} and {after} no longer overlap — {before}'s transition now treats its own last "
+  "{before} and {after} no longer overlap — {before}'s transition out now treats its own last "
   + "frames, then cuts.";
 
 //: The same announcement for a **pair-only** type, and it exists because the sentence above
@@ -9688,7 +9773,7 @@ export const TRANSITION_OVERLAP_REMOVED_TOAST =
 //: to be told where to go.
 export const TRANSITION_OVERLAP_REMOVED_PAIR_ONLY_TOAST =
   "{before} and {after} no longer overlap — {label} needs two pictures, so this boundary is "
-  + "a hard cut. Overlap them again, or choose another transition on {before}.";
+  + "a hard cut. Overlap them again, or choose another transition out on {before}.";
 
 //: The same announcement where the stored type **cannot be classified** -- no catalogue was read,
 //: or the catalogue does not hold this type (2026-08-31).
@@ -9706,8 +9791,8 @@ export const TRANSITION_OVERLAP_REMOVED_PAIR_ONLY_TOAST =
 //: knows the answer is missing.
 export const TRANSITION_OVERLAP_REMOVED_UNCLASSIFIED_TOAST =
   "{before} and {after} no longer overlap, so this boundary is a hard cut. {before}'s stored "
-  + "transition is kept and this workspace cannot say what it does on its own — open {before}'s "
-  + "Transitions tab, or overlap them again.";
+  + "transition out is kept and this workspace cannot say what it does on its own — open "
+  + "{before}'s Transitions tab, or overlap them again.";
 
 //: The catalogue never arrived. `EFFECTS_CATALOGUE_UNAVAILABLE`'s shape and its reason: the rows
 //: cannot say what any transition is, so they say that instead of offering twelve unlabelled ids.
@@ -9999,7 +10084,65 @@ export function overlapBands(shots, { pixelsPerSecond = 1, catalogue = null } = 
   return bands;
 }
 
-//: One row's state, decided once. Three of them, and each renders a different picture:
+//: How many frames the plan **opens** with, when the first Shot in song order is what lays them.
+//:
+//: `app._opening_clip_frames`' port, and it decides one thing the browser could not otherwise
+//: know: whether the first Shot's `Transition in` composes anything (R-45, story 11.f8). A stored
+//: `transition_in` composes a treatment in exactly one place -- the opening frames of the Shot
+//: that lays the plan's first frame, where there is no predecessor and nothing owns the cut --
+//: and `0` here is that place not existing.
+//:
+//: **Two conditions, not one, and they part on a real geometry.** `A` at `[0, 10]` under `B` at
+//: `[0.01, 4.01]` resolves to `B[0.01, 4.01]` and then `A[4.01, 10]`: `A` is first by `start` and
+//: lays no opening frames at all, and `B` lays them but has a predecessor whose `transition_out`
+//: owns that cut. Neither may be treated, so this returns `0` -- which is what keeps one boundary
+//: to one treatment on this side as well as on the server's.
+//:
+//: **The grid is asked as well as the seconds.** A head longer than half a frame can still round
+//: to no frames at all, and `assembly_plan` drops a zero-frame entry -- so a row that asked only
+//: whether the seconds survived would promise a treatment on a Shot the export does not open with.
+//:
+//: **Where this and the server disagree the server wins**, exactly as `boundaryBlendVerdicts` is
+//: subordinate to the split it ports: nothing here is consulted by an export.
+//: `test_the_window_rule_and_the_plan_agree_about_what_opens` holds all three engines -- this,
+//: `app._opening_clip_frames` and `assembly_plan` itself -- to one **number** over a shared table.
+export function openingClipFrames(shots) {
+  const ordered = [...(shots || [])].filter(Boolean)
+    .map((shot) => ({
+      start: Number(shot.start) || 0,
+      end: (Number(shot.start) || 0) + (Number(shot.duration) || 0),
+    }))
+    .sort((a, b) => a.start - b.start);
+  if (!ordered.length) return 0;
+  const first = ordered[0];
+  // What cuts the head, if anything does. `assembly_plan`'s resolution loop subtracts every
+  // later-*starting* window, and this list is in song order, so the earliest of them is the only
+  // one that can move this edge. A later Shot starting within half a frame of this one removes
+  // the head whole, which is the tolerance test below rather than a case of its own.
+  let edge = first.end;
+  if (ordered.length > 1 && ordered[1].start < first.end) edge = ordered[1].start;
+  if (!(edge - first.start > BOUNDARY_TOLERANCE_SECONDS)) return 0;
+  return Math.max(0, gridFrames(first.start, edge));
+}
+
+//: How long an **opening** treatment actually runs, in seconds, or `null` where none does.
+//:
+//: `oneSidedTransitionSeconds`' mirror and its rules: the ceiling is the server's
+//: (`one_sided_frames`, the same constant in both directions) and `null` is the absence
+//: `pair_only` states. What differs is the clamp -- the frames the plan *opens* with, which is
+//: `openingClipFrames`, and never the Shot's own window. The two part where the first Shot has an
+//: Overlap or a nested Shot inside its first half-second, and the Shot's own length would name a
+//: treatment longer than the frames the export writes there.
+export function openingTransitionSeconds(entry, frames) {
+  const ceiling = Number(entry?.one_sided_frames);
+  if (!Number.isFinite(ceiling) || ceiling <= 0) return null;
+  const own = Math.max(0, Number(frames) || 0);
+  if (!own) return null;
+  return Math.max(1, Math.min(ceiling, own)) / ASSEMBLY_FPS;
+}
+
+//: One row's state, decided once. **Five** of them, and each renders a different picture --
+//: *the count read `Three` while four were listed, and it is five since R-45 (2026-08-31)*:
 //:
 //: * `paired` -- an Overlap under this boundary. The blend is `xfade` across it and the Overlap
 //:   *is* the duration (AD-19).
@@ -10007,8 +10150,15 @@ export function overlapBands(shots, { pixelsPerSecond = 1, catalogue = null } = 
 //:   own last frames are treated and then it cuts (story 11.4). A `Transition out` on the last
 //:   Shot is this, not nothing: `_compose_one_sided_transitions` treats it exactly like any other
 //:   unoverlapped boundary, which is a fade at the end of the video.
-//: * `headless` -- a `Transition in` on the first Shot in song order. Nothing precedes it, so
-//:   there is no outgoing field for the write route to mirror onto and nothing composes.
+//: * `opening` -- a `Transition in` on the Shot that lays the plan's **first frame**, which is
+//:   the one boundary in a plan with no predecessor and no outgoing field to own the cut. Its own
+//:   opening frames are treated and the video begins (R-45, story 11.f8). `openingFrames` carries
+//:   how many frames the plan opens with, which is the clamp that treatment is bounded by.
+//: * `headless` -- a `Transition in` with no opening frames to treat. It is the *former* state of
+//:   the row above and is now the narrower thing: the first Shot by `start` whose own head a
+//:   later Shot covers lays no opening frames at all, so nothing composes for it and nothing
+//:   composes for the Shot that buried it either -- that one has a predecessor, and R-45 gives
+//:   the cut to the outgoing Shot. `openingClipFrames` decides which of the two this row is.
 //: * `refused` -- an Overlap with a type set whose **geometry the export will not blend** (story
 //:   11.f7). It is not `paired`: a paired row promises a blend, takes `--blue` and offers to play
 //:   it, and all three of those were false here. It is not `one-sided` either, and folding the two
@@ -10024,12 +10174,24 @@ export function overlapBands(shots, { pixelsPerSecond = 1, catalogue = null } = 
 export function transitionRowState(ordered, position, side, verdicts = null) {
   const nothing = {
     outgoing: null, incoming: null, seconds: 0, blendSeconds: 0, stretches: null,
+    openingFrames: 0,
   };
   if (position < 0) return { ...nothing, state: "headless" };
   const outgoing = side === "transition_out" ? ordered[position] : ordered[position - 1];
   const incoming = side === "transition_out" ? ordered[position + 1] : ordered[position];
   if (!outgoing) {
-    return { ...nothing, state: "headless", incoming: incoming || null };
+    // No Shot on the outgoing side of this seam, which is a `Transition in` on the first Shot in
+    // song order and nothing else: every other row has a Shot on both sides or is `position < 0`
+    // above. So this is the video's own first frame, and the only question left is whether this
+    // Shot lays it -- `openingClipFrames` answers `0` where a later Shot covers its head, and
+    // neither Shot may be treated there (R-45).
+    const openingFrames = openingClipFrames(ordered);
+    return {
+      ...nothing,
+      state: openingFrames > 0 ? "opening" : "headless",
+      incoming: incoming || null,
+      openingFrames,
+    };
   }
   const overlap = incoming
     ? exactSeconds((outgoing.start + outgoing.duration) - incoming.start)
@@ -10112,10 +10274,35 @@ export function transitionRows(project, shot, catalogue, { error = "", song = nu
     const entry = transitionEntry(catalogue, stored);
     const treated = place.state === "one-sided" && stored
       ? oneSidedTransitionSeconds(entry, place.outgoing)
-      : null;
+      : place.state === "opening" && stored
+        // The frames the plan **opens** with, not the Shot's own window: `openingTransitionSeconds`
+        // takes the clamp the export takes, so this row states what will render.
+        ? openingTransitionSeconds(entry, place.openingFrames)
+        : null;
     const note = place.state === "one-sided"
-      ? TRANSITION_ONE_SIDED_NOTE.replace("{shot}", shotOrdinalName(project, place.outgoing?.id))
-      : place.state === "headless"
+      // **A pair-only type promises nothing here either.** The `opening` branch below has
+      // said so since story 11.f8 and this one did not, so a Wipe left on a boundary with no
+      // Overlap told the Director it treated the Shot's last frames while the export composed
+      // nothing and refused it by name.
+      ? (entry?.pair_only
+        ? fillWording(TRANSITION_ONE_SIDED_PAIR_ONLY_NOTE, {
+          label: String(entry?.label || stored),
+          shot: shotOrdinalName(project, place.outgoing?.id),
+        })
+        : TRANSITION_ONE_SIDED_NOTE.replace(
+          "{shot}", shotOrdinalName(project, place.outgoing?.id)))
+      : place.state === "opening"
+        // **A pair-only type promises nothing here.** It has no one-sided form in either
+        // direction (R-34), so the export composes nothing and records that refusal -- and a row
+        // saying "this treats its opening frames" over it would be the sentence
+        // `TRANSITION_OVERLAP_REMOVED_PAIR_ONLY_TOAST` exists because its sibling got wrong.
+        ? (entry?.pair_only
+          ? fillWording(TRANSITION_OPENING_PAIR_ONLY_NOTE, {
+            label: String(entry?.label || stored),
+            shot: shotOrdinalName(project, shot?.id),
+          })
+          : TRANSITION_OPENING_NOTE.replace("{shot}", shotOrdinalName(project, shot?.id)))
+        : place.state === "headless"
         ? TRANSITION_HEADLESS_NOTE.replace("{shot}", shotOrdinalName(project, shot?.id))
         : place.state === "refused"
           // Both rows either side of one boundary say the identical sentence about it, because it
@@ -10136,7 +10323,8 @@ export function transitionRows(project, shot, catalogue, { error = "", song = nu
       ? TRANSITION_PAIRED_LENGTH.replace("{seconds}", place.blendSeconds.toFixed(2))
       : treated === null
         ? ""
-        : TRANSITION_ONE_SIDED_LENGTH.replace("{seconds}", treated.toFixed(2));
+        : (place.state === "opening" ? TRANSITION_OPENING_LENGTH : TRANSITION_ONE_SIDED_LENGTH)
+          .replace("{seconds}", treated.toFixed(2));
     return {
       side: row.side,
       label: row.label,
@@ -10619,8 +10807,8 @@ export const api = {
   shotPreview: (projectId, shotId) => request(`/api/projects/${projectId}/shots/${shotId}/preview`, { method: "POST" }),
   // One **boundary**, previewed: the outgoing Shot, the blend and the incoming Shot as one
   // continuous piece (FX-21, story 11.5). Addressed by the **outgoing** Shot, which is AD-30's
-  // authoritative side -- a route keyed on the incoming half would be keyed on the field the
-  // export never reads. No body, for `shotPreview`'s reason.
+  // authoritative side -- a route keyed on the incoming half would be keyed on the field no
+  // boundary's picture is ever built from. No body, for `shotPreview`'s reason.
   boundaryPreview: (projectId, shotId) => request(`/api/projects/${projectId}/shots/${shotId}/boundary-preview`, { method: "POST" }),
   // One Shot's Parameter Bindings, compiled -- the numbers the `sendcmd` scripts carry, which is
   // what the Drive readout draws (R-27). A read: nothing is written on any path, and it renders

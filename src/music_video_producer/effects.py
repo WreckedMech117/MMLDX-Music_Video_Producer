@@ -297,12 +297,15 @@ __all__ = [
     "ONE_SIDED_FORMS",
     "ONE_SIDED_TRANSITION_FRAMES",
     "ONE_SIDED_TRANSITION_LABEL",
+    "OPENING_FORMS",
+    "OPENING_TRANSITION_LABEL",
     "PREVIEW_FINGERPRINT_INPUTS",
     "PRE_PAD_FAMILIES",
     "PRE_SCALE_FAMILIES",
     "SEAM_SEED_PER_SECOND",
     "SHARPEN_MATRIX",
     "TRANSITION_CATALOGUE",
+    "TRANSITION_PAIR_ONLY_OPENING_REFUSAL",
     "TRANSITION_PAIR_ONLY_REFUSAL",
     "TRANSITION_UNKNOWN_REFUSAL",
     "ChoiceParameter",
@@ -338,6 +341,7 @@ __all__ = [
     "lut_file_argument",
     "lut_id_for_name",
     "one_sided_transition_stages",
+    "opening_transition_stages",
     "pixel_scale",
     "preview_fingerprint",
     "sendcmd_script",
@@ -2577,6 +2581,20 @@ class TransitionDefinition:
     #: composing the same filter would be the catalogue substituting one for the other -- exactly
     #: R-34's complaint about calling `hblur` "Blur", one level up. See `ONE_SIDED_FORMS`.
     one_sided: str = ""
+    #: Which of `OPENING_FORMS` this entry becomes on the **opening** frames of the Shot that
+    #: lays the first frame of the plan (R-45, story 11.f8), or `""` when it has none.
+    #:
+    #: **A second field rather than a direction argument to one**, because the two are two
+    #: pictures and this catalogue is the only thing entitled to say which pictures exist. Every
+    #: entry that has one has the other -- a form that ramps away and its mirror ramping towards
+    #: -- and `test_every_one_sided_form_has_exactly_one_mirror` holds the pair together the way
+    #: `one_sided` and `pair_only` are already held: an entry that gained one and forgot the
+    #: other would be settable and compose nothing, at rc 0.
+    #:
+    #: **A pair-only entry has none in either direction** (R-34). A wipe and a slide move one
+    #: picture across another, and the absence of a second picture is the same absence whichever
+    #: side of the cut it is missing from.
+    one_sided_in: str = ""
 
 
 #: The one-sided forms, as tags, with the composition each names and the measurement behind it.
@@ -2601,16 +2619,59 @@ class TransitionDefinition:
 #: `test_a_one_sided_blur_leaves_every_frame_before_the_ramp_bit_identical`.
 ONE_SIDED_FORMS = ("fade_out", "dip_black", "dip_white", "blur_ramp")
 
+#: The **opening** forms, as tags: the four above, mirrored in time, composed by
+#: `opening_transition_stages` (R-45, story 11.f8).
+#:
+#: **Every entry in `ONE_SIDED_FORMS` is a shape that ramps away, and these are the same four
+#: shapes ramping towards.** The mirror is taken in time and nowhere else, so each keeps the
+#: measurement that separates it from its neighbour rather than acquiring a second one:
+#:
+#: * `fade_in` is `fade_out` read backwards -- the whole treatment spent arriving, no held colour.
+#:   `fade=t=in` is at the colour on the ramp's own first frame and at the picture on the frame
+#:   after its last, which is the outgoing form's frames in reverse: the black instant is the
+#:   video's own first frame, which is what "the video fades up" means and is the one thing an
+#:   opening treatment has that a closing one does not -- a closing ramp's black would fall on
+#:   the frame *after* the clip's last, which is the cut and is not written;
+#: * `rise_black` and `rise_white` mirror the dips exactly: the colour is **held** from the first
+#:   frame to the midpoint and the picture arrives over the second half, where `dip_black` arrives
+#:   at the midpoint and holds to the cut. The hold is what R-34's measurement separated the two
+#:   families by, and it survives the mirror unchanged -- `fade_in` never sits in the colour and
+#:   `rise_black` does;
+#: * `blur_settle` starts at `ONE_SIDED_BLUR_SIGMA` and settles to nothing, where `blur_ramp`
+#:   starts at nothing and reaches it. The resting value on the filter is the **maximum** here
+#:   rather than zero, which is not symmetry for its own sake: a `sendcmd` command timed at t=0
+#:   that failed to fire would leave a sharp first frame and be silent at rc 0, and declaring the
+#:   sigma the treatment starts at makes the ramp's first frame right whether or not that command
+#:   lands. Its *last* frame is `sigma=0`, which is the measured no-op, so the ramp leaves the
+#:   picture bit-identical from there on -- the mirror of `blur_ramp`'s first frame.
+#:
+#: **No two entries share a form and no form is shared across the two tuples.** One-sided there is
+#: only one picture to work with, so two names composing the same filter would be the catalogue
+#: substituting one for the other, which is FX-18's rule and R-34's `hblur` complaint one level up.
+OPENING_FORMS = ("fade_in", "rise_black", "rise_white", "blur_settle")
+
 _TRANSITIONS: tuple[TransitionDefinition, ...] = (
-    TransitionDefinition("dissolve", "Dissolve", "fade", one_sided="fade_out"),
     TransitionDefinition(
-        "fade_black", "Fade through black", "fadeblack", one_sided="dip_black"
+        "dissolve", "Dissolve", "fade", one_sided="fade_out", one_sided_in="fade_in"
     ),
     TransitionDefinition(
-        "fade_white", "Fade through white", "fadewhite", one_sided="dip_white"
+        "fade_black",
+        "Fade through black",
+        "fadeblack",
+        one_sided="dip_black",
+        one_sided_in="rise_black",
+    ),
+    TransitionDefinition(
+        "fade_white",
+        "Fade through white",
+        "fadewhite",
+        one_sided="dip_white",
+        one_sided_in="rise_white",
     ),
     # Horizontal, and the label says so. See the section comment above.
-    TransitionDefinition("blur_wipe", "Blur wipe", "hblur", one_sided="blur_ramp"),
+    TransitionDefinition(
+        "blur_wipe", "Blur wipe", "hblur", one_sided="blur_ramp", one_sided_in="blur_settle"
+    ),
     TransitionDefinition("wipe_left", "Wipe left", "wipeleft", pair_only=True),
     TransitionDefinition("wipe_right", "Wipe right", "wiperight", pair_only=True),
     TransitionDefinition("wipe_up", "Wipe up", "wipeup", pair_only=True),
@@ -2649,10 +2710,34 @@ TRANSITION_UNKNOWN_REFUSAL = (
 #: Overlap outlives the Overlap. `app._compose_one_sided_transitions` formats this constant rather
 #: than wording it again, because two wordings for one condition teach a Director that the
 #: application holds two opinions about it.
+#: **`{neighbour}` is the side the addressed boundary is on** (corrected 2026-08-31). This said
+#: *"does not overlap the shot **after** it"* unconditionally, and a `transition_in`'s boundary
+#: is the one **before** its Shot -- so refusing a pair-only type on an incoming field sent the
+#: Director to look at the wrong seam. The route already picks a separate sentence for the one
+#: incoming boundary that has no neighbour at all (`TRANSITION_PAIR_ONLY_OPENING_REFUSAL`); this
+#: is every other one.
 TRANSITION_PAIR_ONLY_REFUSAL = (
     "{label} moves two pictures across each other, so it only exists where two shots overlap, "
-    "and {shot} does not overlap the shot after it. Drag the two clips across each other to "
-    "make the overlap, or choose one that treats a single shot's own frames: {alternatives}."
+    "and {shot} does not overlap the shot {neighbour} it. Drag the two clips across each other "
+    "to make the overlap, or choose one that treats a single shot's own frames: {alternatives}."
+)
+#: The same refusal at the one boundary that has no shot on the other side of it: a pair-only type
+#: on the `transition_in` of the Shot that opens the plan (R-45, story 11.f8).
+#:
+#: **A second sentence and not a second use of the one above**, because the one above names a
+#: remedy that does not exist here. It says *"drag the two clips across each other to make the
+#: overlap"*, and nothing plays before the first Shot to drag: no edit of this timeline can put a
+#: picture there. Offering it would be this application telling a Director to perform a gesture
+#: that cannot be performed, which is worse than saying nothing.
+#:
+#: Said at the write (`replace_shot_transitions`, where a Director is choosing) and again at the
+#: export, for `TRANSITION_PAIR_ONLY_REFUSAL`'s own reason: the write's check is necessary and not
+#: sufficient. A `transition_in` written on the second Shot with an Overlap under it outlives the
+#: deletion of the first, and the Shot that carries it is then the one that opens the video.
+TRANSITION_PAIR_ONLY_OPENING_REFUSAL = (
+    "{label} moves two pictures across each other, and nothing plays before {shot}, so there is "
+    "no second picture for it to move across. Choose one that treats a single shot's own opening "
+    "frames: {alternatives}."
 )
 
 
@@ -2722,10 +2807,26 @@ ONE_SIDED_BLUR_SIGMA = 20.0
 #: *and* a one-sided transition in one chain.
 ONE_SIDED_TRANSITION_LABEL = "xo"
 
+#: The instance label the **opening** blur's `gblur` carries, and the whole of that composition's
+#: namespace. `ONE_SIDED_TRANSITION_LABEL`'s reasoning, plus one more that is this story's
+#: (R-45): the Shot that opens the plan may carry an opening treatment on its first frames **and**
+#: a one-sided treatment on its last, and on a Shot that resolves into a single clip those are two
+#: filters in one chain. Sharing `xo` would put two `gblur` instances under one name, so one
+#: `sendcmd` target would drive both ramps -- Epic 10's mistargeted-`sendcmd` class, silent at
+#: rc 0 -- and the head's ramp would run again on the tail.
+OPENING_TRANSITION_LABEL = "xi"
+
 
 @dataclass(frozen=True, slots=True)
 class OneSidedTransition:
-    """One clip's own transition-out treatment: what to splice in, and how long it ran.
+    """One clip's own treatment of its own frames: what to splice in, and how long it ran.
+
+    **It is the shape of both directions** (*widened 2026-08-31 by story 11.f8*; it read ~~"One
+    clip's own transition-out treatment"~~ and that was the whole of what existed). A tail is
+    composed by `one_sided_transition_stages` and a head by `opening_transition_stages`, and they
+    return this same triple because the caller does the same thing with either: splice the two
+    groups onto the chain the clip was already going to be cut with, write the scripts beside the
+    render's other inputs, and record `frames`. The direction is the composer's, not this shape's.
 
     `geometry` and `treatment` are `EffectStages`' own two groups and are appended to whatever the
     Shot's Effect Stack already composed -- **after** it, because the transition treats the
@@ -2797,7 +2898,7 @@ def one_sided_transition_stages(
         )
         return OneSidedTransition(
             geometry=(f"sendcmd=f={script.filename}",),
-            treatment=(f"gblur@{ONE_SIDED_TRANSITION_LABEL}=sigma=0",),
+            treatment=(f"gblur@{ONE_SIDED_TRANSITION_LABEL}=sigma=0:sigmaV=0",),
             scripts=(script,),
             frames=frames,
         )
@@ -2820,6 +2921,46 @@ def one_sided_transition_stages(
         treatment=(f"fade=t=out:start_frame={start}:nb_frames={ramp}:color={colour}",),
         scripts=(),
         frames=frames,
+    )
+
+
+def _blur_command(seconds: float, label: str, sigma: float) -> str:
+    """One `sendcmd` line: a `gblur` instance's **horizontal** sigma, at one clip-local time.
+
+    **Two commands and not one, and it is a measurement rather than a precaution** (2026-08-31,
+    this machine's ffmpeg 7.0, `testsrc2` at 192x108 compared by `framemd5`):
+
+    * `gblur` resolves `sigmaV` from `sigma` **once, at configuration**, and its `process_command`
+      recomputes each axis from its own option. So a `sigma` command moves the horizontal pass and
+      leaves the vertical one wherever the filter was built -- with `sigma=20` at init, commanding
+      `sigma 5` is byte-identical to a static `sigma=5:sigmaV=20`, and not to a static `sigma=5`;
+    * commanding **both** is byte-identical to the static value, on every frame, including `0`,
+      which is then the exact identity: `gblur` commanded to `0`/`0` is `framemd5`-identical to the
+      same chain with no `gblur` in it at all. Commanding `sigma` alone to `0` from a `sigma=20`
+      init is **not** -- it is a 0/20 blur, which is a picture, at rc 0.
+    * and the two commands share one interval, comma-separated, which is `sendcmd`'s own list
+      syntax. Inside the script file a comma is a separator and needs no escaping; it is the
+      *filename* in `sendcmd=f=` that may not carry one (AD-22).
+
+    Story 11.4's `blur_ramp` shipped commanding `sigma` alone, so the one-sided blur ran
+    horizontally while naming isotropic sigmas. **That was an accident and horizontal is now
+    the decision** — R-46, 2026-08-31. The paired form is `xfade=transition=hblur`,
+    horizontal, and R-34 catalogued the type as *"Blur wipe"* precisely so the name would not
+    call a horizontal-only effect "Blur": *"FX-18 says a named type is never quietly
+    substituted, and calling a horizontal-only effect 'Blur' is precisely that substitution."*
+    An isotropic one-sided form would make one catalogue entry render two pictures depending on
+    whether an Overlap sits under it, which is that same complaint one level up.
+
+    **So `sigmaV` is pinned at 0 by the init string and never commanded**, and that pin is
+    load-bearing rather than tidy: `sigma=20:sigmaV=0` commanded to `sigma 0` is
+    `framemd5`-identical to the same chain with no `gblur` in it, while `sigma=20` alone —
+    where `sigmaV` resolves to 20 at configuration — commanded to `sigma 0` leaves a 0/20
+    blur that never clears. The opening form starts blurred, so without the explicit `sigmaV=0`
+    it would settle to a vertically-smeared picture at rc 0.
+    """
+    written = _number(sigma)
+    return (
+        f"{_number(seconds)} gblur@{label} sigma {written};"
     )
 
 
@@ -2850,11 +2991,20 @@ def _one_sided_blur_script(
     `_drive_script_name`'s rule and is there for its reason: an export writes every clip's scripts
     into one directory, so two clips whose ramps differ must not share a name, and two whose ramps
     are identical should share one file.
+
+    **Only the horizontal axis is commanded, and `sigmaV` is pinned at 0 by the init string.** See `_blur_command`: a `sigma`
+    command reaches `gblur`'s horizontal pass alone, so this script drove a ramp from a 0/0 blur to
+    a 20/0 one -- horizontal-only, and every sigma it names was half applied. Measured through the
+    real filter rather than read: with `sigma=20` at init, commanding `sigma 5` is byte-identical
+    to a static `sigma=5:sigmaV=20` and not to a static `sigma=5`.
     """
     span = frames - 1
     lines = [
-        f"{_number((start + step) / fps)} gblur@{ONE_SIDED_TRANSITION_LABEL} sigma "
-        f"{_number(sigma * step / span if span else sigma)};"
+        _blur_command(
+            (start + step) / fps,
+            ONE_SIDED_TRANSITION_LABEL,
+            sigma * step / span if span else sigma,
+        )
         for step in range(frames)
     ]
     text = "\n".join(lines) + "\n"
@@ -2865,6 +3015,108 @@ def _one_sided_blur_script(
             f"-{digest[:DRIVE_SCRIPT_DIGEST_CHARACTERS]}{DRIVE_SCRIPT_SUFFIX}"
         ),
         target=f"gblur@{ONE_SIDED_TRANSITION_LABEL}",
+        text=text,
+    )
+
+
+def opening_transition_stages(
+    transition_id: str,
+    *,
+    clip_frames: int,
+    fps: int,
+    width: int = 0,
+    reference_width: int = 0,
+) -> OneSidedTransition | None:
+    """A transition on a clip's **opening** frames, as stages on its own chain -- or `None`.
+
+    `one_sided_transition_stages`' mirror, and everything that function's docstring says about the
+    clamp, the frame count, the timeline length, `fps` and the pixel pair is true here unchanged
+    and is not restated. Three things are this function's own.
+
+    **It is composed at exactly one boundary and the caller decides which** (R-45, story 11.f8):
+    the first entry of the plan, where there is no predecessor and nothing owns the cut. Everywhere
+    else a stored `transition_in` composes nothing and the outgoing Shot's tail is the treatment.
+    This function does not know which boundary it is being asked about, deliberately -- it is a
+    pure composition of a picture, the way its mirror is, and putting R-45's condition in here
+    would put that decision somewhere other than the one place that can see the plan.
+
+    **The treatment starts on the clip's own frame zero**, which is why there is no `start` here
+    and why `clip_frames` is read only for the clamp. An opening treatment that began anywhere but
+    the first frame would leave untreated frames in front of it, which is a cut inside a Shot.
+
+    `None` means this type has no opening form, which is the same absence `pair_only` states and
+    the same one `one_sided_transition_stages` answers with `None` in the other direction (R-34).
+    The caller says so in `TRANSITION_PAIR_ONLY_OPENING_REFUSAL` -- a different sentence from the
+    tail's, because the tail's names a remedy this boundary does not have.
+    """
+    entry = transition_definition(transition_id)
+    if not entry.one_sided_in:
+        return None
+    frames = max(1, min(ONE_SIDED_TRANSITION_FRAMES, clip_frames))
+    if entry.one_sided_in == "blur_settle":
+        sigma = ONE_SIDED_BLUR_SIGMA * pixel_scale(width, reference_width)
+        script = _opening_blur_script(frames=frames, fps=fps, sigma=sigma)
+        return OneSidedTransition(
+            geometry=(f"sendcmd=f={script.filename}",),
+            # **The resting value is the sigma the picture starts at**, not zero. See
+            # `OPENING_FORMS`: a command timed at t=0 that did not fire would leave the first
+            # frame sharp and say nothing at all, and this declaration is what makes the ramp's
+            # own first frame right whether or not that command lands.
+            treatment=(f"gblur@{OPENING_TRANSITION_LABEL}=sigma={_number(sigma)}:sigmaV=0",),
+            scripts=(script,),
+            frames=frames,
+        )
+    # `fade_in` spends the whole treatment arriving; the two rises hold the colour to the midpoint
+    # and then arrive. The mirror of the tail's `start`/`ramp` pair, taken in time: the tail ramps
+    # first and holds to the cut, so the head holds from the first frame and ramps last.
+    ramp = frames if entry.one_sided_in == "fade_in" else max(1, frames // 2)
+    # AD-17's letterbox boundary, in this direction, and it is the same one: these stages ride
+    # `treatment_stages`, which AD-17 fixes *before* `pad`, so a rise from **white** on a Shot
+    # whose aspect differs from the export target brings the picture up out of white and leaves
+    # the bars black. Measured for `dip_white` on 2026-08-29 (picture 235, bars 16) and unchanged
+    # by the mirror. `fade_in` and `rise_black` are unaffected: the bars are already that colour.
+    colour = "white" if entry.one_sided_in == "rise_white" else "black"
+    return OneSidedTransition(
+        geometry=(),
+        treatment=(f"fade=t=in:start_frame={frames - ramp}:nb_frames={ramp}:color={colour}",),
+        scripts=(),
+        frames=frames,
+    )
+
+
+def _opening_blur_script(
+    *, frames: int, fps: int, sigma: float = ONE_SIDED_BLUR_SIGMA
+) -> DriveScript:
+    """`_one_sided_blur_script`'s mirror: `gblur.sigma` from its maximum down to nothing.
+
+    Everything that function records about the `@`-qualified target, the clip-local clock and the
+    filename's digest holds here unchanged and is not restated. What differs is the two ends. The
+    **first** line writes the maximum, which is the value the filter was declared with, so the
+    ramp's own first frame is the blur the treatment starts at whether or not a command timed at
+    zero fires -- and the **last** line writes `0`, the measured `gblur` no-op, so the ramp's own
+    last frame is bit-identical to the untreated one and every frame after it is untouched. That
+    is `blur_ramp`'s first frame, mirrored.
+
+    A one-frame treatment holds the maximum for its single frame, which is what the tail does with
+    its own single frame, and is the only shape where the two ends coincide.
+    """
+    span = frames - 1
+    lines = [
+        _blur_command(
+            step / fps,
+            OPENING_TRANSITION_LABEL,
+            sigma * (span - step) / span if span else sigma,
+        )
+        for step in range(frames)
+    ]
+    text = "\n".join(lines) + "\n"
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return DriveScript(
+        filename=(
+            f"transition-{OPENING_TRANSITION_LABEL}-0-{frames}"
+            f"-{digest[:DRIVE_SCRIPT_DIGEST_CHARACTERS]}{DRIVE_SCRIPT_SUFFIX}"
+        ),
+        target=f"gblur@{OPENING_TRANSITION_LABEL}",
         text=text,
     )
 

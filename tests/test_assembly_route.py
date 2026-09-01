@@ -3921,7 +3921,12 @@ def test_a_one_sided_blur_ramp_addresses_a_label_in_its_own_chain_and_leaves_the
 
     # The target, in the chain produced by the same call. Nothing else can catch a typo in it.
     assert script.target == f"gblur@{ONE_SIDED_TRANSITION_LABEL}"
-    assert f"{script.target}=sigma=0" in chain.split(",")
+    # The init string is read off the same call rather than rebuilt here: it carries the
+    # `sigmaV=0` pin R-46 made load-bearing, and a test that spells it out by hand would go
+    # stale the next time the composer changes what it declares -- which is what happened.
+    declared = composed.treatment[0]
+    assert declared.startswith(f"{script.target}=sigma=0")
+    assert declared in chain.split(",")
     assert f"sendcmd=f={script.filename}" in chain.split(",")
     # A bare relative name, and the file of that name was in the directory ffmpeg stood in.
     assert "/" not in script.filename and ":" not in script.filename
@@ -3932,7 +3937,7 @@ def test_a_one_sided_blur_ramp_addresses_a_label_in_its_own_chain_and_leaves_the
     assert rendered_frames(survivors[0]) == 96
     control = graph_frames(
         without_the_treatment(
-            treated, f"sendcmd=f={script.filename}", f"{script.target}=sigma=0"
+            treated, f"sendcmd=f={script.filename}", declared
         ),
         cwd=tmp_path,
     )
@@ -4011,6 +4016,8 @@ def test_a_pair_only_type_left_one_sided_is_refused_with_its_reason_and_nothing_
             shot=TRANSITION_PAIR_ONLY_REFUSAL.format(
                 label="Wipe left",
                 shot=shot_label(stored, stored.shots[0]),
+                # The export composes from `transition_out` alone (AD-30).
+                neighbour="after",
                 alternatives=", ".join(
                     sorted(
                         entry.label
@@ -4021,6 +4028,798 @@ def test_a_pair_only_type_left_one_sided_is_refused_with_its_reason_and_nothing_
             )
         )
     ]
+    assert comfy.prompts == []
+
+
+def set_transition_in(client, project_id: str, shot_id: str, type_: str | None):
+    """`set_transition`'s mirror: the incoming half of the pair, which AD-30 usually writes."""
+    return client.put(
+        f"/api/projects/{project_id}/shots/{shot_id}/transitions",
+        json={"transition_in": None if type_ is None else {"type": type_}},
+    )
+
+
+def test_the_first_shot_opens_with_its_own_frames_treated_and_changes_no_count(
+    tmp_path: Path, monkeypatch
+):
+    """**R-45's whole acceptance, on the written file and on the graph's frames** (story 11.f8).
+
+    FX-18 says a one-sided transition treats a Shot's own final *or opening* frames, and only the
+    final ones shipped. The first Shot of the plan carries a `transition_in`: its **opening**
+    frames are treated and the video begins. The claims, in the order they can go wrong:
+
+    * **the plan is untouched.** Two entries, not three, and the frame total is the song's. An
+      opening treatment consumes no timeline length and borrows nothing (FX-18, FX-NFR-1), which
+      here means `assembly_plan` never hears about it at all;
+    * **the clip's own count is unchanged.** 96 frames asked for, 96 decoded off the intermediate
+      the export actually wrote;
+    * **and it changed the picture, at the right end.** The **first** frames differ from a control
+      render of the identical chain with only the `fade` stage removed, and **every frame after
+      them is bit-identical** -- which is the half that catches a treatment composed at the tail,
+      or one that ran over the whole clip, or one that composed and changed no pixel at all. That
+      last is this pipeline's signature failure: ffmpeg's exit code is evidence of nothing here.
+
+    The neighbour is the control for the other direction: `shot_b` carries no transition of its
+    own and its argv is the argv this route has always built, character for character. It is also
+    the control for R-45 itself -- nothing composes for a Shot that is not the first.
+    """
+    from music_video_producer.assembly import trim_args
+    from music_video_producer.effects import ONE_SIDED_TRANSITION_FRAMES
+
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    assert set_transition_in(client, project_id, "shot_a", "fade_black").status_code == 200
+    # Nothing was mirrored onto anything: there is no Shot before the first one to mirror to,
+    # which is the whole reason this boundary has no outgoing field to be authoritative with.
+    stored = store.get(project_id)
+    assert stored.shots[0].transition_out is None
+    assert stored.shots[1].transition_in is None
+
+    survivors = kept_intermediates(monkeypatch, tmp_path)
+    commands, response = recorded_trims(client, monkeypatch, project_id)
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    assert body["clip_count"] == 2
+    assert body["total_frames"] == 192
+    assert len(commands) == 2 and len(survivors) == 2
+
+    treated, plain = commands
+    ramp = ONE_SIDED_TRANSITION_FRAMES // 2
+    fade = f"fade=t=in:start_frame={ramp}:nb_frames={ramp}:color=black"
+    assert fade in treated[treated.index("-vf") + 1].split(",")
+    assert plain == trim_args(
+        Path(plain[plain.index("-i") + 1]), Path(plain[-1]), 96, 192, 108
+    )
+
+    assert rendered_frames(survivors[0]) == 96
+
+    control = graph_frames(without_the_treatment(treated, fade))
+    treated_frames = graph_frames(treated)
+    assert len(control) == len(treated_frames) == 96
+    moved = [index for index in range(96) if control[index] != treated_frames[index]]
+    assert moved, "the transition composed and changed nothing, which is rc 0 and wrong"
+    # The **opening** frames and no others: the treatment is over by
+    # `ONE_SIDED_TRANSITION_FRAMES`, and everything from there to the cut is the untreated take.
+    assert max(moved) < ONE_SIDED_TRANSITION_FRAMES
+    assert 0 in moved, "the video's first frame is the black it fades up from"
+    assert control[ONE_SIDED_TRANSITION_FRAMES:] == treated_frames[ONE_SIDED_TRANSITION_FRAMES:]
+
+    assert body["job"]["look"]["transitions"] == [
+        f"shot_a=fade_black opening over {ONE_SIDED_TRANSITION_FRAMES} frames"
+    ]
+    export = tmp_path / "projects" / project_id / "media" / body["export"]
+    assert abs(float(probe(export, "format=duration")) - 8.0) <= 1 / 24
+    assert comfy.prompts == []
+
+
+def test_an_opening_blur_settle_addresses_its_own_label_and_leaves_the_rest_alone(
+    tmp_path: Path, monkeypatch
+):
+    """The driven opening form, with Epic 10's discipline inherited whole (R-25).
+
+    `blur_settle` is the one opening form that is ramped by a compiled `sendcmd` rather than by a
+    filter that knows how to ramp itself, so every target must appear as an `@label` in the chain
+    composed by the same call -- a command aimed at a target that is not in the graph is discarded
+    in silence at rc 0.
+
+    **Its own label, and that is what this test is really about.** The Shot that opens the plan
+    carries a `transition_in` *and* a `transition_out` with no Overlap under it, so both a head
+    ramp and a tail ramp are spliced into one chain. Under one instance name the two `gblur`
+    filters would share a `sendcmd` target and each script would drive both, which is rc 0 with a
+    picture nobody authored. So: two labels, two scripts, both files on disk beside the render,
+    and the frames in the **middle** of the clip bit-identical to a control with neither ramp in
+    it -- which is the only assertion that can tell two ramps from one ramp applied twice.
+    """
+    from music_video_producer.effects import (
+        ONE_SIDED_TRANSITION_FRAMES,
+        ONE_SIDED_TRANSITION_LABEL,
+        OPENING_TRANSITION_LABEL,
+        one_sided_transition_stages,
+        opening_transition_stages,
+    )
+
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    # Detail, because a blur of a flat colour field is that flat colour field.
+    synthesize_detailed_take(shots_dir / "shot_a-h3_00001-audio.mp4", 4.458)
+    assert set_transition_in(client, project_id, "shot_a", "blur_wipe").status_code == 200
+    assert set_transition(client, project_id, "shot_a", "blur_wipe").status_code == 200
+
+    survivors = kept_intermediates(monkeypatch, tmp_path)
+    commands, response = recorded_trims(client, monkeypatch, project_id)
+    assert response.status_code == 200, response.text
+    treated = commands[0]
+    chain = treated[treated.index("-vf") + 1].split(",")
+
+    head = opening_transition_stages("blur_wipe", clip_frames=96, fps=24)
+    tail = one_sided_transition_stages("blur_wipe", clip_frames=96, fps=24)
+    assert head.scripts[0].target == f"gblur@{OPENING_TRANSITION_LABEL}"
+    assert tail.scripts[0].target == f"gblur@{ONE_SIDED_TRANSITION_LABEL}"
+    assert head.scripts[0].target != tail.scripts[0].target
+    for composed in (head, tail):
+        script = composed.scripts[0]
+        assert f"sendcmd=f={script.filename}" in chain
+        assert composed.treatment[0] in chain
+        kept = tmp_path / script.filename
+        assert kept.is_file()
+        assert kept.read_text(encoding="utf-8") == script.text
+
+    assert rendered_frames(survivors[0]) == 96
+    control = graph_frames(
+        without_the_treatment(
+            treated,
+            f"sendcmd=f={head.scripts[0].filename}",
+            f"sendcmd=f={tail.scripts[0].filename}",
+            head.treatment[0],
+            tail.treatment[0],
+        ),
+        cwd=tmp_path,
+    )
+    treated_frames = graph_frames(treated, cwd=tmp_path)
+    moved = [index for index in range(96) if control[index] != treated_frames[index]]
+    assert moved, "both ramps were discarded, which is exactly what rc 0 will not tell you"
+    # The head ramp moved the first frames and the tail ramp moved the last, and the stretch
+    # between them is the untreated picture -- one ramp driving both filters would move it.
+    assert 0 in moved and 95 in moved
+    assert control[ONE_SIDED_TRANSITION_FRAMES:96 - ONE_SIDED_TRANSITION_FRAMES] == (
+        treated_frames[ONE_SIDED_TRANSITION_FRAMES:96 - ONE_SIDED_TRANSITION_FRAMES]
+    )
+    # The head ramp's own **last** frame is `sigma=0`, the measured no-op, so it settles into the
+    # picture rather than snapping out of the blur. `blur_ramp`'s first frame, mirrored.
+    assert control[ONE_SIDED_TRANSITION_FRAMES - 1] == (
+        treated_frames[ONE_SIDED_TRANSITION_FRAMES - 1]
+    )
+    assert comfy.prompts == []
+
+
+def test_a_stored_transition_in_composes_nothing_on_any_shot_but_the_one_that_opens(
+    tmp_path: Path, monkeypatch
+):
+    """R-45's second acceptance: **everywhere else a stored `transition_in` composes nothing.**
+
+    `shot_b` holds the type. It is the ordinary state of nearly every project that carries a
+    transition at all, because AD-30's mirror writes it whenever a Director sets `transition_out`
+    on the Shot in front -- so a composer that read this field at every boundary would fade `shot_a`
+    out and `shot_b` in from **one** gesture, which is the picture `Fade through black` is already
+    called and the substitution FX-18 exists to forbid.
+
+    Asserted on the argv rather than on the record, because a treatment that composes into a chain
+    is a defect whether or not anything writes it down: `shot_b`'s argv is the one a project with
+    no transitions builds, character for character.
+    """
+    from music_video_producer.assembly import trim_args
+
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    # Through the shipped route and through the shipped gesture: a `transition_out` on `shot_a`
+    # is what puts the mirror on `shot_b`, which is the state this test is about.
+    assert set_transition(client, project_id, "shot_a", "dissolve").status_code == 200
+    assert store.get(project_id).shots[1].transition_in.type == "dissolve"
+
+    commands, response = recorded_trims(client, monkeypatch, project_id)
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    plain = commands[1]
+    assert plain == trim_args(
+        Path(plain[plain.index("-i") + 1]), Path(plain[-1]), 96, 192, 108
+    )
+    # One treatment for that boundary, and it is the outgoing Shot's tail.
+    assert body["job"]["look"]["transitions"] == ["shot_a=dissolve one-sided over 12 frames"]
+    assert comfy.prompts == []
+
+
+def test_the_first_shot_can_open_and_still_blend_into_the_overlap_after_it(
+    tmp_path: Path, monkeypatch
+):
+    """R-45's fourth acceptance: **a first Shot with both an opening and a following Overlap.**
+
+    They are two boundaries and two entries of the plan. The opening rides the outgoing Shot's own
+    frames *before* the Overlap -- which `_paired_transitions` guarantees exist, because its rule
+    refuses a blend whose outgoing stretch is empty -- and the blend is a `TransitionClip` of its
+    own with its own two legs. So the head is treated, the blend is unaffected, and the plan is
+    the three entries a blended boundary already produces.
+    """
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    overlap_the_two_shots(client, store, tmp_path, project_id, overlap=0.5)
+    assert set_transition(client, project_id, "shot_a", "dissolve").status_code == 200
+    assert set_transition_in(client, project_id, "shot_a", "fade_white").status_code == 200
+
+    commands, response = recorded_trims(client, monkeypatch, project_id)
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    # Three entries: the head, the blend, the remainder. The blend still composed.
+    assert body["clip_count"] == 3
+    assert body["total_frames"] == 192
+    assert "shot_a=dissolve" in body["job"]["look"]["transitions"]
+    assert body["job"]["look"]["transitions"] == [
+        "shot_a=dissolve", "shot_a=fade_white opening over 12 frames"
+    ]
+    # And the treatment is on the **head** entry, which is the clip that lays the first frame.
+    head = commands[0]
+    assert "fade=t=in:start_frame=6:nb_frames=6:color=white" in (
+        head[head.index("-vf") + 1].split(",")
+    )
+    assert comfy.prompts == []
+
+
+def test_a_pair_only_type_on_the_opening_is_refused_by_name_with_nothing_substituted(
+    tmp_path: Path, monkeypatch
+):
+    """R-45's third acceptance, and FX-19 in the direction nothing had asked it in.
+
+    **Reachable without a hand-edited manifest**, which is why the fixture takes the long way
+    round: a Director authors a "Wipe left" across an Overlap on `shot_b`'s incoming half -- the
+    write route agrees, because there are two pictures to move across each other -- and then drags
+    `shot_b` in front of `shot_a`. `shot_b` is now the Shot that opens the plan and holds a
+    pair-only type on the one boundary that can never have a second picture.
+
+    Nothing is substituted: the argv is the argv a Shot with no transition gets. And the sentence
+    is **not** the one the tail's refusal says, because that one names a remedy this boundary does
+    not have -- *"drag the two clips across each other"*, when nothing can be put in front of the
+    first Shot. It is `TRANSITION_PAIR_ONLY_OPENING_REFUSAL`, the same sentence the write route
+    says at the moment a Director picks one there.
+    """
+    from music_video_producer.app import TRANSITION_REFUSED_RECORD
+    from music_video_producer.assembly import trim_args
+    from music_video_producer.effects import (
+        TRANSITION_CATALOGUE,
+        TRANSITION_PAIR_ONLY_OPENING_REFUSAL,
+    )
+
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    overlap_the_two_shots(client, store, tmp_path, project_id, overlap=0.5)
+    assert set_transition_in(client, project_id, "shot_b", "wipe_left").status_code == 200
+
+    # And now `shot_b` moves in front of `shot_a`, exactly as dragging the clips would move it.
+    for shot_id in ("shot_a", "shot_b"):
+        client.post(f"/api/projects/{project_id}/shots/{shot_id}/unapprove")
+    shots = [shot.model_dump(mode="json") for shot in store.get(project_id).shots]
+    shots[0]["start"], shots[0]["duration"] = 4.0, 4.0
+    shots[1]["start"], shots[1]["duration"] = 0.0, 4.0
+    assert client.put(
+        f"/api/projects/{project_id}/shots", json={"shots": shots}
+    ).status_code == 200
+    for shot_id in ("shot_a", "shot_b"):
+        assert client.post(
+            f"/api/projects/{project_id}/shots/{shot_id}/approve"
+        ).status_code == 200
+    # The mirror AD-30 wrote on `shot_a` is cleared, so the only thing left in the manifest is the
+    # pair-only type on the opening -- which is what this test is about and nothing else.
+    assert set_transition(client, project_id, "shot_a", None).status_code == 200
+    stored = store.get(project_id)
+    assert stored.shots[1].transition_in.type == "wipe_left"
+    assert stored.shots[0].transition_out is None
+
+    commands, response = recorded_trims(client, monkeypatch, project_id)
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    assert body["clip_count"] == 2 and body["total_frames"] == 192
+    for command in commands:
+        assert command == trim_args(
+            Path(command[command.index("-i") + 1]), Path(command[-1]), 96, 192, 108
+        )
+    assert body["job"]["look"]["transitions"] == [
+        TRANSITION_REFUSED_RECORD.format(
+            shot=TRANSITION_PAIR_ONLY_OPENING_REFUSAL.format(
+                label="Wipe left",
+                shot=shot_label(stored, stored.shots[1]),
+                alternatives=", ".join(
+                    sorted(
+                        entry.label
+                        for entry in TRANSITION_CATALOGUE.values()
+                        if not entry.pair_only
+                    )
+                ),
+            )
+        )
+    ]
+    assert comfy.prompts == []
+
+
+def test_the_shot_that_lays_the_first_frame_is_not_always_the_first_shot_by_start(
+    tmp_path: Path, monkeypatch
+):
+    """**The geometry R-45's two definitions part on**, and neither Shot may be treated in it.
+
+    `shot_b` starts within half a frame of `shot_a`, so `assembly_plan`'s resolution loop drops
+    `shot_a`'s head whole -- later on top -- and the plan opens with `shot_b`. Two readings of
+    *"the first Shot of the plan in song order"* are available and both are wrong here:
+
+    * **first by `start`** is `shot_a`, whose own opening frames are not in the export at all. Its
+      first surviving clip begins where `shot_b` ends, so treating it would treat frames in the
+      middle of the video -- at a cut `shot_b`'s outgoing field already owns, which is the
+      two-treatments-for-one-boundary this slice exists to make impossible;
+    * **the first entry of the plan** is `shot_b`, which has a predecessor. R-45's own clause
+      excludes it, and AD-30's mirror means a Director who set anything on `shot_a` has already
+      written `shot_b`'s incoming field -- so composing there would make one gesture fade one Shot
+      out and the next in.
+
+    So the treatment composes where the two **agree**, and here they do not. Both fields are set
+    and the export composes neither, which is asserted on the argv as well as on the record.
+    """
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    # `shot_a` covers the whole song and `shot_b` sits on top of its head, so the take has to hold
+    # the wider window -- widening a window past its take is refused by name, and a fixture that
+    # met that refusal would be a fixture whose only fault was hidden.
+    synthesize_take(shots_dir / "shot_a-h3_00001-audio.mp4", 8.458, colour="red")
+    for shot_id in ("shot_a", "shot_b"):
+        client.post(f"/api/projects/{project_id}/shots/{shot_id}/unapprove")
+    shots = [shot.model_dump(mode="json") for shot in store.get(project_id).shots]
+    # Half a frame is 1/48 s; `shot_b` starts inside that band, so the head is not merely short,
+    # it is a boundary written twice and the resolution loop discards it.
+    shots[0]["start"], shots[0]["duration"] = 0.0, 8.0
+    shots[1]["start"], shots[1]["duration"] = 0.01, 4.0
+    assert client.put(
+        f"/api/projects/{project_id}/shots", json={"shots": shots}
+    ).status_code == 200
+    for shot_id in ("shot_a", "shot_b"):
+        assert client.post(
+            f"/api/projects/{project_id}/shots/{shot_id}/approve"
+        ).status_code == 200
+    project = store.get(project_id)
+    project.shots[0].transition_in = TransitionSpec(type="fade_black")
+    project.shots[1].transition_in = TransitionSpec(type="fade_white")
+    store.save(project)
+
+    commands, response = recorded_trims(client, monkeypatch, project_id)
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    # The plan really is the geometry this test claims: `shot_b` first, then what is left of
+    # `shot_a`. If the resolution ever stops dropping that head, this fails here rather than
+    # passing for a reason that has gone away.
+    assert body["clip_count"] == 2 and body["total_frames"] == 192
+    # `shot_b` is what the export writes first, which is the whole claim: the plan opens with the
+    # Shot that is **not** first by `start`.
+    assert "shot_b" in commands[0][commands[0].index("-i") + 1]
+    assert "shot_a" in commands[1][commands[1].index("-i") + 1]
+    # Nothing was composed for either Shot: no head treatment, no tail treatment, no drive. The
+    # chains are the ones a project carrying no transition at all builds.
+    for command in commands:
+        chain = command[command.index("-vf") + 1] if "-vf" in command else ""
+        assert "fade=t=in" not in chain and "fade=t=out" not in chain, chain
+        assert "sendcmd" not in chain, chain
+    assert body["job"]["look"]["transitions"] == []
+    assert comfy.prompts == []
+
+
+#: Every arrangement the one-treatment sweep is run over, as `(start, duration)` per Shot.
+#:
+#: **Chosen for the shapes that put two treatments near one instant**, not for coverage of the
+#: timeline: Shots that start together, Shots inside the half-frame band where a head is dropped
+#: whole, Shots nested inside their neighbour, Overlaps the split refuses, and windows short enough
+#: that a treatment's clamp is the clip rather than the ceiling. A lattice of pleasant four-second
+#: Shots would sweep thousands of plans and never reach the question.
+OPENING_SWEEP_WINDOWS: tuple[tuple[float, float], ...] = (
+    (4.0, 0.5, 0.02),
+    (0.0, 0.005, 0.01, 0.02, 0.25, 2.0, 3.5, 4.0),
+    (0.5, 4.0),
+    (2.0, 4.0, 6.0, 7.5, 8.0),
+)
+
+
+def opening_sweep_plans():
+    """Every `(windows, transitions_out, transitions_in)` the two sweeps below are run over.
+
+    **`transitions_in` is built the way the shipped route builds it** (AD-30): a `transition_out`
+    on a Shot mirrors onto the *next* Shot in song order, so the incoming field is not a second
+    thing a Director sets -- it is what one gesture produces. A sweep that set the two
+    independently would be sweeping a manifest no route can write, and would miss the only shape
+    that matters here: the mirror sitting on a boundary the outgoing Shot already owns.
+
+    The first Shot in song order also gets a directly written incoming type, which is the one an
+    interface can actually put there, and `None` alongside it so the no-opening case is swept too.
+    """
+    from music_video_producer.effects import TRANSITION_CATALOGUE
+
+    types = (None, "dissolve", "wipe_left")
+    assert TRANSITION_CATALOGUE["dissolve"].one_sided_in, "the sweep needs a type with a form"
+    assert TRANSITION_CATALOGUE["wipe_left"].pair_only, "and one with none in either direction"
+
+    a_durations, b_starts, b_durations, c_starts = OPENING_SWEEP_WINDOWS
+    for a_duration in a_durations:
+        for b_start in b_starts:
+            for b_duration in b_durations:
+                for c_start in c_starts:
+                    windows = [
+                        ("shot_a", 0.0, a_duration),
+                        ("shot_b", b_start, b_duration),
+                        ("shot_c", c_start, 4.0),
+                    ]
+                    order = [item[0] for item in sorted(windows, key=lambda w: w[1])]
+                    for first in types:
+                        for out_a in types:
+                            for out_b in types:
+                                for out_c in types:
+                                    chosen = dict(
+                                        zip(("shot_a", "shot_b", "shot_c"),
+                                            (out_a, out_b, out_c))
+                                    )
+                                    out = {k: v for k, v in chosen.items() if v}
+                                    mirrored = {}
+                                    for spot, shot_id in enumerate(order[:-1]):
+                                        if out.get(shot_id):
+                                            mirrored[order[spot + 1]] = out[shot_id]
+                                    if first:
+                                        mirrored[order[0]] = first
+                                    yield windows, out, mirrored
+
+
+def composed_treatments(windows, out_types, in_types, checks=None):
+    """Every treatment one plan composes, keyed by **the boundary it treats**, or `None`.
+
+    `None` where `assembly_plan` will not build a plan at all, which is a geometry with nothing to
+    say rather than a result.
+
+    **The key is the boundary and not the record's own word**, and that is the whole of what makes
+    this sweep able to fail. A head treatment sits at the seam in front of its Shot: for the Shot
+    that opens the plan that seam is the video's first frame and belongs to nobody, and for every
+    other Shot it is the cut its predecessor's `transition_out` owns. Keying a head by "opening"
+    would put it in a namespace of its own, where it could never collide with the tail that owns
+    the same cut -- a sweep that cannot produce the disagreement it is cited as ruling out.
+
+    Refusals and divergences are not treatments and are skipped: they are what the export records
+    when it composed **nothing**.
+    """
+    from music_video_producer.app import (
+        EXPORT_COMPOSITION_CHECKS,
+        ExportComposition,
+        ExportSubject,
+    )
+    from music_video_producer.assembly import (
+        AssemblyGeometryError,
+        ClipWindow,
+        TransitionChoice,
+        assembly_plan,
+    )
+
+    clips = [
+        ClipWindow(
+            shot_id=shot_id, label=shot_id.upper(), start=start, duration=duration,
+            approved_output=f"{shot_id}.mp4", approved_start=start,
+            approved_duration=duration, source=Path(f"{shot_id}.mp4"),
+        )
+        for shot_id, start, duration in windows
+    ]
+    song = max(clip.end for clip in clips)
+    choices = {
+        shot_id: TransitionChoice(transition_id=stored, xfade=stored)
+        for shot_id, stored in out_types.items()
+    }
+    try:
+        plan = assembly_plan(
+            clips, song, {clip.shot_id: (640, 384) for clip in clips}, choices
+        )
+    except AssemblyGeometryError:
+        return None
+    subject = ExportSubject(
+        clips=tuple(clips), song_seconds=song, stacks={}, looks=lambda **_kw: [],
+        plan=plan, transitions=out_types, transitions_in=in_types,
+    )
+    composition = ExportComposition()
+    for check in checks or EXPORT_COMPOSITION_CHECKS:
+        check(subject, composition)
+
+    order = [clip.shot_id for clip in sorted(clips, key=lambda clip: clip.start)]
+    place = {shot_id: spot for spot, shot_id in enumerate(order)}
+    owned = []
+    for line in composition.look.transitions:
+        if line.startswith(("refused: ", "diverged: ")):
+            continue
+        shot_id, _, rest = line.partition("=")
+        spot = place[shot_id]
+        if " opening over " in rest:
+            # The seam in front of this Shot: the video's own first frame when nothing precedes
+            # it, and otherwise the cut its predecessor owns.
+            owned.append(
+                ("the video opens",) if spot == 0 else ("cut", order[spot - 1], shot_id)
+            )
+        else:
+            # A tail and a blend both treat the seam *after* this Shot, and they are two ways of
+            # treating one boundary rather than two boundaries -- which is why they share a key.
+            owned.append((
+                "cut", shot_id,
+                order[spot + 1] if spot + 1 < len(order) else "the end of the song",
+            ))
+    return owned
+
+
+def test_no_plan_composes_two_treatments_for_one_boundary(request):
+    """**R-45's fifth acceptance, over a sweep rather than an argument.**
+
+    Every worst defect in this epic has been two answers to one question, so this asks the
+    question of every plan a lattice of degenerate geometries can build, with the transitions
+    assigned the way the shipped route assigns them -- **through AD-30's mirror**, because that is
+    what makes "compose both halves" one gesture rather than two fields a Director set.
+
+    A boundary carrying two treatments is the failure. It is reported by name and not counted, and
+    the sweep's own size is asserted so that a lattice quietly narrowed to nothing fails here.
+
+    **What this sweep could not vary, stated rather than left to be discovered.** Three Shots and
+    one song; two transition types, one with a one-sided form in both directions and one with none
+    in either; and no Effect Stack on any Shot. What it *does* vary is the only thing the rule is
+    about: which Shot lays the first frame, whether a boundary blends, and which fields the mirror
+    writes. `test_the_one_treatment_sweep_can_see_the_design_r_45_rejected` is the check that it
+    can fail at all.
+
+    Measured on 2026-08-31: **19,440 plans, 18,009 composed treatments, 0 boundaries treated
+    twice.** The same lattice against the rejected composer collides on 5,544 plans.
+    """
+    collisions = []
+    plans = 0
+    treated = 0
+    for windows, out_types, in_types in opening_sweep_plans():
+        owned = composed_treatments(windows, out_types, in_types)
+        if owned is None:
+            continue
+        plans += 1
+        treated += len(owned)
+        if len(owned) != len(set(owned)):
+            collisions.append((windows, out_types, in_types, owned))
+    assert not collisions[:8], collisions[:8]
+    assert plans > 4000, plans
+    assert treated > 4000, treated
+
+
+def test_the_one_treatment_sweep_can_see_the_design_r_45_rejected(request):
+    """The sweep above, run against the composer R-45 turned down, which it must catch.
+
+    **A sweep that has never produced a single disagreement has not been shown to be capable of
+    one.** This repository has already put a 5,675-boundary sweep into a spec as measured fact when
+    the harness could not produce the disagreement it was cited as ruling out, so the guard above
+    is worth exactly as much as this test is.
+
+    The control is R-36's original ruling as code: *"both transitions now treat their own frames --
+    A's tail fades, B's head fades"*, composed at every boundary with no Overlap instead of at the
+    plan's first frame only. AD-30's mirror writes the incoming field on the neighbour whenever a
+    `transition_out` is set, so one Dissolve on a hard cut becomes a fade out **and** a fade in --
+    the picture `Fade through black` is named for, which is the substitution FX-18 forbids and the
+    distinction R-34 spent a measurement keeping.
+
+    Measured on 2026-08-31: **5,544 of the same 19,440 plans** carry a boundary treated twice
+    under it, against 0 under what shipped.
+    """
+    from music_video_producer.app import (
+        EXPORT_COMPOSITION_CHECKS,
+        TRANSITION_OPENING_RECORD,
+        _boundary_is_overlapped,
+    )
+    from music_video_producer.assembly import ASSEMBLY_FPS, ClipWindow
+    from music_video_producer.effects import opening_transition_stages
+
+    def compose_both_halves(subject, composition):
+        """R-36 as it was originally ruled: every unoverlapped boundary treats both sides."""
+        plan = subject.plan
+        ordered = sorted(subject.clips, key=lambda clip: clip.start)
+        for position, clip in enumerate(ordered):
+            stored = subject.transitions_in.get(clip.shot_id)
+            if stored is None:
+                continue
+            if position and _boundary_is_overlapped(ordered, position - 1):
+                continue
+            index = next(
+                (
+                    spot
+                    for spot, entry in enumerate(plan.clips)
+                    if isinstance(entry, ClipWindow) and entry.shot_id == clip.shot_id
+                ),
+                None,
+            )
+            if index is None:
+                continue
+            composed = opening_transition_stages(
+                stored, clip_frames=plan.frames[index], fps=ASSEMBLY_FPS
+            )
+            if composed is None:
+                continue
+            composition.look.transitions.append(
+                TRANSITION_OPENING_RECORD.format(
+                    shot=clip.shot_id, transition=stored, frames=composed.frames
+                )
+            )
+        return []
+
+    rejected = (*EXPORT_COMPOSITION_CHECKS[:-2], compose_both_halves)
+    collisions = 0
+    plans = 0
+    for windows, out_types, in_types in opening_sweep_plans():
+        owned = composed_treatments(windows, out_types, in_types, checks=rejected)
+        if owned is None:
+            continue
+        plans += 1
+        if len(owned) != len(set(owned)):
+            collisions += 1
+    assert plans > 4000, plans
+    # Named as a floor rather than an equality: the number is a property of the lattice, and a
+    # lattice that grows should not have to be re-counted. What may not change is that it is many.
+    assert collisions > 500, collisions
+
+
+def test_the_window_rule_and_the_plan_agree_about_what_opens(request):
+    """`_opening_clip_frames` against `assembly_plan` itself, over the same lattice.
+
+    The export reads `plan.clips[0]`; the Shot preview and the browser have no plan to read and
+    use the window rule instead. **A port is only honest while something asks both sides the same
+    question and compares the answers**, and the **number** is compared rather than the verdict:
+    two engines agreeing on `0` for different reasons is two engines.
+
+    The plan's answer is both halves of R-45 at once -- the first entry, and its Shot being the
+    first in song order -- because that is what the composer does with it.
+
+    Measured on 2026-08-31: **19,440 plans, 6,480 of them opening, 0 disagreements.** The middle
+    number is the one that matters -- a table where the first Shot always opens would never ask
+    the rule to say no, so it is asserted rather than reported.
+    """
+    from music_video_producer.app import _opening_clip_frames
+    from music_video_producer.assembly import (
+        AssemblyGeometryError,
+        ClipWindow,
+        TransitionChoice,
+        assembly_plan,
+    )
+
+    disagreed = []
+    asked = 0
+    opened = 0
+    for windows, out_types, _in_types in opening_sweep_plans():
+        clips = [
+            ClipWindow(
+                shot_id=shot_id, label=shot_id.upper(), start=start, duration=duration,
+                approved_output=f"{shot_id}.mp4", approved_start=start,
+                approved_duration=duration, source=Path(f"{shot_id}.mp4"),
+            )
+            for shot_id, start, duration in windows
+        ]
+        song = max(clip.end for clip in clips)
+        try:
+            plan = assembly_plan(
+                clips,
+                song,
+                {clip.shot_id: (640, 384) for clip in clips},
+                {
+                    shot_id: TransitionChoice(transition_id=stored, xfade=stored)
+                    for shot_id, stored in out_types.items()
+                },
+            )
+        except AssemblyGeometryError:
+            continue
+        ordered = sorted(clips, key=lambda clip: clip.start)
+        opening = plan.clips[0]
+        planned = (
+            plan.frames[0]
+            if isinstance(opening, ClipWindow) and opening.shot_id == ordered[0].shot_id
+            else 0
+        )
+        asked += 1
+        opened += bool(planned)
+        if _opening_clip_frames(ordered) != planned:
+            disagreed.append((windows, out_types, _opening_clip_frames(ordered), planned))
+    assert not disagreed[:8], disagreed[:8]
+    assert asked > 500, asked
+    # The lattice reaches both answers, which is what stops this passing on a table where the
+    # first Shot always opens and the rule is never asked to say no.
+    assert 0 < opened < asked, (opened, asked)
+
+
+def test_an_opening_treatment_is_refused_when_the_plan_opens_with_a_blend():
+    """`_opening_clip_index`' type guard, pinned at the only boundary that state exists at.
+
+    A `TransitionClip` at index 0 is **not reachable through `assemble_project`**:
+    `_paired_transitions` refuses any boundary whose outgoing stretch is empty, so the outgoing
+    Shot's own frames always sit in front of a blend. The guard is written anyway, for
+    `assembly._split_frames`' own reason -- this function is handed a plan by a caller that may one
+    day build one differently, and composing an *opening* treatment onto a blend would write a
+    `fade=t=in` into a clip that is two Shots at once, driven by a field neither of them owns.
+
+    Asked directly, because no route can construct the state.
+    """
+    from music_video_producer.app import ExportSubject, _opening_clip_index
+    from music_video_producer.assembly import (
+        AssemblyPlan,
+        ClipWindow,
+        TransitionChoice,
+        TransitionClip,
+    )
+
+    def window(shot_id: str, start: float, duration: float) -> ClipWindow:
+        return ClipWindow(
+            shot_id=shot_id, label=shot_id.upper(), start=start, duration=duration,
+            approved_output=f"{shot_id}.mp4", approved_start=start,
+            approved_duration=duration, source=Path(f"{shot_id}.mp4"),
+        )
+
+    clips = [window("shot_a", 0.0, 4.0), window("shot_b", 4.0, 4.0)]
+    blend = TransitionClip(
+        before=window("shot_a", 0.0, 1.0),
+        after=window("shot_b", 0.0, 1.0),
+        choice=TransitionChoice(transition_id="dissolve", xfade="fade"),
+    )
+    geometry = {"width": 640, "height": 384, "song_seconds": 8.0}
+    subject = lambda entries, frames: ExportSubject(
+        clips=tuple(clips), song_seconds=8.0, stacks={}, looks=lambda **_kw: [],
+        plan=AssemblyPlan(clips=entries, frames=frames, **geometry),
+    )
+
+    # The blend first: nothing may be treated, because the frames that open the video are two
+    # Shots blended and neither of them owns that.
+    assert _opening_clip_index(subject([blend, clips[1]], [24, 96])) is None
+    # The identical plan with a plain window in front answers `0`, which is what makes the
+    # assertion above about the guard rather than about the arithmetic.
+    assert _opening_clip_index(subject([clips[0], blend, clips[1]], [72, 24, 96])) == 0
+    # And an empty plan is `None` rather than an index error.
+    assert _opening_clip_index(subject([], [])) is None
+
+
+def test_an_unknown_type_on_the_opening_shots_incoming_field_refuses_the_export_by_name(
+    tmp_path: Path
+):
+    """AD-21 applied to the field R-45 made the export build a picture from.
+
+    Nothing stored says a transition is valid, and the plan stage asks the catalogue again --
+    which it did only of `transition_out` until this slice, because that was the only field an
+    export read. `_compose_opening_transition` now builds from the first Shot's `transition_in`,
+    so a stored value the catalogue cannot name is the same fault there: there is no `xfade` name
+    and no form to compose, and rendering the clip untreated would be an export quietly doing
+    something the manifest did not ask for.
+
+    **Asked of the first Shot in song order and of no other**, which is the whole of the blast
+    radius: every other Shot's `transition_in` is AD-30's mirror and composes nothing, so a value
+    stored there is not something this export builds from and does not refuse it. `shot_b` carries
+    the identical unknown type and the export runs.
+    """
+    from music_video_producer.app import ASSEMBLY_TRANSITION_REFUSAL
+    from music_video_producer.effects import (
+        TRANSITION_CATALOGUE,
+        TRANSITION_UNKNOWN_REFUSAL,
+    )
+
+    client, store, comfy, _app = make_client(tmp_path)
+    project_id, _shots_dir = project_with_two_approved_takes(client, store, tmp_path)
+    # Past the route, which refuses an unknown type at the write -- the state is reachable from a
+    # hand edit or a manifest written by a build whose catalogue held one more entry.
+    project = store.get(project_id)
+    project.shots[1].transition_in = TransitionSpec.model_construct(type="crossfade")
+    store.save(project)
+    assert client.post(f"/api/projects/{project_id}/assemble").status_code == 200
+
+    project = store.get(project_id)
+    project.shots[0].transition_in = TransitionSpec.model_construct(type="crossfade")
+    store.save(project)
+    refused = client.post(f"/api/projects/{project_id}/assemble")
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["detail"] == ASSEMBLY_TRANSITION_REFUSAL.format(
+        shot=shot_label(store.get(project_id), store.get(project_id).shots[0]),
+        detail=TRANSITION_UNKNOWN_REFUSAL.format(
+            transition="crossfade", known=", ".join(sorted(TRANSITION_CATALOGUE))
+        ),
+    )
     assert comfy.prompts == []
 
 
@@ -4109,13 +4908,21 @@ def test_an_unset_or_agreeing_mirror_is_not_a_divergence(tmp_path: Path):
     # "this project mirrors nothing" early return then answered before the unset case was ever
     # reached. Mutating `incoming is None` out of the predicate **survived** against that fixture:
     # it made its own defect impossible, which is the shape this repository has now met roughly
-    # twenty times. `shot_a` carries an incoming type nothing reads (it is the first Shot, so no
-    # pair points at it) purely so the mapping is non-empty while this pair's mirror is absent.
+    # twenty times. `shot_a` carries an incoming type **no pair points at** (it is the first Shot)
+    # purely so the mapping is non-empty while this pair's mirror is absent.
+    #
+    # *Amended 2026-08-31 by R-45.* That parenthesis read "an incoming type nothing reads", and
+    # since story 11.f8 the first Shot's own opening frames are treated from it: `shot_a` lays the
+    # plan's first frame, so the record below is its opening. The fixture's job is unchanged --
+    # the mapping is non-empty and this pair's mirror is unset -- and the extra line is asserted
+    # rather than filtered out, so this test cannot go blind to a treatment appearing here.
     project = store.get(project_id)
     project.shots[0].transition_in = TransitionSpec(type="fade_black")
     project.shots[1].transition_in = None
     store.save(project)
-    assert transitions_after_export() == ["shot_a=dissolve"]
+    assert transitions_after_export() == [
+        "shot_a=dissolve", "shot_a=fade_black opening over 12 frames"
+    ]
 
     # Differing, with the Overlap dragged away: not a pair, so not a divergence.
     project = store.get(project_id)
@@ -4135,5 +4942,11 @@ def test_an_unset_or_agreeing_mirror_is_not_a_divergence(tmp_path: Path):
         ).status_code == 200
     recorded = transitions_after_export()
     assert not [line for line in recorded if line.startswith("diverged: ")], recorded
-    assert recorded == ["shot_a=dissolve one-sided over 12 frames"]
+    # `shot_a`'s own two ends, at two boundaries: the tail into `shot_b` from `transition_out`,
+    # and the video's opening from the `transition_in` set above (R-45). `shot_b`'s `wipe_up` is
+    # the mirror this block is about and composes nothing, which is what the two lines say.
+    assert recorded == [
+        "shot_a=dissolve one-sided over 12 frames",
+        "shot_a=fade_black opening over 12 frames",
+    ]
     assert comfy.prompts == []

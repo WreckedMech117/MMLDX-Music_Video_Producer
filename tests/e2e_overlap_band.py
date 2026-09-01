@@ -707,7 +707,7 @@ def main() -> None:
             # === 5. The rows, in every state ==================================================
             select_clip(driver, wait, "shot_01")
             open_effects_tab(driver, wait)
-            driver.save_screenshot(str(artifact_dir() / f"{NAME}-01-rows-paired-and-headless.png"))
+            driver.save_screenshot(str(artifact_dir() / f"{NAME}-01-rows-paired-and-opening.png"))
 
             rows = {
                 "in": driver.execute_script(ROW_FACTS, "transition-in"),
@@ -719,10 +719,13 @@ def main() -> None:
                 "the paired row's left edge is not `--blue`", rows["out"])
             assert rows["out"]["length"] == "1.50s · from overlap", rows["out"]
             assert rows["out"]["disabled"] is False
-            # The first Shot's `Transition in`: nothing precedes it, so nothing renders from it.
-            assert rows["in"]["state"] == "headless", rows["in"]
+            # The first Shot's `Transition in`: nothing precedes it, so **it opens the video**
+            # (R-45, story 11.f8). This row read `headless` and said nothing renders from it.
+            assert rows["in"]["state"] == "opening", rows["in"]
             assert channels(rows["in"]["borderLeftColor"])[:3] != (0x5b, 0x9b, 0xd5), rows["in"]
-            assert "Nothing plays before shot 01" in rows["in"]["note"], rows["in"]
+            assert rows["in"]["note"] == (
+                "Nothing plays before shot 01 — this treats its opening frames as the video "
+                "begins."), rows["in"]
             assert rows["in"]["disabled"] is False, (
                 "a live editorial choice has been drawn disabled", rows["in"])
             # Every entry the catalogue holds is offered on both rows, pair-only included (FX-19).

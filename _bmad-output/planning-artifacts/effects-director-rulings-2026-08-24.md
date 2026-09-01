@@ -1252,3 +1252,36 @@ substituted.
 **On a hand-edited manifest whose pair disagrees, AD-30 is unchanged:** `transition_out` is
 authoritative and the divergence is reported once. This ruling adds no second authority — it
 names the one boundary where there is no outgoing field to be authoritative *with*.
+
+
+## R-46 — A one-sided Blur wipe is horizontal, like its paired form and its name
+
+*Ruled 2026-08-31, on a defect found while building story 11.f8.*
+
+**`gblur`'s `sigma` command drives the horizontal axis only.** Measured on this machine's ffmpeg
+7.0 by `framemd5`: with `sigma=20` at init, commanding `sigma 5` is **byte-identical to a static
+`sigma=5:sigmaV=20`** and **not** to a static `sigma=5`. `gblur` resolves `sigmaV` from `sigma`
+once at configuration and `process_command` recomputes each axis from its own option.
+
+**So story 11.4's shipped one-sided blur has been horizontal all along, and nobody decided it.**
+`blur_ramp` commands `sigma` alone from an init of `sigma=0`, which pins `sigmaV` at 0 forever.
+It looked correct only because the init happened to be zero; every sigma the script named was half
+applied. Building the opening form surfaced it, because a head that starts blurred would have
+settled to a vertically-smeared picture at rc 0 — which is this pipeline's signature failure.
+
+**Ruled: horizontal, on both ends, on purpose.** The implementer had made both ends isotropic so
+the head and tail would agree with each other. The paired form is `xfade=transition=hblur`, which
+is horizontal, and R-34 catalogued the entry as *"Blur wipe"* precisely so the name would not call
+a horizontal-only effect "Blur": *"FX-18 says a named type is never quietly substituted, and
+calling a horizontal-only effect 'Blur' is precisely that substitution."* An isotropic one-sided
+form would make **one catalogue entry render two pictures** depending on whether an Overlap sits
+under it — the same complaint one level up. Nothing a Director has already exported changes.
+
+**`sigmaV=0` in the init string is load-bearing, not tidy.** Measured: `sigma=20:sigmaV=0`
+commanded to `sigma 0` is `framemd5`-identical to the same chain with no `gblur` in it;
+`sigma=20` alone commanded to `sigma 0` holds a 20-pixel vertical blur for the rest of the clip.
+Decoded through the real composed chain after the ruling landed: the opening blur moves frames
+**0—10** and is byte-identical to an untreated clip for **11—47**. It settles completely.
+
+**If this is ever revisited**, the alternative is not "make it isotropic" but "make it isotropic
+**and rename the type**", because the name is the thing R-34 spent the argument on.

@@ -59,6 +59,8 @@ from music_video_producer.effects import (
     ONE_SIDED_FORMS,
     ONE_SIDED_TRANSITION_FRAMES,
     ONE_SIDED_TRANSITION_LABEL,
+    OPENING_FORMS,
+    OPENING_TRANSITION_LABEL,
     PRE_PAD_FAMILIES,
     PRE_SCALE_FAMILIES,
     PREVIEW_FINGERPRINT_INPUTS,
@@ -81,6 +83,7 @@ from music_video_producer.effects import (
     lut_file_argument,
     lut_id_for_name,
     one_sided_transition_stages,
+    opening_transition_stages,
     preview_fingerprint,
     transition_definition,
     validate_stack,
@@ -3368,9 +3371,24 @@ def test_a_one_sided_blur_addresses_a_label_the_same_call_composes():
 
     The script's first line is the identity, so the ramp grows from nothing, and its last is the
     full sigma -- both written out rather than derived.
+
+    **Each line commands the horizontal axis alone, and the init string pins the vertical one
+    at 0** (R-46, 2026-08-31). `gblur` resolves `sigmaV` from `sigma` once at configuration and
+    commands each axis from its own option, so a `sigma` command moves the horizontal pass only
+    — measured byte-identical to a static `sigma=<commanded>:sigmaV=<init>`. Story 11.4 shipped
+    this ramp commanding `sigma` alone, which made it horizontal by accident; **R-46 makes it
+    horizontal on purpose**, because the paired form is `xfade=transition=hblur` and R-34 named
+    the entry *"Blur wipe"* precisely so it would not call a horizontal-only effect "Blur". An
+    isotropic one-sided form would make one catalogue entry render two pictures depending on
+    whether an Overlap sits under it.
+
+    **`sigmaV=0` in the init string is load-bearing, not tidy.** Measured on ffmpeg 7.0 by
+    `framemd5`: `sigma=20:sigmaV=0` commanded to `sigma 0` is identical to the same chain with no
+    `gblur` in it; `sigma=20` alone commanded to `sigma 0` is a 0/20 blur that never clears. The
+    opening form starts blurred, so without the pin it would settle to a smeared picture at rc 0.
     """
     composed = one_sided_transition_stages("blur_wipe", clip_frames=96, fps=24)
-    assert composed.treatment == (f"gblur@{ONE_SIDED_TRANSITION_LABEL}=sigma=0",)
+    assert composed.treatment == (f"gblur@{ONE_SIDED_TRANSITION_LABEL}=sigma=0:sigmaV=0",)
     assert len(composed.scripts) == 1
     script = composed.scripts[0]
     assert composed.geometry == (f"sendcmd=f={script.filename}",)
@@ -3386,6 +3404,9 @@ def test_a_one_sided_blur_addresses_a_label_the_same_call_composes():
     assert len(lines) == ONE_SIDED_TRANSITION_FRAMES
     assert lines[0] == f"3.5 gblur@{ONE_SIDED_TRANSITION_LABEL} sigma 0;"
     assert lines[-1] == f"3.958333 gblur@{ONE_SIDED_TRANSITION_LABEL} sigma 20;"
+    # No line touches the vertical axis: the pin is in the init string, and a command that
+    # moved it would make this ramp isotropic again without changing any number above.
+    assert not any("sigmaV" in line for line in lines)
 
     # A bare relative name, which is what `sendcmd=f=` takes with the process cwd set to the
     # file's own directory (AD-22, R-30). Every character is one that needs no escaping.
@@ -3394,6 +3415,157 @@ def test_a_one_sided_blur_addresses_a_label_the_same_call_composes():
     # short clip's ramp and a long clip's into one directory cannot have one drive the other.
     other = one_sided_transition_stages("blur_wipe", clip_frames=40, fps=24)
     assert other.scripts[0].filename != script.filename
+
+
+def test_every_one_sided_form_has_exactly_one_mirror_and_no_two_share_a_picture():
+    """R-45's four new forms, held to the four that already existed.
+
+    `one_sided_in` is `one_sided`'s mirror and the two are the same fact about an entry stated in
+    two directions: a type that can treat its own last frames can treat its own first ones, and a
+    pair-only type can do neither (R-34). An entry that gained one and forgot the other would be
+    settable and then compose nothing at that end -- rc 0, right frame count, unchanged picture,
+    which is the failure `test_a_pair_only_entry_is_exactly_one_with_no_one_sided_form` exists for
+    and is the reason this is a test rather than a convention.
+
+    **And no form name appears in both tuples**, which is FX-18's *never quietly substituted*
+    across the pair rather than within one: a shape that ramps away and a shape that ramps towards
+    are two pictures, and one name for both would put the catalogue in the position of choosing.
+    """
+    for entry in TRANSITION_CATALOGUE.values():
+        assert (entry.one_sided == "") == (entry.one_sided_in == ""), entry
+        assert entry.pair_only == (entry.one_sided_in == ""), entry
+        assert entry.one_sided_in in ("", *OPENING_FORMS), entry
+    forms = [
+        entry.one_sided_in for entry in TRANSITION_CATALOGUE.values() if entry.one_sided_in
+    ]
+    assert sorted(forms) == sorted(OPENING_FORMS)
+    assert len(set(forms)) == len(forms)
+    assert not set(OPENING_FORMS) & set(ONE_SIDED_FORMS)
+
+
+def test_an_opening_transition_is_the_mirror_in_time_of_the_form_that_ramps_away():
+    """The four opening forms, written out, beside the four they mirror.
+
+    **The mirror is taken in time and in nothing else**, which is what keeps each of them the same
+    picture R-34 measured, read backwards:
+
+    * a dissolve spends its whole treatment arriving, at either end -- `nb_frames` is the full
+      length and there is no held colour, which is what separates it from the two dips;
+    * a dip **holds**: `dip_black` ramps over the first half of its window and sits in black to
+      the cut, so `rise_black` sits in black from the video's first frame and ramps over the
+      second half. Same halves, same order, reversed. The hold is R-34's whole distinction and it
+      survives the mirror rather than being re-decided;
+    * a wipe has no form in either direction, so it is `None` here as it is there, and the caller
+      says so in the catalogue's own sentence instead of being handed something to render.
+
+    Written out rather than derived from `one_sided_transition_stages`, for this module's standing
+    reason: a mirror computed from the thing it mirrors cannot catch the two of them moving
+    together.
+    """
+    assert opening_transition_stages("dissolve", clip_frames=96, fps=24).treatment == (
+        "fade=t=in:start_frame=0:nb_frames=12:color=black",
+    )
+    assert opening_transition_stages("fade_black", clip_frames=96, fps=24).treatment == (
+        "fade=t=in:start_frame=6:nb_frames=6:color=black",
+    )
+    assert opening_transition_stages("fade_white", clip_frames=96, fps=24).treatment == (
+        "fade=t=in:start_frame=6:nb_frames=6:color=white",
+    )
+    for transition_id in ("wipe_left", "wipe_right", "slide_up", "slide_down"):
+        assert opening_transition_stages(transition_id, clip_frames=96, fps=24) is None
+
+    # The clamp is the tail's, against **frames**: a clip shorter than the ceiling is treated over
+    # its whole length, and a `nb_frames` reaching past the last frame written is a treatment that
+    # composes cleanly and changes nothing at rc 0.
+    long_clip = opening_transition_stages("dissolve", clip_frames=240, fps=24)
+    assert long_clip.frames == ONE_SIDED_TRANSITION_FRAMES
+    assert long_clip.treatment == ("fade=t=in:start_frame=0:nb_frames=12:color=black",)
+    short_clip = opening_transition_stages("dissolve", clip_frames=5, fps=24)
+    assert short_clip.frames == 5
+    assert short_clip.treatment == ("fade=t=in:start_frame=0:nb_frames=5:color=black",)
+    single = opening_transition_stages("fade_black", clip_frames=1, fps=24)
+    assert single.frames == 1
+    assert single.treatment == ("fade=t=in:start_frame=0:nb_frames=1:color=black",)
+
+    # And the two ends of one boundary are two different pictures on purpose: the opening never
+    # composes the stage the closing one does, so a Director who set a Dissolve on the first Shot's
+    # incoming field cannot be shown the tail's `fade=t=out` under another name.
+    for transition_id in ("dissolve", "fade_black", "fade_white"):
+        opening = opening_transition_stages(transition_id, clip_frames=96, fps=24)
+        closing = one_sided_transition_stages(transition_id, clip_frames=96, fps=24)
+        assert opening.treatment != closing.treatment, transition_id
+
+
+def test_an_opening_blur_settles_from_the_sigma_it_declares_down_to_nothing():
+    """`blur_ramp`'s mirror, and the one thing about it that is not symmetry for its own sake.
+
+    The declared resting value is the **maximum** rather than zero. A `sendcmd` command timed at
+    `t=0` that failed to fire would leave the picture's first frame sharp -- silently, at rc 0,
+    which is the class of failure R-25 exists against -- so the filter is declared holding the
+    sigma the treatment starts at and the script's first line writes the same number. The last
+    line writes `0`, which is `gblur`'s measured no-op, so the ramp's own last frame is
+    bit-identical to the untreated one and every frame after it is untouched. That is
+    `blur_ramp`'s first frame, mirrored.
+
+    R-25's own assertion is repeated here rather than assumed: the target string appears as an
+    `@label` in the chain composed by the same call, and it carries the filter class, because
+    `avfilter_graph_send_command` matches a target against the filter's own name and answers
+    `ENOSYS` in silence when nothing matched.
+
+    **The label is not the tail's**, and that is load-bearing rather than tidy: the Shot that opens
+    the plan may carry an opening treatment and a one-sided one on the same chain, and two `gblur`
+    instances under one name would be one `sendcmd` target driving both ramps at rc 0.
+    """
+    composed = opening_transition_stages("blur_wipe", clip_frames=96, fps=24)
+    assert composed.treatment == (f"gblur@{OPENING_TRANSITION_LABEL}=sigma=20:sigmaV=0",)
+    assert len(composed.scripts) == 1
+    script = composed.scripts[0]
+    assert composed.geometry == (f"sendcmd=f={script.filename}",)
+    assert script.target == f"gblur@{OPENING_TRANSITION_LABEL}"
+    assert script.target != f"gblur@{ONE_SIDED_TRANSITION_LABEL}"
+    chain = ",".join((*composed.geometry, *composed.treatment))
+    assert script.target in chain
+    for line in script.text.splitlines():
+        assert line.split(" ")[1] == script.target, line
+
+    lines = script.text.splitlines()
+    assert len(lines) == ONE_SIDED_TRANSITION_FRAMES
+    assert lines[0] == f"0 gblur@{OPENING_TRANSITION_LABEL} sigma 20;"
+    assert lines[-1] == f"0.458333 gblur@{OPENING_TRANSITION_LABEL} sigma 0;"
+    # The first command writes exactly the value the filter was declared with, so a command that
+    # never fires and one that fires are the same first frame.
+    assert lines[0].startswith(f"0 gblur@{OPENING_TRANSITION_LABEL} sigma 20")
+    assert composed.treatment[0].startswith(
+        f"gblur@{OPENING_TRANSITION_LABEL}=sigma=20")
+    # **The horizontal axis alone, every line, and `sigmaV` pinned at 0 by the init string**
+    # (R-46). The pin is what makes the settle complete: measured by `framemd5` on ffmpeg 7.0,
+    # `sigma=20:sigmaV=0` commanded to `sigma 0` is identical to the same chain with no `gblur`
+    # in it, while `sigma=20` alone -- where `sigmaV` resolves to 20 at configuration --
+    # commanded to `sigma 0` holds a 20-pixel vertical blur for the rest of the clip at rc 0.
+    # So this pair of assertions is the whole of the difference between settling and not.
+    assert composed.treatment[0].endswith(":sigmaV=0")
+    for line in lines:
+        assert line.count(f"gblur@{OPENING_TRANSITION_LABEL}") == 1, line
+        assert " sigma " in line and "sigmaV" not in line, line
+
+    assert set(script.filename) <= set("abcdefghijklmnopqrstuvwxyz0123456789_.-")
+    # Two different ramps are two files, and two identical ones share one -- `_drive_script_name`'s
+    # rule, and the export writes every clip's scripts into one directory. A clip **shorter than
+    # the ceiling** is what makes an opening ramp different: unlike the tail's, this one always
+    # starts at frame zero, so every clip long enough to hold the whole treatment composes the
+    # same ramp and should name the same file.
+    assert (
+        opening_transition_stages("blur_wipe", clip_frames=240, fps=24).scripts[0].filename
+        == script.filename
+    )
+    assert (
+        opening_transition_stages("blur_wipe", clip_frames=5, fps=24).scripts[0].filename
+        != script.filename
+    )
+    assert (
+        one_sided_transition_stages("blur_wipe", clip_frames=96, fps=24).scripts[0].filename
+        != script.filename
+    )
 
 
 def test_the_transition_catalogue_is_twelve_and_names_hblur_for_what_it_is():

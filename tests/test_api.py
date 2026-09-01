@@ -26296,6 +26296,9 @@ def test_the_transition_route_refuses_by_name_and_stores_nothing_when_it_does(tm
       because a Director who misspelled one needs the spelling.
     * **A pair-only type with no Overlap** (FX-19, R-34) — the reason a wipe is *in* the list
       rather than absent from it. Said at the write, which is when the Director is choosing.
+    * **A pair-only type on the opening**, in its own sentence (R-45, 2026-08-31). The one above
+      tells a Director to drag the two clips across each other, and nothing plays before the first
+      Shot to drag: offering that remedy there would name a gesture that cannot be performed.
     * **A body naming neither side** — `ShotEffectsRequest.effects`' lesson applied before it can
       be learned twice: `{"transiton_out": ...}` must not read as "clear both" and answer 200.
     * **A locked Shot** — 422 and not 409, on the ruling of 2026-08-18 that puts `locked` on the
@@ -26307,6 +26310,7 @@ def test_the_transition_route_refuses_by_name_and_stores_nothing_when_it_does(tm
     )
     from music_video_producer.effects import (
         TRANSITION_CATALOGUE,
+        TRANSITION_PAIR_ONLY_OPENING_REFUSAL,
         TRANSITION_PAIR_ONLY_REFUSAL,
         TRANSITION_UNKNOWN_REFUSAL,
     )
@@ -26336,9 +26340,31 @@ def test_the_transition_route_refuses_by_name_and_stores_nothing_when_it_does(tm
     assert refused.json()["detail"] == TRANSITION_PAIR_ONLY_REFUSAL.format(
         label="Wipe left",
         shot="SHOT 01 (shot_one)",
+        # A `transition_out`, so the seam is the one after this Shot.
+        neighbour="after",
         alternatives="Blur wipe, Dissolve, Fade through black, Fade through white",
     )
     assert ProjectStore(tmp_path).get(plain).shots[0].transition_out is None
+
+    # The same type on the **incoming** side of the first Shot, where there is no Shot at all on
+    # the other side of the boundary. It is a different sentence because the remedy above does not
+    # exist here, and it is the sentence the export says at the same boundary
+    # (`app._compose_opening_transition`) rather than a second wording of one condition.
+    opening = client.put(transitions_url(plain), json={"transition_in": {"type": "wipe_left"}})
+    assert opening.status_code == 422
+    assert opening.json()["detail"] == TRANSITION_PAIR_ONLY_OPENING_REFUSAL.format(
+        label="Wipe left",
+        shot="SHOT 01 (shot_one)",
+        alternatives="Blur wipe, Dissolve, Fade through black, Fade through white",
+    )
+    assert opening.json()["detail"] != TRANSITION_PAIR_ONLY_REFUSAL.format(
+        label="Wipe left",
+        shot="SHOT 01 (shot_one)",
+        neighbour="before",
+        alternatives="Blur wipe, Dissolve, Fade through black, Fade through white",
+    )
+    assert ProjectStore(tmp_path).get(plain).shots[0].transition_in is None
+
     # And the four that are not pair-only are accepted on that very boundary, which is what makes
     # the refusal a statement about wipes rather than about the geometry.
     for transition_id in ("dissolve", "fade_black", "fade_white", "blur_wipe"):
