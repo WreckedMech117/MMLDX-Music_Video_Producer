@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 08-16-2026 21:31
-last_updated: 08-31-2026 23:29
+last_updated: 08-31-2026 23:48
 project: MusicVideoProducer
 project_key: NOKEY
 tracking_system: file-system
@@ -753,7 +753,7 @@ action_items:
       so a stored one-sided transition on it is skipped in silence. Record the drop
       on ExportLook rather than leaving the provenance quietly incomplete."
     owner: "Dev"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
   - id: "epic-11-retro-item-79-decide-then-fix-preview_fingerprint-stil"
     epic: 11
@@ -762,7 +762,7 @@ action_items:
       chains for the reason AD-28 states in terms. Both reasons Epic 9's retro gave
       for deferring are now spent. One cross-language contract test moves with it."
     owner: "Dev"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-08-30.md"
   - id: "epic-11-retro-item-80-process-make-the-review-pass-non-discret"
     epic: 11

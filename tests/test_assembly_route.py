@@ -1815,7 +1815,7 @@ def test_an_export_made_before_the_look_was_recorded_reads_as_carrying_none(tmp_
     manifest = tmp_path / "projects" / project.id / "project.json"
     body = json.loads(manifest.read_text(encoding="utf-8"))
     before = body["jobs"][0].pop("look")
-    assert before == {"effects": [], "bindings": [], "transitions": []}
+    assert before == {"effects": [], "bindings": [], "transitions": [], "omitted": []}
     manifest.write_text(json.dumps(body), encoding="utf-8")
 
     loaded = ProjectStore(tmp_path).get(project.id).jobs[0]
@@ -2779,7 +2779,7 @@ def test_a_disabled_bound_card_neither_drives_an_export_nor_refuses_one(tmp_path
     assert response.status_code == 200, response.text
     # And the record says the same thing the picture does: nothing composed, nothing driving.
     assert response.json()["job"]["look"] == {
-        "effects": [], "bindings": [], "transitions": []
+        "effects": [], "bindings": [], "transitions": [], "omitted": []
     }
     # The binding is still there, waiting for the card to be switched back on.
     assert store.get(project_id).shots[0].effects[0].bindings != []
@@ -2854,7 +2854,9 @@ def test_a_bound_shot_that_renders_no_frame_still_refuses_the_export(tmp_path: P
     ]
     # And the composition stage, which iterates `plan.clips`, records nothing for the buried Shot
     # — its look never composed and never ran.
-    assert body["job"]["look"] == {"effects": [], "bindings": [], "transitions": []}
+    assert body["job"]["look"] == {
+        "effects": [], "bindings": [], "transitions": [], "omitted": []
+    }
 
     project = store.get(project_id)
     project.song.analysis.song_fingerprint = "12-notthesongthatisonthedisk"
@@ -4950,3 +4952,73 @@ def test_an_unset_or_agreeing_mirror_is_not_a_divergence(tmp_path: Path):
         "shot_a=fade_black opening over 12 frames",
     ]
     assert comfy.prompts == []
+
+
+def test_the_export_says_which_shots_laid_no_frames_through_its_own_registry():
+    """Item 78's wiring, run through `EXPORT_COMPOSITION_CHECKS` rather than by calling the check.
+
+    **The unit test for `_report_omitted_clips` passes with the check unregistered**, which is a
+    guard proving a function works and not that anything calls it. Mutation-checked: removing
+    `_report_omitted_clips` from the registry left every other assertion green. That is the same
+    gap `overlapRemovalToasts` had on 2026-08-30 -- the pure function tested with an argument
+    passed by hand while the caller that must pass it went unasserted -- so it is closed the same
+    way, by going through the thing that does the calling.
+
+    The geometry is `assembly_plan`'s own documented one: `shot_b` is longer than
+    `BOUNDARY_TOLERANCE_SECONDS`, so the resolution loop keeps it, and both its ends round to grid
+    frame 12, so it lays nothing and is dropped.
+    """
+    from music_video_producer.app import (
+        EXPORT_COMPOSITION_CHECKS,
+        ExportComposition,
+        ExportSubject,
+    )
+    from music_video_producer.assembly import ClipWindow, assembly_plan
+
+    def window(shot_id: str, start: float, duration: float) -> ClipWindow:
+        return ClipWindow(
+            shot_id=shot_id, label=shot_id.upper(), start=start, duration=duration,
+            approved_output=f"{shot_id}.mp4", approved_start=start,
+            approved_duration=duration, source=Path(f"{shot_id}.mp4"),
+        )
+
+    clips = [
+        window("shot_a", 0.0, 10.0),
+        window("shot_b", 0.483333, 0.033334),
+    ]
+    plan = assembly_plan(clips, 10.0, {clip.shot_id: (640, 384) for clip in clips})
+    subject = ExportSubject(
+        clips=tuple(clips), song_seconds=10.0, stacks={}, looks=lambda **_kw: [], plan=plan,
+    )
+    composition = ExportComposition()
+    refusals = [
+        line for check in EXPORT_COMPOSITION_CHECKS for line in check(subject, composition)
+    ]
+
+    # It reports and refuses nothing: a sub-frame Shot is a legal edit, and refusing an export
+    # over one would be this application deciding a Director's timeline is wrong.
+    assert refusals == []
+    assert len(composition.look.omitted) == 1
+    said = composition.look.omitted[0]
+    # The **label**, which is what a Director reads, not the id.
+    assert "SHOT_B" in said and "0.483" in said and "0.517" in said
+    assert "lays no frames" in said
+    # The Shot that did lay frames is not named, so the field is about the drop rather than the
+    # plan: without this the check could append every Shot and the assertion above would hold.
+    assert "SHOT_A" not in said
+
+    # And an ordinary plan says nothing at all through the same registry.
+    ordinary = [window("shot_a", 0.0, 5.0), window("shot_b", 5.0, 5.0)]
+    plain_plan = assembly_plan(
+        ordinary, 10.0, {clip.shot_id: (640, 384) for clip in ordinary}
+    )
+    plain = ExportComposition()
+    for check in EXPORT_COMPOSITION_CHECKS:
+        check(
+            ExportSubject(
+                clips=tuple(ordinary), song_seconds=10.0, stacks={},
+                looks=lambda **_kw: [], plan=plain_plan,
+            ),
+            plain,
+        )
+    assert plain.look.omitted == []

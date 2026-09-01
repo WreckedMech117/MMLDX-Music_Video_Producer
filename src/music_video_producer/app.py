@@ -8476,6 +8476,18 @@ ASSEMBLY_TRANSITION_REFUSAL = "{shot}'s transition: {detail}"
 #: indistinguishable from one nobody ever set, which is the silence R-37 exists against.
 TRANSITION_REFUSED_RECORD = "refused: {shot}"
 
+#: How a Shot that laid **no frames** is written into `ExportLook.omitted` (item 78,
+#: 2026-08-31). It states the window the Director drew and the fact that nothing came of it,
+#: because those are the two things they cannot see from the timeline: a clip is on screen at
+#: a length they set, and the export used none of it.
+#:
+#: Seconds rather than frames, deliberately. The count is zero by definition and saying so
+#: twice would be noise; what a Director can act on is the window, which is what they drag.
+ASSEMBLY_OMITTED_RECORD = (
+    "{shot} runs {start:.3f}s to {end:.3f}s but lays no frames on the assembly grid, so the "
+    "export used none of its take. Lengthen it past a frame, or remove it."
+)
+
 #: How a **one-sided** Transition is written into `ExportLook.transitions` (story 11.4, FX-25).
 #:
 #: It keeps the slot's `"<shot_id>=<value>"` shape and spends the value saying the two things a
@@ -9626,6 +9638,34 @@ EXPORT_PLAN_CHECKS: tuple[Callable[[ExportSubject], list[str]], ...] = (
 #: before it may already have added a tail to. A reader of the slot therefore gets every cut and
 #: then the video's own first frame, which is one entry and cannot be confused for a cut: its
 #: record says `opening`.
+def _report_omitted_clips(
+    subject: ExportSubject, composition: ExportComposition
+) -> list[str]:
+    """Every Shot the plan dropped for laying no frames, onto `ExportLook.omitted`.
+
+    **Reports and refuses nothing** (item 78). A window that rounds to the same grid frame at
+    both ends is a legal edit and a sum-neutral drop; what was wrong was that it left no trace.
+    `job.inputs` is built from the plan's surviving entries, so a Shot whose only entry was
+    dropped vanished from FR-24's *"the exact takes this export was built from"* entirely —
+    measured on `assembly_plan`'s own documented geometry, `A[0,10]` with
+    `B[0.483333,0.516667]`, whose inputs list named `shot_a` twice and `shot_b` never.
+
+    Returning `[]` always is the point: refusing here would refuse an export over a Shot the
+    Director is entitled to leave sub-frame, and `EXPORT_DURATION_PROBLEM` already answers the
+    only question that could make it fatal.
+    """
+    plan = subject.plan
+    if plan is None:
+        return []
+    composition.look.omitted.extend(
+        ASSEMBLY_OMITTED_RECORD.format(
+            shot=clip.label, start=clip.start, end=clip.end
+        )
+        for clip in plan.omitted
+    )
+    return []
+
+
 EXPORT_COMPOSITION_CHECKS: tuple[
     Callable[[ExportSubject, ExportComposition], list[str]], ...
 ] = (
@@ -9634,6 +9674,7 @@ EXPORT_COMPOSITION_CHECKS: tuple[
     _compose_one_sided_transitions,
     _compose_opening_transition,
     _report_transition_divergence,
+    _report_omitted_clips,
 )
 
 

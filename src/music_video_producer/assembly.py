@@ -610,6 +610,15 @@ class AssemblyPlan:
     #: boundary" asks by the two shot ids rather than by looking for a label in a sentence that
     #: names two. See `TransitionRefusal`.
     transition_refusals: list[TransitionRefusal] = dataclass_field(default_factory=list)
+    #: The entries this plan **dropped** because they laid no frames on the grid, in song
+    #: order. Empty on almost every plan.
+    #:
+    #: A window can be longer than `BOUNDARY_TOLERANCE_SECONDS` and still round to the same
+    #: grid frame at both ends; that entry contributes nothing and is removed, which is
+    #: provably sum-neutral. Carried here so the export can *say* so — a Shot the
+    #: Director laid down, whose take was resolved and probed, that turns out to put no
+    #: picture on screen, is a fact about their edit rather than an implementation detail.
+    omitted: list[ClipWindow] = dataclass_field(default_factory=list)
 
     @property
     def total_frames(self) -> int:
@@ -1059,8 +1068,25 @@ def assembly_plan(
                     frames=count, label=entry.label, start=entry.start, end=entry.end
                 )
             )
+    omitted: list[ClipWindow] = []
     if not all(frames):
         laid = [pair for pair in zip(entries, frames, strict=True) if pair[1]]
+        # **What was dropped is carried out, not discarded** (item 78, 2026-08-31).
+        # `job.inputs` is built from `plan.clips`, so a Shot whose only entry laid no
+        # frames left no trace at all in FR-24's *"the exact takes this export was built
+        # from"* — measured on this function's own documented geometry,
+        # `A[0,10]` with `B[0.483333,0.516667]`, whose inputs list named `shot_a` twice
+        # and `shot_b` never. The drop is right and the silence was not: a Director
+        # looking at a Shot on the timeline and at the record of the export that
+        # supposedly used it had no way to learn the two disagree.
+        #
+        # Only `ClipWindow`s can appear here. A `TransitionClip` is composed only when
+        # its blend is positive, so it cannot round to nothing.
+        omitted = [
+            entry
+            for entry, count in zip(entries, frames, strict=True)
+            if not count and isinstance(entry, ClipWindow)
+        ]
         entries = [entry for entry, _ in laid]
         frames = [count for _, count in laid]
     # A transition contributes both legs' Shots, and the normalization target is still the
@@ -1089,6 +1115,7 @@ def assembly_plan(
         height=height,
         song_seconds=song_seconds,
         transition_refusals=transition_refusals,
+        omitted=omitted,
     )
 
 

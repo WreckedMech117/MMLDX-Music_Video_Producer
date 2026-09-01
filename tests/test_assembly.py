@@ -1948,3 +1948,49 @@ def test_every_catalogued_transition_reaches_the_argv_as_its_own_xfade_name():
         assert f"xfade=transition={entry.xfade}:" in graph
         seen.add(entry.xfade)
     assert len(seen) == 12, "two catalogue entries resolve to one xfade name"
+
+
+def test_a_window_that_lays_no_frames_leaves_the_plan_but_not_the_record():
+    """Item 78. The drop is right; the silence was not.
+
+    `assembly_plan` removes an entry whose two ends round to the same grid frame. That is correct
+    and provably sum-neutral -- the entry contributed nothing, and its neighbours telescope across
+    it because `round(start * 24) == round(end * 24)` is exactly what made it zero. But
+    `job.inputs` is built from `plan.clips`, so a Shot whose **only** entry was dropped left no
+    trace at all in FR-24's *"the exact takes this export was built from"*.
+
+    Measured on this module's own documented geometry before the field existed: `A[0,10]` with
+    `B[0.483333,0.516667]` gave frames `[12, 228]` and an inputs list naming `shot_a` twice and
+    `shot_b` never. A Director looking at `shot_b` on the timeline and at the record of the export
+    that supposedly used it had no way to learn the two disagree.
+
+    **The assertions are in both directions**, because a field that is always empty and a field
+    that is always full are equally useless: the dropped Shot is named, the surviving one is not,
+    and the frame rule still holds across the drop.
+    """
+    clips = [
+        clip("shot_a", 0.0, 10.0),
+        # Longer than BOUNDARY_TOLERANCE_SECONDS, so the resolution loop keeps it -- and both ends
+        # round to grid frame 12, so it lays nothing. That is the whole of the geometry.
+        clip("shot_b", 0.483333, 0.033334),
+    ]
+    plan = plan_of(clips, 10.0)
+
+    assert list(plan.frames) == [12, 228]
+    assert sum(plan.frames) == round(10.0 * ASSEMBLY_FPS)
+    assert all(count > 0 for count in plan.frames)
+
+    # Gone from the plan, which is what the drop is for.
+    assert [entry.shot_id for entry in plan.clips] == ["shot_a", "shot_a"]
+    # And present in the record, which is what item 78 is for.
+    assert [entry.shot_id for entry in plan.omitted] == ["shot_b"]
+    assert plan.omitted[0].start == pytest.approx(0.483333)
+
+    # A plan that drops nothing records nothing: without this the field could be filled by every
+    # plan and the assertion above would still pass.
+    ordinary = plan_of(
+        [clip("shot_a", 0.0, 5.0), clip("shot_b", 5.0, 5.0)],
+        10.0,
+    )
+    assert ordinary.omitted == []
+    assert [entry.shot_id for entry in ordinary.clips] == ["shot_a", "shot_b"]

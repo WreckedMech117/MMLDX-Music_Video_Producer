@@ -1898,6 +1898,23 @@ class ExportLook(BaseModel):
     #:   refused: `transition_out` is authoritative, is what ran, and this says so (AD-30, story
     #:   11.3). An *unset* mirror is not a divergence and is never reported.
     transitions: list[str] = Field(default_factory=list)
+    #: The Shots whose windows laid **no frames** on the assembly grid, so the export used
+    #: none of their footage. One sentence each, empty on almost every export.
+    #:
+    #: *Added 2026-08-31, Epic 11 retrospective item 78.* `assembly_plan` drops an entry that
+    #: rounds to zero frames — correct, and provably sum-neutral — and
+    #: `job.inputs` is built from the plan's surviving entries, so a Shot whose only entry was
+    #: dropped vanished from FR-24's *"the exact takes this export was built from"*
+    #: altogether. Measured on `assembly_plan`'s own documented geometry: `A[0,10]` with
+    #: `B[0.483333,0.516667]` recorded `shot_a` twice and `shot_b` never.
+    #:
+    #: **It belongs on the look rather than in `inputs`** because it is the opposite claim:
+    #: `inputs` says which takes went in, and adding a take that contributed nothing would
+    #: overstate the export by exactly the frames this field exists to report as absent.
+    #: Needs no `_adopt_*` guard of its own — `look` is already a
+    #: `JOB_RECORDED_FIELDS` entry, so the whole object is server-owned across the generic
+    #: project write.
+    omitted: list[str] = Field(default_factory=list)
 
 
 class RenderJob(BaseModel):
