@@ -283,7 +283,7 @@ Both the repo adapter (`patch_ltx25_dimension_boundary`) and the Director's save
 >
 > *Amended 2026-08-28, and the sentence being amended is the one that said a green run "says
 > nothing about any of them".* Since `tests/test_e2e_harnesses.py`, a green run now says four
-> things about all ~~twenty-four~~ twenty-five, none of which needs a browser: **each one parses, each one
+> things about all ~~twenty-four~~ ~~twenty-five~~ twenty-six, none of which needs a browser: **each one parses, each one
 > imports** (with `selenium` stubbed, so a name a sibling harness stopped exporting fails the
 > suite), **each one appears in the list below with the port it really starts on**, and **the
 > collisions marked below are exactly the collisions there are**. It says nothing whatever about
@@ -313,9 +313,10 @@ uv run --with selenium python tests/e2e_band_panel.py          # default port 87
 uv run --with selenium python tests/e2e_preview_song_change.py   # default port 8784
 uv run --with selenium python tests/e2e_overlap_band.py          # default port 8785
 uv run --with selenium python tests/e2e_transition_preview.py     # default port 8786
+uv run --with selenium python tests/e2e_brief_recovery.py      # default port 8787
 ```
 
-These twenty-two **start and prove their own server** and take no base URL — `--port N` overrides. Order does not matter and they share no state; each creates a fresh temporary data root under `%TEMP%\mvp-<label>-<nonce>`, left behind as evidence.
+These twenty-three **start and prove their own server** and take no base URL — `--port N` overrides. Order does not matter and they share no state; each creates a fresh temporary data root under `%TEMP%\mvp-<label>-<nonce>`, left behind as evidence.
 
 **Three pairs share a default port** — 8768, 8769 and 8779, marked above. (`e2e_band_panel.py` was written for Epic 10 and left off this list through three slices, which is the omission the paragraph below already warns about; it landed on the Monitor preview's 8779.) `ManagedServer` refuses a bound port by name rather than reusing it, so the collision costs a failed start and never a run against the wrong server; it does mean those three pairs cannot run at the same time without `--port`. This list was five entries long and said "these five" while there were twelve, which is why the ports were never noticed to overlap. Two more were missing from it again on 2026-08-25 — the Effects tab's and the Monitor preview's — so **add the line when you add the script**; a gate nobody can find is a gate nobody runs.
 

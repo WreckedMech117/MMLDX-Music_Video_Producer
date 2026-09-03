@@ -20,8 +20,9 @@ from ..app import (
     DEFAULT_SETTING_NOT_A_SETTING,
     DELETE_PROJECT_CONFIRM,
     DOCUMENT_LABELS,
-    DOCUMENT_RESTORE_REFUSAL,
     PROJECT_CHANGED_REFUSAL,
+    RECOVERY_SLOT_SUFFIX,
+    SAVE_CAPTURED_DOCUMENTS,
     DefaultSettingRequest,
     DocumentName,
     ProjectCreate,
@@ -40,6 +41,7 @@ from ..app import (
     _require_in_flight_status_kept,
     _require_song_replacement_confirmation,
     document_restore_notice,
+    document_restore_refusal,
     legal_sections,
     refresh_reference_maps,
 )
@@ -75,19 +77,58 @@ def register(ctx: RouterContext) -> None:
 
     @app.put("/api/projects/{project_id}/documents", response_model=Project)
     def replace_documents(project_id: str, request: ProjectDocumentsRequest) -> Project:
-        project = get_project(project_id)
-        project.creative_brief = request.creative_brief
-        project.treatment = request.treatment
-        project.style_bible = request.style_bible
-        # A lock stops the *Director* from replacing a document; it does not stop the human
-        # who set it from typing in the textarea, so the text above is assigned either way.
-        # Refusing an edit here would leave the Director unable to fix a locked document
-        # without unlocking, saving, editing, and locking again.
-        if request.treatment_locked is not None:
-            project.treatment_locked = request.treatment_locked
-        if request.style_bible_locked is not None:
-            project.style_bible_locked = request.style_bible_locked
-        return store.save(project)
+        """The Director's own save of the three creative documents.
+
+        Every document is written from the body, and the loop is driven off `DOCUMENT_LABELS`
+        rather than naming three fields, so a fourth document arrives here by being added to
+        that mapping and nowhere else.
+
+        **The Brief keeps the version this save displaced, and the other two do not** — the
+        asymmetry is a Director ruling of 2026-09-03 and it follows from which writer is the
+        threat. `SAVE_CAPTURED_DOCUMENTS` carries the argument in full; the short form is that
+        an ordinary reply can replace the Treatment and the Style bible, so their slot is spent
+        on apply and spending it here as well would let one click of Save destroy the copy the
+        Director is protected by. No reply can replace the Brief, so this route is the only
+        thing that displaces its text, and a slot filled anywhere else would never fill at all.
+
+        **A byte-equal re-save captures nothing**, which is `replace_song_context`'s rule and
+        the one case where doing nothing is the whole feature: a Director who opens the Brief
+        and clicks Save without typing must not spend the slot, because the copy it would
+        overwrite is the recoverable one and the copy going in is the live one. The comparison
+        is against the exact value that is about to be stored — this route stores the body
+        verbatim, as it always has for the other two — so there is no normalisation on the way
+        in for the comparison to disagree with.
+
+        A lock stops a *machine* from replacing a document; it does not stop the human who set
+        it from typing in the textarea, so the text is assigned either way. Refusing an edit
+        here would leave the Director unable to fix a locked document without unlocking,
+        saving, editing, and locking again. See `app.document_lock_refusal`, which is what the
+        machines ask.
+
+        **The write is a compare-and-swap, and it became one when the Brief's slot moved here.**
+        `MANIFEST_WRITE_GUARDS`' own rule is that a compare-and-swap is the only answer for a
+        write whose loss is undetectable afterwards, and it names a swapped recovery slot as the
+        example. This route used to be a plain save because it only ever assigned three strings a
+        client was already holding; now it is the route that *fills* a slot, which is
+        `replace_song_context`'s position exactly. A save laid over a manifest a Director reply
+        just wrote would revert the reply *and* capture the pre-reply text as "the version you
+        had before" — two well-formed strings, and nothing downstream can tell.
+        """
+        project, generation = get_project_for_update(project_id)
+        for field in DOCUMENT_LABELS:
+            text = getattr(request, field)
+            stored = getattr(project, field)
+            if field in SAVE_CAPTURED_DOCUMENTS and text != stored:
+                setattr(project, f"{field}{RECOVERY_SLOT_SUFFIX}", stored)
+            setattr(project, field, text)
+            # Tri-state, and the one field here that means "leave it alone" when absent: every
+            # other field defaults to "", which is why an omitted one blanks its document, and
+            # a lock defaulting to False the same way would silently unlock every document on
+            # every ordinary save.
+            locked = getattr(request, f"{field}_locked")
+            if locked is not None:
+                setattr(project, f"{field}_locked", locked)
+        return store.save(project, if_generation=generation)
 
     @app.post("/api/projects/{project_id}/documents/{document}/restore", response_model=Project)
     def restore_document(project_id: str, document: DocumentName) -> Project:
@@ -122,14 +163,14 @@ def register(ctx: RouterContext) -> None:
         of documents they can see.
         """
         project, generation = get_project_for_update(project_id)
-        previous = getattr(project, f"{document}_previous")
+        previous = getattr(project, f"{document}{RECOVERY_SLOT_SUFFIX}")
         if not previous.strip():
-            raise HTTPException(
-                status_code=409,
-                detail=DOCUMENT_RESTORE_REFUSAL.format(document=DOCUMENT_LABELS[document]),
-            )
+            # The refusal names the writer that *would* have kept a version, and that is per
+            # document: for the Brief it is a save, for the other two an applied reply. See
+            # `document_restore_refusal`.
+            raise HTTPException(status_code=409, detail=document_restore_refusal(document))
         displaced = getattr(project, document)
-        setattr(project, f"{document}_previous", displaced)
+        setattr(project, f"{document}{RECOVERY_SLOT_SUFFIX}", displaced)
         setattr(project, document, previous)
         # Recorded in the thread, not only toasted: the chat is the audit trail of what
         # happened to these documents, and a restore is as much a change as a replacement.
@@ -305,11 +346,20 @@ def register(ctx: RouterContext) -> None:
         # The recovery slots and the document locks are server-owned, and this route binds a
         # whole client-supplied `Project` whose every field is defaulted. A body that simply
         # omits them — which is what any client written before they existed sends — arrives
-        # as ""/False, so trusting it lets one ordinary save clear both kept versions and
-        # unlock both documents: exactly what AD-14 and the lock exist to prevent. Worse, a
+        # as ""/False, so trusting it lets one ordinary save clear every kept version and
+        # unlock every document: exactly what AD-14 and the lock exist to prevent. Worse, a
         # body that *invents* a slot would be planting text that the restore route then swaps
-        # into the live document as "the version you had before". Only an applied Director
-        # replacement writes a slot, and only `PUT /documents` sets a lock.
+        # into the live document as "the version you had before". Only the writer that displaced
+        # a document's text writes its slot, and only `PUT /documents` sets a lock.
+        #
+        # The Brief joined this loop on 2026-09-03 with its slot and its lock, and it is the
+        # **sixteenth** recorded time this one route has been the hole for a field a narrower
+        # sibling guards — the transition pair was the fifteenth (2026-08-29). It cost no line
+        # here, because the loop is driven off `DOCUMENT_LABELS` rather than naming four fields,
+        # and that is the whole argument for the mapping: a document added there is adopted here
+        # by arriving. The guard and its test still land in the same commit as the fields (AD-16,
+        # AD-41), and both directions are tested — a body that omits them and a body that invents
+        # them, the second being the worse of the two.
         for field in DOCUMENT_LABELS:
             for owned in (f"{field}_previous", f"{field}_locked"):
                 setattr(project, owned, getattr(current, owned))

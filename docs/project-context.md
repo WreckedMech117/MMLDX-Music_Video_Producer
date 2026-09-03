@@ -86,7 +86,7 @@ Measured 2026-08-24. These are not in `AGENTS.md` and cannot be re-derived by re
 
 **Director-context field classification is an import-time gate.** `app.py:761` runs it at IMPORT TIME: a field on `Song` or `Shot` in neither the `*_DIRECTOR_VISIBLE` nor the `*_DIRECTOR_WITHHELD` frozenset raises `RuntimeError` and the application refuses to start. Raw-measurement fields go withheld, per the `vocal_spans`/`lyric_words` precedent.
 
-**Baseline as of 2026-08-24.** `uv run pytest -q` = 1916 passed in ~121 s. `uv run ruff check .` clean. `node --check` clean on both `web/assets/app.js` and `web/assets/api.js`.
+**Baseline as of 2026-09-03.** `uv run pytest` (**no `-q`** — `pyproject.toml` already sets it, and a second one suppresses the `N passed` line) = **2850 passed** in ~310 s, on a tree carrying this machine's gitignored spec artifacts; a clean checkout collects fewer, because `test_spec_frontmatter.py` parameterises one test per spec file on disk. The figure before this read ~~1916 passed as of 2026-08-24~~. `uv run ruff check .` clean. `node --check` clean on both `web/assets/app.js` and `web/assets/api.js`.
 
 ---
 

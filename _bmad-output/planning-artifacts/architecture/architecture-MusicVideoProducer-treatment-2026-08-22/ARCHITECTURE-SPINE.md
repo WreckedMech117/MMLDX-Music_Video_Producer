@@ -79,7 +79,7 @@ No AD below contradicts or weakens an inherited one.
 
 - **Binds:** TP-9, TP-NFR-1
 - **Prevents:** a persisted revision history nobody asked for, and an unbounded in-memory stack on a long conversation
-- **Rule:** The planning session's undo stack lives in **frontend state**, holding prior Brief text and its attribution ranges, bounded at a fixed depth. Nothing is persisted; a reload loses the stack, which the UX states plainly. **The persisted recovery slot (AD-41) is the durable floor** and holds the version the session began from. This follows the standing paradigm — derived and session state beats stored state — and AD-11's precedent.
+- **Rule:** The planning session's undo stack lives in **frontend state**, holding prior Brief text and its attribution ranges, bounded at a fixed depth. Nothing is persisted; a reload loses the stack, which the UX states plainly. **The persisted recovery slot (AD-41) is the durable floor.** *Corrected 2026-09-03, when the slot shipped:* it holds **the version before the last save that changed the Brief**, which is not the same thing as "the version the session began from" — during a session of repeated saves it moves forward, and the version the session opened with is gone after the second save. Whether Slice D wants a session-opening snapshot as well is a decision for Slice D with its own argument; Slice A deliberately built one slot, one step back, and nothing shaped to serve TP-9. This follows the standing paradigm — derived and session state beats stored state — and AD-11's precedent.
 
 ### AD-35 — Session consent is a client affordance; the wire is explicit every time
 
@@ -117,11 +117,26 @@ No AD below contradicts or weakens an inherited one.
 - **Prevents:** the Director sitting through two passes for a distinction they never asked about, and two analyses fused into one function that can no longer be tested apart
 - **Rule:** The Song → Treatment offer triggers **one job with one progress state** that runs both the existing `align-lyrics` structure pass and `audio.py`'s Song Envelope. **The two computations stay separate functions in separate modules**, each independently callable and independently tested; only the *trigger and the reporting* are shared. Either half failing is reported by name and does not fail the other. Treatment Planning owns this because effects Story 8.1 ships first (R-17).
 
-### AD-41 — The Brief joins the document apparatus, unchanged
+### AD-41 — The Brief joins the document apparatus, and captures on its own save
+
+*Title amended 2026-09-03; it read ~~"joins the document apparatus, unchanged"~~ and the word that was wrong is "unchanged". Shipped in Slice A of Epic 12.*
 
 - **Binds:** TP-1, TP-2
 - **Prevents:** a third document with a fourth set of rules
-- **Rule:** `creative_brief_previous` and `creative_brief_locked` are added, defaulted, and the Brief gains a `DOCUMENT_CONTROLS` entry so lock, recovery and restore behave **identically** to `treatment` and `style_bible`. `replace_project` adopts all three of `creative_brief`, `brief_attribution` and `asset_proposals` from the stored Project via the established `_adopt_*` idiom. A test asserts a full-project PUT omitting each of them leaves it intact.
+- **Rule:** `creative_brief_previous` and `creative_brief_locked` are added, defaulted, and the Brief gains a `DOCUMENT_CONTROLS` entry so **lock and restore** behave identically to `treatment` and `style_bible`. **Capture does not**, and the difference is the threat model rather than an inconsistency — see the amendment below. `replace_project` adopts the Brief's slot and lock from the stored Project via the established idiom, and a test asserts both directions: a full-project PUT omitting each of them leaves it intact, and one *inventing* them does not plant them.
+
+**Amended 2026-09-03 — capture is not identical, because the threat is not the same.** The original Rule said lock, recovery and restore behave *identically* to the other two documents. That is not achievable as written and was not built:
+
+- `treatment` and `style_bible` capture **on an applied Director replacement**. What destroys one is a model rewrite, so the slot is spent by the model's write and never by the human's save — spending it on a save would destroy the copy that protects the Director *from* the model.
+- `creative_brief` captures **on the Director's own save** (`PUT /documents`), which is `routes/song.replace_song_context`'s shape and its threat model: no ordinary reply can replace the Brief, so what destroys one is a save landing over pasted text. A byte-equal re-save captures nothing.
+
+That difference is derived rather than declared. `DOCUMENT_LABELS` used to answer two questions at once — *has the document apparatus* and *may an ordinary reply rewrite it* — which had the same answer while there were two documents. The Brief separates them, so the mapping split: `DOCUMENT_LABELS` is the apparatus (three documents; the lock, the slot, the restore route, the labels, the `replace_project` adopt loop and `DIRECTOR_CONTEXT_EXCLUDE` all derive from it), and `DIRECTOR_REPLACEABLE_DOCUMENTS` is the reply's subset, **derived from `DirectorResult`'s own fields** so it cannot drift from what a reply can actually carry. `SAVE_CAPTURED_DOCUMENTS` is the other half of that partition, and it is where the capture rule above lives.
+
+**`creative_brief` does not go on `DirectorResult`, and that is what makes the split necessary rather than optional.** Suggest Video (TP-3) and the planning passes (TP-10) *will* write the Brief — the Director's framing is that the Brief is the first stage of planning, revised before being broken down into Treatment and Style Bible — but they are their own passes with their own routes, not turns of chat. The lock is what stands between a re-run of Suggest Video and a Brief the Director spent an hour revising; every machine writer asks `app.document_lock_refusal`, which the chat route already does. A lock has never stopped the human who set it from typing in the textarea.
+
+**Two of the three fields this AD names do not exist.** `brief_attribution` arrives with Slice C (AD-33) and `asset_proposals` with Slice F; Slice A adopts what exists. Each arrives with its own `_adopt_*` guard in the same commit as the field, as AD-16 requires.
+
+**One thing this AD does not authorise:** the single slot is one step back that survives forever, and TP-9's *step back through this session's revisions* is a different mechanism with a different lifetime (AD-44: a session-scoped stack restored verbatim, bypassing reconciliation). Slice A builds no stack, and nothing in the slot is shaped so that a later reader can assume it serves TP-9.
 
 ### AD-42 — The Song Planner writes no server state
 

@@ -14,7 +14,7 @@ Three features, one story-numbering space, three epic files that cross-link each
 |---|---|---|---|
 | Base product | 1–7 | 23 | Largely built; see `docs/ROADMAP.md` for verified-vs-unverified |
 | **Shot Effects and Transitions** | 8–11 | 19 | **All four epics shipped (8, 9, 10, 11).** See §2 for what is open. |
-| **Treatment Planning** | 12–17 | 17 | **Fully planned, nothing built** |
+| **Treatment Planning** | 12–17 | 17 | **Slice A shipped 2026-09-03** (Stories 12.1, 12.2 — the Brief's lock, slot, restore and contract). Everything else planned, not built |
 
 *Corrected 2026-08-27.* The effects row read ~~**Fully planned, nothing built**~~ and the story counts read ~~24 / 18~~ for the first two features. The state claim was true on 2026-08-23 and is two epics stale; the treatment count of 17 was right and is untouched. `sprint-status.yaml` carries **`epic-8: done`** (8.1–8.3) and **`epic-9: done`** (9.1–9.7), across roughly fifteen commits ending at `0b0bb96`; `audio.py` and `effects.py` both ship, with the envelope sidecar, beat markers and snapping, the Effects tab, the preview cache and an effects-aware export behind them. Counted today against `epics.md`, `epics-effects.md` and `epics-treatment.md`: **23 / 19 / 17**. The effects figure moved because Epic 9 gained Story 9.7 during the build, and the base figure was never 24. This is the row `AGENTS.md` sends every new session to read first, and it was two epics stale — the same failure Epic 9's retrospective found in the tracker.
 
@@ -27,7 +27,7 @@ Sprint tracking: `_bmad-output/implementation-artifacts/sprint-status.yaml` — 
 | Feature | Artifacts |
 |---|---|
 | Effects | `effects-and-transitions-research-2026-08-21.md` · `effects-director-rulings-2026-08-21.md` (R-1…R-7) · **`effects-director-rulings-2026-08-24.md` (~~R-8…R-28~~ ~~R-8…R-32~~ ~~R-8…R-41~~ R-8…R-46)** *(corrected 2026-08-28 twice, and again on 2026-08-30 by the commit that added R-42 — the third time, and the first where the range moved in the same pass as the ruling rather than one pass later. The first range was written by `ad67a14`, the commit that added R-29 and R-30. The correction to R-32 was written by `1933c2e`, **the commit that added R-33** — the same defect, in the pass that was fixing it. Found by `tests/test_stale_claims.py` on its first run, which is why that guard exists.)* · `prds/prd-MusicVideoProducer-effects-2026-08-21/` · `ux-designs/ux-effects-2026-08-21/` · `architecture/architecture-MusicVideoProducer-effects-2026-08-21/` (AD-16…AD-31 + `BUILD-ORDER.md`) · `epics-effects.md` |
-| Treatment | `treatment-planning-findings-and-rulings-2026-08-22.md` (F-1…F-6, R-1…R-17) · `prds/prd-MusicVideoProducer-treatment-2026-08-22/` · `ux-designs/ux-treatment-2026-08-22/` · `architecture/architecture-MusicVideoProducer-treatment-2026-08-22/` (AD-32…AD-47 + `BUILD-ORDER.md`) · `epics-treatment.md` |
+| Treatment | `treatment-planning-findings-and-rulings-2026-08-22.md` (F-1…F-6, R-1…R-18) · `prds/prd-MusicVideoProducer-treatment-2026-08-22/` · `ux-designs/ux-treatment-2026-08-22/` · `architecture/architecture-MusicVideoProducer-treatment-2026-08-22/` (AD-32…AD-47 + `BUILD-ORDER.md`) · `epics-treatment.md` |
 
 All paths relative to `_bmad-output/planning-artifacts/` — *corrected 2026-08-27, this said ~~`_bmad-output/`~~ and there is no `_bmad-output/prds/`, `ux-designs/` or `architecture/`; every artifact above is one level further down.* Requirement prefixes never collide: base `FR-`, effects `FX-`, treatment `TP-`. Architecture decisions are one sequence, `AD-1`…`AD-47`.
 
@@ -35,7 +35,7 @@ All paths relative to `_bmad-output/planning-artifacts/` — *corrected 2026-08-
 
 ## 2. Where to start
 
-**Treatment Epic 12 or Epic 17 — the effects `BUILD-ORDER.md` has no unbuilt slice left.** Slices A (song analysis), B (the chain builder), C (the Effects tab), D (preview), E (reactive binding) and F (transitions) are all built. Pick from the independent quick wins below, or from §6's open items — which is where the effects work that is genuinely still owed now lives.
+**Treatment `BUILD-ORDER.md`'s Slice B, or Epic 17 — the effects `BUILD-ORDER.md` has no unbuilt slice left, and treatment Slice A shipped 2026-09-03.** Slices A (song analysis), B (the chain builder), C (the Effects tab), D (preview), E (reactive binding) and F (transitions) are all built. Pick from the independent quick wins below, or from §6's open items — which is where the effects work that is genuinely still owed now lives.
 
 *Corrected 2026-08-30.* This said ~~**Effects Epic 10 — Reactive Binding, which is `BUILD-ORDER.md`'s Slice E**~~ and went on describing E's foundation as though nothing had been built on it. Epic 10 shipped 2026-08-27 and Epic 11 on 2026-08-29. This is §1's stale cell met a second time in the same document: the *state* was corrected on 2026-08-27 and the *instruction that reads it* was not, so a session that skipped the table and read this heading — which is what §8 tells it to do — would have started an epic that was already in `git log`.
 
@@ -45,7 +45,7 @@ All paths relative to `_bmad-output/planning-artifacts/` — *corrected 2026-08-
 
 **Independent quick wins**, each justified on its own and blocking nothing:
 
-- Treatment **Story 12.1/12.2** — Brief lock, recovery slot, restore, contract line. Closes FR-16's unstated exception.
+- ~~Treatment **Story 12.1/12.2** — Brief lock, recovery slot, restore, contract line. Closes FR-16's unstated exception.~~ **Shipped 2026-09-03.** The Brief now has the whole apparatus and is the *best* protected of the three. The one thing it did not do as planned is capture: the Brief's slot is filled by the Director's own save, not by an applied reply, because no reply can write the Brief — see AD-41's amendment, and `DIRECTOR_REPLACEABLE_DOCUMENTS`, which is the mapping split that made the difference expressible. **It did not close FR-16 completely**, and the residue is on the other two documents rather than on the Brief — see §6.
 - Treatment **Epic 17** — the Song Planner. Fully independent, sits at the true start of the workflow.
 - Treatment **Story 16.1** — plain proceed-to-next-step buttons, without their offers.
 - ~~Effects **Epic 8** — song analysis, beat markers, beat-snapping.~~ **Shipped 2026-08-24.**
@@ -431,7 +431,7 @@ Helpers are a separate question from routes: `_adopt_shot_effects`, `_adopt_job_
 
 ### The generic project PUT is this codebase's recurring guard hole
 
-`replace_project` — in **`routes/project.py`** since the split, not in `app.py` — carries comments counting the **fifteenth** finding of the same hole *(fifteenth as of 2026-08-29: the Transition pair, `_adopt_shot_transitions`, guarded in the same commit as the field; this said **fourteenth** until 2026-08-30 while §8 of this same document already said fifteen — one number, two places, and they disagreed for a day)*. The established remedy is an `_adopt_*` helper that takes the field off the **stored** project before the body is trusted — `_adopt_song_recovery_slots`, `_adopt_song_vocal_type`, `_adopt_song_analysis`, `_adopt_expansion_maps`, `_adopt_shot_effects`, `_adopt_job_measurements`.
+`replace_project` — in **`routes/project.py`** since the split, not in `app.py` — carries comments counting the **sixteenth** finding of the same hole *(sixteenth as of 2026-09-03: the Brief's recovery slot and lock, which cost no new line because that adoption loop is driven off `DOCUMENT_LABELS`; fifteenth as of 2026-08-29 was the Transition pair, `_adopt_shot_transitions`, guarded in the same commit as the field. This said **fourteenth** until 2026-08-30 while §8 of this same document already said fifteen — one number, two places, and they disagreed for a day, which is why both were moved together this time.)*. The established remedy is an `_adopt_*` helper that takes the field off the **stored** project before the body is trusted — `_adopt_song_recovery_slots`, `_adopt_song_vocal_type`, `_adopt_song_analysis`, `_adopt_expansion_maps`, `_adopt_shot_effects`, `_adopt_job_measurements`.
 
 *Corrected 2026-08-27.* This said ~~"`replace_project` in `app.py` carries a comment counting the **sixth** finding"~~, and both halves were wrong. The route moved; and the count reached **fourteen** — the envelope pointer was the twelfth, the Effect Stack the thirteenth (Epic 9, `_adopt_shot_effects`) and the record of what an export looked like the fourteenth. **Re-counted 2026-08-27 and it is fourteen, not thirteen:** the envelope-pointer guard (`_adopt_song_analysis`, 2026-08-24) had been numbered *seventh*, a number `character_slot` already held since 2026-08-21, so one instance was invisible in the route's own ledger. Dated from `git log -S` on each comment, it falls twelfth; the Effect Stack is the thirteenth and the export-look record the fourteenth. **The ordinals in that route are instance numbers, not a running total:** `routes/song.py`'s "the sixth time that route has had to be defended" is `Song.vocal_type`, instance six, and it is correct and stays six. Only a claim about *how many times in total* has to move.
 
@@ -477,6 +477,22 @@ None blocks starting. All are recorded in the spines' `Deferred` sections.
 - **`populate` after Treatment ships.** Richer Briefs make richer Treatments, and a Treatment is populate's input — **planning succeeding makes populate's job bigger.** Note that `91c7120` recorded populate's first live run and fixed four defects, so some of this may already be answered.
 - **Krea reference sheet sampling stages** — the "one of three" finding is stale; `res_multistep` now appears in the builders. Re-measure before treating reference fidelity as a lever.
 
+**Found while building treatment Slice A (2026-09-03), needs a Director ruling before anyone builds it:**
+
+- **FR-16 still has a hole, and it is not the one Slice A closed.** The Brief is now protected on every path.
+  `treatment` and `style_bible` are not: `PUT /documents` assigns their text from the body with no capture and
+  no confirmation, so a Director who clears the Treatment textarea and clicks **Save document** destroys it with
+  nothing kept — the exact threat model the 2026-09-03 ruling identified for the Brief, on the two documents
+  that were supposed to be the protected ones. Slice A deliberately did not close it, because the obvious fix is
+  wrong: capturing on save for those two would let one click of Save spend the single slot that exists to protect
+  the Director *from the model*. The candidate remedies are a clearing confirmation on the document save
+  (`songContextClearing`'s shape, and the song context asks exactly this question already) or a second slot, and
+  which one is a decision, not an implementation detail. **Measured, not reasoned:** a `PUT /documents`
+  carrying `""` for all three documents left `creative_brief_previous` holding the Brief while both other slots
+  stayed empty, and `POST .../documents/treatment/restore` answered 409. No browser run has been made against
+  it, and no test in the suite asserts either half — the gap is recorded here rather than pinned in code,
+  because pinning the current behaviour would be asserting the defect.
+
 **Open questions with owners:**
 
 - Effects: attribution-free — 3 open, 1 UX (transition catalogue size), 2 architecture.
@@ -491,7 +507,7 @@ Violating one of these is a defect even when the code works.
 1. **The frame grid is inviolable.** The assembled video matches the song within one frame, for every combination of effects and transitions. Effects `FX-NFR-1`.
 2. **One engine describes an effect.** Preview is the export's own filter chain at smaller dimensions — never an approximation. Effects `FX-NFR-3`.
 3. **Nothing renders without confirmation.** Every GPU spend passes an explicit confirmation naming what will run.
-4. **Never silently destroy a creative document.** FR-16, and after Treatment Story 12.1 it holds for all three documents with no exception.
+4. **Never silently destroy a creative document.** FR-16. Since Treatment Slice A shipped (2026-09-03) it holds against every *machine* write for all three documents, and the **Brief** holds against the human save too — its slot is filled by the Director's own save rather than by an applied reply, because no reply can write it (AD-41, amended). **It does not yet hold against the human save for `treatment` and `style_bible`**: measured 2026-09-03, a `PUT /documents` carrying empty text for all three left the Brief recoverable and both of the others gone with the restore answering 409. See §6 — that gap needs a ruling, not an implementation.
 5. **Derived beats stored.** Media presence, envelope validity, preview staleness, proposal staleness, effects presence — all computed at read time, never a stored flag that can outlive its condition. AD-11 and everything that cites it.
 6. **Consent is explicit on the wire, never ambient.** Planning Mode's session consent is a *client* affordance; every request still carries consent. AD-35.
 7. **The palette is closed at six accents.** `--acid` complete/action · `--amber` running/caution · `--red` error · `--cyan` approved · `--blue` transitions and reactive bindings · `--dim`/`--muted` inert. A seventh needs the argument made from scratch.
@@ -503,4 +519,4 @@ Violating one of these is a defect even when the code works.
 
 ## 8. If you only read one thing
 
-Start on **treatment Epic 12 or Epic 17** *(corrected 2026-08-30; this said ~~Start on **effects Epic 10 — Slice E**~~, itself a 2026-08-27 correction of ~~Start on **effects Story 8.1**~~, and Slice E shipped that same day with Slice F two days after it)*. **This one sentence has now been stale three times, and it is the sentence whose whole job is to be read alone** — which is why §1's table, §2's heading and this line are three copies of one fact and were corrected together rather than one at a time. Put a new route in `src/music_video_producer/routes/`, not in `app.py`. Before writing any LLM-facing schema, read §3's model envelope and use `_promoted()`. Before adding any field to `Project` or `Shot`, write its `_adopt_*` guard and its test in the same commit — that hole has now been found ~~fourteen~~ **fifteen** times in one route *(the transition pair, 2026-08-29 — guarded in the same commit as the field, as the Rule asks, and still counted)*. Before planning around any constraint written more than a few days ago, re-run it.
+Start on **treatment Slice B or Epic 17** *(corrected 2026-09-03, when treatment Slice A shipped; this said ~~Start on **treatment Epic 12 or Epic 17**~~, itself a 2026-08-30 correction of ~~Start on **effects Epic 10 — Slice E**~~ and before that of ~~Start on **effects Story 8.1**~~)*. **This one sentence has now been stale three times, and it is the sentence whose whole job is to be read alone** — which is why §1's table, §2's heading and this line are three copies of one fact and were corrected together rather than one at a time. Put a new route in `src/music_video_producer/routes/`, not in `app.py`. Before writing any LLM-facing schema, read §3's model envelope and use `_promoted()`. Before adding any field to `Project` or `Shot`, write its `_adopt_*` guard and its test in the same commit — that hole has now been found ~~fourteen~~ ~~fifteen~~ **sixteen** times in one route *(the Brief's slot and lock, 2026-09-03 — guarded in the same commit as the fields, as the Rule asks, and still counted; the transition pair, 2026-08-29, was the fifteenth)*. Before planning around any constraint written more than a few days ago, re-run it.

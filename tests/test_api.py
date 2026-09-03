@@ -67,10 +67,13 @@ from music_video_producer.app import (
     CONSISTENCY_PROMPT_TOO_LONG,
     DELETE_ASSET_CITED,
     DIRECTOR_CONTEXT_EXCLUDE,
+    DIRECTOR_REPLACEABLE_DOCUMENTS,
     DOCUMENT_LABELS,
     DOCUMENT_LOCK_NOTICE,
     DOCUMENT_REJECTED_EMPTY_NOTICE,
     DOCUMENT_REJECTED_NOTICE,
+    DOCUMENT_SLOT_CAPTURE,
+    DOCUMENT_SLOT_DISPLACEMENT,
     ENHANCE_IN_FLIGHT_REFUSAL,
     ENHANCE_PREFIX_SUFFIX,
     EXPAND_PROMPTS_WITHOUT_SHOTS,
@@ -113,6 +116,7 @@ from music_video_producer.app import (
     RESTORE_AUDIO_NO_TAKE_REFUSAL,
     RESTORE_AUDIO_NOT_SONG_AUDIO_REFUSAL,
     RESTORE_AUDIO_PREFIX_SUFFIX,
+    SAVE_CAPTURED_DOCUMENTS,
     SAVE_RACE_REFUSAL,
     SHOT_BINDINGS_ABSENT_REFUSAL,
     SHOT_BINDINGS_CARD_MOVED_REFUSAL,
@@ -163,6 +167,9 @@ from music_video_producer.app import (
     create_app,
     document_change_notice,
     document_first_draft_notice,
+    document_lock_refusal,
+    document_restore_notice,
+    document_restore_refusal,
     heal_orphaned_local_jobs_at_startup,
     multiview_refusal,
     prose_claims_shots,
@@ -6159,12 +6166,34 @@ class ConcurrentEditDirector(FakeDirector):
 
 
 def documented_project(store: ProjectStore, name: str) -> Project:
-    """A project whose two creative documents both hold work worth losing."""
+    """A project whose three creative documents all hold work worth losing.
+
+    The Brief joined on 2026-09-03 with its own slot and lock, and it is filled here for the
+    reason a fixture exists at all: every guard below reaches its fields by interpolation off
+    `DOCUMENT_LABELS`, so a Brief left at `""` would let each of them run over a document with
+    nothing in it and pass whatever it did.
+    """
     project = store.create(Project(name=name))
+    project.creative_brief = "A night drive that opens into wilderness; one character, no dialogue."
     project.treatment = "The original treatment, written by hand over several sessions."
     project.style_bible = "Sodium amber, hard backlight, 35mm grain, wardrobe continuity notes."
     store.save(project)
     return store.get(project.id)
+
+
+def project_documents(project: Project, **overrides: object) -> dict:
+    """The body `PUT /documents` takes for this project, as the browser sends it.
+
+    Every document and every lock, because the route reads an absent lock as *leave it alone*
+    and an absent document as *blank it* -- so a partial body written by hand in a test is a
+    different request from the one the workspace makes.
+    """
+    body: dict = {}
+    for field in DOCUMENT_LABELS:
+        body[field] = getattr(project, field)
+        body[f"{field}_locked"] = getattr(project, f"{field}_locked")
+    body.update(overrides)
+    return body
 
 
 def test_applied_replacement_keeps_the_previous_version_and_names_what_changed(tmp_path: Path):
@@ -6450,20 +6479,52 @@ def test_an_imported_songs_lyrics_and_style_reach_the_directors_context(tmp_path
 
 
 def test_document_mapping_field_names_and_context_exclusion_cannot_drift():
-    """One mapping, and everything derived from it — asserted, not assumed.
+    """Two mappings now, and every derived site reads the one that answers its question.
 
-    The guard loop reaches document fields by string interpolation (`f"{field}_previous"`),
-    so a name in `DOCUMENT_LABELS` that `Project` does not carry is an `AttributeError` at
-    request time rather than a startup failure, and a slot on `Project` that the mapping does
-    not know about is a full second copy of a document silently added to every prompt.
+    `DOCUMENT_LABELS` is *has the document apparatus* — a lock, a single kept version, a restore
+    route and a name on screen. `DIRECTOR_REPLACEABLE_DOCUMENTS` is *may an ordinary reply
+    rewrite it*. Those were one mapping while there were two documents, and the Brief is the case
+    that separates them: it has the apparatus and no reply may write it.
+
+    Both halves matter. The apparatus loops reach fields by string interpolation
+    (`f"{field}_previous"`), so a name in `DOCUMENT_LABELS` that `Project` does not carry is an
+    `AttributeError` at request time rather than a startup failure, and a slot on `Project` that
+    the mapping does not know about is a full second copy of a document silently added to every
+    prompt. The reply loop reads the candidate off `DirectorResult` by the same name, so an entry
+    there that the model has no field for is the same `AttributeError` one route along.
     """
     assert set(DOCUMENT_LABELS) == set(get_args(DocumentName))
     for field in DOCUMENT_LABELS:
         for owned in (field, f"{field}_previous", f"{field}_locked"):
             assert owned in Project.model_fields, owned
-        # The loop reads the candidate off DirectorResult by the same name.
-        assert field in DirectorResult.model_fields, field
         assert DIRECTOR_CONTEXT_EXCLUDE[f"{field}_previous"] is True, field
+    # The reply-replaceable subset is a subset, and every member of it is a field a reply
+    # actually carries — which is what it is derived from, asserted here rather than assumed.
+    assert set(DIRECTOR_REPLACEABLE_DOCUMENTS) <= set(DOCUMENT_LABELS)
+    for field, label in DIRECTOR_REPLACEABLE_DOCUMENTS.items():
+        assert field in DirectorResult.model_fields, field
+        assert DOCUMENT_LABELS[field] == label, field
+    # And the Brief is deliberately not one, which is the Director's ruling of 2026-09-03 and
+    # the reason the mapping had to split at all. Pinned here because the whole feature inverts
+    # if `creative_brief` ever lands on `DirectorResult`: an ordinary chat turn would start
+    # rewriting the Director's own input, and the capture would silently move off the save.
+    assert "creative_brief" in DOCUMENT_LABELS
+    assert "creative_brief" not in DirectorResult.model_fields
+    assert "creative_brief" not in DIRECTOR_REPLACEABLE_DOCUMENTS
+    # The two halves partition the apparatus: every document either captures on an applied reply
+    # or captures on its own save, and none does both or neither.
+    assert set(SAVE_CAPTURED_DOCUMENTS) | set(DIRECTOR_REPLACEABLE_DOCUMENTS) == set(DOCUMENT_LABELS)
+    assert not set(SAVE_CAPTURED_DOCUMENTS) & set(DIRECTOR_REPLACEABLE_DOCUMENTS)
+    assert SAVE_CAPTURED_DOCUMENTS == ("creative_brief",)
+    # Every recovery sentence is phrased per document off that partition, so neither can name a
+    # writer the document does not have.
+    for field in DOCUMENT_LABELS:
+        replaceable = field in DIRECTOR_REPLACEABLE_DOCUMENTS
+        assert ("Director reply" in DOCUMENT_SLOT_CAPTURE[field]) is replaceable, field
+        assert ("save" in DOCUMENT_SLOT_CAPTURE[field]) is not replaceable, field
+        assert ("applied replacement" == DOCUMENT_SLOT_DISPLACEMENT[field]) is replaceable, field
+        assert DOCUMENT_SLOT_DISPLACEMENT[field] in document_restore_notice(field), field
+        assert DOCUMENT_SLOT_CAPTURE[field] in document_restore_refusal(field), field
     slots = {name for name in Project.model_fields if name.endswith("_previous")}
     assert slots == {f"{field}_previous" for field in DOCUMENT_LABELS}
     assert {name for name in DIRECTOR_CONTEXT_EXCLUDE if name.endswith("_previous")} == slots
@@ -6491,45 +6552,265 @@ def test_document_mapping_field_names_and_context_exclusion_cannot_drift():
 def test_full_project_put_cannot_clear_the_slots_or_the_locks(tmp_path: Path):
     """The sibling-route hole the Song story had, in its document form.
 
-    `replace_project` binds a whole client `Project` and every one of these four fields is
+    `replace_project` binds a whole client `Project` and every one of these six fields is
     defaulted, so a body that merely *omits* them — which is what any client written before
-    they existed sends — arrives as ""/False. Trusting it means one ordinary save clears both
-    kept versions and unlocks both documents. Worse, a body that *invents* a slot would be
+    they existed sends — arrives as ""/False. Trusting it means one ordinary save clears every
+    kept version and unlocks every document. Worse, a body that *invents* a slot would be
     planting text the restore route then swaps into the live document as "the version you
     had before".
+
+    **Driven off `DOCUMENT_LABELS` in both directions**, so a document added to the mapping is
+    covered here by arriving rather than by somebody remembering to extend two lists — which is
+    how the Brief's pair is covered in the same commit that adds them (AD-16, AD-41). The forge
+    direction used to name `treatment` alone; it now names every document, because a slot the
+    body invented is the failure that survives into the *restore button* rather than merely
+    losing something, and one document proving it says nothing about the next.
     """
     client, store = make_client_with_director(tmp_path, RefusingDirector())
     project = documented_project(store, "Full save")
-    project.treatment_previous = "The kept treatment an ordinary save must not discard."
-    project.style_bible_previous = "The kept style bible an ordinary save must not discard."
-    project.treatment_locked = True
-    project.style_bible_locked = True
+    for field in DOCUMENT_LABELS:
+        setattr(project, f"{field}_previous", f"The kept {field} an ordinary save must not discard.")
+        setattr(project, f"{field}_locked", True)
     store.save(project)
 
     omitted = client.get(f"/api/projects/{project.id}").json()
     for field in DOCUMENT_LABELS:
         del omitted[f"{field}_previous"]
         del omitted[f"{field}_locked"]
-    omitted["creative_brief"] = "Edited by a client that predates recovery."
+    omitted["treatment"] = "Edited by a client that predates recovery."
 
     response = client.put(f"/api/projects/{project.id}", json=omitted)
 
     assert response.status_code == 200
     saved = ProjectStore(tmp_path).get(project.id)
-    assert saved.creative_brief == "Edited by a client that predates recovery."
-    assert saved.treatment_previous == "The kept treatment an ordinary save must not discard."
-    assert saved.style_bible_previous == "The kept style bible an ordinary save must not discard."
-    assert saved.treatment_locked is True
-    assert saved.style_bible_locked is True
+    assert saved.treatment == "Edited by a client that predates recovery."
+    for field in DOCUMENT_LABELS:
+        kept = f"The kept {field} an ordinary save must not discard."
+        assert getattr(saved, f"{field}_previous") == kept, field
+        assert getattr(saved, f"{field}_locked") is True, field
 
     forged = client.get(f"/api/projects/{project.id}").json()
-    forged["treatment_previous"] = "Text nobody ever wrote, planted to be restored later."
-    forged["treatment_locked"] = False
+    for field in DOCUMENT_LABELS:
+        forged[f"{field}_previous"] = f"Text nobody wrote, planted so a restore swaps it in: {field}."
+        forged[f"{field}_locked"] = False
 
     assert client.put(f"/api/projects/{project.id}", json=forged).status_code == 200
     unforged = ProjectStore(tmp_path).get(project.id)
-    assert unforged.treatment_previous == "The kept treatment an ordinary save must not discard."
-    assert unforged.treatment_locked is True
+    for field in DOCUMENT_LABELS:
+        kept = f"The kept {field} an ordinary save must not discard."
+        assert getattr(unforged, f"{field}_previous") == kept, field
+        assert getattr(unforged, f"{field}_locked") is True, field
+    # And the planted text reached nothing a Director can be shown: the restore route swaps the
+    # *stored* slot into the live document, so the forgery must not be recoverable either.
+    for field in DOCUMENT_LABELS:
+        restored = client.post(f"/api/projects/{project.id}/documents/{field}/restore")
+        assert restored.status_code == 200, field
+        assert restored.json()[field] == f"The kept {field} an ordinary save must not discard.", field
+
+
+def test_a_brief_save_keeps_the_version_it_displaced_and_the_restore_swaps_it_back(tmp_path: Path):
+    """TP-1's core, and the Brief's own threat model rather than the Treatment's.
+
+    Nothing a Director reply does can touch the Brief, so the write that destroys one is a save
+    landing over pasted text — `Song.lyrics_previous`' case exactly. The slot is therefore filled
+    by `PUT /documents`, which is the Director's own save, and that is the ruling of 2026-09-03.
+
+    Re-read through a fresh `ProjectStore` because the response body is the object the handler
+    just built; only the manifest proves the recovery survives a restart. And the restore runs
+    through the real route rather than reading the field, because the claim is that the Director
+    can get the text back, not that a string was stored somewhere.
+    """
+    client, store = make_client_with_director(tmp_path, RefusingDirector())
+    project = documented_project(store, "Brief recovery")
+    pasted = project.creative_brief
+
+    saved = client.put(
+        f"/api/projects/{project.id}/documents",
+        json=project_documents(project, creative_brief="A daylight desert chase. Nothing like it."),
+    )
+
+    assert saved.status_code == 200
+    stored = ProjectStore(tmp_path).get(project.id)
+    assert stored.creative_brief == "A daylight desert chase. Nothing like it."
+    assert stored.creative_brief_previous == pasted
+    # Only the Brief's slot moved: the other two capture on an applied reply, and a human save
+    # that spent theirs would destroy the copy that protects them from the model.
+    assert stored.treatment_previous == ""
+    assert stored.style_bible_previous == ""
+
+    restored = client.post(f"/api/projects/{project.id}/documents/creative_brief/restore")
+
+    assert restored.status_code == 200
+    back = ProjectStore(tmp_path).get(project.id)
+    assert back.creative_brief == pasted
+    # The swap is symmetric, so a mis-click costs nothing — and the thread records it, because
+    # the chat is the audit trail of what happened to the creative documents.
+    assert back.creative_brief_previous == "A daylight desert chase. Nothing like it."
+    assert back.messages[-1].content == document_restore_notice("creative_brief")
+    assert "save that changed it" in back.messages[-1].content
+
+
+def test_a_byte_equal_brief_save_captures_nothing(tmp_path: Path):
+    """The one case where doing nothing is the whole feature.
+
+    A Director opening the Brief and clicking Save without typing is the likeliest accidental
+    path there is. There is one slot: capturing on that save overwrites the genuinely
+    recoverable version with a copy of the live text, so the click that changed nothing destroys
+    the only thing the feature exists to keep. `replace_song_context` states the rule and this is
+    its document half.
+
+    The comparison has to be against what is *stored* rather than against what the client last
+    sent, which is the shape the second save below has: it carries text the first save made
+    current.
+    """
+    client, store = make_client_with_director(tmp_path, RefusingDirector())
+    project = documented_project(store, "Brief no-op")
+    client.put(
+        f"/api/projects/{project.id}/documents",
+        json=project_documents(project, creative_brief="The revision worth keeping."),
+    )
+    current = ProjectStore(tmp_path).get(project.id)
+    assert current.creative_brief_previous == project.creative_brief
+
+    again = client.put(
+        f"/api/projects/{project.id}/documents", json=project_documents(current)
+    )
+
+    assert again.status_code == 200
+    unchanged = ProjectStore(tmp_path).get(project.id)
+    assert unchanged.creative_brief == "The revision worth keeping."
+    assert unchanged.creative_brief_previous == project.creative_brief
+    # And the restore still returns the version the Director actually wants, rather than a copy
+    # of what is already on screen — which is what a spent slot looks like from the outside.
+    client.post(f"/api/projects/{project.id}/documents/creative_brief/restore")
+    assert ProjectStore(tmp_path).get(project.id).creative_brief == project.creative_brief
+
+
+def test_a_brief_save_that_differs_only_in_whitespace_still_keeps_a_version(tmp_path: Path):
+    """The comparison is against what will be *stored*, and this is the half that says so.
+
+    "A byte-equal re-save captures nothing" has an obvious over-correction: comparing the two
+    texts stripped, or collapsed, or trimmed. That reads as the tidier no-op check and it is a
+    silent data loss — this route stores the body verbatim, as it always has for the other two
+    documents, so a save that only adds a paragraph break *does* change what is on disk, and a
+    comparison looser than the write leaves that change with no previous version behind it.
+
+    The rule is therefore not "ignore trivia", it is **compare the exact value you are about to
+    store against the exact value you are replacing**. `replace_song_context` normalises on the
+    way in and compares the normalised submission for that reason; this route normalises nothing,
+    and comparing as though it did would be the mismatch the rule exists to forbid.
+    """
+    client, store = make_client_with_director(tmp_path, RefusingDirector())
+    project = documented_project(store, "Whitespace only")
+    padded = f"{project.creative_brief}\n\n"
+
+    response = client.put(
+        f"/api/projects/{project.id}/documents",
+        json=project_documents(project, creative_brief=padded),
+    )
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.creative_brief == padded
+    assert saved.creative_brief_previous == project.creative_brief
+
+
+def test_a_locked_brief_refuses_a_machine_write_and_still_takes_the_directors_own(tmp_path: Path):
+    """A lock stops the machines, never the human who set it. TP-1, and ruling 2 of 2026-09-03.
+
+    Nothing writes the Brief yet: Suggest Video (TP-3) and the planning passes (TP-10) will, and
+    the lock is what stands between a re-run of one of them and a Brief the Director spent an
+    hour revising. So the enforcement point is asserted directly — `document_lock_refusal` is the
+    one answer to *may a machine write this document*, and the chat route already asks it — and
+    the human half through the real save route, where refusing would leave a Director unable to
+    fix a locked document without unlocking, saving, editing and locking again.
+    """
+    client, store = make_client_with_director(tmp_path, RefusingDirector())
+    project = documented_project(store, "Locked brief")
+
+    assert document_lock_refusal(project, "creative_brief") == ""
+    project.creative_brief_locked = True
+    store.save(project)
+    locked = store.get(project.id)
+
+    refusal = document_lock_refusal(locked, "creative_brief")
+    assert DOCUMENT_LABELS["creative_brief"] in refusal
+    assert "you can still edit the document yourself" in refusal
+    # Every document answers the same question the same way, which is the point of one helper.
+    for field in DOCUMENT_LABELS:
+        expected = (
+            DOCUMENT_LOCK_NOTICE.format(document=DOCUMENT_LABELS[field])
+            if getattr(locked, f"{field}_locked")
+            else ""
+        )
+        assert document_lock_refusal(locked, field) == expected, field
+
+    typed = client.put(
+        f"/api/projects/{project.id}/documents",
+        json=project_documents(locked, creative_brief="Edited by the Director who locked it."),
+    )
+
+    assert typed.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.creative_brief == "Edited by the Director who locked it."
+    # The lock survives the edit, and the slot still captured: locking a document does not stop
+    # the Director's own save from being recoverable.
+    assert saved.creative_brief_locked is True
+    assert saved.creative_brief_previous == project.creative_brief
+
+
+def test_an_ordinary_reply_can_neither_write_the_brief_nor_spend_its_slot(tmp_path: Path):
+    """The Brief is the Director's input, and no chat turn rewrites it — structurally.
+
+    `DirectorResult` carries no `creative_brief`, so the apply loop cannot reach for one; this
+    asserts the consequence through the route with consent given, which is the only state in
+    which a reply writes anything at all. A reply that could write the Brief would invert the
+    feature: the document the Treatment and Style bible are generated *from* would be rewritten
+    by the same turn that generates them.
+    """
+    director = RevisingDirector()
+    client, store = make_client_with_director(tmp_path, director)
+    project = documented_project(store, "Reply cannot write the brief")
+    project.creative_brief_previous = "The genuinely recoverable brief."
+    store.save(project)
+
+    response = client.post(
+        f"/api/projects/{project.id}/director/chat",
+        json={"message": "Rewrite everything", "apply_documents": True},
+    )
+
+    assert response.status_code == 200
+    saved = ProjectStore(tmp_path).get(project.id)
+    assert saved.creative_brief == project.creative_brief
+    assert saved.creative_brief_previous == "The genuinely recoverable brief."
+    # The two it may write did move, so the turn was a real one rather than a decline.
+    assert saved.treatment != project.treatment
+    # And the reply does not name the Brief in what it claims to have changed.
+    assert DOCUMENT_LABELS["creative_brief"] not in saved.messages[-1].content
+
+
+def test_each_documents_restore_refusal_names_the_writer_that_would_keep_a_version(tmp_path: Path):
+    """The one sentence a Director reads while looking for a version that is not there.
+
+    It used to say a version is only kept "when a Director reply actually replaces the document".
+    For the Brief that names a writer which does not exist and, by ruling, never will — so the
+    sentence would tell a Director the Brief is unprotected and to stop looking for the button
+    that protects it. Executed through the real route for every document, because the phrase is
+    chosen per document and a mapping asserted in isolation proves nothing about the 409.
+    """
+    client, store = make_client_with_director(tmp_path, RefusingDirector())
+    project = store.create(Project(name="Empty slots"))
+
+    for field in DOCUMENT_LABELS:
+        refused = client.post(f"/api/projects/{project.id}/documents/{field}/restore")
+        assert refused.status_code == 409, field
+        assert refused.json()["detail"] == document_restore_refusal(field), field
+        assert DOCUMENT_SLOT_CAPTURE[field] in refused.json()["detail"], field
+        # The client recognises every one of them by the same marker, or its stale-project
+        # refresh silently stops working for whichever document changed wording.
+        assert "nothing to restore" in refused.json()["detail"], field
+    assert "a save changes the document's text" in document_restore_refusal("creative_brief")
+    assert "a Director reply" in document_restore_refusal("treatment")
 
 
 def test_identical_candidate_neither_spends_the_slot_nor_claims_a_change(tmp_path: Path):
@@ -6951,7 +7232,7 @@ def test_restore_rejects_an_unknown_document_and_an_unknown_project(tmp_path: Pa
     client, store = make_client_with_director(tmp_path, RefusingDirector())
     project = documented_project(store, "Bad targets")
 
-    unknown_document = client.post(f"/api/projects/{project.id}/documents/creative_brief/restore")
+    unknown_document = client.post(f"/api/projects/{project.id}/documents/shot_list/restore")
     unknown_project = client.post("/api/projects/project_deadbeef0000/documents/treatment/restore")
 
     assert unknown_document.status_code == 422
@@ -7365,7 +7646,9 @@ def test_the_chat_route_handles_the_real_result_model_and_not_only_a_stand_in(tm
     assert saved.treatment == result.treatment
     assert [shot.duration for shot in saved.shots] == [20]
     assert [(notice.kind, notice.text) for notice in saved.messages[-1].notices] == [
-        ("change", document_change_notice([DOCUMENT_LABELS[field] for field in DOCUMENT_LABELS])),
+        # Named off the reply-replaceable mapping, which is what the route's own loop reads:
+        # a reply carries no Brief, so a Brief in this sentence would be a change nobody made.
+        ("change", document_change_notice(list(DIRECTOR_REPLACEABLE_DOCUMENTS.values()))),
         ("flag", SHOT_WINDOW_NOTICE.format(duration=20, start=0, minimum=4, maximum=15)),
     ]
 
@@ -25015,6 +25298,78 @@ def test_every_manifest_write_is_classified():
     # And the reason the table is worth reading: all three groups are populated, so it
     # describes a distribution rather than a policy nobody follows.
     assert len(set(MANIFEST_WRITE_GUARDS.values())) == 3
+
+
+def test_a_document_save_that_races_another_write_refuses_rather_than_capturing_blind(
+    tmp_path: Path,
+):
+    """`PUT /documents` became a slot filler on 2026-09-03, and a slot filler cannot be blind.
+
+    It used to assign three strings a client was already holding, and losing that race cost a
+    visible edit somebody could retype. It now captures the Brief's single kept version, which
+    puts it in the category `MANIFEST_WRITE_GUARDS` says is the *only* one a compare-and-swap is
+    mandatory for: a save laid over a manifest another save just wrote reverts that save **and**
+    records its text as "the version you had before". Both outcomes are a well-formed pair of
+    strings and both requests answer 200, so nothing downstream can tell which happened.
+
+    Two tabs on one project is how this is reached, and it is the ordinary case rather than a
+    contrived one: the same Save document button in each.
+    """
+    client, store, _ = make_client(tmp_path)
+    project = store.create(Project(name="Brief save races"))
+    held = store.get(project.id)
+    held.creative_brief = "The brief the Director pasted in from somewhere else."
+    store.save(held)
+    gate = Interleaved()
+    park_the_next_read(store, gate)
+
+    def save(text: str):
+        return client.put(
+            f"/api/projects/{project.id}/documents",
+            json={"creative_brief": text, "treatment": "", "style_bible": ""},
+        )
+
+    first, second = gate.run(
+        lambda: save("A revision typed in the first tab"),
+        lambda: save("A revision typed in the second tab"),
+    )
+
+    assert gate.fired == [True], "the second save never landed inside the first"
+    assert second.status_code == 200, second.text
+    assert first.status_code == 409, first.text
+    assert first.json()["detail"] == SAVE_RACE_REFUSAL
+    stored = store.get(project.id)
+    assert stored.creative_brief == "A revision typed in the second tab"
+    # The kept version is the text the winning save actually displaced. Without the guard the
+    # loser would land last and the slot would hold "A revision typed in the second tab" -- a
+    # version that was never previous to anything, offered to the Director as recoverable.
+    assert stored.creative_brief_previous == "The brief the Director pasted in from somewhere else."
+
+
+def test_every_route_that_fills_a_single_recovery_slot_is_a_compare_and_swap():
+    """One slot, one writer per act, and no writer allowed to fill it from a stale read.
+
+    Three routes fill a single kept version -- the song context's two fields, the Brief, and the
+    two restores that swap one back -- and the argument is identical at all of them: there is one
+    copy, the route both reads and writes it, and a swap or a capture made from a stale copy
+    leaves a manifest nothing downstream can find fault with. `replace_documents` was the one
+    outside this set until the Brief's slot moved into it, and it was outside for a good reason
+    that stopped being true rather than by oversight.
+
+    Asserted against the source as well as the table, because a classification is a claim about
+    code: the table saying compare-and-swap and the route calling `get_project` would be the
+    inventory lying in exactly the direction that makes it useless.
+    """
+    saving = app_py_saving_routes()
+    for name in (
+        "replace_documents",
+        "replace_song_context",
+        "restore_document",
+        "restore_song_context",
+    ):
+        assert MANIFEST_WRITE_GUARDS[name] == WRITE_GUARD_COMPARE_AND_SWAP, name
+        assert "get_project_for_update(" in saving[name], name
+        assert "if_generation=" in saving[name], name
 
 
 def test_the_two_recovery_slot_restores_are_written_the_same_way():

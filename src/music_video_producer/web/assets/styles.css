@@ -233,6 +233,12 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .document-tabs button.active { color: var(--acid); border-bottom-color: var(--acid); }
 .document-editor { display: none; min-height: 0; margin: 0; padding: 16px; }
 .document-editor.active { display: grid; grid-template-rows: auto 1fr; }
+/* The Brief carries a help paragraph between its label and its box (TP-2), so its panel has one
+   more row than the other two. Scoped to the panel rather than written as a third row for every
+   document: the Treatment and Style bible have no such paragraph, and an empty auto row there
+   costs nothing visually but makes the rule lie about what the panel contains. */
+.document-editor[data-doc-panel="brief"].active { grid-template-rows: auto auto 1fr; }
+.document-editor .field-help { margin: 0 0 10px; }
 .document-editor textarea { resize: none; font-size: 14px; line-height: 1.6; }
 .document-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; padding: 12px; border-top: 1px solid var(--line); }
 /* Per-document controls: shown only while their own document tab is active, so neither pair

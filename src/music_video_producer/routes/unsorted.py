@@ -36,8 +36,7 @@ from ..app import (
     ASSISTANT_WITHOUT_WRITABLE_SHOTS,
     CHAT_EMPTY_MESSAGE,
     DIRECTOR_CONTEXT_EXCLUDE,
-    DOCUMENT_LABELS,
-    DOCUMENT_LOCK_NOTICE,
+    DIRECTOR_REPLACEABLE_DOCUMENTS,
     DOCUMENT_REJECTED_EMPTY_NOTICE,
     DOCUMENT_REJECTED_NOTICE,
     EXPANSION_DUPLICATE_NOTICE,
@@ -63,6 +62,7 @@ from ..app import (
     assistant_reply,
     document_change_notice,
     document_first_draft_notice,
+    document_lock_refusal,
     document_not_requested_notice,
     effect_catalogue_report,
     expand_shots,
@@ -154,8 +154,8 @@ def register(ctx: RouterContext) -> None:
         snapshot = get_project(project_id)
         snapshot.messages.append(TreatmentMessage(role="user", content=request.message))
         # The recovery slots are excluded, and that is not an optimisation. This dump is the
-        # whole project, so leaving them in would echo a second full copy of both documents
-        # into every prompt — and the recorded root cause of the original document
+        # whole project, so leaving them in would echo a second full copy of every creative
+        # document into every prompt — and the recorded root cause of the original document
         # corruption was degradation under rich context (JSON in context begets JSON), the
         # very failure `document_rejection` was written to catch. The locks stay: they are
         # two booleans, and knowing a document is off-limits is useful direction.
@@ -183,7 +183,13 @@ def register(ctx: RouterContext) -> None:
         replaced: list[str] = []
         first_drafts: list[str] = []
         not_requested: list[str] = []
-        for field, label in DOCUMENT_LABELS.items():
+        # `DIRECTOR_REPLACEABLE_DOCUMENTS`, not `DOCUMENT_LABELS`: this loop asks *which
+        # documents may an ordinary reply rewrite*, and since 2026-09-03 that is no longer the
+        # same question as *which documents have a lock, a slot and a restore route*. The Brief
+        # has the apparatus and is not here, because `DirectorResult` carries no text for it —
+        # which is what the mapping is derived from, so this loop cannot reach for a field a
+        # reply does not have.
+        for field, label in DIRECTOR_REPLACEABLE_DOCUMENTS.items():
             candidate = getattr(result, field)
             existing = getattr(project, field)
             # A candidate identical to the stored text is not a replacement, whatever the
@@ -199,13 +205,12 @@ def register(ctx: RouterContext) -> None:
             # recovery slot on a replacement it refused to make. It is *reported* only when
             # the candidate would genuinely have changed something, or a project with a
             # locked Treatment would carry the same paragraph on every reply forever.
-            if getattr(project, f"{field}_locked"):
+            # `document_lock_refusal` rather than the check written out here, so the one
+            # question *may a machine write this document* has one answer across the chat
+            # route and every planning pass that comes after it. See that function.
+            if refusal := document_lock_refusal(project, field):
                 if not reason:
-                    notices.append(
-                        MessageNotice(
-                            kind="refusal", text=DOCUMENT_LOCK_NOTICE.format(document=label)
-                        )
-                    )
+                    notices.append(MessageNotice(kind="refusal", text=refusal))
                 continue
             # Consent is the second "do not write, and say why" gate, and it sits *after* the
             # lock deliberately: a lock is durable state the Director set and a flag is one

@@ -25,9 +25,11 @@ from music_video_producer.app import (
     APPLY_DOCUMENTS_LABEL,
     ASSET_NAME_LIMIT,
     CONSISTENCY_PROMPT_LIMIT,
+    DIRECTOR_REPLACEABLE_DOCUMENTS,
     DOCUMENT_LABELS,
     DOCUMENT_LOCK_NOTICE,
-    DOCUMENT_RESTORE_REFUSAL,
+    DOCUMENT_SLOT_CAPTURE,
+    DOCUMENT_SLOT_DISPLACEMENT,
     MULTIVIEW_SUBJECTS,
     SECTION_LOOK_SKIP_ALL_WRITTEN,
     SECTION_LOOK_SKIP_WRITTEN,
@@ -39,12 +41,14 @@ from music_video_producer.app import (
     SONG_LYRICS_LIMIT,
     SONG_REPLACEMENT_CONSEQUENCE,
     MusicRequest,
+    ProjectDocumentsRequest,
     SnapCutsRequest,
     SongPlannerRequest,
     _require_song_replacement_confirmation,
     create_app,
     document_not_requested_notice,
     document_restore_notice,
+    document_restore_refusal,
 )
 from music_video_producer.assembly import BOUNDARY_TOLERANCE_SECONDS
 from music_video_producer.batch import (
@@ -237,9 +241,14 @@ def css_track_list(value: str) -> list[str]:
 
 
 def scoped_control_group(document_tab: str) -> str:
-    """The markup of the controls group scoped to one document tab."""
+    """The markup of the controls group scoped to one document tab.
+
+    The class list is matched loosely because one group carries `active` in the markup: the
+    Brief's tab is the one open on load and the tab handler only runs on a click, so its pair
+    of controls would otherwise be invisible until the Director switched tabs and came back.
+    """
     group = re.search(
-        rf'<div class="document-scoped" data-doc-controls="{document_tab}">.*?</div>',
+        rf'<div class="document-scoped[^"]*" data-doc-controls="{document_tab}">.*?</div>',
         INDEX_HTML.read_text(encoding="utf-8"),
         re.DOTALL,
     )
@@ -2001,7 +2010,12 @@ def test_song_context_restore_wording_agrees_with_the_server_on_both_sides():
     for not_this in ("other", "missing", "nonString"):
         assert result[not_this] is False, not_this
     # The two refusals must not be confusable in either direction.
-    assert result["marker"] not in DOCUMENT_RESTORE_REFUSAL
+    # Every document, not `treatment` alone: the Brief's refusal names a *save* as what keeps a
+    # version, which is what this one says too, so the near miss is real and only the markers
+    # keep the two recovery paths from claiming each other's failure.
+    for document in DOCUMENT_LABELS:
+        assert result["marker"] not in document_restore_refusal(document), document
+        assert result["documentMarker"] in document_restore_refusal(document), document
     assert result["documentMarker"] not in SONG_CONTEXT_RESTORE_REFUSAL
     # One sentence for the act, matching the server's word for word.
     for field, label in SONG_CONTEXT_LABELS.items():
@@ -2254,23 +2268,36 @@ def test_document_restore_wording_agrees_on_both_sides():
     recognising a 409 the moment the server's phrasing changed.
     """
     script = """
-      import { DOCUMENT_LABELS, DOCUMENT_RESTORE_REFUSAL_MARKER, documentRestoreNotice }
+      import { DOCUMENT_LABELS, DIRECTOR_REPLACEABLE_DOCUMENTS, DOCUMENT_RESTORE_REFUSAL_MARKER,
+               documentRestoreNotice, documentRestoreTitle, documentReplaceableByReply,
+               documentSlotDisplacement, documentSlotCapture }
         from './src/music_video_producer/web/assets/api.js';
       const attempt = (fn) => { try { return fn(); } catch (error) { return `THREW: ${error.message}`; } };
+      const over = (fn) => Object.fromEntries(Object.keys(DOCUMENT_LABELS).map((d) => [d, fn(d)]));
       console.log(JSON.stringify({
         labels: DOCUMENT_LABELS,
+        replaceable: DIRECTOR_REPLACEABLE_DOCUMENTS,
         marker: DOCUMENT_RESTORE_REFUSAL_MARKER,
-        notices: {
-          treatment: documentRestoreNotice('treatment'),
-          style_bible: documentRestoreNotice('style_bible'),
-        },
-        unknown: attempt(() => documentRestoreNotice('creative_brief')),
+        notices: over(documentRestoreNotice),
+        displacement: over(documentSlotDisplacement),
+        capture: over(documentSlotCapture),
+        armed: over((d) => documentRestoreTitle(d, true)),
+        empty: over((d) => documentRestoreTitle(d, false)),
+        unknown: attempt(() => documentRestoreNotice('shot_list')),
+        unknownReplaceable: attempt(() => documentReplaceableByReply('shot_list')),
+        unknownDisplacement: attempt(() => documentSlotDisplacement('shot_list')),
+        unknownCapture: attempt(() => documentSlotCapture('shot_list')),
+        unknownTitle: attempt(() => documentRestoreTitle('shot_list', false)),
       }));
     """
 
     browser = run_module(script)
 
     assert browser["labels"] == DOCUMENT_LABELS
+    # The second mapping crosses the wire too, and the server *derives* it from DirectorResult
+    # while the browser can only transcribe it. This is the only thing holding the transcription
+    # to what a reply can actually carry -- and the browser's change toast is decided by it.
+    assert browser["replaceable"] == DIRECTOR_REPLACEABLE_DOCUMENTS
     for document in DOCUMENT_LABELS:
         assert browser["notices"][document] == document_restore_notice(document), document
         # The sentence has to say the swap is reversible; single-slot recovery the Director
@@ -2278,9 +2305,40 @@ def test_document_restore_wording_agrees_on_both_sides():
         assert "swaps back" in browser["notices"][document], document
         # And that no model was involved, which is the point of the route existing.
         assert "No Director call was made" in browser["notices"][document], document
-    assert browser["marker"] in DOCUMENT_RESTORE_REFUSAL
-    # A document the server has no field for must throw rather than toast "undefined".
-    assert "THREW: Unknown document" in browser["unknown"]
+        # The phrase naming what fills the slot is per document on both sides, or the Brief's
+        # tooltip promises a Director reply that will never come.
+        assert browser["displacement"][document] == DOCUMENT_SLOT_DISPLACEMENT[document], document
+        # The two sides word the clause for their own sentence -- "one is kept when ..." in the
+        # tooltip, "A version is only kept when ..." in the 409 -- so they are held to naming
+        # the same writer rather than to being the same string.
+        for writer in ("Director reply", "save"):
+            assert (writer in browser["capture"][document]) == (
+                writer in DOCUMENT_SLOT_CAPTURE[document]
+            ), (document, writer)
+    assert browser["displacement"]["creative_brief"] == "save that changed it"
+    assert browser["displacement"]["treatment"] == "applied replacement"
+    assert browser["marker"] in document_restore_refusal("treatment")
+    assert browser["marker"] in document_restore_refusal("creative_brief")
+    # The tooltip is where the phrases are actually read, and **both of its states are executed
+    # here**. Only the armed one had coverage: hardcoding the empty state's clause back to "a
+    # Director reply replaces it" left the whole offline suite green, and that sentence sits on
+    # the Brief's greyed-out button telling a Director to wait for a writer that will never come.
+    # The browser harness caught it and the browser harnesses do not run under pytest.
+    for document in DOCUMENT_LABELS:
+        assert browser["displacement"][document] in browser["armed"][document], document
+        assert browser["capture"][document] in browser["empty"][document], document
+        assert DOCUMENT_LABELS[document] in browser["armed"][document], document
+        assert "No previous version" in browser["empty"][document], document
+    assert "Director reply" not in browser["empty"]["creative_brief"]
+    assert "Director reply" in browser["empty"]["treatment"]
+    # A document the server has no field for must throw rather than toast "undefined" -- and that
+    # holds for every function that takes a document name, not only the two that were probed.
+    # `documentReplaceableByReply` returning `false` for an unknown name is the safe-sounding
+    # wrong answer: it is also the Brief's answer, so a typo'd document would quietly inherit the
+    # Brief's wording everywhere instead of failing. That mutation survived until this loop.
+    for probe in ("unknown", "unknownReplaceable", "unknownDisplacement", "unknownCapture",
+                  "unknownTitle"):
+        assert "THREW: Unknown document" in str(browser[probe]), probe
 
 
 def test_restore_reaches_a_real_route_and_sends_no_chat_message():
@@ -2319,20 +2377,53 @@ def test_restore_reaches_a_real_route_and_sends_no_chat_message():
     assert '$(control.restore).addEventListener("click", () => restoreDocument(documentKey));' in bindings
 
 
-def test_document_save_sends_both_locks_so_the_toggles_are_not_decorative():
+def test_document_save_sends_every_lock_and_no_slot_from_the_one_control_table():
     """`PUT /documents` reads an absent lock as "leave it alone", by design.
 
-    That is what stops an ordinary save from silently unlocking both documents — but it also
+    That is what stops an ordinary save from silently unlocking every document — but it also
     means a client that omits the locks can never set one, so the save path has to send them
     every time.
+
+    Built from `DOCUMENT_CONTROLS` rather than naming each editor and checkbox: the save used
+    to spell out three textarea ids and two checkbox ids of its own, so the Brief's lock would
+    have had to be remembered here as well as in the table, the markup and the bind loop. The
+    payload is executed rather than grepped for, against a browser-shaped stub of the controls,
+    because "the loop is present" is not the claim -- the claim is what the route receives.
     """
     handler = APP_JS.read_text(encoding="utf-8").split("async function saveProject", 1)[1].split("\n}", 1)[0]
 
-    assert 'treatment_locked: $("#lock-treatment").checked' in handler
-    assert 'style_bible_locked: $("#lock-style").checked' in handler
-    # The recovery slots are never sent: only an applied Director replacement writes them.
-    for forbidden in ("treatment_previous", "style_bible_previous"):
+    assert "for (const [documentKey, control] of Object.entries(DOCUMENT_CONTROLS))" in handler
+    assert "documents[documentKey] = $(control.box).value;" in handler
+    assert "documents[control.lockedField] = $(control.lock).checked;" in handler
+    # No document, editor id or lock id is spelled out a second time here.
+    for forbidden in ("#lock-", "#treatment-text", "#style-bible", "#creative-brief"):
         assert forbidden not in handler, forbidden
+    # The recovery slots are never sent: the server decides what it displaced, and a client that
+    # could name a kept version could plant one for the restore button to swap in.
+    for field in DOCUMENT_LABELS:
+        assert f"{field}_previous" not in handler, field
+
+    payload = run_module("""
+      import { DOCUMENT_CONTROLS } from './src/music_video_producer/web/assets/api.js';
+      const values = { "#creative-brief": "brief text", "#treatment-text": "treatment text", "#style-bible": "style text" };
+      const locks = { "#lock-brief": true, "#lock-treatment": false, "#lock-style": true };
+      const $ = (selector) => ({ value: values[selector], checked: locks[selector] });
+      const documents = {};
+      for (const [documentKey, control] of Object.entries(DOCUMENT_CONTROLS)) {
+        documents[documentKey] = $(control.box).value;
+        documents[control.lockedField] = $(control.lock).checked;
+      }
+      console.log(JSON.stringify(documents));
+    """)
+
+    assert payload == {
+        "creative_brief": "brief text", "creative_brief_locked": True,
+        "treatment": "treatment text", "treatment_locked": False,
+        "style_bible": "style text", "style_bible_locked": True,
+    }
+    # And the server takes exactly that shape: every key is a field the request model declares,
+    # and every document and lock it declares is sent.
+    assert set(payload) == set(ProjectDocumentsRequest.model_fields)
 
 
 def test_treatment_markup_exposes_every_control_the_app_dereferences():
@@ -2385,6 +2476,17 @@ def test_lock_checkboxes_are_seeded_from_their_own_locked_field():
     assert "$(control.lock).checked = Boolean(state.project?.[control.lockedField]);" in seeding
     # Rendering the workspace has to seed them, or a locked project still loads unchecked.
     assert "syncDocumentControls();" in app_js_block("function renderTreatment")
+    # And so does a successful save, which is not the same claim and was not true until the
+    # Brief's slot moved onto this route. `PUT /documents` now *fills* a kept version, so the
+    # first save that changes the Brief arms its restore button -- and without this the button
+    # stays greyed out until the next project load, offering nothing at the exact moment there is
+    # finally something to offer. Every offline gate was green: each half is right on its own, and
+    # nothing joined them until the page was driven in a browser (tests/e2e_brief_recovery.py).
+    save = app_js_block("async function saveProject")
+    assert "syncDocumentControls();" in save
+    assert "renderTreatment" not in without_comments(save), (
+        "re-rendering the editors from the save's reply is a discard waiting for a race"
+    )
 
 
 def test_restore_button_enabled_state_derives_from_its_own_previous_slot():
@@ -2415,7 +2517,8 @@ def test_restore_button_enabled_state_derives_from_its_own_previous_slot():
         noProject: documentRestoreAvailable(null, 'treatment'),
         absent: documentRestoreAvailable(undefined, 'treatment'),
         nonString: documentRestoreAvailable({ treatment_previous: 5 }, 'treatment'),
-        unknown: attempt(() => documentRestoreAvailable({}, 'creative_brief')),
+        unknown: attempt(() => documentRestoreAvailable({}, 'shot_list')),
+        keptBrief: documentRestoreAvailable({ creative_brief_previous: 'kept brief' }, 'creative_brief'),
       }));
     """
 
@@ -2428,6 +2531,8 @@ def test_restore_button_enabled_state_derives_from_its_own_previous_slot():
     for empty in ("whitespace", "missing", "noProject", "absent", "nonString"):
         assert available[empty] is False, empty
     assert "THREW: Unknown document" in available["unknown"]
+    # The Brief's slot enables the Brief's button, off its own field like the other two.
+    assert available["keptBrief"] is True
 
     # And that answer is what the button's state is, rather than a constant or a second rule.
     seeding = app_js_block("function syncDocumentControls")
@@ -2444,7 +2549,7 @@ def test_restore_refusal_is_recognised_and_recovered_from_rather_than_just_toast
     working and every retry fails identically against the same stale state. So the predicate is
     executed against the server's own wording, an unrelated error, and a non-string.
     """
-    refusal = DOCUMENT_RESTORE_REFUSAL.format(document=DOCUMENT_LABELS["treatment"])
+    refusal = document_restore_refusal("treatment")
     script = f"""
       import {{ documentRestoreRefusal, documentRestoreStaleNotice }}
         from './src/music_video_producer/web/assets/api.js';
@@ -2782,14 +2887,15 @@ def test_chat_toast_reports_what_changed_instead_of_asserting_an_update():
     """
     script = """
       import { documentChangeToast } from './src/music_video_producer/web/assets/api.js';
-      const before = { treatment: 'old treatment', style_bible: 'old style bible' };
+      const before = { creative_brief: 'the brief', treatment: 'old treatment', style_bible: 'old style bible' };
       console.log(JSON.stringify({
         treatmentOnly: documentChangeToast(before, { ...before, treatment: 'new treatment' }),
         styleOnly: documentChangeToast(before, { ...before, style_bible: 'new style bible' }),
-        both: documentChangeToast(before, { treatment: 'new t', style_bible: 'new s' }),
+        both: documentChangeToast(before, { ...before, treatment: 'new t', style_bible: 'new s' }),
         lockedOrRejected: documentChangeToast(before, { ...before }),
         identicalRewrite: documentChangeToast(before, { ...before }),
         firstEverFill: documentChangeToast({}, { treatment: 'first treatment' }),
+        briefEditedInTheSameWindow: documentChangeToast(before, { ...before, creative_brief: 'edited by hand' }),
       }));
     """
 
@@ -2798,7 +2904,7 @@ def test_chat_toast_reports_what_changed_instead_of_asserting_an_update():
     assert "Style bible" not in toasts["treatmentOnly"]
     assert "Style bible" in toasts["styleOnly"]
     assert "Treatment" not in toasts["styleOnly"]
-    for label in DOCUMENT_LABELS.values():
+    for label in DIRECTOR_REPLACEABLE_DOCUMENTS.values():
         assert label in toasts["both"], label
     # Nothing moved: the toast must say so rather than announce an update that never happened.
     for unchanged in ("lockedOrRejected", "identicalRewrite"):
@@ -2806,6 +2912,11 @@ def test_chat_toast_reports_what_changed_instead_of_asserting_an_update():
         for label in DOCUMENT_LABELS.values():
             assert label not in toasts[unchanged], (unchanged, label)
     assert "Treatment" in toasts["firstEverFill"]
+    # The Brief is diffed by nothing here, because no reply can carry it: a Brief that moved
+    # while the call was in flight was moved by the Director, and crediting the reply with it
+    # is the same mistake the `applied` flag exists to stop one step further along.
+    assert "no document changed" in toasts["briefEditedInTheSameWindow"]
+    assert DOCUMENT_LABELS["creative_brief"] not in toasts["briefEditedInTheSameWindow"]
 
     handler = chat_submit_handler()
     assert "const before = state.project;" in handler
@@ -3236,7 +3347,9 @@ def test_lock_toggle_confirms_the_lock_and_reverts_the_control_when_the_save_fai
         treatmentLocked: documentLockNotice('treatment', true),
         treatmentUnlocked: documentLockNotice('treatment', false),
         styleLocked: documentLockNotice('style_bible', true),
-        unknown: attempt(() => documentLockNotice('creative_brief', true)),
+        briefLocked: documentLockNotice('creative_brief', true),
+        briefUnlocked: documentLockNotice('creative_brief', false),
+        unknown: attempt(() => documentLockNotice('shot_list', true)),
       }));
     """
 
@@ -3245,6 +3358,18 @@ def test_lock_toggle_confirms_the_lock_and_reverts_the_control_when_the_save_fai
     assert notices["treatmentUnlocked"].startswith(f"{DOCUMENT_LABELS['treatment']} is unlocked")
     assert notices["styleLocked"].startswith(f"{DOCUMENT_LABELS['style_bible']} is locked")
     assert "THREW: Unknown document" in notices["unknown"]
+    # The Brief's pair says something different, and both halves of the reply wording are false
+    # for it: no Director reply writes the Brief, and its kept version comes from the Director's
+    # own save -- so it goes on being recorded while the lock is on. A toast claiming otherwise
+    # tells a Director their edits stopped being recoverable at the moment they protected them.
+    brief = DOCUMENT_LABELS["creative_brief"]
+    assert notices["briefLocked"].startswith(f"{brief} is locked")
+    assert notices["briefUnlocked"].startswith(f"{brief} is unlocked")
+    for state in ("briefLocked", "briefUnlocked"):
+        assert "planning pass" in notices[state], state
+        assert "Director reply" not in notices[state], state
+    assert "no previous version is recorded" not in notices["briefLocked"]
+    assert "keeps the version it replaced" in notices["briefLocked"]
 
     binding = app_js_block('$(control.lock).addEventListener("change"', "    });")
     assert "documentLockNotice(documentKey, event.currentTarget.checked)" in binding
@@ -3302,6 +3427,56 @@ def test_system_audit_line_is_visually_distinct_from_director_prose():
     """)["thread"]
     for role in ("user", "assistant", "system"):
         assert f'<div class="message {role}">' in stamped, role
+
+
+def test_the_brief_states_what_belongs_in_it_and_what_is_generated_from_it():
+    """TP-2, and it is a deliverable rather than a comment.
+
+    The Brief is the first stage of planning: it is revised and edited, and *then* broken down
+    into the Treatment and the Style bible. A Director cannot discover that from an empty
+    textarea, and a constraint that never reached the Brief cannot reach either document
+    generated from it -- so the sentence has to be beside the box where the Brief is written,
+    not in a docstring.
+
+    The markup cannot import the constant, which is how the two would drift; this asserts they
+    are the same paragraph, that it sits in the Brief's own panel rather than one of the other
+    two, and that it says all three of the things it exists to say.
+    """
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    # Read out of api.js, which is where the one wording lives: the markup cannot import it, and
+    # a constant nobody executes is how the two copies drift.
+    help_source = run_module("""
+      import { BRIEF_HELP } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({ help: BRIEF_HELP }));
+    """)["help"]
+    panel = re.search(
+        r'<label class="document-editor active" data-doc-panel="brief">.*?</label>',
+        markup,
+        re.DOTALL,
+    )
+    assert panel, "the Brief has no editor panel"
+
+    help_text = re.search(r'<span class="field-help">(.*?)</span>', panel.group(0), re.DOTALL)
+    assert help_text, "the Brief panel carries no help paragraph"
+    assert help_text.group(1) == help_source
+    # It names what belongs in the Brief, and that the other two are made from it.
+    assert "first stage of planning" in help_source
+    for generated in ("Treatment", "Style bible"):
+        assert generated in help_source, generated
+    assert "generated from it" in help_source
+    # And the two protections beside it, because a recovery nobody knows about is not one.
+    assert "keeps the version it replaced" in help_source
+    assert "Lock" in help_source
+    # The other two panels carry no such paragraph: it is about the Brief, and repeating it
+    # over the Treatment would tell a Director the Treatment is what everything is made from.
+    for other in ("treatment", "style"):
+        other_panel = re.search(
+            rf'<label class="document-editor" data-doc-panel="{other}">.*?</label>',
+            markup,
+            re.DOTALL,
+        )
+        assert other_panel, other
+        assert "field-help" not in other_panel.group(0), other
 
 
 def test_document_prose_names_come_only_from_the_label_mapping():

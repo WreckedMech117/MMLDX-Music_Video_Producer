@@ -249,15 +249,24 @@
           </div>
           <div class="document-column">
             <div class="document-tabs"><button class="active" data-doc="brief">Brief</button><button data-doc="treatment">Treatment</button><button data-doc="style">Style bible</button></div>
-            <label class="document-editor active" data-doc-panel="brief"><span>Creative brief</span><textarea id="creative-brief" placeholder="Core idea, emotional arc, audience, constraints…"></textarea></label>
+            <!-- The Brief's help paragraph is api.js's BRIEF_HELP, asserted against this markup by
+                 tests/test_frontend_contract.py: TP-2 asks the Brief to state what belongs in it and
+                 that the Treatment and Style bible are generated from it, and the only place that is
+                 worth saying is beside the box where the Brief is written. A `span`, not a `p`:
+                 a `label`'s content model is phrasing content, and it is a grid item here, so
+                 it lays out as a block either way. -->
+            <label class="document-editor active" data-doc-panel="brief"><span>Creative brief</span><span class="field-help">The Brief is the first stage of planning and the document the others are made from: the core idea, the emotional arc, who it is for, and the constraints you already know — location, cast, look, anything fixed. The Treatment and the Style bible are generated from it, so what is not here cannot reach them. Revise it as often as you like: each save that changes it keeps the version it replaced, and Lock stops a planning pass overwriting it.</span><textarea id="creative-brief" placeholder="Core idea, emotional arc, audience, constraints…"></textarea></label>
             <label class="document-editor" data-doc-panel="treatment"><span>Treatment</span><textarea id="treatment-text" placeholder="The structured treatment appears here…"></textarea></label>
             <label class="document-editor" data-doc-panel="style"><span>Visual continuity</span><textarea id="style-bible" placeholder="Color, lenses, lighting, wardrobe, locations, continuity rules…"></textarea></label>
             <!-- Lock and restore belong to one document each, so they live in a group scoped to
-                 that document's tab: the Creative brief is never replaced by a Director reply and
-                 has neither control. The button and label wording is the DOCUMENT_LABELS spelling,
-                 asserted by tests/test_frontend_contract.py; the restore tooltips are set from the
-                 same mapping by syncDocumentControls rather than duplicated here. -->
+                 that document's tab. All three documents have both since 2026-09-03: the Creative
+                 brief is still never replaced by a Director *reply*, but it is what Suggest Video
+                 and the planning passes write, and its kept version comes from the Director's own
+                 save. The button and label wording is the DOCUMENT_LABELS spelling, asserted by
+                 tests/test_frontend_contract.py; the restore tooltips are set from the same mapping
+                 by syncDocumentControls rather than duplicated here, and so is each lock's toast. -->
             <div class="document-actions">
+              <div class="document-scoped active" data-doc-controls="brief"><label class="lock-toggle" title="A locked Brief is not overwritten by a planning pass; you can still edit and save it yourself"><input type="checkbox" id="lock-brief">Lock Creative brief</label><button class="quiet-button" id="restore-brief" disabled>Restore Creative brief</button></div>
               <div class="document-scoped" data-doc-controls="treatment"><label class="lock-toggle" title="A locked document is never replaced by a Director reply"><input type="checkbox" id="lock-treatment">Lock Treatment</label><button class="quiet-button" id="restore-treatment" disabled>Restore Treatment</button></div>
               <div class="document-scoped" data-doc-controls="style"><label class="lock-toggle" title="A locked document is never replaced by a Director reply"><input type="checkbox" id="lock-style">Lock Style bible</label><button class="quiet-button" id="restore-style" disabled>Restore Style bible</button></div>
               <!-- The expansion control is one name in three places: this id, its label, and app.js's

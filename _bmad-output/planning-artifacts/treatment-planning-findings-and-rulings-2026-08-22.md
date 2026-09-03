@@ -210,6 +210,40 @@ Recorded here as a **cross-PRD dependency**, owned by whichever of the two featu
 
 **Ownership settled 2026-08-22: Treatment Planning owns it.** The Director accepted the recommendation that effects **Story 8.1** (the Song Envelope) is built first, as the story with no dependencies and no blockers. Treatment Planning therefore arrives second at the same song and inherits the obligation: **TP-18's offer must present one analysis moment covering both computations, with one indicator**, rather than adding a second pass the Director sits through separately. Designing for it now is cheaper than retrofitting it.
 
+
+### R-18 — A save that empties a document asks first; the slot stays the model's
+
+*Ruled 2026-09-03, on a defect Slice A surfaced by fixing its neighbour.*
+
+**Slice A moved FR-16's exception rather than removing it.** The Brief now keeps a version on the
+Director's own save and can restore it. `PUT /documents` still writes `treatment` and `style_bible`
+from the body with **no capture and no confirmation** — measured through the real route on
+2026-09-03: a save carrying empty text for all three left `creative_brief_previous` holding the
+Brief while both other slots stayed empty, and `POST .../documents/treatment/restore` answered
+**409**. A Director who clears the Treatment textarea and clicks Save destroys it with nothing kept,
+and the Brief is now the best protected of the three.
+
+**The obvious fix is wrong, and that is why this is a ruling.** Capturing on save into
+`treatment_previous` would let one Save click spend the single slot that exists to protect the
+Director *from an unrequested model rewrite* — which is precisely the distinction Slice A's
+own ruling drew between the Brief's threat model and theirs.
+
+**Ruled: ask before a save empties stored text.** The shape is `songContextClearing`, which already
+asks exactly this question about the lyric sheet, and the slot is left holding whatever the model
+last displaced. A second slot per document was considered and declined: it is two more `Project`
+fields, two more adopt guards, and a restore control that has to say *which* version it will bring
+back — paid to protect against a gesture the Director makes deliberately and can be asked
+about instead.
+
+**The known limit, stated rather than discovered.** This is a client-side guard, so an API client
+still deletes silently — the identical boundary the song context's own ledger entry records
+for the same mechanism. It is accepted here for the same reason: the loss this prevents is a
+Director's own mis-click, and a caller writing raw JSON is not making one.
+
+**Not in scope, and deliberately:** whether Slice D's session revision history (TP-9, AD-44) makes
+the single-slot question moot for documents the planning tools touch. That is a different mechanism
+with a different lifetime and it gets its own argument.
+
 ## Open questions for the PRD
 
 1. ~~**What exactly is a "Brief" for, now?**~~ **Answered 2026-08-22, and the analyst's premise was wrong.** The Brief is *already* upstream: `timeline.py` puts `creative_brief` into the project dump at three call sites, and the Director's own prompt opens *"You are handed the whole project: creative brief, treatment, style bible, the song's words."* Treatment and Style Bible have always been generated with the Brief as an input — the Director's original understanding was correct.

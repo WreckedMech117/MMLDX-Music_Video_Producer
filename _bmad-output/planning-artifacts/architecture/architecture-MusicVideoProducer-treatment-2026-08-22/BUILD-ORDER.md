@@ -33,20 +33,22 @@ graph LR
 
 ---
 
-## Slice A — The Brief apparatus
+## Slice A — The Brief apparatus  *(shipped 2026-09-03)*
 
 | | |
 |---|---|
 | Delivers | TP-1, TP-2 |
 | Depends on | nothing |
 | Binds | AD-41 |
-| Risk | **Low.** A third instance of a pattern that exists twice. |
+| Risk | ~~**Low.** A third instance of a pattern that exists twice.~~ **Measured: not low.** The pattern existed twice because two documents shared one mapping that was answering *two* questions — has the apparatus, and may an ordinary reply rewrite it. The Brief has the first and not the second, so it is not a third instance of anything: the mapping had to split (`DOCUMENT_LABELS` / `DIRECTOR_REPLACEABLE_DOCUMENTS`), every derived site had to be pointed at the one that answers its question, and the capture moved to a different route on a Director ruling. |
 
-`creative_brief_previous`, `creative_brief_locked`, a `DOCUMENT_CONTROLS` entry, the contract line, and `_adopt_brief_fields` in `replace_project`.
+`creative_brief_previous`, `creative_brief_locked`, a `DOCUMENT_CONTROLS` entry, the contract line, and the `replace_project` adoption.
 
-**Write the adopt test in the same commit as the fields.** That route's own comments count six findings of this hole; this is the second time it has been closed *before* a field existed rather than after it cleared someone's work.
+*Built 2026-09-03, with two departures worth recording.* There is no `_adopt_brief_fields`: the adopt loop is driven off `DOCUMENT_LABELS`, so the Brief is adopted by being in that mapping and a helper would have been a second list to keep level. And the risk line below was wrong — see it.
 
-**Ships value alone:** FR-16 stops having an exception whether or not anything else in this feature is ever built.
+**Write the adopt test in the same commit as the fields.** ~~That route's own comments count six findings of this hole~~ *(stale when written: the count was fourteen by 2026-08-27 and the Brief is the **sixteenth**, 2026-09-03)*; this is another case where it has been closed *before* a field existed rather than after it cleared someone's work.
+
+**Ships value alone:** the Brief gets the whole apparatus whether or not anything else in this feature is ever built, and it ends up the best protected of the three documents. *Amended 2026-09-03:* this said ~~FR-16 stops having an exception~~ without qualification, and that is not what shipped. FR-16 now holds against every **machine** write for all three; against the Director's **own save** the Brief holds and `treatment` and `style_bible` do not, which is a residue in the opposite direction and is recorded in `docs/BUILD-HANDOFF.md` §6.
 
 ---
 

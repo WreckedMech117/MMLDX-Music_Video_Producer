@@ -67,7 +67,7 @@ TP-NFR-5: Model output crosses the persistence boundary only through guards
 - **Asking and writing are separate tools, not one tool with optional fields.** On a model that drops fields silently, an optional field and a dropped field are the same bytes. Every required field promoted through `_promoted()`, which raises on an unknown name (AD-38)
 - A long pass validates before it writes; a failure is reported by exception class and elapsed time, never by `str(exc)` — a `ReadTimeout` stringifies to `""` (AD-39)
 - One analysis job composes structure alignment and the Song Envelope **without merging the computations** (AD-40)
-- The Brief joins the existing document apparatus unchanged, adopted in `replace_project` (AD-41)
+- The Brief joins the existing document apparatus — same lock, same slot, same restore route — but **captures on the Director's own save** rather than on an applied reply, because no reply can write it. Adopted in `replace_project` (AD-41, amended 2026-09-03)
 - The Song Planner route **returns fields and stores nothing** (AD-42)
 - A planning turn is an ordinary `TreatmentMessage`; what it changed is carried as `MessageNotice` entries (AD-43)
 - Undo restores a snapshot **verbatim and bypasses reconciliation** — an undo is not an edit (AD-44)
@@ -162,13 +162,14 @@ So that nothing can destroy an idea I typed and leave me no way back.
 **Given** the three creative documents
 **When** the Brief's protections are implemented
 **Then** `creative_brief_previous` and `creative_brief_locked` exist, defaulted so every existing `project.json` loads unchanged (TP-1, AD-41)
-**And** the Brief gains a `DOCUMENT_CONTROLS` entry so lock, recovery and restore behave identically to `treatment` and `style_bible`
+**And** the Brief gains a `DOCUMENT_CONTROLS` entry so **lock and restore** behave identically to `treatment` and `style_bible`
+**And** its recovery slot is filled by the Director's own save rather than by an applied reply, since no reply can write the Brief — a byte-equal re-save captures nothing (AD-41, amended 2026-09-03)
 **And** a locked Brief refuses every automatic write by name.
 
-**Given** any automatic write that replaces Brief text
+**Given** any write that replaces Brief text — the Director's own save today, a planning pass once one exists
 **When** it runs
 **Then** the prior version is preserved in the recovery slot and the Director can restore it (TP-1, TP-NFR-1)
-**And** a test asserts the Brief against the same expectations already asserted for `treatment` and `style_bible`, so **FR-16 holds for all three documents with no exception**.
+**And** a test asserts the Brief against the same expectations already asserted for `treatment` and `style_bible`, so **FR-16 holds against every machine write for all three documents with no exception**. *Amended 2026-09-03, when this shipped:* the unqualified version of that sentence is not true and was not made true here. Against the Director's **own save**, the Brief is protected and `treatment`/`style_bible` are not — `PUT /documents` writes their text with no capture and no confirmation, measured. That residue is the reverse of the exception this story was written to remove, it needs a ruling rather than an implementation, and it is recorded in `docs/BUILD-HANDOFF.md` §6.
 
 **Given** the generic `PUT /api/projects/{project_id}`
 **When** a body omits the Brief's fields, or invents them

@@ -785,7 +785,12 @@ async function saveSongContext() {
   // one crossed assignment cannot exist on only one of the two paths.
   const context = songContextFields($("#song-lyrics").value, $("#song-style").value);
   // The route assigns both fields from the body, so a save with an empty box deletes what is
-  // stored -- and a Song, unlike the two creative documents, keeps no previous version to restore.
+  // stored. Each field does keep the version this save displaces -- `replace_song_context` fills
+  // its slot exactly as `PUT /documents` now fills the Brief's -- but there is one slot per
+  // field and the next save spends it, which is what SONG_CONTEXT_CLEARING_CONSEQUENCE says.
+  // This comment used to claim a Song keeps no previous version at all: that was true when it
+  // was written, went false when the slots landed, and is the third copy of the sentence whose
+  // other two were corrected on 2026-08-18. Corrected 2026-09-03.
   // Asked only for that: replacing existing text with nothing. Replacing it with different text is
   // typing, and a question on every save teaches the Director to click through this one.
   const cleared = songContextClearing(state.project.song, context);
@@ -1013,9 +1018,10 @@ function syncTransportState() {
 
 function renderTreatment() {
   const project = state.project;
-  $("#creative-brief").value = project?.creative_brief || "";
-  $("#treatment-text").value = project?.treatment || "";
-  $("#style-bible").value = project?.style_bible || "";
+  // The same table again: each document's editor is filled from the field of its own name.
+  for (const [documentKey, control] of Object.entries(DOCUMENT_CONTROLS)) {
+    $(control.box).value = project?.[documentKey] || "";
+  }
   syncDocumentControls();
   const thread = $("#chat-thread");
   // The whole body -- the empty-thread copy, every bubble, the prose/notice split and every
@@ -5171,18 +5177,32 @@ function renderReadiness() {
 // not have.
 async function saveProject(notice = "Project saved") {
   if (!requireProject()) return false;
-  const documents = {
-    creative_brief: $("#creative-brief").value,
-    treatment: $("#treatment-text").value,
-    style_bible: $("#style-bible").value,
-    // Sent on every document save, never omitted: the route reads an absent lock as "leave
-    // it alone", so omitting them would make the checkboxes purely decorative.
-    treatment_locked: $("#lock-treatment").checked,
-    style_bible_locked: $("#lock-style").checked,
-  };
+  // Built from the one control table rather than naming each editor and each checkbox again:
+  // the table is what the render, seed, bind and restore paths already read, and a document
+  // spelled out a fifth time here is how a new one ships saveable everywhere but here.
+  //
+  // Every lock is sent on every document save, never omitted: the route reads an absent lock as
+  // "leave it alone", so omitting them would make the checkboxes purely decorative. The recovery
+  // slots are never sent -- the server decides what it displaced, and a client that could name a
+  // kept version could plant one for the restore button to swap in.
+  const documents = {};
+  for (const [documentKey, control] of Object.entries(DOCUMENT_CONTROLS)) {
+    documents[documentKey] = $(control.box).value;
+    documents[control.lockedField] = $(control.lock).checked;
+  }
   try {
     state.project = await api.saveDocuments(state.project.id, documents);
     markDocumentsSaved();
+    // The save can change what the controls have to say, so they are re-seeded from the reply
+    // rather than left showing what they showed before it. The Brief's kept version is *filled
+    // by this route* -- the first save that changes it arms a restore button that would
+    // otherwise stay greyed out until the next project load, offering nothing at the moment
+    // there is finally something to offer. Found by driving it in a browser; every offline gate
+    // was green, because each half is correct on its own and nothing joined them.
+    //
+    // `syncDocumentControls`, never `renderTreatment`: the editors hold what was just saved, and
+    // re-rendering them from the reply is a discard waiting for the one save that races a reply.
+    syncDocumentControls();
     toast(notice);
     return true;
   }
@@ -6482,7 +6502,11 @@ function bindEvents() {
       syncDocumentControls();
     });
   }
-  ["creative-brief", "treatment-text", "style-bible"].forEach((id) => $("#" + id).addEventListener("input", () => { state.documentsDirty = true; state.dirty = true; }));
+  // Off the same table as the save, so a document whose editor is not marked dirty cannot exist:
+  // an unflagged editor loses its typing silently on the next restore or reply.
+  for (const control of Object.values(DOCUMENT_CONTROLS)) {
+    $(control.box).addEventListener("input", () => { state.documentsDirty = true; state.dirty = true; });
+  }
   $("#song-file").addEventListener("change", async (event) => {
     const file = event.target.files[0];
     if (!file) return;
@@ -6866,9 +6890,9 @@ function bindEvents() {
   $$(".document-tabs button").forEach((button) => button.addEventListener("click", () => {
     $$(".document-tabs button").forEach((item) => item.classList.toggle("active", item === button));
     $$(".document-editor").forEach((editor) => editor.classList.toggle("active", editor.dataset.docPanel === button.dataset.doc));
-    // Lock and restore each belong to one document. The Creative brief has neither -- it is
-    // never replaced by a Director reply -- so controls left visible there offer actions that
-    // cannot apply to the text on screen.
+    // Lock and restore each belong to one document, so only the open tab's pair is shown:
+    // a lock left visible over another document's text protects something the Director is not
+    // looking at, and a restore button swaps a version they cannot see.
     $$("[data-doc-controls]").forEach((group) => group.classList.toggle("active", group.dataset.docControls === button.dataset.doc));
   }));
   $("#chat-form").addEventListener("submit", async (event) => {

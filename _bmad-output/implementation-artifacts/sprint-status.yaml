@@ -110,9 +110,9 @@ development_status:
   11-5-preview-a-transition: done
   epic-11-retrospective: done
 
-  epic-12: backlog
-  12-1-lock-recover-and-restore-the-brief: backlog
-  12-2-the-brief-says-what-it-is-for: backlog
+  epic-12: done
+  12-1-lock-recover-and-restore-the-brief: done
+  12-2-the-brief-says-what-it-is-for: done
   epic-12-retrospective: optional
 
   epic-13: backlog

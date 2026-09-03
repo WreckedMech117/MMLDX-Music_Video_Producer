@@ -81,6 +81,9 @@ from .director import (
     DirectorBudgetExhausted,
     DirectorClient,
     DirectorError,
+    # Imported for `DIRECTOR_REPLACEABLE_DOCUMENTS`, which asks this model which documents a
+    # reply can carry rather than keeping a second list of them.
+    DirectorResult,
     DirectorUnavailable,
     director_result_schema,
     document_rejection,
@@ -259,15 +262,90 @@ SONG_REPLACEMENT_CONSEQUENCE = (
 )
 
 
-# The creative documents a Director reply can replace, keyed by field name. One mapping,
-# and everything else about them is derived from it: the field names the guard loop reaches
-# by interpolation, the slots kept out of the model's context, and the labels used on
-# screen. Adding a third document must not require finding four other places, because the
-# one that gets missed silently leaks a document's kept copy back into every prompt.
-# `api.js`'s DOCUMENT_LABELS is the frontend half; tests assert both sides, the
+# The creative documents that carry the document apparatus — a lock, a single recovery slot,
+# a restore route and a name to call them on screen — keyed by field name. One mapping, and
+# everything about the apparatus is derived from it: the field names the guard loops reach by
+# interpolation, the slots kept out of the model's context, the restore route's path segment,
+# and the labels used on screen. Adding a fourth document must not require finding four other
+# places, because the one that gets missed silently leaks a document's kept copy back into
+# every prompt. `api.js`'s DOCUMENT_LABELS is the frontend half; tests assert both sides, the
 # `DocumentName` literal, and `Project`'s actual fields all agree.
-DOCUMENT_LABELS = {"treatment": "Treatment", "style_bible": "Style bible"}
-DocumentName = Literal["treatment", "style_bible"]
+#
+# **This said "the creative documents a Director reply can replace" until 2026-09-03, and it
+# was one mapping doing two jobs.** Those two questions — *has the apparatus* and *may an
+# ordinary reply rewrite it* — had the same answer while there were two documents, so nothing
+# distinguished them. The Brief is the case that separates them: it has the apparatus and no
+# reply may write it, because `DirectorResult` carries no field for it and (Director ruling,
+# 2026-09-03) will not. `DIRECTOR_REPLACEABLE_DOCUMENTS` below is the second question, and
+# every derived site now reads whichever of the two answers the question it is asking.
+DOCUMENT_LABELS = {
+    "creative_brief": "Creative brief",
+    "treatment": "Treatment",
+    "style_bible": "Style bible",
+}
+DocumentName = Literal["creative_brief", "treatment", "style_bible"]
+
+#: The subset an *ordinary Director reply* may rewrite — the second job the mapping above used
+#: to do — and it is **derived, not transcribed**: a reply is a `DirectorResult`, so the
+#: documents it can replace are exactly the ones that model carries text for. The chat route's
+#: apply loop and `api.js`'s `documentChangeToast` read this; nothing about the lock, the slot,
+#: the restore route or the labels does.
+#:
+#: Deriving it rather than listing it is what makes the two mappings unable to disagree: adding
+#: a document to `DOCUMENT_LABELS` gives it the apparatus, and whether a reply may write it is
+#: then answered by `DirectorResult` itself rather than by a second list somebody has to
+#: remember. Suggest Video (TP-3) will write the Brief and is deliberately *not* a member: it is
+#: its own long pass with its own route, not a turn of chat, and it goes through
+#: `document_lock_refusal` like any other machine write.
+DIRECTOR_REPLACEABLE_DOCUMENTS = {
+    field: label
+    for field, label in DOCUMENT_LABELS.items()
+    if field in DirectorResult.model_fields
+}
+
+#: The documents whose recovery slot is filled by the Director's **own save**, and the other
+#: half of the same partition — derived from the line above rather than listed beside it.
+#:
+#: The rule is *whichever writer is the threat fills the slot*, and it follows from the split:
+#: a document an ordinary reply can replace captures on apply, and capturing on the human's save
+#: as well would let one click of Save spend the single slot that exists to protect them from the
+#: model. A document no reply can replace has no such writer, so its own save is the
+#: displacement — and if it did not capture there, its slot would never fill at all and the
+#: restore button beside it would be furniture.
+#:
+#: This is `routes/song.replace_song_context`'s shape and its threat model, which is the
+#: Director's ruling of 2026-09-03: what destroys a Brief is a save landing over pasted text.
+#: A byte-equal re-save captures nothing — the one case where doing nothing is the whole
+#: feature, in that route's own words — and `replace_documents` is where that is enforced.
+SAVE_CAPTURED_DOCUMENTS = tuple(
+    field for field in DOCUMENT_LABELS if field not in DIRECTOR_REPLACEABLE_DOCUMENTS
+)
+
+#: The two phrases every recovery sentence has to fill in differently depending on which writer
+#: fills the document's slot, keyed by document and derived from the partition above.
+#:
+#: One phrase table rather than two sets of sentences, so the restore confirmation, the one-way
+#: variant, the empty-slot refusal and both of the browser's tooltips stay *one* sentence each.
+#: Getting this wrong is not cosmetic: the refusal used to say a version is only kept "when a
+#: Director reply actually replaces the document", and for the Brief that sentence names a writer
+#: that does not exist and never will — a Director reading it would conclude the Brief is not
+#: protected and stop looking for the button that protects it.
+#:
+#: `api.js` derives the same two phrases from its own copy of the partition, and a contract test
+#: executes both sides. For `treatment` and `style_bible` every sentence below is byte-identical
+#: to what it was before the Brief existed, which is the point.
+DOCUMENT_SLOT_DISPLACEMENT = {
+    field: ("applied replacement" if field in DIRECTOR_REPLACEABLE_DOCUMENTS else "save that changed it")
+    for field in DOCUMENT_LABELS
+}
+DOCUMENT_SLOT_CAPTURE = {
+    field: (
+        "a Director reply actually replaces the document"
+        if field in DIRECTOR_REPLACEABLE_DOCUMENTS
+        else "a save changes the document's text"
+    )
+    for field in DOCUMENT_LABELS
+}
 
 # The two context fields of a Song, keyed by field name and named for the screen. One mapping,
 # and the recovery slots, the restore route's path segment, the per-field save loop and the
@@ -922,8 +1000,13 @@ DOCUMENT_NOT_REQUESTED_NOTICE = (
 # A restore is a *swap*, not a pop: the text being replaced moves into the recovery slot,
 # so a restore is normally its own inverse and a mis-click costs nothing. Saying so is the
 # whole point — single-slot recovery the Director is afraid to use is not recovery.
+#
+# `{displacement}` is `DOCUMENT_SLOT_DISPLACEMENT`'s phrase for this document — "applied
+# replacement" for the two a reply can rewrite, "save that changed it" for the Brief — because
+# naming the wrong writer here tells the Director to look for a protection that is not the one
+# they have.
 DOCUMENT_RESTORE_NOTICE = (
-    "{document} was restored to the version kept before the last applied replacement. "
+    "{document} was restored to the version kept before the last {displacement}. "
     "No Director call was made. The text that was replaced is now the kept version, so "
     "restoring again swaps back."
 )
@@ -931,13 +1014,17 @@ DOCUMENT_RESTORE_NOTICE = (
 # restore is one-way, and claiming reversibility exactly where the recovered text matters
 # most would be the one lie this feature cannot afford.
 DOCUMENT_RESTORE_ONE_WAY_NOTICE = (
-    "{document} was restored to the version kept before the last applied replacement. "
+    "{document} was restored to the version kept before the last {displacement}. "
     "No Director call was made. The document it replaced was empty, so nothing recoverable "
     "was displaced and there is nothing to swap back to: this restore is one-way."
 )
+# `{capture}` is `DOCUMENT_SLOT_CAPTURE`'s clause for this document. The refusal is the one
+# sentence a Director reads at the exact moment they are looking for a version that is not
+# there, so it has to name the writer that would have kept one — the Brief's is a save, and
+# telling them to wait for a Director reply would be telling them to wait forever.
 DOCUMENT_RESTORE_REFUSAL = (
     "No previous version of {document} was kept, so there is nothing to restore. A version "
-    "is only kept when a Director reply actually replaces the document."
+    "is only kept when {capture}."
 )
 
 
@@ -1306,7 +1393,45 @@ def document_restore_notice(document: DocumentName, *, reversible: bool = True) 
     one-way and must not claim otherwise.
     """
     template = DOCUMENT_RESTORE_NOTICE if reversible else DOCUMENT_RESTORE_ONE_WAY_NOTICE
-    return template.format(document=DOCUMENT_LABELS[document])
+    return template.format(
+        document=DOCUMENT_LABELS[document],
+        displacement=DOCUMENT_SLOT_DISPLACEMENT[document],
+    )
+
+
+def document_restore_refusal(document: DocumentName) -> str:
+    """Refuse a restore with an empty slot, naming the writer that *would* fill it.
+
+    A function rather than a bare `.format` at the one call site, for `document_restore_notice`'s
+    reason and one more: the refusal now interpolates two things, and a second caller that filled
+    in only `{document}` would ship a sentence with a literal `{capture}` in it to the one screen
+    where the Director is already looking for something that is missing.
+    """
+    return DOCUMENT_RESTORE_REFUSAL.format(
+        document=DOCUMENT_LABELS[document], capture=DOCUMENT_SLOT_CAPTURE[document]
+    )
+
+
+def document_lock_refusal(project: Project, document: DocumentName) -> str:
+    """The sentence refusing a **machine** write to a locked document, or `""` to proceed.
+
+    One implementation of *may a machine write this document*, so that the chat route and every
+    machine writer that comes after it — Suggest Video (TP-3), the planning passes (TP-10) —
+    cannot answer it differently. The chat route inlined this check for two documents; the Brief
+    is the case that makes a shared answer worth having, because its lock is the whole reason it
+    has one: nothing writes the Brief today, and what the lock exists for is to stand between a
+    re-run of Suggest Video and a Brief the Director spent an hour revising.
+
+    **It is a lock against machines only.** `PUT /documents` assigns a locked document's text
+    from the body exactly as it assigns an unlocked one's, and `restore_document` restores a
+    locked document — a lock stops the Director's model, not the human who set it, and
+    `DOCUMENT_LOCK_NOTICE` says so where the Director reads it. Refusing the human's own edit
+    would leave them unable to fix a locked document without unlocking, saving, editing and
+    locking again.
+    """
+    if not getattr(project, f"{document}_locked"):
+        return ""
+    return DOCUMENT_LOCK_NOTICE.format(document=DOCUMENT_LABELS[document])
 
 
 def shot_render_provenance(shot: Shot) -> bool:
@@ -9835,12 +9960,15 @@ class ProjectDocumentsRequest(BaseModel):
     style_bible: str = ""
     # Locks are tri-state on the wire: `None` means "leave the stored lock as it is". Every
     # other field here defaults to "", which is why an omitted one blanks its document —
-    # a lock defaulting to False the same way would silently unlock both documents on every
+    # a lock defaulting to False the same way would silently unlock every document on every
     # ordinary save, and the save path would quietly defeat the feature.
     #
-    # The recovery slots are deliberately absent from this model. Only an applied Director
-    # replacement writes them; a save cannot forge, clear, or advance a kept version, and
-    # because the route mutates the *stored* project they survive untouched.
+    # The recovery slots are deliberately absent from this model, and that is *more* true now
+    # that one of them is filled here. A body cannot forge, clear, or advance a kept version:
+    # the route computes the Brief's slot from the text it is displacing, so the only thing a
+    # client can influence is the new text. The other two survive untouched because the route
+    # mutates the stored project.
+    creative_brief_locked: bool | None = None
     treatment_locked: bool | None = None
     style_bible_locked: bool | None = None
 
@@ -9955,6 +10083,12 @@ SONG_CONTEXT_RESTORE_NOTICE = (
 # The refusal's wording deliberately shares no phrase with `DOCUMENT_RESTORE_REFUSAL`: both halves
 # recognise their own refusal by substring, and an overlapping phrase would let one recovery path
 # claim the other's failure and "refresh" a project that was never stale.
+#
+# The Brief's document refusal (2026-09-03) is the near miss this sentence predicted: it names a
+# *save* as what keeps a version, exactly as this one does, because for the Brief that is true.
+# What keeps the two apart is that neither marker -- "was kept for this song" and "nothing to
+# restore" -- appears in the other's sentence, and a contract test executes that over every
+# document rather than over `treatment` alone.
 SONG_CONTEXT_RESTORE_REFUSAL = (
     "No previous version of {field} was kept for this song, so there is nothing to swap back to. "
     "A version is kept when a save replaces stored text with different text."
@@ -10475,6 +10609,12 @@ MANIFEST_WRITE_GUARDS: dict[str, str] = {
     "remove_song": WRITE_GUARD_COMPARE_AND_SWAP,
     "replace_project": WRITE_GUARD_COMPARE_AND_SWAP,
     "replace_shots": WRITE_GUARD_COMPARE_AND_SWAP,
+    # Moved up from "not yet been through" on 2026-09-03, when the Brief's recovery slot
+    # started being filled here. The rule above is that a compare-and-swap is the only
+    # answer for a write whose loss is undetectable afterwards, and it names a recovery
+    # slot as its example; this route is now `replace_song_context`'s twin rather than
+    # three strings a client was already holding.
+    "replace_documents": WRITE_GUARD_COMPARE_AND_SWAP,
     "replace_song_context": WRITE_GUARD_COMPARE_AND_SWAP,
     "restore_document": WRITE_GUARD_COMPARE_AND_SWAP,
     "restore_song_context": WRITE_GUARD_COMPARE_AND_SWAP,
@@ -10514,7 +10654,6 @@ MANIFEST_WRITE_GUARDS: dict[str, str] = {
     "replace_character_slot": WRITE_GUARD_LAST_WRITER_WINS,
     "replace_consistency_prompt": WRITE_GUARD_LAST_WRITER_WINS,
     "replace_default_setting": WRITE_GUARD_LAST_WRITER_WINS,
-    "replace_documents": WRITE_GUARD_LAST_WRITER_WINS,
     "replace_sampling_profile": WRITE_GUARD_LAST_WRITER_WINS,
     "replace_sections": WRITE_GUARD_LAST_WRITER_WINS,
     # Beside its sibling and classified the same way, for the same reason: it is one Director,

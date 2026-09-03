@@ -720,21 +720,91 @@ export function songChangeNeedsConfirmation(project) {
   return Boolean(project?.song) && Boolean(project?.shots?.length);
 }
 
-// The two creative documents a Director reply can replace, and what each is called on
-// screen. The server states the same mapping in app.py's DOCUMENT_LABELS; the keys are the
-// path segment the restore route accepts, so a rename here 404s rather than mislabelling.
-export const DOCUMENT_LABELS = { treatment: "Treatment", style_bible: "Style bible" };
+// The three creative documents that carry the document apparatus -- a lock, a single kept
+// version, a restore route and a name on screen -- and what each is called. The server states
+// the same mapping in app.py's DOCUMENT_LABELS; the keys are the path segment the restore route
+// accepts, so a rename here 404s rather than mislabelling.
+//
+// This said "the two creative documents a Director reply can replace" until 2026-09-03, and that
+// was one mapping answering two questions. DIRECTOR_REPLACEABLE_DOCUMENTS below is the other
+// one: the Brief has the apparatus and no reply writes it, so every site here reads whichever
+// mapping answers the question it is asking.
+export const DOCUMENT_LABELS = { creative_brief: "Creative brief", treatment: "Treatment", style_bible: "Style bible" };
 
-// Every per-document control, in one table: the two element ids the Treatment workspace
-// exposes, the project fields they read, and the document tab each pair belongs to. One
+// The subset an ordinary Director reply may rewrite -- the server derives it from
+// DirectorResult's own fields, and a contract test executes both sides against each other, so
+// this transcription cannot drift from what a reply can actually carry. Read by
+// documentChangeToast, which is asking "what did this reply do", and by the recovery wording
+// below, which is asking "which writer fills this document's slot". Nothing about the lock, the
+// restore button or the labels reads it.
+export const DIRECTOR_REPLACEABLE_DOCUMENTS = { treatment: "Treatment", style_bible: "Style bible" };
+
+// What the Brief is for, stated where a Director writing one will read it (TP-2). The Brief is
+// the first stage of planning: it is revised and edited, and then broken down into the Treatment
+// and the Style bible -- so a constraint that is not in the Brief cannot reach either of them,
+// and that is the thing a Director has no way to discover from an empty textarea.
+//
+// It also states the two protections beside it, because a recovery nobody knows about is not a
+// recovery. The markup cannot import this, so a contract test asserts the paragraph matches.
+export const BRIEF_HELP =
+  "The Brief is the first stage of planning and the document the others are made from: the core " +
+  "idea, the emotional arc, who it is for, and the constraints you already know — location, " +
+  "cast, look, anything fixed. The Treatment and the Style bible are generated from it, so what " +
+  "is not here cannot reach them. Revise it as often as you like: each save that changes it keeps " +
+  "the version it replaced, and Lock stops a planning pass overwriting it.";
+
+// Pure: may an ordinary Director reply rewrite this document? One predicate, so the three
+// wordings below and the change toast cannot answer it differently.
+export function documentReplaceableByReply(document) {
+  // An unknown document has to throw rather than answer "no reply writes that one", which is
+  // the safe-sounding wrong answer: it would put a typo'd document quietly on the Brief's side
+  // of every wording below. `documentLabel` is the one lookup that throws, so it is asked first.
+  documentLabel(document);
+  return Object.hasOwn(DIRECTOR_REPLACEABLE_DOCUMENTS, document);
+}
+
+// What fills each document's single kept version, as the two phrases the recovery sentences
+// need: the noun after "the version kept before the last ", and the clause after "one is kept
+// when ". Mirrors app.py's DOCUMENT_SLOT_DISPLACEMENT and DOCUMENT_SLOT_CAPTURE, and is derived
+// from the mapping above on this side too.
+//
+// Not cosmetic. The tooltip on an empty Brief slot used to be able to say a version is kept
+// "when a Director reply replaces it" -- naming a writer that does not exist for the Brief and
+// never will, which tells the Director the box is not protected and to stop looking for the
+// button that protects it.
+export function documentSlotDisplacement(document) {
+  return documentReplaceableByReply(document) ? "applied replacement" : "save that changed it";
+}
+
+export function documentSlotCapture(document) {
+  return documentReplaceableByReply(document)
+    ? "a Director reply replaces it"
+    : "a save changes its text";
+}
+
+// Every per-document control, in one table: the three element ids each document exposes in the
+// Treatment workspace, the project fields they read, and the tab each set belongs to. One
 // mapping because the alternative — a document's selectors, fields and prose name spelled
-// out again at the seed, render, bind and label sites — is exactly how a rename half-lands
+// out again at the seed, render, bind, save and label sites — is exactly how a rename half-lands
 // and leaves a control wired to the other document. The field names are the ones the
 // restore route derives with `getattr(project, f"{document}_previous")`, so they cannot be
 // spelled differently here without the two halves disagreeing about the same slot.
+//
+// `box` is the editor itself, added 2026-09-03 with the Brief's entry: the save path used to
+// name three textarea ids of its own, so a fourth document would have had to be remembered
+// there as well as here. Now the save reads this table and a document is one entry.
 export const DOCUMENT_CONTROLS = {
+  creative_brief: {
+    tab: "brief",
+    box: "#creative-brief",
+    lock: "#lock-brief",
+    restore: "#restore-brief",
+    lockedField: "creative_brief_locked",
+    previousField: "creative_brief_previous",
+  },
   treatment: {
     tab: "treatment",
+    box: "#treatment-text",
     lock: "#lock-treatment",
     restore: "#restore-treatment",
     lockedField: "treatment_locked",
@@ -742,6 +812,7 @@ export const DOCUMENT_CONTROLS = {
   },
   style_bible: {
     tab: "style",
+    box: "#style-bible",
     lock: "#lock-style",
     restore: "#restore-style",
     lockedField: "style_bible_locked",
@@ -813,15 +884,17 @@ export function documentRestoreAvailable(project, document) {
 }
 
 // What the restore button says it will do, in the two states it has. Named from
-// DOCUMENT_LABELS so the tooltip, the toast and the markup's label are one spelling.
+// DOCUMENT_LABELS so the tooltip, the toast and the markup's label are one spelling, and the
+// phrase naming *what fills the slot* comes from the recovery wording above rather than being
+// written out — for the Brief nothing a Director reply does will ever fill it.
 export function documentRestoreTitle(document, available) {
   const label = documentLabel(document);
   return available
-    ? `Swap ${label} back to the version kept before the last applied replacement; no Director call is made`
-    : `No previous version of ${label} is kept yet; one is kept when a Director reply replaces it`;
+    ? `Swap ${label} back to the version kept before the last ${documentSlotDisplacement(document)}; no Director call is made`
+    : `No previous version of ${label} is kept yet; one is kept when ${documentSlotCapture(document)}`;
 }
 
-// Toggling a lock is a change to how the *next* Director reply behaves, so the toast has to
+// Toggling a lock is a change to how the *next* machine write behaves, so the toast has to
 // confirm that change rather than report a generic save — "Project saved" tells the Director
 // nothing about whether the document is now protected.
 export const DOCUMENT_LOCK_SET_NOTICE =
@@ -829,8 +902,20 @@ export const DOCUMENT_LOCK_SET_NOTICE =
 export const DOCUMENT_LOCK_CLEARED_NOTICE =
   "{document} is unlocked: a Director reply may replace it, keeping the previous version for restore.";
 
+// And the same two sentences for a document no reply writes. Both halves of the pair above are
+// false for the Brief: no Director reply is what its lock stands against — a planning pass is,
+// which is the whole reason TP-1 gives it one — and its kept version comes from the Director's
+// own save, so it goes on being recorded while the lock is on. A toast that said otherwise would
+// tell a Director their edits are no longer recoverable at the moment they protect the document.
+export const PLANNED_DOCUMENT_LOCK_SET_NOTICE =
+  "{document} is locked: a planning pass will not overwrite it. Your own edits still save, and each save that changes it keeps the version it replaced.";
+export const PLANNED_DOCUMENT_LOCK_CLEARED_NOTICE =
+  "{document} is unlocked: a planning pass may overwrite it, keeping the previous version for restore.";
+
 export function documentLockNotice(document, locked) {
-  const wording = locked ? DOCUMENT_LOCK_SET_NOTICE : DOCUMENT_LOCK_CLEARED_NOTICE;
+  const wording = documentReplaceableByReply(document)
+    ? (locked ? DOCUMENT_LOCK_SET_NOTICE : DOCUMENT_LOCK_CLEARED_NOTICE)
+    : (locked ? PLANNED_DOCUMENT_LOCK_SET_NOTICE : PLANNED_DOCUMENT_LOCK_CLEARED_NOTICE);
   return wording.replace("{document}", documentLabel(document));
 }
 
@@ -1058,7 +1143,10 @@ export function documentChangeToast(before, after, applied = true) {
   if (!applied) {
     return documentProposalDeclined(after) ? DOCUMENT_NOT_APPLIED_TOAST : DOCUMENT_UNCHANGED_TOAST;
   }
-  const changed = Object.keys(DOCUMENT_LABELS).filter(
+  // DIRECTOR_REPLACEABLE_DOCUMENTS, not DOCUMENT_LABELS: this toast reports what *this reply*
+  // did, and a reply cannot carry the Brief at all. Diffing it here would credit the reply with
+  // a change the Director had just typed and saved themselves.
+  const changed = Object.keys(DIRECTOR_REPLACEABLE_DOCUMENTS).filter(
     (document) => (before?.[document] ?? "") !== (after?.[document] ?? ""),
   );
   if (!changed.length) return DOCUMENT_UNCHANGED_TOAST;
@@ -3138,12 +3226,14 @@ export const UNSAVED_DOCUMENT_EDITS_CONSEQUENCE =
 // the Director reads is the same sentence the thread records. It says the swap is
 // symmetric on purpose: single-slot recovery nobody dares use is not recovery.
 export const DOCUMENT_RESTORE_NOTICE =
-  "{document} was restored to the version kept before the last applied replacement. " +
+  "{document} was restored to the version kept before the last {displacement}. " +
   "No Director call was made. The text that was replaced is now the kept version, so " +
   "restoring again swaps back.";
 
 export function documentRestoreNotice(document) {
-  return DOCUMENT_RESTORE_NOTICE.replace("{document}", documentLabel(document));
+  return DOCUMENT_RESTORE_NOTICE
+    .replace("{document}", documentLabel(document))
+    .replace("{displacement}", documentSlotDisplacement(document));
 }
 
 // True when a rejection is the restore route refusing because no version was ever kept.

@@ -2106,15 +2106,34 @@ class Project(BaseModel):
     creative_brief: str = ""
     treatment: str = ""
     style_bible: str = ""
-    # Single-slot recovery per AD-14: the one value an applied Director replacement
-    # overwrote, and nothing older. A rejected or locked candidate leaves these alone —
-    # capturing on attempt rather than on apply would let a refused candidate destroy the
-    # only copy of the document the refusal exists to protect.
+    # Single-slot recovery per AD-14: the one value the write that displaced it overwrote,
+    # and nothing older. **One slot, one step back, and deliberately not a stack** — TP-9's
+    # "step back through this session's revisions" is a different mechanism with a different
+    # lifetime (a session-scoped history restored verbatim, AD-44), and nothing here is shaped
+    # to grow into it.
+    #
+    # *Which* write fills a slot differs by document, because the threat differs, and that is a
+    # Director ruling of 2026-09-03 rather than an inconsistency. For `treatment` and
+    # `style_bible` it is an applied Director replacement: a rejected or locked candidate leaves
+    # them alone, since capturing on attempt rather than on apply would let a refused candidate
+    # destroy the only copy of the document the refusal exists to protect. For `creative_brief`
+    # it is the Director's own save (`PUT /documents`), on `Song.lyrics_previous`' argument: no
+    # ordinary reply can replace the Brief — `DirectorResult` has no field for it — so what
+    # destroys a Brief is a save landing over pasted text, and a save whose text equals the
+    # stored text captures nothing at all. See `app.SAVE_CAPTURED_DOCUMENTS`.
+    creative_brief_previous: str = ""
     treatment_previous: str = ""
     style_bible_previous: str = ""
     # Per-document locks, mirroring `Shot.locked`: the Director's "do not touch this" for a
     # creative document. Every field here is defaulted so manifests written before this
     # existed load unchanged.
+    #
+    # The Brief's lock has no machine to refuse today, and it is built to hold anyway: TP-3's
+    # Suggest Video and TP-10's planning passes write the Brief, and this lock is what will
+    # stand between a re-run of one of them and a Brief the Director spent an hour revising.
+    # Every machine write asks `app.document_lock_refusal` first; a lock has never stopped the
+    # human who set it from typing in the textarea.
+    creative_brief_locked: bool = False
     treatment_locked: bool = False
     style_bible_locked: bool = False
     song: Song | None = None

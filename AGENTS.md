@@ -22,6 +22,8 @@ Local-first studio that turns a song into an AI music video through a user-manag
 ## Running and verifying
 
 - Prefix every Python command with `uv run`; bare `pytest` and `ruff` run outside the project environment.
+- **Run the suite as `uv run pytest`, never `uv run pytest -q`.** `pyproject.toml` already sets `addopts = "-q"`, so adding the flag runs at `-qq` and **suppresses the `N passed` line**, leaving nothing but a block of dots to count by eye. That is the mechanical cause of six consecutive miscounted baselines in this project's specs (2698/2699, 2728/2729, 2761/2762, 2780/2783, and two more) — every one of them a number somebody counted rather than read. Quote it as **collected / passed / failed**, which are three different numbers and have disagreed.
+- **The suite's size is not a property of the commit.** `_bmad-output/implementation-artifacts/` is gitignored and `tests/test_spec_frontmatter.py` parameterises one test per spec file *on disk*, so writing a spec adds a test. A clean checkout of a commit collects fewer tests than the machine that made it. Record what you measured and on what tree.
 - `node --check src/music_video_producer/web/assets/app.js` is a required gate and appears in no config file.
 - Browser QA is a release gate, not optional; it needs the app on an isolated port with an empty data root — see `docs/OPERATIONS.md`.
 - ComfyUI must already be running at `MVP_COMFY_URL` before any live render or `/object_info` check.
