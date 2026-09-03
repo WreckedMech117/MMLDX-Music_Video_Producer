@@ -359,6 +359,32 @@ edge-case findings changed under checking — one was pre-existing rather than a
 (proved by running the same geometry against a worktree at the pre-fix commit), one could not be
 reproduced at all.
 
+### Two of this project's own gates were inert, and both always exited 0
+
+*Found 2026-09-03, one per slice, by two different implementers — neither by me.*
+
+**`uv run pytest -q` suppresses the number it is run for.** `pyproject.toml` already sets
+`addopts = "-q"`, so the flag makes it `-qq`, which drops the `N passed` summary line entirely.
+Every spec in this project told its implementer to *count the progress block* — that is counting
+characters by eye, and it is a sufficient mechanism for six consecutive miscounted baselines
+without anyone being careless. **Run `uv run pytest` with no flag** and quote
+**collected / passed / failed** as three numbers; they have disagreed.
+
+**`node --check` proves nothing about either JS asset.** Node parses a `.js` file as CommonJS and
+goes quiet the moment it meets ESM syntax, and `app.js` and `api.js` have been ES modules for as
+long as `AGENTS.md` has called this a required gate. Measured on the real file: broken syntax
+appended to `app.js` exits **0** as `.js`, exits **1** as `.mjs`, and the intact file exits **0**
+as `.mjs`. The suite covered this by accident all along — `test_frontend_contract.py` imports both
+assets under node — and now covers it on purpose, in
+`test_node_check_is_only_a_gate_when_the_asset_is_read_as_a_module`, which also demonstrates it can
+fail. **The `AGENTS.md` line still names the inert form and sits inside the `bmad:context` managed
+block**, so correcting it there is a Director call rather than an edit that would survive a
+refresh.
+
+**The pattern worth carrying:** both gates were green for months *because* they could not fail. A
+check that has never once failed has not been shown to be capable of failing — and the cheapest
+test of a gate is to break the thing it watches and confirm it says so.
+
 ### A claim in a spec that was not executed is a hypothesis, and must say so
 
 *Item 81.* Across Epics 9, 10 and 11 **every wrong claim was reasoned and every right one was
@@ -479,7 +505,8 @@ None blocks starting. All are recorded in the spines' `Deferred` sections.
 
 **Found while building treatment Slice A (2026-09-03), needs a Director ruling before anyone builds it:**
 
-- **FR-16 still has a hole, and it is not the one Slice A closed.** The Brief is now protected on every path.
+- ~~**FR-16 still has a hole, and it is not the one Slice A closed.**~~ **Closed 2026-09-03 by R-18 and Slice A2 — see §7 law 4.** The candidate remedy this entry named first is the one that shipped: a clearing confirmation on the document save, in `songContextClearing`'s shape, with the consequence sentence derived from `SAVE_CAPTURED_DOCUMENTS`/`DIRECTOR_REPLACEABLE_DOCUMENTS` rather than written per document. `tests/test_frontend_contract.py` now drives the Save button and the lock checkbox through it, and `tests/e2e_document_clearing.py` is the browser gate. The paragraph below is left standing as the record of what was measured.
+  The Brief is now protected on every path.
   `treatment` and `style_bible` are not: `PUT /documents` assigns their text from the body with no capture and
   no confirmation, so a Director who clears the Treatment textarea and clicks **Save document** destroys it with
   nothing kept — the exact threat model the 2026-09-03 ruling identified for the Brief, on the two documents
@@ -507,7 +534,7 @@ Violating one of these is a defect even when the code works.
 1. **The frame grid is inviolable.** The assembled video matches the song within one frame, for every combination of effects and transitions. Effects `FX-NFR-1`.
 2. **One engine describes an effect.** Preview is the export's own filter chain at smaller dimensions — never an approximation. Effects `FX-NFR-3`.
 3. **Nothing renders without confirmation.** Every GPU spend passes an explicit confirmation naming what will run.
-4. **Never silently destroy a creative document.** FR-16. Since Treatment Slice A shipped (2026-09-03) it holds against every *machine* write for all three documents, and the **Brief** holds against the human save too — its slot is filled by the Director's own save rather than by an applied reply, because no reply can write it (AD-41, amended). **It does not yet hold against the human save for `treatment` and `style_bible`**: measured 2026-09-03, a `PUT /documents` carrying empty text for all three left the Brief recoverable and both of the others gone with the restore answering 409. See §6 — that gap needs a ruling, not an implementation.
+4. **Never silently destroy a creative document.** FR-16. Since Treatment Slice A shipped (2026-09-03) it holds against every *machine* write for all three documents, and the **Brief** holds against the human save too — its slot is filled by the Director's own save rather than by an applied reply, because no reply can write it (AD-41, amended). ~~**It does not yet hold against the human save for `treatment` and `style_bible`**: measured 2026-09-03, a `PUT /documents` carrying empty text for all three left the Brief recoverable and both of the others gone with the restore answering 409. See §6 — that gap needs a ruling, not an implementation.~~ **Ruled and built 2026-09-03 (R-18, Slice A2): a save that would replace a document's stored text with nothing asks first**, and the sentence it asks with is derived from the same partition — the Brief's says the version is kept and names Restore, the other two say nothing is kept and that the slot beside them is still the model's. **The server did not move and must not**: capturing on save for those two would spend the single slot that exists to protect the Director from an unrequested rewrite. So this is a **client-side** guard and an API client still deletes silently — the identical, accepted boundary the song context's own clearing question has.
 5. **Derived beats stored.** Media presence, envelope validity, preview staleness, proposal staleness, effects presence — all computed at read time, never a stored flag that can outlive its condition. AD-11 and everything that cites it.
 6. **Consent is explicit on the wire, never ambient.** Planning Mode's session consent is a *client* affordance; every request still carries consent. AD-35.
 7. **The palette is closed at six accents.** `--acid` complete/action · `--amber` running/caution · `--red` error · `--cyan` approved · `--blue` transitions and reactive bindings · `--dim`/`--muted` inert. A seventh needs the argument made from scratch.

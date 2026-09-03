@@ -782,6 +782,76 @@ export function documentSlotCapture(document) {
     : "a save changes its text";
 }
 
+// Pure: does *this* save keep the version it is about to replace? The other half of
+// `documentReplaceableByReply`, and the browser's mirror of app.py's SAVE_CAPTURED_DOCUMENTS,
+// which is derived from the identical partition on that side. Named rather than written out as a
+// negation wherever it is needed, because it is the question the clearing consequence asks and
+// there is exactly one right answer per document.
+export function documentCapturedOnSave(document) {
+  return !documentReplaceableByReply(document);
+}
+
+// Which stored documents a save would delete outright.
+//
+// `PUT /documents` writes every document from the body, so saving with an empty box deletes what
+// is stored — and an omitted field is read there as "", so a document missing from the payload
+// counts the same as an emptied one. Whitespace is not text, on both sides, exactly as
+// `songContextClearing` has it.
+//
+// Asked only for that case: text that exists being replaced with nothing. Editing a document down
+// to *different* text is typing, and a question about every save would train the Director to click
+// through the one question that protects real work — `songContextClearing`'s own argument.
+//
+// Returns document keys, where `songContextClearing` returns phrases. What this save costs is not
+// the same for all three, and the answer is decided per document by the partition above, so the
+// question needs the key; labelling happens once, inside `documentClearingQuestion`.
+export function documentClearing(project, documents) {
+  return Object.keys(DOCUMENT_LABELS).filter(
+    (name) => Boolean(project?.[name]?.trim()) && !documents?.[name]?.trim(),
+  );
+}
+
+// "A", "A and B", "A, B and C" — one spelling for a run of document names, because a single save
+// can clear any of the three and the question names every one it is about.
+function documentNames(documents) {
+  const labels = documents.map(documentLabel);
+  if (labels.length < 2) return labels.join("");
+  return `${labels.slice(0, -1).join(", ")} and ${labels[labels.length - 1]}`;
+}
+
+// What is true after the click, stated exactly. **Two sentences because the partition has two
+// sides, not three because there are three documents** — a per-document sentence would be a
+// second copy of a fact `documentCapturedOnSave` already holds, and the copy is what goes stale.
+//
+// SONG_CONTEXT_CLEARING_CONSEQUENCE's standard applies to both halves: a consequence that
+// overstates the damage is as corrosive as one that understates it — a Director who believes an
+// emptied field is gone forever will not look for the Restore button that would bring it back.
+// So the captured half names the button *and* its one-step limit, and the uncaptured half says
+// what the slot beside those boxes actually holds instead of implying it is empty or that this
+// save is about to fill it. It is not: R-18 left that slot to the model deliberately, because it
+// is the only protection there is against an unrequested rewrite.
+export const DOCUMENT_CLEARING_KEPT_CONSEQUENCE =
+  "{documents}: the version this save replaces is kept, and Restore beside the box swaps it back " +
+  "— but only the one most recent version, so the next save spends it.";
+export const DOCUMENT_CLEARING_UNKEPT_CONSEQUENCE =
+  "{documents}: nothing is kept by this save. The one version kept for restore is whatever a " +
+  "Director reply last replaced, if anything, and this save leaves it exactly as it is — so the " +
+  "text being deleted here has no way back.";
+
+// The question, assembled from the partition rather than from a table of sentences. Both halves
+// appear when one save clears documents from both sides of it, and neither appears for a side
+// this save is not touching.
+export function documentClearingQuestion(cleared) {
+  const consequence = [
+    [cleared.filter((name) => documentCapturedOnSave(name)), DOCUMENT_CLEARING_KEPT_CONSEQUENCE],
+    [cleared.filter((name) => !documentCapturedOnSave(name)), DOCUMENT_CLEARING_UNKEPT_CONSEQUENCE],
+  ]
+    .filter(([documents]) => documents.length)
+    .map(([documents, wording]) => wording.replace("{documents}", documentNames(documents)))
+    .join("\n\n");
+  return `Save this? It deletes the stored text of ${documentNames(cleared)} for this project.\n\n${consequence}`;
+}
+
 // Every per-document control, in one table: the three element ids each document exposes in the
 // Treatment workspace, the project fields they read, and the tab each set belongs to. One
 // mapping because the alternative — a document's selectors, fields and prose name spelled
@@ -3222,16 +3292,34 @@ export const UNSAVED_DOCUMENT_EDITS_CONSEQUENCE =
   "server, and only stored text is ever kept as a recoverable version, so unsaved edits cannot be restored " +
   "afterwards. Cancel and save the document first to keep them.";
 
-// The one wording for a restore, mirroring app.py's DOCUMENT_RESTORE_NOTICE so the toast
-// the Director reads is the same sentence the thread records. It says the swap is
-// symmetric on purpose: single-slot recovery nobody dares use is not recovery.
+// The wording for a restore, mirroring `app.py` so the toast the Director reads is the same
+// sentence the thread records. It says the swap is symmetric on purpose: single-slot
+// recovery nobody dares use is not recovery.
+//
+// **There are two sentences, and until 2026-09-03 this side had one** — so the claim
+// in the line above was false in exactly the case that matters. `app.py` picks
+// `DOCUMENT_RESTORE_ONE_WAY_NOTICE` when the text being displaced was empty, because an
+// empty slot has to refuse and *"claiming reversibility exactly where the recovered text
+// matters most would be the one lie this feature cannot afford"*. The thread said the
+// restore was one-way while the toast beside it promised a swap back and the Restore button
+// under both was greyed out: three surfaces, two of them wrong, found in a screenshot.
 export const DOCUMENT_RESTORE_NOTICE =
   "{document} was restored to the version kept before the last {displacement}. " +
   "No Director call was made. The text that was replaced is now the kept version, so " +
   "restoring again swaps back.";
 
-export function documentRestoreNotice(document) {
-  return DOCUMENT_RESTORE_NOTICE
+// ...except where the displaced text was empty. Byte-identical to `app.py`'s, and a contract
+// test holds the pair together so a correction to one cannot land without the other.
+export const DOCUMENT_RESTORE_ONE_WAY_NOTICE =
+  "{document} was restored to the version kept before the last {displacement}. " +
+  "No Director call was made. The document it replaced was empty, so nothing recoverable " +
+  "was displaced and there is nothing to swap back to: this restore is one-way.";
+
+// `reversible` is the server's own word for it and arrives with the restore's reply; the
+// default is the symmetric sentence, because that is what every restore before this one was
+// and a caller that has not been taught the difference should not start claiming one-wayness.
+export function documentRestoreNotice(document, { reversible = true } = {}) {
+  return (reversible ? DOCUMENT_RESTORE_NOTICE : DOCUMENT_RESTORE_ONE_WAY_NOTICE)
     .replace("{document}", documentLabel(document))
     .replace("{displacement}", documentSlotDisplacement(document));
 }

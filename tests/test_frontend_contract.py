@@ -31,6 +31,7 @@ from music_video_producer.app import (
     DOCUMENT_SLOT_CAPTURE,
     DOCUMENT_SLOT_DISPLACEMENT,
     MULTIVIEW_SUBJECTS,
+    SAVE_CAPTURED_DOCUMENTS,
     SECTION_LOOK_SKIP_ALL_WRITTEN,
     SECTION_LOOK_SKIP_WRITTEN,
     SECTION_LOOKS_ALL_WRITTEN,
@@ -2279,6 +2280,7 @@ def test_document_restore_wording_agrees_on_both_sides():
         replaceable: DIRECTOR_REPLACEABLE_DOCUMENTS,
         marker: DOCUMENT_RESTORE_REFUSAL_MARKER,
         notices: over(documentRestoreNotice),
+        oneWay: over((d) => documentRestoreNotice(d, { reversible: false })),
         displacement: over(documentSlotDisplacement),
         capture: over(documentSlotCapture),
         armed: over((d) => documentRestoreTitle(d, true)),
@@ -2305,6 +2307,21 @@ def test_document_restore_wording_agrees_on_both_sides():
         assert "swaps back" in browser["notices"][document], document
         # And that no model was involved, which is the point of the route existing.
         assert "No Director call was made" in browser["notices"][document], document
+        # **The other sentence, which this side did not have until 2026-09-03.** The server
+        # picks it when the displaced text was empty (`reversible=bool(displaced.strip())`),
+        # because an empty slot has to refuse and claiming reversibility exactly where the
+        # recovered text matters most is the one lie this feature cannot afford. The browser
+        # carried only the symmetric wording, so the toast promised a swap back while the
+        # thread recorded a one-way restore and the button beside them was greyed out --
+        # three surfaces, two of them wrong, and no offline gate could see it because
+        # nothing asked this side for the sentence it did not have.
+        assert browser["oneWay"][document] == document_restore_notice(
+            document, reversible=False
+        ), document
+        assert "one-way" in browser["oneWay"][document], document
+        # And the two are genuinely different sentences, so a mutation that returns the same
+        # one for both arms fails here rather than passing on a coincidence.
+        assert browser["oneWay"][document] != browser["notices"][document], document
         # The phrase naming what fills the slot is per document on both sides, or the Brief's
         # tooltip promises a Director reply that will never come.
         assert browser["displacement"][document] == DOCUMENT_SLOT_DISPLACEMENT[document], document
@@ -2367,7 +2384,12 @@ def test_restore_reaches_a_real_route_and_sends_no_chat_message():
 
     handler = app_js_block("async function restoreDocument")
     assert "api.restoreDocument(state.project.id, documentKey)" in handler
-    assert "documentRestoreNotice(documentKey)" in handler
+    # The notice is toasted **with the arm the server chose**, not unconditionally: the
+    # handler derives `reversible` from whether the slot holds anything after the swap,
+    # exactly as `restore_document` derives it from the text it displaced. This is a
+    # source check and a weak one -- `test_the_restore_toast_says_the_same_thing_the_thread_will_record`
+    # drives the bound click and asserts both sentences, which is where the coverage is.
+    assert "documentRestoreNotice(documentKey, { reversible:" in handler
     assert "directorChat" not in handler
     assert "api.saveDocuments" not in handler
     # Both controls route through this one function rather than reimplementing the call, and
@@ -2424,6 +2446,262 @@ def test_document_save_sends_every_lock_and_no_slot_from_the_one_control_table()
     # And the server takes exactly that shape: every key is a field the request model declares,
     # and every document and lock it declares is sent.
     assert set(payload) == set(ProjectDocumentsRequest.model_fields)
+
+
+def test_a_save_that_empties_a_document_asks_first():
+    """R-18: `PUT /documents` writes every document from the body, so an empty box deletes.
+
+    Measured through the real route on 2026-09-03: a save carrying empty text for all three left
+    `creative_brief_previous` holding the Brief and both other slots empty, with
+    `POST .../documents/treatment/restore` answering 409. Slice A gave the Brief a capture on
+    save; it did not give one to the Treatment or the Style bible, and it must not — their single
+    slot exists to protect the Director from an unrequested model rewrite, and spending it on a
+    Save click is the thing R-18 declined.
+
+    So the guard is a question, in `songContextClearing`'s shape, and it is driven here through
+    the button a Director actually clicks rather than by calling the predicate: the decision is
+    pure and lives in `api.js`, but the *asking* is a line in `saveProject` and a fixture that
+    cannot fail on its absence is the failure this repository has ~22 instances of.
+    """
+    saves = run_workspace(
+        """
+      const boxes = { creative_brief: '#creative-brief', treatment: '#treatment-text', style_bible: '#style-bible' };
+      const stored = {
+        id: 'p1', shots: [], jobs: [], messages: [],
+        creative_brief: 'the brief', treatment: 'the treatment', style_bible: 'the style bible',
+        creative_brief_previous: null, treatment_previous: null, style_bible_previous: null,
+      };
+      const sent = () => requests.filter((request) => request.path === '/api/projects/p1/documents');
+      // One save, driven through the Save document button: the project on the left of the
+      // comparison is what the server holds, the boxes on the right are what the click would send.
+      const save = async (project, typed, reply) => {
+        state.project = { ...stored, ...project };
+        state.documentsDirty = true;
+        for (const [document, selector] of Object.entries(boxes)) at(selector).value = typed[document];
+        answer(reply);
+        await fire('#save-treatment:click', {});
+        return {
+          asked: [...asked],
+          sent: sent().map((request) => JSON.parse(request.body)),
+          onScreen: Object.fromEntries(
+            Object.entries(boxes).map(([document, selector]) => [document, at(selector).value]),
+          ),
+          project: { treatment: state.project.treatment, creative_brief: state.project.creative_brief },
+          dirty: state.documentsDirty,
+        };
+      };
+      const full = { creative_brief: 'the brief', treatment: 'the treatment', style_bible: 'the style bible' };
+
+      const refused = await save({}, { ...full, treatment: '' }, false);
+      const accepted = await save({}, { ...full, treatment: '' }, true);
+      const brief = await save({}, { ...full, creative_brief: '' }, false);
+      const both = await save({}, { ...full, creative_brief: '', treatment: '' }, false);
+      const bothUnkept = await save({}, { ...full, treatment: '', style_bible: '' }, false);
+      const retyped = await save({}, { ...full, treatment: 'a different treatment' }, false);
+      const alreadyEmpty = await save({ treatment: '' }, { ...full, treatment: '' }, false);
+      // Whitespace is not text, on both sides -- `songContextClearing` uses `.trim()` and this
+      // matches it. A box holding spaces over stored text is a clearing; a stored document that
+      // is only spaces has nothing to lose.
+      const spacesTyped = await save({}, { ...full, treatment: '   ' }, false);
+      const spacesStored = await save({ treatment: '  \\n ' }, { ...full, treatment: '' }, false);
+
+      // The lock checkbox saves through the same function, so it asks too -- and a decline has to
+      // put the checkbox back, or the Director is looking at a lock the server never took.
+      state.project = { ...stored };
+      state.documentsDirty = true;
+      for (const [document, selector] of Object.entries(boxes)) at(selector).value = full[document];
+      at('#treatment-text').value = '';
+      at('#lock-treatment').checked = true;
+      answer(false);
+      await fire('#lock-treatment:change', { currentTarget: at('#lock-treatment') });
+      const lock = { asked: [...asked], sent: sent().length, checked: at('#lock-treatment').checked };
+
+      console.log(JSON.stringify({
+        refused, accepted, brief, both, bothUnkept, retyped, alreadyEmpty, spacesTyped, spacesStored, lock,
+        keptWording: contract.DOCUMENT_CLEARING_KEPT_CONSEQUENCE,
+        unkeptWording: contract.DOCUMENT_CLEARING_UNKEPT_CONSEQUENCE,
+      }));
+    """,
+        responses={
+            "/api/projects/p1/documents": {
+                "body": {
+                    "id": "p1", "shots": [], "jobs": [], "messages": [],
+                    "creative_brief": "the brief", "treatment": "", "style_bible": "the style bible",
+                }
+            }
+        },
+    )
+
+    # --- Declining stops the save dead, and changes nothing on screen ------------------------
+    assert len(saves["refused"]["asked"]) == 1
+    assert saves["refused"]["sent"] == []
+    # The emptied box is left emptied: the Director's own gesture is not undone for them, and
+    # re-seeding the textareas here would discard whatever else they had typed.
+    assert saves["refused"]["onScreen"]["treatment"] == ""
+    assert saves["refused"]["project"]["treatment"] == "the treatment"
+    # And the project is still unsaved, or the next project switch stops asking about work that
+    # really is unsaved.
+    assert saves["refused"]["dirty"] is True
+
+    # --- The Treatment's sentence must not promise a recovery it does not have ---------------
+    question = saves["refused"]["asked"][0]
+    assert "Treatment" in question
+    assert saves["unkeptWording"].replace("{documents}", "Treatment") in question
+    assert saves["keptWording"] not in question
+    assert "Creative brief" not in question, question
+    assert "Style bible" not in question, question
+    # And no Restore is offered anywhere in it: the button beside the Treatment answers 409
+    # for text this save deletes, so naming it is the overstatement's mirror image.
+    assert "Restore" not in question, question
+
+    # --- Accepting sends it, carrying the emptied document and the untouched ones -------------
+    assert len(saves["accepted"]["asked"]) == 1
+    assert len(saves["accepted"]["sent"]) == 1
+    assert saves["accepted"]["sent"][0]["treatment"] == ""
+    assert saves["accepted"]["sent"][0]["creative_brief"] == "the brief"
+    assert saves["accepted"]["sent"][0]["style_bible"] == "the style bible"
+
+    # --- The Brief's sentence says the version is kept and where Restore is -------------------
+    assert len(saves["brief"]["asked"]) == 1
+    brief_question = saves["brief"]["asked"][0]
+    assert saves["keptWording"].replace("{documents}", "Creative brief") in brief_question
+    assert "Restore beside the box" in brief_question
+    # The lie corrected twice already, and a third copy found in app.js during Slice A: the Brief
+    # does keep a version, and a Director told otherwise stops looking for the button.
+    assert "no way back" not in brief_question, brief_question
+    assert saves["unkeptWording"] not in brief_question
+
+    # --- Two documents cleared in one save is one question naming both ------------------------
+    assert len(saves["both"]["asked"]) == 1
+    together = saves["both"]["asked"][0]
+    assert "Creative brief" in together and "Treatment" in together
+    # And each is on the side of the partition that is true for it, in one sentence each.
+    assert saves["keptWording"].replace("{documents}", "Creative brief") in together
+    assert saves["unkeptWording"].replace("{documents}", "Treatment") in together
+    assert saves["both"]["sent"] == []
+    # Two documents on the *same* side share one sentence, and it names both -- with one per
+    # side the pair could be named by two sentences of one document each and read the same.
+    assert len(saves["bothUnkept"]["asked"]) == 1
+    assert saves["unkeptWording"].replace("{documents}", "Treatment and Style bible") in (
+        saves["bothUnkept"]["asked"][0]
+    )
+
+    # --- Typing is not deleting, and an empty document loses nothing ---------------------------
+    assert saves["retyped"]["asked"] == []
+    assert len(saves["retyped"]["sent"]) == 1
+    assert saves["alreadyEmpty"]["asked"] == []
+    assert len(saves["alreadyEmpty"]["sent"]) == 1
+
+    # --- Whitespace is not text, on both sides -------------------------------------------------
+    assert len(saves["spacesTyped"]["asked"]) == 1, "spaces saved over a document are a clearing"
+    assert saves["spacesStored"]["asked"] == [], "emptying a whitespace-only document loses nothing"
+    assert len(saves["spacesStored"]["sent"]) == 1
+
+    # --- The lock toggle asks through the same guard, and a decline puts the box back ----------
+    assert len(saves["lock"]["asked"]) == 1
+    assert saves["lock"]["sent"] == 0
+    assert saves["lock"]["checked"] is False, (
+        "declining the clearing question left a lock on screen the server never took"
+    )
+
+
+def test_document_clearing_consequence_is_derived_from_the_capture_partition():
+    """Two sentences because the partition has two sides — not three because there are three.
+
+    `SAVE_CAPTURED_DOCUMENTS` and `DIRECTOR_REPLACEABLE_DOCUMENTS` are the two halves Slice A
+    split `DOCUMENT_LABELS` into, and which of them a document falls in is the whole answer to
+    "what does this save cost". A hand-written sentence per document would be a third copy of
+    that fact, and `SONG_CONTEXT_CLEARING_CONSEQUENCE` is the standing evidence of what happens
+    to those copies: it claimed a song kept no previous version, was corrected, and a third copy
+    of the same lie was still in `app.js` when Slice A went looking.
+
+    So the derivation is executed against the server's own partition rather than transcribed,
+    and the sentence a document receives is asserted to be the one that is true for it.
+    """
+    browser = run_module("""
+      import { DOCUMENT_LABELS, documentCapturedOnSave, documentClearing, documentClearingQuestion,
+               DOCUMENT_CLEARING_KEPT_CONSEQUENCE, DOCUMENT_CLEARING_UNKEPT_CONSEQUENCE }
+        from './src/music_video_producer/web/assets/api.js';
+      const attempt = (fn) => { try { return fn(); } catch (error) { return `THREW: ${error.message}`; } };
+      const documents = Object.keys(DOCUMENT_LABELS);
+      const stored = Object.fromEntries(documents.map((name) => [name, 'stored ' + name]));
+      const emptied = Object.fromEntries(documents.map((name) => [name, '']));
+      console.log(JSON.stringify({
+        captured: Object.fromEntries(documents.map((name) => [name, documentCapturedOnSave(name)])),
+        kept: DOCUMENT_CLEARING_KEPT_CONSEQUENCE,
+        unkept: DOCUMENT_CLEARING_UNKEPT_CONSEQUENCE,
+        questions: Object.fromEntries(documents.map((name) => [name, documentClearingQuestion([name])])),
+        everything: documentClearing(stored, emptied),
+        nothingStored: documentClearing(emptied, emptied),
+        // An absent key is read by the route as "", so a document missing from the payload is
+        // a clearing exactly as an emptied box is.
+        omitted: documentClearing(stored, {}),
+        noProject: documentClearing(null, emptied),
+        unknownCaptured: attempt(() => documentCapturedOnSave('shot_list')),
+        unknownQuestion: attempt(() => documentClearingQuestion(['shot_list'])),
+      }));
+    """)
+
+    # The browser's answer to "does this save keep what it replaces" is the server's partition.
+    assert browser["captured"] == {
+        document: document in SAVE_CAPTURED_DOCUMENTS for document in DOCUMENT_LABELS
+    }
+    assert browser["captured"] == {
+        document: document not in DIRECTOR_REPLACEABLE_DOCUMENTS for document in DOCUMENT_LABELS
+    }
+    # Every document gets the sentence its own side of the partition owns, and only that one.
+    for document, label in DOCUMENT_LABELS.items():
+        question = browser["questions"][document]
+        captured = browser["captured"][document]
+        owned = browser["kept"] if captured else browser["unkept"]
+        other = browser["unkept"] if captured else browser["kept"]
+        assert owned.replace("{documents}", label) in question, document
+        assert other.replace("{documents}", label) not in question, document
+        assert label in question, document
+        # One consequence sentence, not both: the side this save is not touching says nothing,
+        # or every question carries a sentence about no document at all.
+        assert question.count("\n\n") == 1, question
+    # The captured sentence names the button and its one-step limit; the uncaptured one says what
+    # the slot beside the box actually holds. Overstating the damage is as corrosive as
+    # understating it — SONG_CONTEXT_CLEARING_CONSEQUENCE's own standard, and the reason the
+    # Brief's question may not say the text is gone.
+    assert "Restore beside the box" in browser["kept"]
+    assert "the next save spends it" in browser["kept"]
+    assert "no way back" in browser["unkept"]
+    assert "Director reply last replaced" in browser["unkept"]
+    assert "this save leaves it exactly as it is" in browser["unkept"]
+    # Neither sentence may claim the other's outcome.
+    assert "Restore" not in browser["unkept"]
+    assert "no way back" not in browser["kept"]
+
+    # What a clearing is: stored text replaced with nothing, and nothing else.
+    assert browser["everything"] == list(DOCUMENT_LABELS)
+    assert browser["nothingStored"] == []
+    assert browser["omitted"] == list(DOCUMENT_LABELS)
+    assert browser["noProject"] == []
+    # A document neither mapping knows about fails loudly rather than being quietly filed on the
+    # Brief's side of the sentence, which is the safe-sounding wrong answer.
+    for probe in ("unknownCaptured", "unknownQuestion"):
+        assert "THREW: Unknown document" in str(browser[probe]), probe
+
+    # And there is one sentence per side, not one per document: no document's name is written
+    # into either constant.
+    api_source = API_JS.read_text(encoding="utf-8")
+    block = api_source.split("export const DOCUMENT_CLEARING_KEPT_CONSEQUENCE", 1)[1].split(
+        "export function documentClearingQuestion", 1
+    )[0]
+    for label in DOCUMENT_LABELS.values():
+        assert label not in block, label
+
+    # The question is asked before the request, not after it: `saveProject` returns `false` on a
+    # decline, which is also what the lock handler reads to put its checkbox back.
+    handler = APP_JS.read_text(encoding="utf-8").split("async function saveProject", 1)[1].split(
+        "\n}", 1
+    )[0]
+    assert "documentClearing(state.project, documents)" in handler
+    assert "window.confirm(documentClearingQuestion(cleared))" in handler
+    assert handler.index("documentClearingQuestion") < handler.index("api.saveDocuments")
+    assert "return false;" in handler.split("documentClearingQuestion", 1)[1].split("\n", 1)[0]
 
 
 def test_treatment_markup_exposes_every_control_the_app_dereferences():
@@ -2583,6 +2861,57 @@ def test_restore_refusal_is_recognised_and_recovered_from_rather_than_just_toast
         "documentRestoreStaleNotice(documentKey, documentRestoreAvailable(state.project, documentKey))"
         in handler
     )
+
+
+def test_the_restore_toast_says_the_same_thing_the_thread_will_record():
+    """The **wiring**, executed — not the sentence, which is asserted elsewhere.
+
+    `documentRestoreNotice` gained a one-way arm on 2026-09-03 and a test held both sentences to
+    the server's. That test passes with the caller ignoring the arm entirely: mutating
+    `restoreDocument` back to `documentRestoreNotice(documentKey)` **survived** it. This is the
+    third time in three slices that a pure decision was covered and the caller that decides was
+    not — the same gap `overlapRemovalToasts` had, and `_report_omitted_clips` after it.
+
+    So this drives the real handler. `reversible` is derived the way the server derives it
+    (`bool(displaced.strip())` on the text the swap pushed into the slot), which after the reply is
+    simply whether the slot now holds anything — and the two cases below differ *only* in that.
+    """
+    from music_video_producer.app import document_restore_notice
+
+    project = {
+        "id": "p1", "name": "P", "shots": [], "assets": [], "messages": [],
+        "creative_brief": "", "treatment": "restored text", "style_bible": "",
+        "creative_brief_previous": "", "style_bible_previous": "",
+        "creative_brief_locked": False, "treatment_locked": False, "style_bible_locked": False,
+    }
+    reversible = {**project, "treatment_previous": "the text this restore displaced"}
+    one_way = {**project, "treatment_previous": ""}
+
+    def toast_for(reply):
+        return run_workspace(
+            """
+              state.project = __SEED__;
+              const said = [];
+              at('#toast-region').append = (item) => said.push(item.textContent);
+              // The bound click, not the function: `restoreDocument` is module-private, and
+              // driving the control a Director actually presses is the stronger test anyway.
+              answer(true);
+              await fire('#restore-treatment:click');
+              await flush();
+              console.log(JSON.stringify({ said }));
+            """.replace("__SEED__", json.dumps(project)),
+            responses={"/api/projects/p1/documents/treatment/restore": {"body": reply}},
+        )["said"]
+
+    swapped = toast_for(reversible)
+    final = toast_for(one_way)
+
+    assert swapped == [document_restore_notice("treatment", reversible=True)]
+    assert final == [document_restore_notice("treatment", reversible=False)]
+    # The whole point: the two differ, and they differ because of the reply rather than because
+    # of anything the caller knew beforehand.
+    assert swapped != final
+    assert "one-way" in final[0] and "one-way" not in swapped[0]
 
 
 def test_expansion_reaches_a_real_route_and_sends_no_chat_message_or_render():
@@ -29058,3 +29387,58 @@ def test_an_overlap_the_export_composes_is_drawn_exactly_as_it_was():
         fields={"shot_a": {"transition_out": {"type": "dissolve"}}}), shot_id="shot_a")["rows"][1]
     assert one_sided["state"] == "one-sided", one_sided
     assert one_sided["note"] == "No overlap — this treats shot 01's last frames, then cuts."
+
+
+def test_node_check_is_only_a_gate_when_the_asset_is_read_as_a_module(tmp_path):
+    """The `node --check` gate in `AGENTS.md`, made real — and proved able to fail.
+
+    **On a `.js` file it proves nothing about either asset.** Node parses `.js` as CommonJS and
+    stops complaining the moment it meets ESM syntax, and `app.js` and `api.js` have been ES
+    modules for as long as that line has called itself a required gate. Measured on the real file
+    2026-09-03: broken syntax appended to `app.js` exits **0** as `.js`, exits **1** as `.mjs`, and
+    the intact file exits **0** as `.mjs`.
+
+    The suite has covered this by accident all along, because `run_module` imports both assets
+    under node and a syntax error fails those tests. What was missing is a check that says so, and
+    one that demonstrates it can fail — this repository has ~22 instances of a guard that could not
+    have caught its own defect, and a gate that always exits 0 is the purest form of it.
+
+    This is the second inert gate found in two slices. The first was `pyproject.toml`'s
+    `addopts = "-q"`, which made `uv run pytest -q` run at `-qq` and suppress the `N passed` line
+    every spec asked its implementer to report.
+    """
+    import shutil
+    import subprocess
+
+    assets = [APP_JS, API_JS]
+    assert all(path.is_file() for path in assets), assets
+
+    def check(path: Path) -> int:
+        # `check=False` on purpose: a non-zero exit is the answer this asks for, not an
+        # error. Half the assertions below are that node *did* refuse.
+        return subprocess.run(
+            ["node", "--check", str(path)], capture_output=True, text=True, check=False
+        ).returncode
+
+    for asset in assets:
+        intact = tmp_path / f"{asset.stem}.mjs"
+        shutil.copyfile(asset, intact)
+        assert check(intact) == 0, f"{asset.name} does not parse as an ES module"
+
+        # The half that makes the assertion above mean something: the same file with a syntax
+        # error must fail. Without this the check passes on an empty file.
+        broken = tmp_path / f"{asset.stem}-broken.mjs"
+        broken.write_bytes(asset.read_bytes() + b"\nexport function broken( {\n")
+        assert check(broken) == 1, (
+            f"a syntax error in {asset.name} was not caught even as a module, so this gate is "
+            "inert in both spellings and something other than node has to hold it"
+        )
+
+        # And the demonstration of why the extension matters, kept executable rather than
+        # described: the identical broken bytes read as CommonJS pass.
+        as_commonjs = tmp_path / f"{asset.stem}-broken.js"
+        as_commonjs.write_bytes(broken.read_bytes())
+        assert check(as_commonjs) == 0, (
+            "node now rejects ESM syntax errors in a .js file, which would make the `node --check "
+            "…app.js` form in AGENTS.md a real gate again — delete this assertion and say so"
+        )
