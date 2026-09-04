@@ -2332,7 +2332,9 @@ def test_document_restore_wording_agrees_on_both_sides():
             assert (writer in browser["capture"][document]) == (
                 writer in DOCUMENT_SLOT_CAPTURE[document]
             ), (document, writer)
-    assert browser["displacement"]["creative_brief"] == "save that changed it"
+    assert browser["displacement"]["creative_brief"] == (
+        DOCUMENT_SLOT_DISPLACEMENT["creative_brief"]
+    )
     assert browser["displacement"]["treatment"] == "applied replacement"
     assert browser["marker"] in document_restore_refusal("treatment")
     assert browser["marker"] in document_restore_refusal("creative_brief")

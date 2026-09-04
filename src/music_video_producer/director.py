@@ -5,7 +5,7 @@ import re
 from base64 import b64encode
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import httpx
 from pydantic import BaseModel, Field, ValidationError
@@ -16,6 +16,12 @@ from .assistant_prompt import (
     FILL_SHOTS_DESCRIPTION,
 )
 from .models import AssetRole, ShotMode, SingingState
+from .planning_prompt import (
+    ASK_DIRECTOR_DESCRIPTION,
+    PLANNING_SYSTEM_PROMPT,
+    PROPOSE_ASSETS_DESCRIPTION,
+    WRITE_BRIEF_DESCRIPTION,
+)
 
 #: Default completion budget for one H3 expansion. Large because it has to cover a
 #: reasoning phase as well as the answer: a model on the Director's machine spent 899
@@ -672,6 +678,318 @@ class AssetProposal(BaseModel):
 class StageManagerResult(BaseModel):
     message: str
     assets: list[AssetProposal] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------------------------
+# Treatment planning: three tools that cannot be mistaken for each other (AD-38, story 14.1)
+# ---------------------------------------------------------------------------------------------
+#
+# **The required lists below are the load-bearing part of this feature, not the prompts.** On this
+# model an *optional field* and a *dropped field* are the same bytes, and this repository has paid
+# for that three times:
+#
+# * `DirectorResult` never required `shots`, which was the root cause of **every** empty-shots
+#   failure — asked for in words across three measured runs while the grammar never mentioned it.
+# * `fill_shots` applied modes and citations while silently omitting `use_song_audio` and
+#   `singing` twice, with the narration claiming otherwise.
+# * `_promoted` raises on an unknown name because a promotion that quietly does nothing
+#   reproduces that shape exactly.
+#
+# So *"asked a question and wrote nothing"* is a **different tool**, not a missing key. Three
+# tools, each strict, and `_strict_tool_schema` refuses to emit one that has an optional field at
+# all — see it. TP-10 ("planning writes the Brief and proposals, never the Treatment or the Style
+# bible") is likewise structural: `WriteBriefArguments` has no field for either, so there is no
+# check anybody can forget to run.
+
+#: The tool that asks and writes nothing. Its existence *is* AD-38: a question-only turn has to be
+#: a shape of its own, because the alternative — one tool with the document field left out — is
+#: byte-identical to a write whose document field the model dropped.
+ASK_DIRECTOR_TOOL = "ask_director"
+
+#: The one tool in this application that a machine writes a creative document with. Named for the
+#: document rather than for the act, so that "which tool can write the Style bible" has the answer
+#: *none* by inspection of this list rather than by reading a schema.
+WRITE_BRIEF_TOOL = "write_brief"
+
+#: Proposals. It writes nothing either — see `ProposeAssetsArguments` for what happens to one.
+PROPOSE_ASSETS_TOOL = "propose_assets"
+
+
+class AskDirectorArguments(BaseModel):
+    """The `ask_director` argument object, and the source of its JSON schema.
+
+    One field, required, and non-empty at both levels — the list and every string in it. A call
+    with no questions is "asked nothing and wrote nothing", which is the silent no-op this whole
+    taxonomy exists to make impossible; it is a `ValidationError` at the edge instead, reported to
+    the Director as a refused call with the raw arguments beside it.
+    """
+
+    questions: list[Annotated[str, Field(min_length=1)]] = Field(
+        min_length=1,
+        description=(
+            "The questions you want the Director to answer, one per entry, in plain language. "
+            "Ask for what you actually need to write a better brief."
+        ),
+    )
+
+
+class WriteBriefArguments(BaseModel):
+    """The `write_brief` argument object, and the source of its JSON schema.
+
+    **What is absent here is the point.** There is no `treatment` field and no `style_bible`
+    field, so TP-10 holds by the shape of the call rather than by a check in a route that somebody
+    could forget to write, move or weaken. A model cannot ask for something it has no key for.
+
+    One field, and it is the whole document. `min_length=1` is what makes `PlanningTurn.brief`
+    unambiguous: a validated write always carries text, so the empty string can mean *no write was
+    proposed* and nothing else.
+    """
+
+    creative_brief: str = Field(
+        min_length=1,
+        description=(
+            "The complete new creative brief, replacing the existing one in full. Not a patch and "
+            "not a paragraph to append."
+        ),
+    )
+
+
+class ProposeAssetsArguments(BaseModel):
+    """The `propose_assets` argument object, and the source of its JSON schema.
+
+    Reuses `AssetProposal` rather than mirroring it, unlike `ShotCitationFill`, and the difference
+    is which side the model is on: `AssetCitation` is a *manifest* record whose fields the model
+    must not gain the power to set, whereas `AssetProposal` is already exactly and only "what a
+    model proposed" — `stage_manager` produces it from a model reply today. There is no second
+    audience to drift away from.
+
+    **What happens to a proposal today: nothing is persisted.** `Project` has no `asset_proposals`
+    field, and this slice does not add one — where proposals *live* is Slice F (AD-36, AD-46). A
+    proposal produced here is validated, counted and named in the turn's notice, and then it exists
+    only in the chat thread the Director reads. Nothing is written to the library, no image is
+    generated, and re-asking produces different proposals. Do not build anything on the assumption
+    that a proposal survives the turn until Slice F gives it somewhere to survive in.
+    """
+
+    assets: list[AssetProposal] = Field(
+        min_length=1,
+        description="One entry per asset you are proposing. Send only assets the library lacks.",
+    )
+
+
+def _refuse_optional_fields(schema: dict[str, Any], label: str) -> None:
+    """Raise unless every property of ``schema`` is in its ``required`` list.
+
+    **This is what makes the promotion bite rather than decorate.** `_promoted` already refuses an
+    unknown *name*; what it cannot see is a name its caller forgot to write down, and that omission
+    is invisible in exactly the direction that matters — the field simply becomes optional, the
+    decoder is free to drop it, and the tool call arrives looking like a smaller answer rather than
+    a broken one. AD-38 says *every* field of a planning tool is required, so this asserts the
+    whole rule instead of trusting three hand-kept tuples to stay exhaustive.
+
+    It runs at import, because `PLANNING_TOOL_NAMES` is built from `planning_tools()` at module
+    scope. A name dropped from a `require` list therefore stops the application from starting, on
+    the precedent of the `Song`/`Shot` field classification gate, rather than shipping a tool whose
+    grammar is quietly looser than its docstring.
+    """
+    required = schema.get("required", [])
+    optional = [name for name in schema.get("properties", {}) if name not in required]
+    if optional:
+        raise ValueError(
+            f"{label} would go on the wire with optional field(s) {', '.join(optional)}; "
+            "every field of a planning tool is required (AD-38)"
+        )
+
+
+def _strict_tool_schema(
+    model: type[BaseModel],
+    *,
+    require: Sequence[str],
+    require_each: Mapping[str, Sequence[str]] | None = None,
+) -> dict[str, Any]:
+    """One planning tool's wire schema: `_model_facing_schema`, with every field promoted.
+
+    `constrained_schema`'s two axes and `_model_facing_schema`'s docstring-stripping, joined
+    because a tool needs both and neither alone: the response-format helper does not strip the
+    paragraphs above (which are addressed to the next person editing this file, not to a model),
+    and the tool helper promotes nothing.
+
+    Deep-copied for `constrained_schema`'s reason — no variant may leak into the next caller's
+    schema — and checked for exhaustiveness at both levels, which is the only reason the explicit
+    `require` lists earn their place beside a rule that could otherwise be "require everything".
+    An explicit list is a statement of intent that `_promoted` can catch a typo in; the check is
+    what catches the opposite mistake, a name left out.
+
+    **The inherited `required` list is cleared first, and that one line is what makes the
+    promotion load-bearing rather than decorative.** `_promoted` *folds* a caller's names into
+    whatever Pydantic already produced, which is right where it is used — `constrained_schema`
+    tightens a grammar the model owns — and wrong here. A field with no default is in
+    `model_json_schema()["required"]` for free, so on a model written without defaults every name
+    in `require` would be a name the schema already had: deleting one would change nothing, no
+    test could fail, and the whole list would be documentation that looks like a mechanism. The
+    list is *stated* here instead. Delete a name and this function raises, at import, before the
+    application starts.
+    """
+    schema = deepcopy(_model_facing_schema(model))
+    schema.pop("required", None)
+    schema["required"] = _promoted(schema, require)
+    _refuse_optional_fields(schema, model.__name__)
+    for prop, fields in (require_each or {}).items():
+        entry = _entry_schema(schema, prop)
+        entry.pop("required", None)
+        entry["required"] = _promoted(entry, fields)
+        _refuse_optional_fields(entry, f"{model.__name__}.{prop} entries")
+    return schema
+
+
+def planning_tools() -> list[dict[str, Any]]:
+    """The planning tool surface as it goes on the wire, generated rather than written.
+
+    `assistant_tools`' argument, and one more that is specific to this surface: `AssetProposal`'s
+    `kind` is a `Literal`, so it reaches LM Studio's constrained decoder as an `enum` and *guides
+    sampling* toward the four kinds this application has rather than only refusing a fifth after
+    the fact. A hand-written copy of that list here would be the second definition of the taxonomy,
+    and the one that goes stale in the direction that admits a malformed call.
+    """
+    return [
+        {
+            "type": "function",
+            "function": {"name": name, "description": description, "parameters": parameters},
+        }
+        for name, description, parameters in (
+            (
+                ASK_DIRECTOR_TOOL,
+                ASK_DIRECTOR_DESCRIPTION,
+                _strict_tool_schema(AskDirectorArguments, require=("questions",)),
+            ),
+            (
+                WRITE_BRIEF_TOOL,
+                WRITE_BRIEF_DESCRIPTION,
+                _strict_tool_schema(WriteBriefArguments, require=("creative_brief",)),
+            ),
+            (
+                PROPOSE_ASSETS_TOOL,
+                PROPOSE_ASSETS_DESCRIPTION,
+                _strict_tool_schema(
+                    ProposeAssetsArguments,
+                    require=("assets",),
+                    require_each={"assets": ("kind", "name", "prompt")},
+                ),
+            ),
+        )
+    ]
+
+
+#: The tool names `parse_planning_reply` accepts, **derived from the surface** rather than listed
+#: beside it: a fourth tool put on the wire without the parser learning it would send every one of
+#: its calls to `malformed`, silently, and a second list is how that happens.
+PLANNING_TOOL_NAMES: tuple[str, ...] = tuple(
+    tool["function"]["name"] for tool in planning_tools()
+)
+
+
+class PlanningTurn(BaseModel):
+    """One planning answer: what it said, what it asked, what it wants written, what it got wrong.
+
+    Four fields where a single tool with optional keys would have had one, and that is the whole
+    of AD-38 in one class. `questions` non-empty with `brief` empty is *asked and wrote nothing* —
+    a complete, successful turn. `brief` empty on a turn that meant to write is not representable
+    at all: `WriteBriefArguments.creative_brief` has `min_length=1`, so a `write_brief` call whose
+    document field the model dropped fails validation and lands in `malformed`, where the Director
+    is told about it. Those two outcomes are the same bytes under a one-tool design.
+
+    `malformed` carries `AssistantTurn.malformed`'s contract exactly: a call that does not fit the
+    vocabulary is the *expected* local-model failure rather than an exception, one bad entry must
+    not discard the good ones beside it, and each entry is raw model output kept for a notice's
+    `raw` — the field `DIRECTOR_CONTEXT_EXCLUDE` strips, so it is inspectable without being fed
+    back into the next call.
+
+    `proposals` is not persisted by anything. See `ProposeAssetsArguments`.
+    """
+
+    message: str = ""
+    #: The Director-facing questions of a question-only turn, in the order the model asked them.
+    questions: list[str] = Field(default_factory=list)
+    #: The proposed replacement Brief, or `""` for *no write was proposed*. Unambiguous because a
+    #: validated `write_brief` call always carries text.
+    brief: str = ""
+    proposals: list[AssetProposal] = Field(default_factory=list)
+    malformed: list[str] = Field(default_factory=list)
+
+    def wrote_nothing(self) -> bool:
+        """True when this turn proposed no document write — asking, proposing, or neither.
+
+        A method rather than `not turn.brief` at each call site, because the question a caller is
+        asking is about the *turn*, and `brief == ""` is an encoding of the answer rather than the
+        answer. It is also the sentence a test can name.
+        """
+        return not self.brief
+
+
+def parse_planning_reply(reply: dict[str, Any]) -> PlanningTurn:
+    """Split one provider reply into questions, a Brief, proposals and refused calls. I/O-free.
+
+    `parse_assistant_reply`'s contract on the other surface, and every branch here is a shape a
+    local model actually produces: no `tool_calls` at all (it chatted instead), a tool name that is
+    not ours, `arguments` as a JSON string or as an already-decoded object, an argument object
+    missing its one key, and a single bad entry inside an otherwise good list. None of them raises.
+
+    Entries are validated **one at a time** wherever there is a list, for the reason the shot
+    surface has to: validating the list whole would let one proposal with a fifth `kind` discard
+    nine good ones beside it.
+
+    A second `write_brief` call in one turn is refused rather than allowed to overwrite the first.
+    Last-write-wins would be a silent discard of an entire proposed document — the one outcome
+    this module is least willing to produce — and there is no sane merge of two whole briefs.
+    """
+    content = reply.get("content")
+    turn = PlanningTurn(message=content.strip() if isinstance(content, str) else "")
+    calls = reply.get("tool_calls")
+    for call in calls if isinstance(calls, list) else []:
+        function = call.get("function") if isinstance(call, dict) else None
+        name = function.get("name") if isinstance(function, dict) else None
+        if not isinstance(function, dict) or name not in PLANNING_TOOL_NAMES:
+            turn.malformed.append(_raw_argument(call))
+            continue
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except ValueError:
+                turn.malformed.append(_raw_argument(function.get("arguments")))
+                continue
+        if not isinstance(arguments, dict):
+            turn.malformed.append(_raw_argument(arguments))
+            continue
+        if name == WRITE_BRIEF_TOOL:
+            try:
+                written = WriteBriefArguments.model_validate(arguments)
+            except ValidationError:
+                turn.malformed.append(_raw_argument(arguments))
+                continue
+            if turn.brief:
+                turn.malformed.append(_raw_argument(arguments))
+                continue
+            turn.brief = written.creative_brief
+            continue
+        key = "questions" if name == ASK_DIRECTOR_TOOL else "assets"
+        entries = arguments.get(key)
+        if not isinstance(entries, list) or not entries:
+            turn.malformed.append(_raw_argument(arguments))
+            continue
+        for entry in entries:
+            if name == ASK_DIRECTOR_TOOL:
+                question = entry.strip() if isinstance(entry, str) else ""
+                if question:
+                    turn.questions.append(question)
+                else:
+                    turn.malformed.append(_raw_argument(entry))
+                continue
+            try:
+                turn.proposals.append(AssetProposal.model_validate(entry))
+            except ValidationError:
+                turn.malformed.append(_raw_argument(entry))
+    return turn
 
 
 # The Treatment is already written per section — the live project's is literally an
@@ -1464,6 +1782,62 @@ class DirectorClient:
         try:
             response = await self._completion(body=body, headers=headers)
             return parse_assistant_reply(self._reply(response))
+        except (
+            httpx.HTTPError,
+            KeyError,
+            IndexError,
+            TypeError,
+            json.JSONDecodeError,
+            ValueError,
+        ) as error:
+            raise DirectorError(f"LLM director returned an invalid response: {error}") from error
+
+    async def assist_planning(
+        self, *, message: str, project_context: dict[str, Any]
+    ) -> PlanningTurn:
+        """One planning turn: the Director's request, the project, and the three planning tools.
+
+        `assist`'s transport with `planning_tools()` in place of `assistant_tools()`, and the same
+        two decisions for the same measured reasons. **One round trip**, because the agentic shape
+        doubles the wall-clock of a call a Director is watching and would put the tool results into
+        the second turn's context — the recorded root cause of Director degradation. And
+        `tool_choice: "auto"` rather than forced, which matters more here than it does there: a
+        forced call on this surface would make the model pick one of three acts on a turn where
+        the honest answer is prose, and `ask_director` is close enough to "say something" that it
+        would be picked. The no-tool case is reported as a notice instead.
+
+        `project_context` is `director_chat`'s dump — the whole project minus
+        `DIRECTOR_CONTEXT_EXCLUDE` — rather than a trimmed builder of its own, because planning is
+        about the documents and the library rather than about a selection of shots. A builder that
+        trims this for a long pass belongs with the pass that needs it (Slice E).
+
+        Everything this returns is a *proposal*. Nothing here writes: the consent gate, the Brief's
+        lock and the rejection guard all live in the route, per AD-35, so that a request without
+        explicit consent is refused no matter what any earlier request said.
+        """
+        if not self.base_url or not self.model:
+            raise DirectorUnavailable(
+                "LLM director is not configured. Set MVP_LLM_BASE_URL and MVP_LLM_MODEL."
+            )
+        headers = self._headers()
+        body = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": PLANNING_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {"request": message, "plan": project_context}, ensure_ascii=False
+                    ),
+                },
+            ],
+            "temperature": PLAN_TEMPERATURE,
+            "tools": planning_tools(),
+            "tool_choice": "auto",
+        }
+        try:
+            response = await self._completion(body=body, headers=headers)
+            return parse_planning_reply(self._reply(response))
         except (
             httpx.HTTPError,
             KeyError,

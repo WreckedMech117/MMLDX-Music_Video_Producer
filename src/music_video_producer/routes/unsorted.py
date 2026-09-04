@@ -6,10 +6,11 @@ file the one place the split does not hold, and a route landing here is a questi
 resource is this?") rather than a decision. It is called `unsorted` so that reading the
 import list is enough to see it growing; a comfortable name would let it accrete quietly.
 
-Five routes, and `assemble` and `readiness` would have been here too if tests were not holding
-them in `app.py` -- so the true size of this tail is seven, not five. `assemble` is held by
-`trim_args` and `concat_args` being patched in `music_video_producer.app`'s namespace, which is
-the class of pin no widened source guard can lift.
+~~Five~~ **six** routes (`planning_turn` joined them on 2026-09-03, story 14.1), and `assemble`
+and `readiness` would have been here too if tests were not holding them in `app.py` -- so the true
+size of this tail is eight, not six. `assemble` is held by `trim_args` and `concat_args` being
+patched in `music_video_producer.app`'s namespace, which is the class of pin no widened source
+guard can lift.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ from ..app import (
     CHAT_EMPTY_MESSAGE,
     DIRECTOR_CONTEXT_EXCLUDE,
     DIRECTOR_REPLACEABLE_DOCUMENTS,
+    DOCUMENT_LABELS,
     DOCUMENT_REJECTED_EMPTY_NOTICE,
     DOCUMENT_REJECTED_NOTICE,
     EXPANSION_DUPLICATE_NOTICE,
@@ -49,11 +51,18 @@ from ..app import (
     EXPANSION_UNKNOWN_NOTICE,
     EXPANSION_WITHOUT_SHOTS,
     EXPANSION_WRITTEN_NOTICE,
+    NOTICE_JOIN,
+    PLANNING_EMPTY_MESSAGE,
+    PLANNING_MALFORMED_EMPTY_NOTICE,
+    PLANNING_MALFORMED_NOTICE,
+    PLANNING_WITHOUT_CONSENT_NOTICE,
+    PLANNING_WITHOUT_TOOL_CALL_NOTICE,
     SHOT_PLAN_EMPTY_NOTICE,
     SHOT_WINDOW_NOTICE,
     AssistantRequest,
     DirectorRequest,
     EffectCatalogueResponse,
+    PlanningRequest,
     ShotExpansionOutcome,
     _short,
     apply_expansions,
@@ -69,6 +78,8 @@ from ..app import (
     expansion_rejection,
     expansion_shot_label,
     expansion_sweep_notices,
+    planning_proposals_notice,
+    planning_questions_notice,
     prose_claims_shots,
     refresh_reference_maps,
     rejection_notice,
@@ -325,6 +336,143 @@ def register(ctx: RouterContext) -> None:
             # `live`'s values are the stored objects, so the writes above are already on the
             # plan; only the Shots the model added past the end of what it saw are new.
             project.shots = [*project.shots, *added]
+        return store.save(project, if_generation=generation)
+
+    @app.post("/api/projects/{project_id}/planning/turn", response_model=Project)
+    async def planning_turn(project_id: str, request: PlanningRequest) -> Project:
+        """One Treatment Planning turn: the assistant asks, writes the Brief, or proposes assets.
+
+        Story 14.1, and the load-bearing decisions are next door in `director.py`: three tools with
+        no optional fields, so *asked a question and wrote nothing* is a different call rather than
+        a missing key (AD-38), and no field anywhere that could write the Treatment or the Style
+        bible (TP-10). This route is what turns those into a stored turn, and four properties are
+        load-bearing here rather than there:
+
+        * **Consent is per request and is never remembered.** `request.apply_documents` is the only
+          thing that lets the Brief be written, it is read from *this* body, and nothing about it
+          is stored on the `Project` or inferred from the thread (AD-35). A second request with the
+          flag off is refused however emphatically the first one carried it.
+        * **The Brief's lock is Slice A's `document_lock_refusal`**, not a second implementation of
+          *may a machine write this document*. Same question, same answer, same sentence as the one
+          that refuses a Director reply — which is the whole reason that function was extracted.
+        * **The write is `director_chat`'s document loop for one document**, in the same order and
+          for the same recorded reasons: an echo of the stored text is not a replacement, the lock
+          is reported before consent because a lock is durable state and a flag is one turn, and
+          the recovery slot is captured on *apply* rather than on attempt so a refused candidate
+          can never overwrite the only copy of the good document.
+        * **AD-43**: what happened is `MessageNotice` entries on an ordinary `TreatmentMessage`.
+          Nothing is announced by a convention inside `content`.
+
+        Nothing here spends GPU time, touches `comfy`, sets a status, queues a job or promotes an
+        asset — and nothing writes a proposal anywhere, because there is nowhere to write it until
+        Slice F. `PLANNING_PROPOSALS_NOTICE` says so to the Director rather than leaving "3 assets
+        proposed" to read like three assets appeared.
+
+        The snapshot-then-re-read, the write generation, and the 503/502 mapping are
+        `director_chat`'s, for the reasons documented there.
+        """
+        snapshot = get_project(project_id)
+        snapshot.messages.append(TreatmentMessage(role="user", content=request.message))
+        context = snapshot.model_dump(mode="json", exclude=DIRECTOR_CONTEXT_EXCLUDE)
+        try:
+            turn = await director.assist_planning(
+                message=request.message, project_context=context
+            )
+        except DirectorUnavailable as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        except DirectorError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        project, generation = get_project_for_update(project_id)
+        project.messages.append(TreatmentMessage(role="user", content=request.message))
+        notices: list[MessageNotice] = []
+        label = DOCUMENT_LABELS["creative_brief"]
+        # `turn.wrote_nothing()` rather than `not turn.brief`: the question this branch asks is
+        # about the turn, and the empty string is an encoding of the answer rather than the answer.
+        if not turn.wrote_nothing():
+            existing = project.creative_brief
+            # An echo of the stored text is not a replacement. Spending the single recovery slot on
+            # it would annihilate the genuinely recoverable version with a copy of the live one,
+            # and announcing it would be a change the Director cannot find.
+            if turn.brief.strip() != existing.strip():
+                reason = document_rejection(turn.brief, existing)
+                refusal = document_lock_refusal(project, "creative_brief")
+                if refusal:
+                    if not reason:
+                        notices.append(MessageNotice(kind="refusal", text=refusal))
+                elif not request.apply_documents:
+                    # Carries the lock's silence rule for its reason: a candidate the guard would
+                    # have refused anyway would not have landed with consent either, so reporting
+                    # it as merely unrequested would invite a retry that also refuses.
+                    if not reason:
+                        notices.append(
+                            MessageNotice(
+                                kind="refusal",
+                                text=PLANNING_WITHOUT_CONSENT_NOTICE.format(document=label),
+                            )
+                        )
+                elif reason:
+                    # The candidate travels in `raw`, never in the sentence — `raw` is the field
+                    # `DIRECTOR_CONTEXT_EXCLUDE` strips, so it is inspectable without being fed
+                    # back to the model on the next turn.
+                    notices.append(
+                        rejection_notice(
+                            DOCUMENT_REJECTED_NOTICE,
+                            DOCUMENT_REJECTED_EMPTY_NOTICE,
+                            raw=turn.brief,
+                            document=label,
+                            reason=reason,
+                        )
+                    )
+                else:
+                    # **The Brief's recovery slot is captured here, and that is a departure from
+                    # Slice A worth stating.** `SAVE_CAPTURED_DOCUMENTS` puts the Brief in the
+                    # save-captures group, derived from `DIRECTOR_REPLACEABLE_DOCUMENTS` on the
+                    # argument that no reply can write the Brief so its own save is the only
+                    # displacement there is. That argument was true until this route existed. The
+                    # rule underneath it — *whichever writer is the threat fills the slot* — now
+                    # names two writers for this document, and a machine write that displaced a
+                    # Brief the Director spent an hour on without keeping a copy is precisely the
+                    # loss the slot exists to prevent. Capture on apply, never on attempt.
+                    project.creative_brief_previous = existing
+                    project.creative_brief = turn.brief
+                    # A blank target accepts any first draft, so the slot it captures is empty and
+                    # a restore would refuse. Reported separately, because describing that as a
+                    # replacement whose previous version "can be restored" is a promise broken by
+                    # the very next click.
+                    wording = (
+                        document_first_draft_notice
+                        if not existing.strip()
+                        else document_change_notice
+                    )
+                    notices.append(MessageNotice(kind="change", text=wording([label])))
+        if turn.questions:
+            notices.append(
+                MessageNotice(kind="flag", text=planning_questions_notice(turn.questions))
+            )
+        if turn.proposals:
+            notices.append(
+                MessageNotice(
+                    kind="flag",
+                    text=planning_proposals_notice(
+                        [_short(proposal.name) for proposal in turn.proposals]
+                    ),
+                )
+            )
+        if turn.malformed:
+            notices.append(
+                rejection_notice(
+                    PLANNING_MALFORMED_NOTICE,
+                    PLANNING_MALFORMED_EMPTY_NOTICE,
+                    raw=NOTICE_JOIN.join(turn.malformed),
+                    count=len(turn.malformed),
+                )
+            )
+        # Prose and no tool call at all, which is a different fact from a question-only turn: one
+        # is the model choosing the tool that writes nothing, the other is it reaching for no tool.
+        if not notices and turn.wrote_nothing():
+            notices.append(MessageNotice(kind="flag", text=PLANNING_WITHOUT_TOOL_CALL_NOTICE))
+        message = turn.message.strip() or PLANNING_EMPTY_MESSAGE
+        project.messages.append(assistant_reply(message, notices))
         return store.save(project, if_generation=generation)
 
     @app.post("/api/projects/{project_id}/director/expand", response_model=Project)

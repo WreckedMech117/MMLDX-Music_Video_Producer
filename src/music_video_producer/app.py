@@ -334,15 +334,39 @@ SAVE_CAPTURED_DOCUMENTS = tuple(
 #: `api.js` derives the same two phrases from its own copy of the partition, and a contract test
 #: executes both sides. For `treatment` and `style_bible` every sentence below is byte-identical
 #: to what it was before the Brief existed, which is the point.
+#: What displaced the version now sitting in a document's recovery slot, worded for the
+#: middle of a restore sentence.
+#:
+#: **The Brief names two writers, and until 2026-09-04 it named one** (Director's ruling,
+#: same day). This phrase was derived from `DIRECTOR_REPLACEABLE_DOCUMENTS` on the argument
+#: that no ordinary reply can write the Brief, so a save is the only thing that fills its
+#: slot — and slice B's `write_brief` falsified the second half without touching
+#: the first. A restore after a planning write told the Director their kept version came
+#: from a save.
+#:
+#: It is a **list**, and a list goes stale: a fourth writer of this slot has to be added
+#: here by hand. That was chosen over deriving it from a writers mapping, deliberately —
+#: the sentence is what a Director reads at the moment they are deciding whether to spend
+#: a restore, and naming the gesture they actually made is worth more than a mechanism
+#: that cannot go stale. `test_document_restore_wording_agrees_on_both_sides` holds this
+#: to `api.js`'s copy, so the staleness cannot be one-sided.
+#:
+#: `SONG_CONTEXT_RESTORE_NOTICE` carries the identical *"save that changed it"* wording and
+#: is untouched: `Song.lyrics` really does have one writer.
 DOCUMENT_SLOT_DISPLACEMENT = {
-    field: ("applied replacement" if field in DIRECTOR_REPLACEABLE_DOCUMENTS else "save that changed it")
+    field: (
+        "applied replacement"
+        if field in DIRECTOR_REPLACEABLE_DOCUMENTS
+        else "save or planning write that changed it"
+    )
     for field in DOCUMENT_LABELS
 }
 DOCUMENT_SLOT_CAPTURE = {
     field: (
         "a Director reply actually replaces the document"
         if field in DIRECTOR_REPLACEABLE_DOCUMENTS
-        else "a save changes the document's text"
+        # Both writers, for `DOCUMENT_SLOT_DISPLACEMENT`'s reason one block up.
+        else "a save or a planning write changes the document's text"
     )
     for field in DOCUMENT_LABELS
 }
@@ -1338,6 +1362,88 @@ ASSISTANT_WITHOUT_TOOL_CALL_NOTICE = (
 # What the reply says when the model returned no sentence of its own, on `EXPANSION_EMPTY_MESSAGE`'s
 # argument: a reply that is a bare separator followed by notices is not a reply.
 ASSISTANT_EMPTY_MESSAGE = "Assistant ProducerBot returned no summary of this turn."
+
+
+# ---------------------------------------------------------------------------------------------
+# Treatment planning notices (story 14.1). AD-43: a planning turn is an ordinary
+# `TreatmentMessage` carrying `MessageNotice` entries — never a parallel record, and never a
+# convention inside `content` that something has to parse back out of prose.
+# ---------------------------------------------------------------------------------------------
+
+# A question-only turn, which is a **complete, successful turn** and not a failure to act. It is a
+# `flag` rather than a `refusal` for exactly that reason: nothing was refused, the model chose the
+# tool whose whole purpose is to write nothing, and calling that a refusal would teach the Director
+# to read the honest answer as a malfunction. `NoticeKind`'s own definition of `flag` — "there was
+# nothing to write, and something is worth a look" — is this case written down before it existed.
+#
+# The questions travel as the notice's own sentence rather than inside the model's prose, which is
+# AD-43: what a turn did is data, and a client that had to find the questions by searching
+# `content` would be parsing an announcement back out of prose.
+PLANNING_QUESTIONS_NOTICE = (
+    "Asked, and wrote nothing — this is a complete answer, not a failure: {questions} Reply in the "
+    "composer and the next turn can act on what you say."
+)
+# The consent refusal. `DOCUMENT_NOT_REQUESTED_NOTICE` cannot be reused and the difference is not
+# cosmetic: that sentence tells the Director to tick "Apply document changes" beside the chat
+# composer, and this route has no such control — Planning Mode (Slice D, AD-34) is the affordance
+# that will send the flag, and it does not exist yet. A notice naming a control that is not on the
+# screen is worse than no notice at all, which is why the label in the chat one is quoted from
+# `APPLY_DOCUMENTS_LABEL` rather than typed.
+#
+# It says the same three things the chat wording does, because they are the same three facts:
+# nothing was written, no previous version was recorded, and the proposed text is not kept. There
+# is no proposal slot here either.
+PLANNING_WITHOUT_CONSENT_NOTICE = (
+    "Proposed but not applied: {document}. Writing a document is consented to per request, so "
+    "nothing was written and no previous version was recorded. Send the request again with "
+    "document writing switched on to apply it; the text proposed here is not kept."
+)
+# Proposals, and the sentence exists to say what does *not* happen to them. `Project` has no
+# `asset_proposals` field until Slice F (AD-36), so a proposal lives in this thread and nowhere
+# else — and "3 assets proposed" on its own reads exactly like something was added to the library,
+# which is the claim this application spends most of its notice wordings refusing to make.
+PLANNING_PROPOSALS_NOTICE = (
+    "Proposed {count} asset(s): {assets}. These are suggestions only — nothing was generated, "
+    "nothing was added to the library, and they are not kept anywhere but in this reply."
+)
+# `ASSISTANT_MALFORMED_NOTICE`'s shape on this surface, and the wording differs where the
+# vocabulary does: nothing here is a mode or a role, so naming the shot vocabulary would send the
+# Director looking at a taxonomy this turn never touched.
+PLANNING_MALFORMED_NOTICE = (
+    "Discarded: {count} tool call(s) the planning tools could not accept — a required field the "
+    "model left out, an asset kind this application does not have, or arguments that could not be "
+    "read. Nothing was written for them. What the model sent is kept beside this notice for "
+    "inspection and is left out of the context of the next Director call."
+)
+PLANNING_MALFORMED_EMPTY_NOTICE = (
+    "Discarded: {count} tool call(s) the planning tools could not accept — a required field the "
+    "model left out, an asset kind this application does not have, or arguments that could not be "
+    "read. Nothing was written for them, and the model sent nothing to inspect."
+)
+# Prose and no tool call at all. Distinguished from a question-only turn on purpose: one is the
+# model choosing the tool that writes nothing, the other is the model not reaching for a tool, and
+# collapsing them would hide the case where the persona needs iterating.
+PLANNING_WITHOUT_TOOL_CALL_NOTICE = (
+    "The model answered in prose and called no tool, so nothing was asked, written or proposed. "
+    "Ask again, more directly, if you wanted it to revise the brief."
+)
+PLANNING_EMPTY_MESSAGE = "The planner returned no summary of this turn."
+
+
+def planning_questions_notice(questions: list[str]) -> str:
+    """The Director-facing sentence of a question-only turn, numbered.
+
+    Numbered because the Director answers them in one reply and an unnumbered run of questions in
+    one paragraph gets answered as one question. `_short` caps each: every character here is model
+    output going into a thread that is context for the next call.
+    """
+    listed = " ".join(f"{n}. {_short(question, 200)}" for n, question in enumerate(questions, 1))
+    return PLANNING_QUESTIONS_NOTICE.format(questions=listed)
+
+
+def planning_proposals_notice(names: list[str]) -> str:
+    """Name what was proposed, and say plainly that it went nowhere. See the wording above."""
+    return PLANNING_PROPOSALS_NOTICE.format(count=len(names), assets=", ".join(names))
 
 
 def assistant_fill_summary(applied: dict[str, object]) -> str:
@@ -6764,6 +6870,35 @@ class AssistantRequest(BaseModel):
     shot_ids: list[str] = Field(min_length=1)
 
 
+class PlanningRequest(BaseModel):
+    """One planning turn: what the Director asked, and whether this request may write a document.
+
+    **`apply_documents` is AD-35 on the wire, and it ships here rather than with Planning Mode.**
+    The rule is that Planning Mode is *frontend* state: every planning request carries its
+    document-write consent explicitly, per request, and the server never stores, infers or
+    remembers it. What session consent buys the Director is not ticking a box every turn; what it
+    must never buy is a server that will write because of something it was told earlier.
+
+    So the gate is built in the same slice as the tools. Shipping the tools ungated and gating them
+    in Slice D would create an ungated path that *existed* — the shape of every guard hole this
+    project has found, sixteen times in one route alone — and it would be a path with no client,
+    which is the kind nobody notices is open.
+
+    The name and the shape are `DirectorRequest.apply_documents` deliberately: same field name,
+    same `DeclinedIfNull` decline-on-null, same default of off. There is one consent idiom on this
+    application's wire and this is it. `apply_shots` has no sibling here because no planning tool
+    can write a shot, and `AssistantRequest`'s "the selection is the scope" has none either — a
+    planning turn is about the project's documents, not about a set of shots.
+
+    Nothing gates `propose_assets`. A proposal writes nothing to the project — it is not persisted
+    at all until Slice F — so there is nothing to consent to, and requiring consent for it would
+    teach the Director to switch writing on for a turn that only wanted suggestions.
+    """
+
+    message: str = Field(min_length=1)
+    apply_documents: DeclinedIfNull = False
+
+
 class SelectTakeRequest(BaseModel):
     #: A file one of this Shot's own h3 jobs produced (repo-relative under ComfyUI's
     #: output root), or —
@@ -10605,6 +10740,12 @@ MANIFEST_WRITE_GUARDS: dict[str, str] = {
     "assistant_fill": WRITE_GUARD_COMPARE_AND_SWAP,
     "director_chat": WRITE_GUARD_COMPARE_AND_SWAP,
     "expand_shot_prompts": WRITE_GUARD_COMPARE_AND_SWAP,
+    # A planning turn, like a chat turn, holds the manifest open across a model call that this
+    # project has measured at up to 300 seconds — and what it writes when it lands is a creative
+    # document plus its single recovery slot. That is the rule's own example of a write whose loss
+    # is undetectable afterwards: both outcomes are a well-formed manifest and nothing downstream
+    # can tell which Brief the Director meant to keep.
+    "planning_turn": WRITE_GUARD_COMPARE_AND_SWAP,
     "read_render_status": WRITE_GUARD_COMPARE_AND_SWAP,
     "remove_song": WRITE_GUARD_COMPARE_AND_SWAP,
     "replace_project": WRITE_GUARD_COMPARE_AND_SWAP,

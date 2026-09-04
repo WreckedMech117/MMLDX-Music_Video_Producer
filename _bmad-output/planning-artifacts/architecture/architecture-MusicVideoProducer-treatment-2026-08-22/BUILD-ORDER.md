@@ -52,20 +52,24 @@ graph LR
 
 ---
 
-## Slice B — The planning tools
+## Slice B — The planning tools  *(shipped 2026-09-03)*
 
 | | |
 |---|---|
 | Delivers | the mechanism behind TP-7, TP-10 |
 | Depends on | nothing |
 | Binds | AD-38, AD-43 |
-| Risk | **Medium**, and concentrated in the schemas. |
+| Risk | **Medium**, and concentrated in the schemas — which is where it turned out to be. |
 
-Three separate tools — ask, write-brief, propose-assets — each with its own strict schema, **every required field promoted through `_promoted()`**.
+Three separate tools — `ask_director`, `write_brief`, `propose_assets` — each with its own strict schema, **every required field promoted through `_promoted()`**, plus `POST /api/projects/{id}/planning/turn` carrying AD-35's per-request consent.
 
 **The required lists are the load-bearing part, not the prompts.** `_promoted()` raises on an unknown name precisely because `shots` was asked for in words across three measured runs while the grammar never mentioned it. Get the lists right and a dropped field becomes a validation failure; get them wrong and it becomes a silent no-op that narrates success.
 
-**Build headless.** Tools and schemas are testable with a recording double before any UI exists, and should be.
+*Amended 2026-09-03 by the slice that built it, because the sentence above prescribes a mechanism that does not work on its own.* `_promoted()` **folds** a caller's names into the `required` list Pydantic already produced, which is correct where it was written — `constrained_schema` tightens a grammar the model owns — and inert here: a field with no default is required for free, so on these three argument models every promoted name was a name the schema already had. Deleting one changed nothing and no test could fail. `_strict_tool_schema` clears the inherited list before promoting, so the tuple is the sole statement of what the wire requires, and it then refuses to emit any tool with an optional field left over. **The verification step this file and the slice spec both prescribe — "delete a name from the `_promoted()` list and watch a test fail" — survives without that one line.** It was run: mutation M1 survives against the folding form and is killed against the shipped one.
+
+**Build headless.** Tools and schemas are testable with a recording double before any UI exists, and should be. Built that way: no GPU, no LM Studio, no render, no pixel, and neither JS asset moved.
+
+**What it did not do:** the Brief's recovery slot now has two writers. `SAVE_CAPTURED_DOCUMENTS` is derived from `DIRECTOR_REPLACEABLE_DOCUMENTS` on Slice A's argument that *no reply can write the Brief*, so `DOCUMENT_SLOT_DISPLACEMENT["creative_brief"]` reads "save that changed it" — and a restore after a planning write now tells the Director their kept version came from a save. `write_brief` captures the slot (not capturing would leave a machine write with no recovery until AD-44's undo lands in Slice D), and the wording was left alone because correcting it moves `api.js`, which mirrors the same two phrases, and because which writer the sentence should name is a Director call. **Slice D owns it.**
 
 ---
 

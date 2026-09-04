@@ -14,7 +14,7 @@ Three features, one story-numbering space, three epic files that cross-link each
 |---|---|---|---|
 | Base product | 1–7 | 23 | Largely built; see `docs/ROADMAP.md` for verified-vs-unverified |
 | **Shot Effects and Transitions** | 8–11 | 19 | **All four epics shipped (8, 9, 10, 11).** See §2 for what is open. |
-| **Treatment Planning** | 12–17 | 17 | **Slice A shipped 2026-09-03** (Stories 12.1, 12.2 — the Brief's lock, slot, restore and contract). Everything else planned, not built |
+| **Treatment Planning** | 12–17 | 17 | **Slices A and B shipped 2026-09-03** (Stories 12.1, 12.2 — the Brief's lock, slot, restore and contract; Story 14.1 — the three planning tools, the per-request consent gate and `POST .../planning/turn`). Everything else planned, not built |
 
 *Corrected 2026-08-27.* The effects row read ~~**Fully planned, nothing built**~~ and the story counts read ~~24 / 18~~ for the first two features. The state claim was true on 2026-08-23 and is two epics stale; the treatment count of 17 was right and is untouched. `sprint-status.yaml` carries **`epic-8: done`** (8.1–8.3) and **`epic-9: done`** (9.1–9.7), across roughly fifteen commits ending at `0b0bb96`; `audio.py` and `effects.py` both ship, with the envelope sidecar, beat markers and snapping, the Effects tab, the preview cache and an effects-aware export behind them. Counted today against `epics.md`, `epics-effects.md` and `epics-treatment.md`: **23 / 19 / 17**. The effects figure moved because Epic 9 gained Story 9.7 during the build, and the base figure was never 24. This is the row `AGENTS.md` sends every new session to read first, and it was two epics stale — the same failure Epic 9's retrospective found in the tracker.
 
@@ -35,7 +35,7 @@ All paths relative to `_bmad-output/planning-artifacts/` — *corrected 2026-08-
 
 ## 2. Where to start
 
-**Treatment `BUILD-ORDER.md`'s Slice B, or Epic 17 — the effects `BUILD-ORDER.md` has no unbuilt slice left, and treatment Slice A shipped 2026-09-03.** Slices A (song analysis), B (the chain builder), C (the Effects tab), D (preview), E (reactive binding) and F (transitions) are all built. Pick from the independent quick wins below, or from §6's open items — which is where the effects work that is genuinely still owed now lives.
+**Treatment `BUILD-ORDER.md`'s Slice C, E or F, or Epic 17 — the effects `BUILD-ORDER.md` has no unbuilt slice left, and treatment Slices A and B both shipped 2026-09-03.** *(This said ~~Slice B~~ until the commit that shipped Slice B, which is the fourth time a "where to start" line in this document has named work that was already in `git log` — see the corrections under the table above. Slice D still wants A + B + C, so C is what unblocks it; E and F need only A + B and are reachable now.)* The effects slices A (song analysis), B (the chain builder), C (the Effects tab), D (preview), E (reactive binding) and F (transitions) are all built. Pick from the independent quick wins below, or from §6's open items — which is where the effects work that is genuinely still owed now lives.
 
 *Corrected 2026-08-30.* This said ~~**Effects Epic 10 — Reactive Binding, which is `BUILD-ORDER.md`'s Slice E**~~ and went on describing E's foundation as though nothing had been built on it. Epic 10 shipped 2026-08-27 and Epic 11 on 2026-08-29. This is §1's stale cell met a second time in the same document: the *state* was corrected on 2026-08-27 and the *instruction that reads it* was not, so a session that skipped the table and read this heading — which is what §8 tells it to do — would have started an epic that was already in `git log`.
 
@@ -369,6 +369,16 @@ Every spec in this project told its implementer to *count the progress block* �
 characters by eye, and it is a sufficient mechanism for six consecutive miscounted baselines
 without anyone being careless. **Run `uv run pytest` with no flag** and quote
 **collected / passed / failed** as three numbers; they have disagreed.
+
+*Amended 2026-09-03 by story 14.1, because "run it with no flag and quote three numbers" is one
+command short.* The `addopts = "-q"` that is still in effect suppresses pytest's
+`collected N items` **header** as well; what a flagless run prints is the summary line — `2857
+passed` — and no collected figure anywhere. So the third number needs its own command:
+**`uv run pytest --collect-only`**, whose last line is `N tests collected`. Measured on `71ddd3b`:
+`--collect-only` says 2857 and the run says `2857 passed, 1 warning`. Quoting a collected count
+off a flagless run means quoting the passed count under a different name, which is the fifth of
+the six miscounts (*2805-passing quoted as 2806-collected*) reproduced by following the
+instruction that was written to prevent it.
 
 **`node --check` proves nothing about either JS asset.** Node parses a `.js` file as CommonJS and
 goes quiet the moment it meets ESM syntax, and `app.js` and `api.js` have been ES modules for as

@@ -48,6 +48,12 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+# The one phrase the restore sentence uses, read from the server rather than retyped here.
+# A harness outside `uv run pytest` transcribing a Director-facing sentence is a copy no
+# gate watches: this file carried "save that changed it" and would have gone on asserting
+# it after the sentence changed.
+from music_video_producer.app import DOCUMENT_SLOT_DISPLACEMENT
+
 NAME = "brief-recovery"
 
 PASTED = (
@@ -189,9 +195,12 @@ def main() -> None:
             assert after["creative_brief_previous"] == PASTED, after["creative_brief_previous"]
             wait.until(lambda browser: browser.find_element(By.ID, "restore-brief").is_enabled())
             restore = driver.find_element(By.ID, "restore-brief")
-            assert "save that changed it" in (restore.get_attribute("title") or ""), (
-                restore.get_attribute("title")
-            )
+            # Read off the server rather than retyped. This line said "save that changed it"
+            # and was stale the moment `write_brief` became a second writer of the slot --
+            # invisible to `uv run pytest`, because this harness runs outside it.
+            assert DOCUMENT_SLOT_DISPLACEMENT["creative_brief"] in (
+                restore.get_attribute("title") or ""
+            ), restore.get_attribute("title")
             visible_and_clickable(driver, restore, "the enabled Brief restore button")
             assert covering_element(driver, restore) is None, (
                 "a toast is intercepting clicks meant for the Brief's restore button"
@@ -226,7 +235,7 @@ def main() -> None:
             # documents -- and it is on screen, not only in the manifest.
             thread = driver.find_element(By.ID, "chat-thread").text
             assert "Creative brief was restored" in thread, thread[-400:]
-            assert "save that changed it" in thread, thread[-400:]
+            assert DOCUMENT_SLOT_DISPLACEMENT["creative_brief"] in thread, thread[-400:]
             result["restore_round_trips"] = True
 
             # --- The lock says what it protects against, and does not stop the human --------------

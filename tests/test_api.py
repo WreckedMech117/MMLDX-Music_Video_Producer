@@ -6647,7 +6647,9 @@ def test_a_brief_save_keeps_the_version_it_displaced_and_the_restore_swaps_it_ba
     # the chat is the audit trail of what happened to the creative documents.
     assert back.creative_brief_previous == "A daylight desert chase. Nothing like it."
     assert back.messages[-1].content == document_restore_notice("creative_brief")
-    assert "save that changed it" in back.messages[-1].content
+    # Read from the constant rather than retyped: this line said "save that changed it" and
+    # went stale the day `write_brief` became a second writer of the Brief's slot.
+    assert DOCUMENT_SLOT_DISPLACEMENT["creative_brief"] in back.messages[-1].content
 
 
 def test_a_byte_equal_brief_save_captures_nothing(tmp_path: Path):
@@ -6809,7 +6811,12 @@ def test_each_documents_restore_refusal_names_the_writer_that_would_keep_a_versi
         # The client recognises every one of them by the same marker, or its stale-project
         # refresh silently stops working for whichever document changed wording.
         assert "nothing to restore" in refused.json()["detail"], field
-    assert "a save changes the document's text" in document_restore_refusal("creative_brief")
+    assert DOCUMENT_SLOT_CAPTURE["creative_brief"] in document_restore_refusal("creative_brief")
+    # ...and it really does name both writers, which is the thing that went wrong: a phrase
+    # read off the source agrees with the source by construction, so this half is what says
+    # the source is right.
+    assert "planning write" in DOCUMENT_SLOT_DISPLACEMENT["creative_brief"]
+    assert "save" in DOCUMENT_SLOT_DISPLACEMENT["creative_brief"]
     assert "a Director reply" in document_restore_refusal("treatment")
 
 
@@ -24964,9 +24971,22 @@ def test_the_director_chat_is_never_shown_a_shots_effect_stack(tmp_path: Path):
     assert reply.status_code == 200, reply.text
 
     serialised = json.dumps(director.contexts[0])
-    assert "effects" not in serialised
-    assert "punch_in" not in serialised
-    assert "1.77" not in serialised
+    # **The timestamps come out before the value is searched for, and this is a repair rather
+    # than a loosening.** `1.77` is four characters of decimal, and `created_at` /`updated_at` are
+    # serialised with microseconds — so `"2026-09-04T04:26:11.778697Z"` contains the planted zoom
+    # and this assertion fails on a project created during the 770th millisecond of any second.
+    # Observed on 2026-09-03, in a full run whose only failure it was; the parameter never
+    # reached the dump. A substring search for a *number* against a payload that carries clocks
+    # is a test that fails a few times in a hundred for a reason nobody can reproduce, which is
+    # worse than no test — the next implementer inherits it as a baseline they cannot trust.
+    # Only date-time strings are blanked, so every value this test is actually about is still
+    # searched for, including inside the Shot it was planted on.
+    timeless = re.sub(r'"\d{4}-\d\d-\d\dT[^"]*"', '""', serialised)
+    assert "effects" not in timeless
+    assert "punch_in" not in timeless
+    assert "1.77" not in timeless
+    # The blanking must not be what makes this pass: the Shot's own fields survive it.
+    assert '"prompt": "A corridor"' in timeless
     # And the plan facts the Director *is* meant to read are still there, so this is a
     # withholding rather than an emptied dump.
     assert "A corridor" in serialised

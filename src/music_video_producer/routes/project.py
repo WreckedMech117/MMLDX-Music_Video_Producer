@@ -118,6 +118,14 @@ def register(ctx: RouterContext) -> None:
         for field in DOCUMENT_LABELS:
             text = getattr(request, field)
             stored = getattr(project, field)
+            # **This capture has a second caller now and will have a third.** Slice B's
+            # `write_brief` fills the same slot from the planning route, and Suggest Video
+            # (story 13.1) will: *"the existing text goes to the recovery slot, and a locked
+            # Brief refuses the write by name"*. The lock half is already shared —
+            # `app.document_lock_refusal` exists for exactly that and names both callers in
+            # its own docstring. This half is not, and a third inline copy of *displace the
+            # stored text into the slot* is the two-answers-to-one-question shape that has
+            # produced this project's worst defects. **Extract before duplicating.**
             if field in SAVE_CAPTURED_DOCUMENTS and text != stored:
                 setattr(project, f"{field}{RECOVERY_SLOT_SUFFIX}", stored)
             setattr(project, field, text)

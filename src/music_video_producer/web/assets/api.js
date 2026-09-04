@@ -773,7 +773,13 @@ export function documentReplaceableByReply(document) {
 // never will, which tells the Director the box is not protected and to stop looking for the
 // button that protects it.
 export function documentSlotDisplacement(document) {
-  return documentReplaceableByReply(document) ? "applied replacement" : "save that changed it";
+  // Two writers for the Brief since 2026-09-04: a save, and slice B's `write_brief`.
+  // Mirrors `app.DOCUMENT_SLOT_DISPLACEMENT`, and a contract test holds the pair together
+  // so this cannot drift from it. The song context's identical phrase is not this one and
+  // stays as it is: a lyric sheet really does have a single writer.
+  return documentReplaceableByReply(document)
+    ? "applied replacement"
+    : "save or planning write that changed it";
 }
 
 export function documentSlotCapture(document) {
