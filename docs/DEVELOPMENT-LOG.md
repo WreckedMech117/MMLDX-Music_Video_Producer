@@ -4,6 +4,53 @@
 >
 > Entries cite the spec they were built from. Specs live under `_bmad-output/implementation-artifacts/`, which `.gitignore` excludes, so those paths resolve on the authoring machine but **not in a clone**. Each entry therefore carries its own reasoning rather than deferring to the spec, and any binding decision is recorded in the tracked planning artifacts (`_bmad-output/planning-artifacts/`, notably `ARCHITECTURE-SPINE.md`).
 
+## 2026-09-04 — Eleven days this log did not cover, and where the record actually is
+
+**This entry exists because the log stopped on 2026-08-24 and four epics landed after it.** A
+searcher finding nothing between 2026-08-24 and 2026-09-04 would reasonably read that as a quiet
+fortnight. It was the opposite. Nothing requires an entry per change — no gate, no line in
+`AGENTS.md` — so the habit simply lapsed, and this names the gap rather than backfilling eleven
+days of prose that the commit messages already carry better.
+
+**Where the record is, in the order worth reading it:**
+
+| What | Where |
+|---|---|
+| What each change did and why | the commit messages, which this project writes long on purpose |
+| Every Director decision | `effects-director-rulings-2026-08-24.md` (R-1—R-46) and `treatment-planning-findings-and-rulings-2026-08-22.md` (R-1—R-18) |
+| What each epic cost and taught | `epic-8-retro-*.md` through `epic-11-retro-*.md`, and their 86 action items in `sprint-status.yaml` — all closed |
+| Everything found and not fixed | `deferred-work.md`, ~53 open entries above `## Resolved` |
+| Why an architecture decision reads as it does | the two `ARCHITECTURE-SPINE.md` files, amended in place with strike-throughs |
+
+**What landed.** Effects **Epic 10** (audio-reactive bindings) and **Epic 11** (transitions) shipped
+with retrospectives; Epic 11's found a defect that put the wrong Shot in a delivered video at HTTP
+200 with every gate green, and its repair introduced two regressions of its own that a second review
+pass caught. Treatment Planning then began: **Slice A** gave the Brief a lock, a recovery slot and a
+restore route, closing FR-16's one standing exception; **R-18's** confirmation stopped a save
+silently emptying the Treatment; **Slice B** built the three planning tools headless.
+
+**Three findings from that stretch generalise beyond their slices, and are the reason this entry is
+worth having:**
+
+1. **Two of this project's required gates were inert, and both always exited 0.** `uv run pytest -q`
+   ran at `-qq` because `addopts` already sets it, suppressing both the `N passed` line and the
+   `collected N items` header — the mechanical cause of six consecutive miscounted baselines. And
+   `node --check` on a `.js` asset proves nothing, because node parses `.js` as CommonJS and falls
+   silent at ESM syntax, which both assets have used for months. Neither was carelessness; both were
+   green *because they could not fail*.
+2. **A verification step can certify the thing it was written to prevent.** Slice B's spec said to
+   prove a required field by deleting it from the `_promoted()` list — and `_promoted` folds names
+   into a list Pydantic already produced, so on required-by-default models that deletion changes
+   nothing. The step could not fail, on the slice whose entire content was those lists.
+3. **The recurring survivor is the wiring.** Three slices running, the mutation that lived was a
+   pure decision covered by a test and the caller that calls it not covered at all.
+
+**Suite at this entry: 2886 passed, 0 failed** (`uv run pytest`, no `-q`); collected from
+`--collect-only`, which is the only place that figure survives. `ruff check .` clean; both JS assets
+parse as ES modules.
+
+---
+
 ## 2026-08-24 — One read for one measurement: the band and the drag stop being able to disagree
 
 Retrospective action item **A5**, closing cross-story findings **S4** and **S5** and taking **A4**
