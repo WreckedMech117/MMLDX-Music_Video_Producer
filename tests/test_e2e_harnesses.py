@@ -2,8 +2,8 @@
 
 Epic 10's retrospective action item **22**: *a gate that is not in the gate is not a gate.*
 `pyproject.toml` sets `testpaths = ["tests"]` with pytest's default `python_files`, so all
-~~twenty-four~~ ~~twenty-five~~ ~~twenty-six~~ **twenty-nine** `tests/e2e_*.py` files —
-~~twenty-three~~ ~~twenty-four~~ ~~twenty-five~~ **twenty-eight** harnesses
+~~twenty-four~~ ~~twenty-five~~ ~~twenty-six~~ ~~twenty-nine~~ **thirty** `tests/e2e_*.py` files —
+~~twenty-three~~ ~~twenty-four~~ ~~twenty-five~~ ~~twenty-eight~~ **twenty-nine** harnesses
 and `e2e_support.py` — sit outside `uv run pytest`. *(Corrected 2026-09-04: this said twenty-six
 and twenty-five, and was two harnesses stale before Suggest Video's was added — a count going
 stale inside the module whose whole subject is counts going stale, and the one number here that
@@ -335,7 +335,7 @@ def test_the_runbook_counts_what_it_lists():
 
 @pytest.mark.parametrize("name", [path.stem for path in harnesses()])
 def test_each_harness_is_reached_by_all_of_the_above(name):
-    """A named case per harness, so a green run says which twenty-eight were looked at.
+    """A named case per harness, so a green run says which twenty-nine were looked at.
 
     Without this the whole of item 22 is seven test functions, and a harness that vanished from
     `tests/` would take its coverage with it silently — which is the failure mode of every count

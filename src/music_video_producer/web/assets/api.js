@@ -902,6 +902,182 @@ export const DOCUMENT_CONTROLS = {
   },
 };
 
+// ---------------------------------------------------------------------------------------------
+// The Brief's attribution (TP-8, AD-32, AD-45). **Every decision about a mark is here.** app.js
+// measures boxes, positions bars and appends text nodes, and re-derives none of the answers
+// below. There is no automated guard on that split -- it is discipline -- so the seam is drawn
+// where it can be read: nothing in this section touches an element, and nothing in app.js's
+// mirror section decides which characters a mark covers, what it says, or whether it is drawable.
+//
+// **Nothing here computes a range (AD-45).** No function below searches the Brief for anything.
+// The only inputs are the text on screen and the ranges the server sent; the only thing done to a
+// range is to clamp it into that text and drop what is left if it cannot be drawn. A frontend
+// that re-derived offsets "so the marks keep up while the Director types" would be a second
+// authority on provenance, and the one authority is `app.reconcile_attribution`, server side, on
+// every write.
+//
+// What that costs, said out loud rather than hidden: between a keystroke and the save that
+// follows it, an insertion *before* a mark moves the text under its wash and nothing here
+// corrects it. The next reply from the server does, because the server is the only thing
+// entitled to.
+// ---------------------------------------------------------------------------------------------
+
+// Every element the mirror overlay needs, named once. Deliberately **not** fields on
+// DOCUMENT_CONTROLS above: `app.ATTRIBUTED_DOCUMENTS` maps `creative_brief` and nothing else, so
+// an entry there would give the Treatment and the Style bible a mirror each, and the first loop
+// over that table would build two overlays over documents that have no ranges to draw.
+export const BRIEF_ATTRIBUTION_CONTROLS = {
+  frame: "#brief-frame",
+  mirror: "#brief-mirror",
+  text: "#brief-mirror-text",
+  rules: "#brief-mirror-rules",
+  readout: "#brief-attribution",
+};
+
+// One zero-width character closing the mirror's text, and it is a metric fix rather than a
+// flourish. A `<textarea>` gives a trailing newline a line box of its own -- the caret can sit on
+// that empty last line -- and a `white-space: pre-wrap` block does not, so a Brief ending in a
+// newline makes the mirror exactly one line shorter than the box it is behind and every mark
+// below the fold sits one line high. Zero width, so it changes no wrapping; it only guarantees
+// the last line box exists. `mirror.scrollHeight === textarea.scrollHeight` is what proves it.
+export const BRIEF_MIRROR_TAIL = "\u200b";
+
+// What a mark says when the caret is inside it. Three cases, and the second is the one that
+// matters: `BriefRange.message_id` is `""` for a machine write with no turn to point at -- today
+// Suggest Video, which is its own pass with no thread and no message -- and a blank label would
+// read as a bug rather than as the fact. The third is a turn the thread no longer carries, which
+// must not be told as "no turn": those are different statements about where a mark came from.
+export const BRIEF_ATTRIBUTION_TURN = "Assistant · turn {turn} of this thread";
+export const BRIEF_ATTRIBUTION_NO_TURN = "Assistant · a pass of its own, not a chat turn";
+export const BRIEF_ATTRIBUTION_LOST_TURN = "Assistant · a turn no longer in this thread";
+
+// The Brief's attribution with no caret in it, which is also its **non-visual** expression. AD-32
+// hides the paint from assistive technology and says the accessible form is the range list, and
+// shipping only the hiding half would ship a feature no screen reader can see -- so this sentence
+// is carried by a live region that is not `aria-hidden`, and the caret label above replaces it in
+// the same element. One mechanism, both jobs.
+export const BRIEF_ATTRIBUTION_UNMARKED = "Nothing in this Brief was written by the assistant.";
+export const BRIEF_ATTRIBUTION_MARKED =
+  "Written by the assistant: {count} {stretches}. Put the caret in one to name the turn.";
+
+// One offset as a whole number, or 0. `Number.isFinite` rather than a truthiness test, because
+// `0` is a perfectly good offset and a `NaN` out of a hand-edited manifest must not become one.
+function briefOffset(value) {
+  return Number.isFinite(value) ? Math.trunc(value) : 0;
+}
+
+// The marks that can actually be drawn over this text, in order and never overlapping.
+//
+// **Clamp, then drop** -- both, and which one applies is decided per range rather than per
+// manifest. A range running past the end of the Brief is clamped to it, because the Brief it was
+// written against was longer and the part of the mark that is still there is still true; a range
+// left with nothing in it after clamping is dropped, because a zero-width wash is not a thing
+// anyone can look at. Nothing throws: a hand-edited manifest, or any future writer with a bug,
+// must not take the Brief's editor down with it.
+//
+// The overlap clamp is there for the same reason. The server writes disjoint ranges, so two that
+// overlap are already a manifest saying something impossible -- and the segment walk below would
+// hand back overlapping slices and wash the same characters twice.
+export function briefAttributionRanges(text, ranges) {
+  const body = typeof text === "string" ? text : "";
+  const listed = Array.isArray(ranges) ? [...ranges] : [];
+  listed.sort((left, right) => briefOffset(left?.start) - briefOffset(right?.start));
+  const drawable = [];
+  let floor = 0;
+  for (const range of listed) {
+    const start = Math.min(Math.max(briefOffset(range?.start), floor), body.length);
+    const end = Math.min(Math.max(briefOffset(range?.end), 0), body.length);
+    if (end <= start) continue;
+    const messageId = typeof range?.message_id === "string" ? range.message_id : "";
+    drawable.push({ start, end, messageId });
+    floor = end;
+  }
+  return drawable;
+}
+
+// The whole Brief as a run of pieces, each either the Director's or one mark's. `mark` is the
+// index into `briefAttributionRanges`' answer, or `-1` for text nobody attributed -- the unmarked
+// default is the Director's, and there is no "the Director wrote this" range to carry.
+//
+// Pieces rather than markup, and that is constraint 2 rather than a preference: this is text the
+// Director types, and interpolating it into `innerHTML` makes every `<` in a Brief a parse
+// instruction -- a script-injection hole with the Director's own document as the vector. app.js
+// turns each piece into a text node and never assembles a string.
+export function briefAttributionSegments(text, ranges) {
+  const body = typeof text === "string" ? text : "";
+  const marks = briefAttributionRanges(body, ranges);
+  const segments = [];
+  let cursor = 0;
+  marks.forEach((mark, index) => {
+    if (mark.start > cursor) segments.push({ text: body.slice(cursor, mark.start), mark: -1 });
+    segments.push({
+      text: body.slice(mark.start, mark.end), mark: index, messageId: mark.messageId,
+    });
+    cursor = mark.end;
+  });
+  segments.push({ text: `${body.slice(cursor)}${BRIEF_MIRROR_TAIL}`, mark: -1 });
+  return segments;
+}
+
+// Which mark the caret is in, or -1. Half-open offsets, so `end` is one past the last marked
+// character and two marks that touch share a number: a caret at a shared boundary belongs to the
+// mark that *starts* there, which is why the containment pass runs before the boundary pass.
+// The boundary pass is not a nicety -- a caret at the very end of a mark is visually inside it,
+// and without it the label would go blank the moment the Director clicked after the last word of
+// an assistant paragraph.
+export function briefAttributionMarkAt(marks, caret) {
+  const listed = Array.isArray(marks) ? marks : [];
+  if (!Number.isFinite(caret)) return -1;
+  const at = Math.trunc(caret);
+  const inside = listed.findIndex((mark) => at >= mark.start && at < mark.end);
+  return inside >= 0 ? inside : listed.findIndex((mark) => at === mark.end);
+}
+
+// Which turn wrote a mark, in the Director's words. `messages` is the thread as the project
+// carries it; the turn is its 1-based position in that thread, which is what "the turn that wrote
+// it" means to somebody scrolling the thread six months later.
+export function briefAttributionLabel(messages, messageId) {
+  if (typeof messageId !== "string" || !messageId) return BRIEF_ATTRIBUTION_NO_TURN;
+  const listed = Array.isArray(messages) ? messages : [];
+  const turn = listed.findIndex((message) => message?.id === messageId);
+  if (turn < 0) return BRIEF_ATTRIBUTION_LOST_TURN;
+  return BRIEF_ATTRIBUTION_TURN.replace("{turn}", String(turn + 1));
+}
+
+// What the readout says with no caret in a mark: the range list in a sentence, which is AD-32's
+// accessible form of the attribution.
+export function briefAttributionSummary(count) {
+  const marked = Number.isFinite(count) ? Math.trunc(count) : 0;
+  if (marked <= 0) return BRIEF_ATTRIBUTION_UNMARKED;
+  return BRIEF_ATTRIBUTION_MARKED
+    .replace("{count}", marked === 1 ? "one" : String(marked))
+    .replace("{stretches}", marked === 1 ? "stretch" : "stretches");
+}
+
+// One mark's rule: **one bar down the whole block**, from its first character to its last and
+// across the blank lines inside it (the Director's ruling, 2026-09-04).
+//
+// Measured rather than styled, and that is the ruling's own reason. A mark is an arbitrary
+// substring -- `reconcile_attribution` was executed to check, and a mark the Director has typed
+// in front of on its own line survives starting mid-line -- so a `border-left` on the marked span
+// would draw once at whatever x the mark happens to start at, and `box-decoration-break: clone`
+// would draw one per visual line, which is the option the ruling rejected.
+//
+// `rects` are the client rectangles of the mark's own text and `originTop` is the viewport y of
+// the layer the bars are appended to -- which is the mirror's own padding box, and which scrolls
+// with the mirror's content, so a bar placed against it travels with the text rather than with
+// the box and nothing has to be re-measured on a scroll. `null` when a mark has no box to measure
+// at all: not an error, a mark the browser laid out as nothing, which is every mark in a panel
+// that is not on screen.
+export function briefMarkRule(rects, originTop) {
+  const boxes = (Array.isArray(rects) ? rects : []).filter((box) => box && box.height > 0);
+  if (!boxes.length) return null;
+  const top = Math.min(...boxes.map((box) => box.top));
+  const bottom = Math.max(...boxes.map((box) => box.bottom));
+  const origin = Number.isFinite(originTop) ? originTop : 0;
+  return { top: top - origin, height: Math.max(bottom - top, 0) };
+}
+
 // The chat composer's per-turn consent to replace the creative documents, sent as the route's
 // `apply_documents`. One selector and one label because three copies — the markup's checkbox,
 // the handler that reads it, and the sentence the server's notice quotes — are how a rename

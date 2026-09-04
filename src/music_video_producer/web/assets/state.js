@@ -89,6 +89,17 @@ export const state = {
   // empty object is the honest starting state, and an absent key makes the clip draw exactly
   // what it drew before this existed.
   renderPhase: {},
+  // The Brief's attribution as the last render drew it: the server's ranges, clamped into the
+  // text that was on screen, in the order the mirror's marks and their rules were built in. The
+  // caret label reads this rather than re-deriving anything, so "which mark is the caret in" and
+  // "which stretch is washed" cannot answer differently.
+  //
+  // Derived, never sent, and deliberately **not** on `state.project`: the project object is what
+  // `PUT /api/projects/{id}` sends back whole, and `brief_attribution` is server-owned (AD-45) --
+  // a clamped copy folded into it would be a client writing provenance, which is the one thing
+  // that route re-adopts the stored value to prevent. Empty is the honest starting state: a
+  // Brief nobody has rendered yet has no marks to be inside.
+  briefMarks: [],
 };
 
 export function selectedAsset() {

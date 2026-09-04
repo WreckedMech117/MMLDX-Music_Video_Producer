@@ -237,13 +237,70 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .document-tabs button.active { color: var(--acid); border-bottom-color: var(--acid); }
 .document-editor { display: none; min-height: 0; margin: 0; padding: 16px; }
 .document-editor.active { display: grid; grid-template-rows: auto 1fr; }
-/* The Brief carries a help paragraph between its label and its box (TP-2), so its panel has one
-   more row than the other two. Scoped to the panel rather than written as a third row for every
-   document: the Treatment and Style bible have no such paragraph, and an empty auto row there
-   costs nothing visually but makes the rule lie about what the panel contains. */
-.document-editor[data-doc-panel="brief"].active { grid-template-rows: auto auto 1fr; }
+/* The Brief carries a help paragraph between its label and its box (TP-2), and since 2026-09-04
+   an attribution readout beneath it (TP-8), so its panel has two more rows than the other two.
+   Scoped to the panel rather than written for every document: the Treatment and the Style bible
+   have neither -- `app.ATTRIBUTED_DOCUMENTS` maps `creative_brief` alone and neither of them
+   grows a mirror -- and empty auto rows there cost nothing visually but make the rule lie about
+   what the panel contains. */
+.document-editor[data-doc-panel="brief"].active { grid-template-rows: auto auto 1fr auto; }
 .document-editor .field-help { margin: 0 0 10px; }
 .document-editor textarea { resize: none; font-size: 14px; line-height: 1.6; }
+/* ---- The Brief's attribution overlay (AD-32, TP-8, DESIGN 3) -------------------------------
+   A read-only styled block **behind** a real `<textarea>`, sharing its metrics exactly, with the
+   box's own background moved out to the frame so the mirror can be seen through it. The Brief
+   stays a `<textarea>`: text, caret, selection, paste, undo, IME and spellcheck are the
+   browser's, and no `contenteditable` is introduced anywhere in this application.
+
+   **The two undeclared metrics, declared.** `white-space` and `overflow` appear nowhere else in
+   this stylesheet: a textarea takes the user agent's `pre-wrap`/`auto` and a block takes
+   `normal`/`visible`, and `normal` collapses every run of spaces and every newline -- so a mirror
+   that does not say `pre-wrap` wraps differently from its first character and every mark is in
+   the wrong place. `overflow-wrap` is the same trap one layer down: the user agent breaks a long
+   unbreakable word inside a textarea and does not inside a block.
+
+   **The scrollbar gutter is handled rather than ignored** (constraint 4). `overflow-y: scroll` on
+   *both*, so the gutter is reserved whether the Brief overflows or not: with `auto` the bar
+   appears the moment the Brief passes one screen and takes ~15px off the *textarea's* wrapping
+   width and not the mirror's, and every line below re-wraps under a mirror that did not. That
+   drift looks perfect in a screenshot of the top of the box, which is the failure this slice
+   exists to avoid. The mirror's own bar is drawn in the same place at the same offset as the
+   textarea's, which is painted over it. */
+.brief-frame { position: relative; display: grid; min-height: 0; }
+#creative-brief, .brief-mirror { overflow-x: hidden; overflow-y: scroll; white-space: pre-wrap; overflow-wrap: break-word; word-break: normal; }
+/* The textarea's own metrics, restated: a block inherits none of them, and `font: inherit` alone
+   would take the 14px body size and the *normal* line height rather than this editor's 1.6. */
+.brief-mirror { position: absolute; inset: 0; z-index: 0; margin: 0; font: inherit; font-size: 14px; line-height: 1.6; letter-spacing: normal; word-spacing: normal; tab-size: 8; border: 1px solid transparent; border-radius: 5px; padding: 9px 10px; color: transparent; pointer-events: none; }
+/* The control ground, the same literal the `input, textarea, select` rule above sets, because
+   there is no palette token for it and inventing one is a palette change this slice is not
+   entitled to make (DESIGN 1: the palette is closed). A contract test asserts the two literals
+   are the same string, so the duplication is guarded rather than merely regretted. */
+.brief-mirror { background: #101212; }
+.brief-mirror-text { display: block; }
+.brief-frame textarea { position: relative; z-index: 1; background: transparent; }
+/* Neutral, and that is a design law rather than a preference (DESIGN 3): `--surface-1` wash and a
+   2px `--line-strong` rule, **no accent**. Provenance is not a state, and "colour the attribution
+   wash" is named in DESIGN's Don't list. The mirror's text is transparent -- the textarea's own
+   text is the text on screen -- so `mark` has to say so or the user agent paints it black on
+   yellow. */
+.brief-mark { background: var(--surface-1); color: transparent; }
+/* One rule down the whole block, from a mark's first character to its last and across the blank
+   lines inside it (Director's ruling, 2026-09-04). Its own measured layer rather than a
+   `border-left` on the mark, because a mark can start mid-line: a border would draw once at the
+   wrong x, and `box-decoration-break: clone` would draw one per visual line. `inset: 0` makes
+   this layer the mirror's padding box, and an absolutely positioned child of a scroll container
+   scrolls with its content -- which is why a scroll costs no re-measurement. */
+.brief-mirror-rules { position: absolute; inset: 0; pointer-events: none; }
+.brief-mark-rule { position: absolute; left: 2px; width: 2px; background: var(--line-strong); }
+/* DESIGN 3's hover/focus state: the rule brightens. Driven by the caret rather than by the
+   pointer -- the mirror is behind a textarea and takes no pointer events at all, and a caret is
+   what the acceptance asks about. */
+.brief-mark-rule.named { background: var(--muted); }
+/* The caret label and, in the same element, the attribution's non-visual expression: a live
+   region that is **not** `aria-hidden`, so AD-32's "the accessible expression is the range list,
+   not the paint" is delivered rather than only half-delivered. The established Consolas
+   micro-label form (9px, letter-spaced, uppercase), as every other origin and kind label uses. */
+.brief-attribution { min-height: 13px; margin: 7px 2px 0; color: var(--muted); font: 9px/1.4 Consolas, monospace; letter-spacing: .1em; text-transform: uppercase; }
 .document-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; padding: 12px; border-top: 1px solid var(--line); }
 /* Per-document controls: shown only while their own document tab is active, so neither pair
    is offered over the Creative brief, which has no lock and no kept version. */

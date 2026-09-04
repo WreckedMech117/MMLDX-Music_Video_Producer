@@ -1,4 +1,4 @@
-import { adoptedShotEffects, aiModPlan, alignLyricsKeptTranscription, api, applyRenderStatus, APPLY_DOCUMENTS_CONTROL, approvalControl, approvalNotice, assetNamePlan, assetsForTab, assetTab, assetTabEmpty, ASSET_NAME_HELP, ASSET_NAME_LABEL, ASSET_ROLE_LABELS, ASSET_TABS, assistantControl, assistantFillAllControl, assistantToast, ASSISTANT_EDIT_BLOCKED, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, batchReportToast, beatBandIdentity, beatMarkersControlPlan, characterSlotPlan, CITATION_MISSING_LABEL, clearDocumentConsent, clipEffectsChip, comfyOutputUrl, consistencyAnchorPlan, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, documentChangeToast, documentClearing, documentClearingQuestion, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, DOCUMENT_CONTROLS, driveReadoutPlan, driveReadoutView, driveReadoutWanted, effectBandChange, effectBandEdit, effectBandStripDrag, effectBandStripHit, effectBandStripPlan, effectBandToggle, effectBindingsBody, effectBindingsSet, effectControlKey, effectControlTarget, effectCopyBody, effectCopyReport, effectDropTarget, effectMoveOffered, effectNudgeDirection, effectNudgeTarget, effectParameterDefinition, effectParameterReadout, effectParameterValue, effectSliderFill, effectsPanelModel, effectsRefusalNotice, effectStackAdd, effectStackChanged, effectStackMove, effectStackRemove, effectStackSetParameter, effectStackToggle, effectStackWrite, EFFECT_BAND_CLOSED, EFFECT_BAND_ID, EFFECT_PARAMETER_ID, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, expansionReport, generateAllPlan, hasActiveRenderJobs, INSTRUMENTAL_NOTE, jobTarget, markReadyControl, markReadyNotice, monitorPreviewView, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, PLACEHOLDER_PROMPT, prefillControl, PREVIEW_UNPLAYABLE, previewAdoption, randomSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderAgainQuestion, renderSettledToast, RENDER_POLL_INTERVAL_MS, resolveShotMode, shotBoundaries, shotCitations, shotEffectStack, shotExpansionToast, shotInspectorReadiness, shotLabel, shotModeOptionLabel, shotPreviewWanted, shotPromptCell, shotSpecificationProblems, shotTab, shotTabAfterKey, shotTabStrip, shotTakeUrl, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SHOT_TABS, SINGING_STATES, snapSeconds, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songOrderRanks, songRefusalMessage, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, tagLyricLine, threadHtml, unsavedWorkPending, unsavedWorkQuestion, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, vocalTaggingPlan, vocalTypeSpec, VOCAL_TYPES, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE } from "./api.js";
+import { adoptedShotEffects, aiModPlan, alignLyricsKeptTranscription, api, applyRenderStatus, APPLY_DOCUMENTS_CONTROL, approvalControl, approvalNotice, assetNamePlan, assetsForTab, assetTab, assetTabEmpty, ASSET_NAME_HELP, ASSET_NAME_LABEL, ASSET_ROLE_LABELS, ASSET_TABS, assistantControl, assistantFillAllControl, assistantToast, ASSISTANT_EDIT_BLOCKED, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, batchReportToast, beatBandIdentity, beatMarkersControlPlan, BRIEF_ATTRIBUTION_CONTROLS, briefAttributionLabel, briefAttributionMarkAt, briefAttributionRanges, briefAttributionSegments, briefAttributionSummary, briefMarkRule, characterSlotPlan, CITATION_MISSING_LABEL, clearDocumentConsent, clipEffectsChip, comfyOutputUrl, consistencyAnchorPlan, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, documentChangeToast, documentClearing, documentClearingQuestion, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, DOCUMENT_CONTROLS, driveReadoutPlan, driveReadoutView, driveReadoutWanted, effectBandChange, effectBandEdit, effectBandStripDrag, effectBandStripHit, effectBandStripPlan, effectBandToggle, effectBindingsBody, effectBindingsSet, effectControlKey, effectControlTarget, effectCopyBody, effectCopyReport, effectDropTarget, effectMoveOffered, effectNudgeDirection, effectNudgeTarget, effectParameterDefinition, effectParameterReadout, effectParameterValue, effectSliderFill, effectsPanelModel, effectsRefusalNotice, effectStackAdd, effectStackChanged, effectStackMove, effectStackRemove, effectStackSetParameter, effectStackToggle, effectStackWrite, EFFECT_BAND_CLOSED, EFFECT_BAND_ID, EFFECT_PARAMETER_ID, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, expansionReport, generateAllPlan, hasActiveRenderJobs, INSTRUMENTAL_NOTE, jobTarget, markReadyControl, markReadyNotice, monitorPreviewView, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, PLACEHOLDER_PROMPT, prefillControl, PREVIEW_UNPLAYABLE, previewAdoption, randomSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderAgainQuestion, renderSettledToast, RENDER_POLL_INTERVAL_MS, resolveShotMode, shotBoundaries, shotCitations, shotEffectStack, shotExpansionToast, shotInspectorReadiness, shotLabel, shotModeOptionLabel, shotPreviewWanted, shotPromptCell, shotSpecificationProblems, shotTab, shotTabAfterKey, shotTabStrip, shotTakeUrl, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SHOT_TABS, SINGING_STATES, snapSeconds, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songOrderRanks, songRefusalMessage, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, tagLyricLine, threadHtml, unsavedWorkPending, unsavedWorkQuestion, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, vocalTaggingPlan, vocalTypeSpec, VOCAL_TYPES, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE } from "./api.js";
 import { ASSEMBLE_RUNNING, EXPORT_PRESETS, EXPORT_PRESET_DEFAULT, assemblyControl, assemblyProgress, effectiveOffset, latestAssemblyExport, monitorShowsTake, monitorState, newShotFromPlan, renderProgressByTarget, renderingFlag, shotRenderState, takeAnchorControl, takeAudioControl, takesStripRows, trimNudgeControl } from "./api.js";
 // Suggest Video's watched pass (TP-4, story 13.2). Every decision is pure and lives in api.js --
 // the ticking approximation, the measurement, the abandon question and the note's face -- and
@@ -1032,6 +1032,11 @@ function renderTreatment() {
   for (const [documentKey, control] of Object.entries(DOCUMENT_CONTROLS)) {
     $(control.box).value = project?.[documentKey] || "";
   }
+  // The mirror holds a copy of the Brief's text, so it is filled from the same reply in the same
+  // pass. A mirror rendered a moment later -- or only on the next keystroke -- is the previous
+  // project's Brief sitting behind this one's, with this one's ranges washing whatever characters
+  // happen to be at those offsets.
+  renderBriefAttribution();
   syncDocumentControls();
   syncSuggestVideoControls();
   const thread = $("#chat-thread");
@@ -1042,6 +1047,105 @@ function renderTreatment() {
   // appearing, so the assignment itself is pinned by tests/test_frontend_contract.py.
   thread.innerHTML = threadHtml(project?.messages);
   thread.scrollTop = thread.scrollHeight;
+}
+
+// ---- The Brief's attribution mirror, the drawing half (AD-32, TP-8) --------------------------
+// **The seam.** Every decision is `api.js`'s and is imported: which characters a mark covers
+// after clamping, what its label says, whether it is drawable at all, and where its rule runs.
+// Nothing below decides any of that. What is here is the three things a pure function cannot do
+// -- append a text node, measure a box, and put a bar at a number of pixels.
+//
+// The client never computes a range (AD-45): the only ranges drawn are the ones the server sent
+// on the project, and no save carries any back.
+
+//: The bars this render drew, in mark order. Kept so the caret label can brighten one without
+//: asking the DOM to find it again -- and so "which bar belongs to which mark" is the order they
+//: were created in rather than a second lookup that could disagree with the first.
+let briefMarkRules = [];
+
+// The mirror's text and its rules, from the text on screen and the ranges the server sent.
+//
+// Exported for the executed frontend contract, on `renderSong`'s argument: it is reached from
+// `renderTreatment`, from the input handler and from the tab handler, and from nowhere else, so a
+// grep for the call passes just as happily on a function nothing ever runs.
+export function renderBriefAttribution() {
+  const box = $(DOCUMENT_CONTROLS.creative_brief.box);
+  const body = $(BRIEF_ATTRIBUTION_CONTROLS.text);
+  const text = box.value;
+  // One pure function asked twice rather than once and then cast: the marks the segments were cut
+  // from and the marks the caret is matched against have to be the same list in the same order,
+  // and the only way to be sure of that is for both to be `briefAttributionRanges(text, ...)` of
+  // the same two arguments.
+  const marks = briefAttributionRanges(text, state.project?.brief_attribution);
+  state.briefMarks = marks;
+  // **Text nodes, never an HTML string** (constraint 2). A Brief containing `<script>` or
+  // `</textarea>` is text the Director typed, and interpolating it into `innerHTML` would make
+  // every `<` in their own document a parse instruction. `createTextNode` cannot create an
+  // element however the Brief is spelled, which is a property of the construction rather than of
+  // an escape somebody has to keep getting right.
+  body.textContent = "";
+  for (const segment of briefAttributionSegments(text, state.project?.brief_attribution)) {
+    const node = document.createTextNode(segment.text);
+    if (segment.mark < 0) {
+      body.append(node);
+      continue;
+    }
+    const painted = document.createElement("mark");
+    painted.className = "brief-mark";
+    painted.append(node);
+    body.append(painted);
+  }
+  // The readout goes back to the range list here, and not only when the caret moves. It is the
+  // caret label's own element, so without this line a label naming turn 3 of the project that was
+  // on screen a moment ago survives a project switch and stands over a Brief nobody is looking at
+  // -- and over a Brief with no attribution at all, which is the worst of the three.
+  $(BRIEF_ATTRIBUTION_CONTROLS.readout).textContent = briefAttributionSummary(marks.length);
+  drawBriefMarkRules();
+  syncBriefMirrorScroll();
+}
+
+// One 2px bar per mark, from its first character to its last and across the blank lines inside it.
+//
+// Measured, because a mark is an arbitrary substring and can start mid-line: a `border-left` on
+// the marked span would draw once at whatever x that is, which is the option the ruling rejected.
+// `#brief-mirror-rules` is `inset: 0` inside the mirror, so its own box *is* the mirror's padding
+// box and scrolls with the mirror's content -- which is why a bar placed against its top stays
+// over its own text through a scroll with nothing re-measured.
+function drawBriefMarkRules() {
+  const rules = $(BRIEF_ATTRIBUTION_CONTROLS.rules);
+  rules.textContent = "";
+  briefMarkRules = [];
+  const origin = rules.getBoundingClientRect().top;
+  for (const painted of $(BRIEF_ATTRIBUTION_CONTROLS.text).querySelectorAll("mark")) {
+    const span = document.createRange();
+    span.selectNodeContents(painted);
+    const rule = briefMarkRule([...span.getClientRects()], origin);
+    if (!rule) continue;
+    const bar = document.createElement("div");
+    bar.className = "brief-mark-rule";
+    bar.style.top = `${rule.top}px`;
+    bar.style.height = `${rule.height}px`;
+    rules.append(bar);
+    briefMarkRules.push(bar);
+  }
+}
+
+// The mirror follows the box's scroll, which is the whole of AD-32's "the mirror scrolls with the
+// textarea". There was no scroll listener anywhere in these assets before this one.
+function syncBriefMirrorScroll() {
+  const mirror = $(BRIEF_ATTRIBUTION_CONTROLS.mirror);
+  mirror.scrollTop = $(DOCUMENT_CONTROLS.creative_brief.box).scrollTop;
+}
+
+// What the Brief says about itself under the caret, and its non-visual expression in the same
+// element: the turn that wrote the mark the caret is in, or the range list when it is in none.
+function syncBriefAttributionLabel() {
+  const marks = state.briefMarks;
+  const at = briefAttributionMarkAt(marks, $(DOCUMENT_CONTROLS.creative_brief.box).selectionStart);
+  $(BRIEF_ATTRIBUTION_CONTROLS.readout).textContent = at < 0
+    ? briefAttributionSummary(marks.length)
+    : briefAttributionLabel(state.project?.messages, marks[at].messageId);
+  briefMarkRules.forEach((bar, index) => bar.classList.toggle("named", index === at));
 }
 
 // Both per-document controls, seeded from the project's own fields through the one control
@@ -6695,8 +6799,33 @@ function bindEvents() {
   }
   // Off the same table as the save, so a document whose editor is not marked dirty cannot exist:
   // an unflagged editor loses its typing silently on the next restore or reply.
-  for (const control of Object.values(DOCUMENT_CONTROLS)) {
-    $(control.box).addEventListener("input", () => { state.documentsDirty = true; state.dirty = true; });
+  for (const [documentKey, control] of Object.entries(DOCUMENT_CONTROLS)) {
+    $(control.box).addEventListener("input", () => {
+      state.documentsDirty = true;
+      state.dirty = true;
+      // The mirror is a *copy* of the Brief's text, so it follows every keystroke or it is a
+      // stale copy behind a live one within one character -- and the wash would then sit over
+      // whatever the Director had just replaced. Only the Brief has a mirror:
+      // `app.ATTRIBUTED_DOCUMENTS` maps `creative_brief` alone.
+      if (documentKey === "creative_brief") renderBriefAttribution();
+    });
+  }
+  // The Brief's attribution overlay (AD-32). Bound once here rather than inside the render: a
+  // listener added on every render is a listener added again on every project load.
+  const briefBox = $(DOCUMENT_CONTROLS.creative_brief.box);
+  // The mirror scrolls with the textarea, which is AD-32's own sentence. There was no scroll
+  // listener anywhere in these assets before this one.
+  briefBox.addEventListener("scroll", syncBriefMirrorScroll);
+  // The rules are measured pixel positions, so they are wrong the instant the box changes size.
+  // `resize: none` is set and the Director cannot drag it -- but the panel is a grid `1fr` row,
+  // so the *window* still resizes it, and so does the tab switch that takes the Brief from
+  // `display: none` to laid out, at which point every mark first has a box at all. A
+  // ResizeObserver sees both; a `window.resize` listener sees only the first.
+  new ResizeObserver(() => { drawBriefMarkRules(); syncBriefMirrorScroll(); }).observe(briefBox);
+  // Every gesture that can move a caret without changing the text. `input` is not among them --
+  // it re-renders above, and the render resets the readout to the range list on purpose.
+  for (const gesture of ["click", "keyup", "select", "focus"]) {
+    briefBox.addEventListener(gesture, syncBriefAttributionLabel);
   }
   $("#song-file").addEventListener("change", async (event) => {
     const file = event.target.files[0];

@@ -268,8 +268,17 @@
                  that the Treatment and Style bible are generated from it, and the only place that is
                  worth saying is beside the box where the Brief is written. A `span`, not a `p`:
                  a `label`'s content model is phrasing content, and it is a grid item here, so
-                 it lays out as a block either way. -->
-            <label class="document-editor active" data-doc-panel="brief"><span>Creative brief</span><span class="field-help">The Brief is the first stage of planning and the document the others are made from: the core idea, the emotional arc, who it is for, and the constraints you already know — location, cast, look, anything fixed. The Treatment and the Style bible are generated from it, so what is not here cannot reach them. Revise it as often as you like: each save that changes it keeps the version it replaced, and Lock stops a planning pass overwriting it.</span><textarea id="creative-brief" placeholder="Core idea, emotional arc, audience, constraints…"></textarea></label>
+                 it lays out as a block either way.
+
+                 The Brief alone carries the attribution overlay (AD-32, TP-8): a read-only
+                 `#brief-mirror` behind a real `<textarea>` whose own background is moved out to
+                 `#brief-frame`, and a `#brief-attribution` readout beneath it. The mirror is
+                 `aria-hidden` because it is paint; the readout is not, because AD-32 says the
+                 accessible expression of the attribution is the range list rather than the
+                 paint, and it is the caret label's own element. Every one of these ids is
+                 api.js's BRIEF_ATTRIBUTION_CONTROLS, asserted against this markup by
+                 tests/test_frontend_contract.py. All spans, for the reason above. -->
+            <label class="document-editor active" data-doc-panel="brief"><span>Creative brief</span><span class="field-help">The Brief is the first stage of planning and the document the others are made from: the core idea, the emotional arc, who it is for, and the constraints you already know — location, cast, look, anything fixed. The Treatment and the Style bible are generated from it, so what is not here cannot reach them. Revise it as often as you like: each save that changes it keeps the version it replaced, and Lock stops a planning pass overwriting it.</span><span class="brief-frame" id="brief-frame"><span class="brief-mirror" id="brief-mirror" aria-hidden="true"><span class="brief-mirror-text" id="brief-mirror-text"></span><span class="brief-mirror-rules" id="brief-mirror-rules"></span></span><textarea id="creative-brief" placeholder="Core idea, emotional arc, audience, constraints…"></textarea></span><span class="brief-attribution" id="brief-attribution" role="status" aria-live="polite"></span></label>
             <label class="document-editor" data-doc-panel="treatment"><span>Treatment</span><textarea id="treatment-text" placeholder="The structured treatment appears here…"></textarea></label>
             <label class="document-editor" data-doc-panel="style"><span>Visual continuity</span><textarea id="style-bible" placeholder="Color, lenses, lighting, wardrobe, locations, continuity rules…"></textarea></label>
             <!-- Lock and restore belong to one document each, so they live in a group scoped to

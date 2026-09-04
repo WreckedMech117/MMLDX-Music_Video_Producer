@@ -365,8 +365,23 @@ const requests = [];
 //: The selector of the element `focus()` was last called on, or "".
 let focused = "";
 const make = (selector) => ({
-  selector, value: "", disabled: false, checked: false, textContent: "", innerHTML: "",
+  selector, value: "", disabled: false, checked: false, innerHTML: "",
   className: "", title: "", src: "", min: "", max: "", required: false,
+  // A real element always has a numeric scroll offset. It was absent, and `undefined` is not a
+  // value a test can compare against -- `JSON.stringify` drops the key entirely, so "the mirror
+  // was never scrolled to where the box is" and "the mirror was never rendered at all" read the
+  // same. The Brief's mirror is the first thing in these assets to synchronise a scroll.
+  scrollTop: 0, scrollLeft: 0,
+  // `textContent` as an accessor, and `append` recording rather than discarding, because the
+  // Brief's attribution mirror is built out of **text nodes** -- AD-32 constraint 2 -- and with a
+  // plain property and a no-op `append` nothing here could read back what was built. The pair is
+  // what makes "a Brief containing `<script>` produced a text node and not an element" a
+  // measurement rather than a reading of the construction. Clearing on a `textContent` write is
+  // the DOM's own behaviour and is what every rebuild in this workspace relies on.
+  appended: [],
+  get textContent() { return this.written ?? ""; },
+  set textContent(value) { this.written = String(value); this.appended = []; },
+  append(...nodes) { this.appended.push(...nodes); },
   // The element's own id, and `contains`, which together are what make the focus-preserving
   // rebuild *observable*. `captureInspectorEdit` asks exactly two questions -- does the focused
   // element have an id, and is it inside this panel -- and with neither answerable here it
@@ -394,7 +409,7 @@ const make = (selector) => ({
   // reads to decide there is an edit in progress, and making every focus call look like one
   // would change what the two-second rebuild restores under every test in this file.
   focus() { focused = this.selector; },
-  append() {}, remove() {}, pause() {}, load() {}, click() {},
+  remove() {}, pause() {}, load() {}, click() {},
   // Attributes are recorded rather than discarded. They were no-ops, and that was a hole with a
   // shape: an accessible name is *only* ever set through `setAttribute`, so no test in this file
   // could read one back, and `aria-label` and `aria-pressed` were assertable only as authored
@@ -465,7 +480,16 @@ const at = (selector) => {
 };
 // The generation form is read at bind time by syncMusicVariant, which needs a real preset.
 at("#music-form").elements.preset.value = "balanced";
-globalThis.document = { querySelector: at, querySelectorAll: () => [], createElement: () => make("<created>") };
+globalThis.document = {
+  querySelector: at,
+  querySelectorAll: () => [],
+  // The tag is remembered, and text nodes exist, because the attribution mirror's whole
+  // construction is `createTextNode` for the Director's text and `createElement("mark")` for a
+  // stretch the assistant wrote. A `createElement` that forgot what it made could not tell the
+  // two apart, which is exactly the distinction constraint 2 is about.
+  createElement: (tag) => Object.assign(make("<created>"), { tagName: String(tag).toUpperCase() }),
+  createTextNode: (data) => ({ nodeName: "#text", data: String(data) }),
+};
 globalThis.window = {
   addEventListener(type, handler) { listeners.set("window:" + type, handler); },
   // Really removed, so a gesture that ends is a gesture nothing can fire again. Without it the
@@ -517,6 +541,23 @@ globalThis.fetch = (path, options = {}) => {
     headers: { get: () => "application/json" },
     json: async () => canned.body,
   });
+};
+// `ResizeObserver`, recorded rather than simulated. The Brief's attribution rules are measured
+// pixel positions, so they are re-measured when the box changes size -- a window resize, or the
+// tab switch that takes the Brief from `display: none` to laid out. Without this the workspace
+// would not boot here at all; with it, `resize('#creative-brief')` is a test firing the real
+// callback, and an `observe` that was never called is a named failure rather than a silent pass.
+const observed = [];
+globalThis.ResizeObserver = class {
+  constructor(handler) { this.handler = handler; }
+  observe(element) { observed.push({ selector: element.selector, handler: this.handler }); }
+  unobserve() {}
+  disconnect() {}
+};
+const resize = (selector) => {
+  const found = observed.filter((entry) => entry.selector === selector);
+  if (!found.length) throw new Error("nothing observes " + selector);
+  for (const entry of found) entry.handler([], null);
 };
 // The browser session store, `mvp-session`, seeded with `__SESSION__` before the workspace boots.
 // It answered `undefined` before, which every reader here catches -- so `persistSession` threw and
@@ -30160,3 +30201,747 @@ def test_node_check_is_only_a_gate_when_the_asset_is_read_as_a_module(tmp_path):
             "node now rejects ESM syntax errors in a .js file, which would make the `node --check "
             "…app.js` form in AGENTS.md a real gate again — delete this assertion and say so"
         )
+
+
+# ---------------------------------------------------------------------------------------------
+# The Brief shows which half came from where (14.3 Slice C2, TP-8, AD-32, AD-45)
+#
+# C1 built the record and nothing drew it. These are the browser's half, and they are split the
+# way the code is: the pure decisions are executed under node out of `api.js`, the markup and the
+# stylesheet are read, and **every wiring point is driven through a bound control or a real
+# project load** rather than by calling the function under it. The recorded survivor of this
+# repository's last six mutation runs has been exactly the second half — a pure decision covered
+# and its caller not — and for this slice that is: the mirror is never rendered, the scroll is
+# never synced, the resize is never observed, and the label is not cleared when the project
+# changes. There is a test below that fails for each of those four on its own.
+# ---------------------------------------------------------------------------------------------
+
+#: A Brief whose one mark starts **mid-line**. This is not a decorative fixture: a machine write's
+#: marks are whole-line aligned, but a mark that survives a save need not be — the Director typing
+#: `Maybe: ` in front of a marked heading leaves the mark starting at offset 7 with their own
+#: words before it on that line, which was executed against `reconcile_attribution` rather than
+#: reasoned about, and is the reason the rule cannot be a `border-left` on the marked span.
+MID_LINE_BRIEF = "Maybe: ## Cast\nOne driver and a hitchhiker.\nThe Director's own line."
+MID_LINE_RANGE = {"start": 7, "end": 43, "message_id": "msg_2"}
+
+#: The thread the label resolves an id against.
+ATTRIBUTED_THREAD = [
+    {"id": "msg_1", "role": "user", "content": "Ask."},
+    {"id": "msg_2", "role": "assistant", "content": "Answer."},
+]
+
+
+def attributed_project(brief: str, ranges: list[dict], **rest) -> dict:
+    """A project as a route serves one, carrying a Brief and the ranges the server wrote."""
+    return {
+        "id": "p2", "name": "Two", "shots": [], "jobs": [], "assets": [], "sections": [],
+        "messages": ATTRIBUTED_THREAD, "song": None,
+        "creative_brief": brief, "brief_attribution": ranges,
+        **rest,
+    }
+
+
+def mirror_contents(body: str, responses: dict) -> dict:
+    """Boot the workspace, run `body`, and hand back what it printed."""
+    return run_workspace(body, responses=responses)
+
+
+#: The shape the mirror's own children are read back in: a text node is `{"text": ...}` and a
+#: marked stretch is `{"tag": ..., "klass": ..., "text": ...}`. Written once because five tests
+#: below ask for it, and because it is the assertion that makes "text nodes, never an HTML
+#: string" a measurement — a mirror assembled by string concatenation has no children to read.
+MIRROR_SHAPE = """
+const mirrorShape = () => at('#brief-mirror-text').appended.map((node) => (
+  node.nodeName === '#text'
+    ? { text: node.data }
+    : { tag: node.tagName, klass: node.className,
+        text: node.appended.map((child) => child.data).join('') }));
+"""
+
+
+def brief_attribution_module(script: str):
+    """Run one script against `api.js`'s attribution decisions, imported by name."""
+    return run_module("""
+      import {
+        BRIEF_ATTRIBUTION_CONTROLS, BRIEF_ATTRIBUTION_LOST_TURN, BRIEF_ATTRIBUTION_MARKED,
+        BRIEF_ATTRIBUTION_NO_TURN, BRIEF_ATTRIBUTION_TURN, BRIEF_ATTRIBUTION_UNMARKED,
+        BRIEF_MIRROR_TAIL, briefAttributionLabel, briefAttributionMarkAt, briefAttributionRanges,
+        briefAttributionSegments, briefAttributionSummary, briefMarkRule,
+      } from './src/music_video_producer/web/assets/api.js';
+      __BODY__
+    """.replace("__BODY__", script))
+
+
+def test_a_mark_is_cut_at_its_own_characters_including_one_that_starts_mid_line():
+    """The segments the mirror is built from, asserted by comparison over the awkward cases.
+
+    Compared whole rather than checked for a shape: "every segment is non-empty", "the marks are
+    in order" would pass for a walk that dropped a mark, and a provenance feature that loses a
+    mark loses it silently.
+    """
+    cases = brief_attribution_module("""
+      const cut = (text, ranges) => briefAttributionSegments(text, ranges);
+      console.log(JSON.stringify({
+        midLine: cut(__BRIEF__, [__RANGE__]),
+        wholeLine: cut("A\\nB\\n", [{ start: 0, end: 2, message_id: "" }]),
+        // Two runs that touch share a number, which is what half-open offsets mean.
+        touching: cut("abcdef", [
+          { start: 1, end: 3, message_id: "m1" }, { start: 3, end: 5, message_id: "m2" }]),
+        fromTheStart: cut("abc", [{ start: 0, end: 3, message_id: "m1" }]),
+        unattributed: cut("plain text", []),
+        empty: cut("", [{ start: 0, end: 4, message_id: "m1" }]),
+      }));
+    """.replace("__BRIEF__", json.dumps(MID_LINE_BRIEF)).replace("__RANGE__", json.dumps(MID_LINE_RANGE)))
+
+    tail = "\u200b"
+    # The wash starts at the character, not at the line: the Director's `Maybe: ` is its own
+    # unmarked piece and the mark begins at the `#`.
+    assert cases["midLine"] == [
+        {"text": "Maybe: ", "mark": -1},
+        {"text": "## Cast\nOne driver and a hitchhiker.", "mark": 0, "messageId": "msg_2"},
+        {"text": f"\nThe Director's own line.{tail}", "mark": -1},
+    ]
+    assert cases["wholeLine"] == [
+        {"text": "A\n", "mark": 0, "messageId": ""},
+        {"text": f"B\n{tail}", "mark": -1},
+    ]
+    assert cases["touching"] == [
+        {"text": "a", "mark": -1},
+        {"text": "bc", "mark": 0, "messageId": "m1"},
+        {"text": "de", "mark": 1, "messageId": "m2"},
+        {"text": f"f{tail}", "mark": -1},
+    ]
+    assert cases["fromTheStart"] == [
+        {"text": "abc", "mark": 0, "messageId": "m1"},
+        {"text": tail, "mark": -1},
+    ]
+    # A Brief with no attribution is one unmarked piece, which is what every Brief written before
+    # this field existed is, and it must not grow a `<mark>`.
+    assert cases["unattributed"] == [{"text": f"plain text{tail}", "mark": -1}]
+    assert cases["empty"] == [{"text": tail, "mark": -1}]
+
+
+def test_a_range_that_does_not_fit_the_text_is_clamped_or_dropped_and_never_throws():
+    """Constraint 9. A hand-edited manifest, or any future writer with a bug, can carry an offset
+    past the end — and a bad range must not take the Brief's editor down with it.
+
+    Both answers, chosen per range rather than per manifest: a range running past the end is
+    **clamped**, because the part of the mark that is still in the text is still true; a range
+    left with nothing in it is **dropped**, because a zero-width wash is not a thing anyone can
+    look at. Every case here is executed, so "never throws" is a measurement.
+    """
+    cases = brief_attribution_module("""
+      const attempt = (text, ranges) => {
+        try { return { ranges: briefAttributionRanges(text, ranges) }; }
+        catch (error) { return { threw: String(error) }; }
+      };
+      console.log(JSON.stringify({
+        pastTheEnd: attempt("abcdef", [{ start: 3, end: 99, message_id: "m1" }]),
+        whollyPastTheEnd: attempt("abc", [{ start: 40, end: 60, message_id: "m1" }]),
+        negative: attempt("abcdef", [{ start: -5, end: 2, message_id: "m1" }]),
+        inverted: attempt("abcdef", [{ start: 4, end: 2, message_id: "m1" }]),
+        empty: attempt("abcdef", [{ start: 2, end: 2, message_id: "m1" }]),
+        overlapping: attempt("abcdef", [
+          { start: 0, end: 4, message_id: "m1" }, { start: 2, end: 6, message_id: "m2" }]),
+        unsorted: attempt("abcdef", [
+          { start: 4, end: 6, message_id: "m2" }, { start: 0, end: 2, message_id: "m1" }]),
+        nonsense: attempt("abcdef", [{ start: null, end: "x" }, {}, null, 7]),
+        notAList: attempt("abcdef", null),
+        noText: attempt(null, [{ start: 0, end: 2, message_id: "m1" }]),
+      }));
+    """)
+
+    for name, case in cases.items():
+        assert "threw" not in case, (name, case)
+    assert cases["pastTheEnd"]["ranges"] == [{"start": 3, "end": 6, "messageId": "m1"}]
+    assert cases["whollyPastTheEnd"]["ranges"] == []
+    assert cases["negative"]["ranges"] == [{"start": 0, "end": 2, "messageId": "m1"}]
+    assert cases["inverted"]["ranges"] == []
+    assert cases["empty"]["ranges"] == []
+    # Two marks over one character is a manifest saying something impossible. The later one is
+    # clamped to start where the earlier one ends, so no character is ever washed twice.
+    assert cases["overlapping"]["ranges"] == [
+        {"start": 0, "end": 4, "messageId": "m1"}, {"start": 4, "end": 6, "messageId": "m2"}]
+    assert cases["unsorted"]["ranges"] == [
+        {"start": 0, "end": 2, "messageId": "m1"}, {"start": 4, "end": 6, "messageId": "m2"}]
+    assert cases["nonsense"]["ranges"] == []
+    assert cases["notAList"]["ranges"] == []
+    assert cases["noText"]["ranges"] == []
+
+
+def test_the_mirror_closes_with_a_zero_width_character_so_a_trailing_newline_keeps_its_line():
+    """The metric divergence a screenshot of the top of the box cannot show.
+
+    A `<textarea>` gives a trailing newline a line box of its own — the caret can sit on that
+    empty last line — and a `white-space: pre-wrap` block does not. Without a closing character
+    the mirror is exactly one line shorter than the box it is behind, and every mark below the
+    fold sits one line high. Zero width, so it changes no wrapping.
+    """
+    read = brief_attribution_module("""
+      console.log(JSON.stringify({
+        tail: BRIEF_MIRROR_TAIL,
+        width: BRIEF_MIRROR_TAIL.length,
+        trailing: briefAttributionSegments("a\\n", []).map((piece) => piece.text),
+        // And it is outside every mark, or the wash would extend past the marked text.
+        afterAMarkThatRunsToTheEnd: briefAttributionSegments(
+          "abc", [{ start: 0, end: 3, message_id: "m1" }]),
+      }));
+    """)
+    assert read["tail"] == "\u200b"
+    assert read["width"] == 1
+    assert read["trailing"] == ["a\n\u200b"]
+    assert read["afterAMarkThatRunsToTheEnd"][-1] == {"text": "\u200b", "mark": -1}
+
+
+def test_the_label_names_the_turn_and_says_what_an_empty_message_id_is():
+    """Constraint 5. `message_id` is a `TreatmentMessage.id`, or `""` for Suggest Video — which
+    has no turn to point at — and the empty case must read as what it is rather than as a blank
+    or as a missing turn. Those are three different statements and this asserts three answers.
+    """
+    read = brief_attribution_module("""
+      const thread = __THREAD__;
+      console.log(JSON.stringify({
+        turn: briefAttributionLabel(thread, "msg_2"),
+        first: briefAttributionLabel(thread, "msg_1"),
+        noTurn: briefAttributionLabel(thread, ""),
+        lost: briefAttributionLabel(thread, "msg_gone"),
+        noThread: briefAttributionLabel(null, "msg_2"),
+        constants: { turn: BRIEF_ATTRIBUTION_TURN, none: BRIEF_ATTRIBUTION_NO_TURN,
+                     lost: BRIEF_ATTRIBUTION_LOST_TURN },
+      }));
+    """.replace("__THREAD__", json.dumps(ATTRIBUTED_THREAD)))
+
+    assert read["turn"] == "Assistant · turn 2 of this thread"
+    assert read["first"] == "Assistant · turn 1 of this thread"
+    # Not a blank, and not "no turn was recorded": a pass of its own is a positive statement.
+    assert read["noTurn"] == read["constants"]["none"]
+    assert read["noTurn"].strip()
+    assert "{" not in read["noTurn"]
+    # And it is not told as the same thing as a turn the thread no longer carries.
+    assert read["lost"] == read["constants"]["lost"]
+    assert read["lost"] != read["noTurn"]
+    assert read["noThread"] == read["lost"]
+
+
+def test_the_caret_finds_the_mark_it_is_in_at_either_edge_and_nowhere_else():
+    """Half-open offsets, so `end` is one past the last marked character and two marks that touch
+    share a number: a caret on a shared boundary belongs to the mark that *starts* there.
+
+    The boundary case is not a nicety. Without it the label goes blank the moment the Director
+    clicks after the last word of an assistant paragraph, which is where a caret lands most.
+    """
+    read = brief_attribution_module("""
+      const marks = briefAttributionRanges("abcdef", [
+        { start: 1, end: 3, message_id: "m1" }, { start: 3, end: 5, message_id: "m2" }]);
+      const at = (caret) => briefAttributionMarkAt(marks, caret);
+      console.log(JSON.stringify({
+        marks,
+        before: at(0), start: at(1), inside: at(2), shared: at(3), inSecond: at(4),
+        end: at(5), after: at(6), nowhere: at(99), noCaret: at(null), noMarks:
+          briefAttributionMarkAt([], 2),
+      }));
+    """)
+    assert read["before"] == -1
+    assert read["start"] == 0 and read["inside"] == 0
+    # The shared number belongs to the mark that starts there, not to the one that ends there.
+    assert read["shared"] == 1
+    assert read["inSecond"] == 1
+    # And the caret one past the last marked character is still inside it.
+    assert read["end"] == 1
+    assert read["after"] == -1 and read["nowhere"] == -1
+    assert read["noCaret"] == -1 and read["noMarks"] == -1
+
+
+def test_the_rule_runs_the_whole_height_of_a_mark_across_the_lines_inside_it():
+    """The Director's ruling of 2026-09-04: **one rule down the whole block**, from a mark's first
+    character to its last, across the blank lines inside it.
+
+    The rectangles are the mark's own, which is what makes a mid-line start irrelevant to the
+    bar's x — it has none of its own, and the stylesheet puts it at the block's left edge.
+    """
+    read = brief_attribution_module("""
+      // Three visual lines of a wrapped mark, the middle one a blank line inside it. The rule
+      // covers all three: from the first line's top to the last line's bottom.
+      const lines = [
+        { top: 120, bottom: 142, height: 22, left: 40, right: 300 },
+        { top: 142, bottom: 164, height: 22, left: 11, right: 11 },
+        { top: 164, bottom: 186, height: 22, left: 11, right: 180 },
+      ];
+      console.log(JSON.stringify({
+        whole: briefMarkRule(lines, 100),
+        scrolled: briefMarkRule(lines, 60),
+        single: briefMarkRule([lines[0]], 100),
+        // Out of order, because `getClientRects` is not promised in any order.
+        reversed: briefMarkRule([...lines].reverse(), 100),
+        laidOutAsNothing: briefMarkRule([], 100),
+        zeroHeight: briefMarkRule([{ top: 5, bottom: 5, height: 0 }], 0),
+        notRects: briefMarkRule(null, 100),
+        noOrigin: briefMarkRule([lines[0]], null),
+      }));
+    """)
+    assert read["whole"] == {"top": 20, "height": 66}
+    # One bar, not one per visual line: three lines produced one rule 66px tall.
+    assert read["reversed"] == read["whole"]
+    assert read["scrolled"] == {"top": 60, "height": 66}
+    assert read["single"] == {"top": 20, "height": 22}
+    # A mark the browser laid out as nothing is not an error; it is a mark with no bar.
+    assert read["laidOutAsNothing"] is None
+    assert read["zeroHeight"] is None
+    assert read["notRects"] is None
+    assert read["noOrigin"] == {"top": 120, "height": 22}
+
+
+def test_the_readout_says_the_range_list_in_a_sentence_including_when_there_is_none():
+    """AD-32: the attribution's accessible expression is the range list, not the paint. This is
+    that list said out loud, and it is the same element the caret label uses.
+    """
+    read = brief_attribution_module("""
+      console.log(JSON.stringify({
+        none: briefAttributionSummary(0),
+        one: briefAttributionSummary(1),
+        three: briefAttributionSummary(3),
+        negative: briefAttributionSummary(-2),
+        nonsense: briefAttributionSummary(null),
+        unmarked: BRIEF_ATTRIBUTION_UNMARKED, marked: BRIEF_ATTRIBUTION_MARKED,
+      }));
+    """)
+    assert read["none"] == read["unmarked"]
+    assert read["negative"] == read["unmarked"] and read["nonsense"] == read["unmarked"]
+    assert read["one"] == "Written by the assistant: one stretch. Put the caret in one to name the turn."
+    assert read["three"].startswith("Written by the assistant: 3 stretches.")
+    for answer in (read["none"], read["one"], read["three"]):
+        assert "{" not in answer, answer
+
+
+def test_the_brief_alone_grows_a_mirror_and_the_paint_is_hidden_from_assistive_technology():
+    """AD-32 in the markup: a read-only div behind a real `<textarea>`, `aria-hidden`, and **no
+    `contenteditable` anywhere in this application**.
+
+    And the other half of AD-32's sentence, which is the half that gets dropped: hiding the paint
+    is only honest if the attribution reaches assistive technology by some other route. The
+    readout is that route — a live region that is *not* `aria-hidden` — and this asserts it
+    exists, carries a role, and is not hidden. Shipping the hiding half alone ships a feature no
+    screen reader can see.
+    """
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    named = run_module("""
+      import { BRIEF_ATTRIBUTION_CONTROLS } from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify(BRIEF_ATTRIBUTION_CONTROLS));
+    """)
+
+    panel = re.search(
+        r'<label class="document-editor active" data-doc-panel="brief">.*?</label>',
+        markup, re.DOTALL,
+    )
+    assert panel, "the Brief has no editor panel"
+    # Every element the overlay needs is in the Brief's own panel, under the id api.js names.
+    for role, selector in named.items():
+        assert selector.startswith("#"), (role, selector)
+        assert f'id="{selector[1:]}"' in panel.group(0), (role, selector)
+
+    mirror = re.search(r'<span class="brief-mirror"[^>]*>', panel.group(0))
+    assert mirror and 'aria-hidden="true"' in mirror.group(0), mirror
+
+    readout = re.search(r'<span class="brief-attribution"[^>]*>', panel.group(0))
+    assert readout, "the attribution has no readout, so it reaches nothing but the eye"
+    assert 'role="status"' in readout.group(0), readout.group(0)
+    assert 'aria-live="polite"' in readout.group(0), readout.group(0)
+    assert "aria-hidden" not in readout.group(0), (
+        "the only non-visual carrier of the attribution is itself hidden from assistive "
+        "technology, which is AD-32's sentence delivered backwards"
+    )
+
+    # The textarea is still a textarea, and it is still inside the frame the mirror sits behind.
+    assert '<textarea id="creative-brief"' in panel.group(0)
+    # Neither of the other two documents grows a mirror: ATTRIBUTED_DOCUMENTS maps the Brief
+    # alone, and an overlay over a document with no ranges is a box drawn over nothing.
+    for other in ("treatment", "style"):
+        other_panel = re.search(
+            rf'<label class="document-editor" data-doc-panel="{other}">.*?</label>', markup,
+            re.DOTALL,
+        )
+        assert other_panel, other
+        for forbidden in ("brief-mirror", "brief-frame", "brief-attribution"):
+            assert forbidden not in other_panel.group(0), (other, forbidden)
+
+    # AD-32's flat prohibition, asserted over the whole application rather than over this slice:
+    # **no `contenteditable` is introduced anywhere**. Introducing one is writing the attribute or
+    # assigning the property; `event.target.isContentEditable` in the keyboard guard is a *read*
+    # of somebody else's element and has been there since long before this feature, so the
+    # assertion is about the three spellings that make an element editable rather than about the
+    # word appearing.
+    for source in (markup, APP_JS.read_text(encoding="utf-8"), API_JS.read_text(encoding="utf-8")):
+        lowered = source.lower()
+        for introduced in ("contenteditable=", 'setattribute("contenteditable"',
+                           "contenteditable =", "contenteditable:"):
+            assert introduced not in lowered, introduced
+
+
+def test_the_mirror_declares_the_two_metrics_the_textarea_never_did():
+    """`white-space` and `overflow` are declared **nowhere** for the Brief's textarea: it takes
+    the user agent's `pre-wrap` and `auto`, and a block takes `normal` and `visible`.
+
+    `normal` collapses every run of spaces and every newline, so a mirror that does not say
+    `pre-wrap` wraps differently from its first character and every mark is in the wrong place.
+    `overflow` is the wrapping *width*: with `auto` the textarea's scrollbar appears the moment
+    the Brief passes one screen and takes its gutter out of the textarea's content width and not
+    the mirror's — a drift that looks perfect in a screenshot of the top of the box, which is why
+    both are pinned here and measured again in `tests/e2e_brief_attribution.py`.
+    """
+    css = STYLES_CSS.read_text(encoding="utf-8")
+
+    shared = re.search(r"\n#creative-brief, \.brief-mirror \{([^}]*)\}", css)
+    assert shared, "the box and its mirror no longer share one rule for their wrapping metrics"
+    for declaration in ("white-space: pre-wrap", "overflow-wrap: break-word", "overflow-y: scroll"):
+        assert declaration in shared.group(1), (declaration, shared.group(1))
+
+    mirror = "".join(
+        match.group(1) for match in re.finditer(r"\n\.brief-mirror \{([^}]*)\}", css)
+    )
+    assert mirror, "the mirror has no style of its own"
+    # The metrics a block inherits none of, restated against `.document-editor textarea`'s own.
+    editor = re.search(r"\n\.document-editor textarea \{([^}]*)\}", css)
+    assert editor, editor
+    for declaration in ("font-size: 14px", "line-height: 1.6"):
+        assert declaration in editor.group(1), declaration
+        assert declaration in mirror, declaration
+    base = re.search(r"\ninput, textarea, select \{([^}]*)\}", css)
+    assert base, base
+    for declaration in ("padding: 9px 10px", "border-radius: 5px"):
+        assert declaration in base.group(1), declaration
+        assert declaration in mirror, declaration
+    # The border occupies the same 1px so the two content boxes are the same width, and it is
+    # transparent so the textarea's own visible border is the only one on screen.
+    assert "border: 1px solid transparent" in mirror
+    assert "position: absolute" in mirror and "inset: 0" in mirror
+    assert "pointer-events: none" in mirror
+
+    # The control ground is the same literal the base rule sets. There is no palette token for
+    # it, so the duplication is guarded rather than merely regretted: a change to one without the
+    # other leaves the Brief's box a different colour from every other input on the screen.
+    ground = re.search(r"background: (#[0-9a-fA-F]{3,8});", base.group(1))
+    assert ground, base.group(1)
+    assert f"background: {ground.group(1)}" in mirror, (ground.group(1), mirror)
+    # And the textarea gives its own up, or the mirror is behind an opaque box.
+    frame = re.search(r"\n\.brief-frame textarea \{([^}]*)\}", css)
+    assert frame and "background: transparent" in frame.group(1), frame
+
+
+def test_the_attribution_is_surface_and_rule_and_carries_no_accent():
+    """DESIGN §3, and it is a design law rather than a preference: the treatment is `--surface-1`
+    wash and a 2px `--line-strong` rule, brightening to `--muted`. **No accent.**
+
+    *"Colour the attribution wash"* is named in DESIGN's Don't list — provenance is not a state,
+    and the palette is closed at six accents. Asserted as *which tokens appear*, because a
+    seventh accent is added by writing one token, and the state-is-never-colour-alone floor is
+    met by the rule being a shape and the label being text.
+    """
+    css = STYLES_CSS.read_text(encoding="utf-8")
+    rules = {
+        name: match.group(1)
+        for name in (".brief-mark", ".brief-mark-rule", ".brief-mark-rule.named",
+                     ".brief-attribution")
+        for match in [re.search(rf"\n{re.escape(name)} \{{([^}}]*)\}}", css)]
+        if match
+    }
+    assert set(rules) == {".brief-mark", ".brief-mark-rule", ".brief-mark-rule.named",
+                          ".brief-attribution"}, sorted(rules)
+
+    assert "background: var(--surface-1)" in rules[".brief-mark"]
+    assert "width: 2px" in rules[".brief-mark-rule"]
+    assert "background: var(--line-strong)" in rules[".brief-mark-rule"]
+    assert "background: var(--muted)" in rules[".brief-mark-rule.named"]
+    # The established Consolas micro-label form: 9px, letter-spaced, uppercase.
+    assert "Consolas" in rules[".brief-attribution"]
+    assert "9px" in rules[".brief-attribution"]
+    assert "letter-spacing" in rules[".brief-attribution"]
+    assert "text-transform: uppercase" in rules[".brief-attribution"]
+
+    accents = {"--acid", "--amber", "--red", "--red-edge", "--cyan", "--blue"}
+    for name, body in rules.items():
+        used = set(re.findall(r"var\((--[\w-]+)\)", body))
+        assert not used & accents, (name, sorted(used & accents))
+        # And no invented colour either: every colour here is a palette token.
+        assert not re.search(r"#[0-9a-fA-F]{3,8}", body), (name, body)
+
+
+def test_the_mirror_is_built_from_text_nodes_and_a_brief_full_of_markup_creates_no_element():
+    """Constraint 2, and it is a defect class rather than a style preference.
+
+    The Brief is text the Director types. Interpolating it into `innerHTML` makes every `<` in
+    their own document a parse instruction, and a mirror assembled by string concatenation is a
+    hole however carefully it escapes today. This drives a real project load carrying `<script>`
+    and `</textarea>` in the Brief and reads back **what the mirror is made of**: text nodes for
+    the Director's characters and one `<mark>` per stretch the assistant wrote, with the markup
+    characters sitting inside a text node as data.
+    """
+    hostile = "<script>alert(1)</script> and </textarea><img src=x onerror=1>"
+    marked = attributed_project(
+        hostile, [{"start": 0, "end": 25, "message_id": "msg_2"}])
+    read = run_workspace(
+        MIRROR_SHAPE + """
+      state.project = { id: 'p1', name: 'One', shots: [], jobs: [], assets: [], sections: [],
+                        messages: [], song: null, creative_brief: '', brief_attribution: [] };
+      answer(true);
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      await flush();
+      console.log(JSON.stringify({
+        shape: mirrorShape(),
+        // Nothing was ever assigned as markup: an `innerHTML` write would show here.
+        innerHTML: at('#brief-mirror-text').innerHTML,
+        box: at('#creative-brief').value,
+      }));
+    """,
+        responses={"/api/projects/p2": {"body": marked}},
+    )
+
+    assert read["box"] == hostile
+    assert read["innerHTML"] == ""
+    assert read["shape"] == [
+        {"tag": "MARK", "klass": "brief-mark", "text": "<script>alert(1)</script>"},
+        {"text": " and </textarea><img src=x onerror=1>\u200b"},
+    ]
+    # One element, and it is the `<mark>` the attribution asked for. Nothing in the Brief made a
+    # second one, whatever it was spelled as.
+    assert [piece for piece in read["shape"] if "tag" in piece] == [
+        {"tag": "MARK", "klass": "brief-mark", "text": "<script>alert(1)</script>"}]
+
+
+def test_the_project_load_paints_the_mirror_and_every_keystroke_keeps_it():
+    """**The mirror is never rendered** — the first of this slice's four wiring mutants.
+
+    Driven through a real project switch rather than by calling the render, because a pure
+    function covered by a test and a caller covered by nothing is the survivor this repository
+    has recorded six slices running. The second half is the keystroke: the mirror is a *copy* of
+    the Brief's text, so a render that only runs on load is a stale copy behind a live one within
+    one character.
+    """
+    marked = attributed_project(MID_LINE_BRIEF, [MID_LINE_RANGE])
+    read = run_workspace(
+        MIRROR_SHAPE + """
+      state.project = { id: 'p1', name: 'One', shots: [], jobs: [], assets: [], sections: [],
+                        messages: [], song: null, creative_brief: '', brief_attribution: [] };
+      answer(true);
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      await flush();
+      const loaded = { shape: mirrorShape(), readout: at('#brief-attribution').textContent,
+                       marks: state.briefMarks };
+      // The Director types at the end of the Brief. The mirror follows the box, and the marks
+      // are still the server's -- nothing here re-derives an offset (AD-45).
+      at('#creative-brief').value = at('#creative-brief').value + " Then a new sentence.";
+      fire('#creative-brief:input', {});
+      const typed = { shape: mirrorShape(), marks: state.briefMarks };
+      console.log(JSON.stringify({ loaded, typed }));
+    """,
+        responses={"/api/projects/p2": {"body": marked}},
+    )
+
+    assert read["loaded"]["shape"] == [
+        {"text": "Maybe: "},
+        {"tag": "MARK", "klass": "brief-mark",
+         "text": "## Cast\nOne driver and a hitchhiker."},
+        {"text": "\nThe Director's own line.\u200b"},
+    ], "the project load did not paint the mirror"
+    assert read["loaded"]["readout"].startswith("Written by the assistant: one stretch.")
+    assert read["loaded"]["marks"] == [{"start": 7, "end": 43, "messageId": "msg_2"}]
+    # The keystroke is in the mirror, and the mark is where the server put it. Compared
+    # **whole** rather than at two positions: a mirror that appends the Brief again without
+    # clearing what it already held -- which is what a missing `textContent = ""` is, and
+    # what a Director would see as the Brief drawn twice, then three times -- still has the
+    # right piece at index 1 and the right piece at the end. That mutant survived until
+    # this assertion was the whole list.
+    assert read["typed"]["shape"] == [
+        {"text": "Maybe: "},
+        {"tag": "MARK", "klass": "brief-mark",
+         "text": "## Cast\nOne driver and a hitchhiker."},
+        {"text": "\nThe Director's own line. Then a new sentence.\u200b"},
+    ], read["typed"]["shape"]
+    assert read["typed"]["marks"] == read["loaded"]["marks"]
+
+
+def test_the_mirror_follows_the_boxs_scroll_and_is_re_measured_when_the_box_resizes():
+    """**The scroll is never synced** and **the resize is never observed** — mutants two and
+    three, each driven through the thing that fires it rather than through the function under it.
+
+    There was no scroll listener anywhere in these assets before this slice, and no scroll
+    synchronisation of any kind. A mirror that does not follow the box is correct at the top of
+    a long Brief and wrong everywhere below it, which is precisely what a screenshot cannot show.
+
+    The resize is a `ResizeObserver` rather than a `window.resize` listener because the panel is
+    a grid `1fr` row: the window resizes the box, and so does the tab switch that takes the Brief
+    from `display: none` to laid out, at which point every mark first has a box at all.
+    """
+    marked = attributed_project(MID_LINE_BRIEF, [MID_LINE_RANGE])
+    read = run_workspace(
+        """
+      state.project = { id: 'p1', name: 'One', shots: [], jobs: [], assets: [], sections: [],
+                        messages: [], song: null, creative_brief: '', brief_attribution: [] };
+      answer(true);
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      await flush();
+      const seeded = at('#brief-mirror').scrollTop;
+      at('#creative-brief').scrollTop = 417;
+      fire('#creative-brief:scroll', {});
+      const scrolled = at('#brief-mirror').scrollTop;
+      // The box is re-laid out under a mirror that is somewhere else entirely.
+      at('#brief-mirror').scrollTop = 0;
+      at('#creative-brief').scrollTop = 209;
+      resize('#creative-brief');
+      const resized = at('#brief-mirror').scrollTop;
+      console.log(JSON.stringify({ seeded, scrolled, resized }));
+    """,
+        responses={"/api/projects/p2": {"body": marked}},
+    )
+
+    assert read["seeded"] == 0, "the render left the mirror somewhere the box is not"
+    assert read["scrolled"] == 417, "the mirror does not follow the box's scroll"
+    assert read["resized"] == 209, "the box was resized and nothing re-measured the mirror"
+
+
+def test_the_caret_names_the_turn_and_a_project_switch_takes_the_label_with_it():
+    """**The label is not cleared when the project changes** — the fourth wiring mutant, and the
+    one that is invisible in the project it happens in.
+
+    The readout is one element doing two jobs: the caret label, and the range list that is the
+    attribution's accessible expression. The render resets it, so a label naming turn 2 of the
+    project that was on screen a moment ago cannot survive a switch and stand over a Brief that
+    has no attribution at all — which is the worst of the three states it could be left in.
+    """
+    marked = attributed_project(MID_LINE_BRIEF, [MID_LINE_RANGE])
+    plain = {
+        "id": "p3", "name": "Three", "shots": [], "jobs": [], "assets": [], "sections": [],
+        "messages": [], "song": None, "creative_brief": "Wholly hand typed.",
+        "brief_attribution": [],
+    }
+    read = run_workspace(
+        """
+      state.project = { id: 'p1', name: 'One', shots: [], jobs: [], assets: [], sections: [],
+                        messages: [], song: null, creative_brief: '', brief_attribution: [] };
+      answer(true);
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      await flush();
+      const summary = at('#brief-attribution').textContent;
+      // The caret goes into the mark, by the gesture that puts it there.
+      at('#creative-brief').selectionStart = 20;
+      fire('#creative-brief:click', {});
+      const named = at('#brief-attribution').textContent;
+      // And back out of it, by another.
+      at('#creative-brief').selectionStart = 2;
+      fire('#creative-brief:keyup', {});
+      const outside = at('#brief-attribution').textContent;
+      at('#creative-brief').selectionStart = 20;
+      fire('#creative-brief:focus', {});
+      const namedAgain = at('#brief-attribution').textContent;
+      // Now a different project, with no attribution at all.
+      await fire('#project-select:change', { target: { value: 'p3' } });
+      await flush();
+      console.log(JSON.stringify({ summary, named, outside, namedAgain,
+        switched: at('#brief-attribution').textContent, marks: state.briefMarks }));
+    """,
+        responses={"/api/projects/p2": {"body": marked}, "/api/projects/p3": {"body": plain}},
+    )
+
+    assert read["named"] == "Assistant · turn 2 of this thread"
+    assert read["namedAgain"] == read["named"]
+    assert read["outside"] == read["summary"]
+    assert read["summary"].startswith("Written by the assistant: one stretch.")
+    assert read["marks"] == []
+    assert read["switched"] == "Nothing in this Brief was written by the assistant.", (
+        "the label naming a turn in the project that was on screen a moment ago survived the "
+        "switch and now stands over a Brief nobody wrote a word of"
+    )
+
+
+def test_neither_the_treatment_nor_the_style_bible_is_given_a_mirror_by_the_client():
+    """`ATTRIBUTED_DOCUMENTS` maps `creative_brief` alone, and the client honours that.
+
+    The Brief's redraw hangs off the one document control table, so this asserts the *branch*
+    rather than the absence of markup: typing in the Treatment must not rebuild the Brief's
+    mirror, and it must not clear the Brief's marks. The server's half — that a reply rewriting
+    the Treatment leaves `brief_attribution` alone — is
+    `tests/test_brief_attribution.py::test_a_chat_turn_that_rewrites_the_other_documents_leaves_the_marks_alone`.
+    """
+    marked = attributed_project(MID_LINE_BRIEF, [MID_LINE_RANGE], treatment="A treatment.")
+    read = run_workspace(
+        MIRROR_SHAPE + """
+      state.project = { id: 'p1', name: 'One', shots: [], jobs: [], assets: [], sections: [],
+                        messages: [], song: null, creative_brief: '', brief_attribution: [] };
+      answer(true);
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      await flush();
+      const before = { shape: mirrorShape(), marks: state.briefMarks };
+      // The Treatment is regenerated under the Director's hands, and then typed in.
+      at('#treatment-text').value = 'A wholly different treatment.';
+      fire('#treatment-text:input', {});
+      at('#style-bible').value = 'A style bible.';
+      fire('#style-bible:input', {});
+      console.log(JSON.stringify({ before, after: { shape: mirrorShape(),
+        marks: state.briefMarks, readout: at('#brief-attribution').textContent } }));
+    """,
+        responses={"/api/projects/p2": {"body": marked}},
+    )
+    assert read["after"]["shape"] == read["before"]["shape"]
+    assert read["after"]["marks"] == read["before"]["marks"] == [
+        {"start": 7, "end": 43, "messageId": "msg_2"}]
+    assert read["after"]["readout"].startswith("Written by the assistant: one stretch.")
+
+
+def test_a_brief_with_no_attribution_behaves_exactly_as_it_did_before_this_slice():
+    """The state every Brief written before this field existed is in, and every hand-typed one.
+
+    A mirror with one text node and no `<mark>` is the whole of it: no wash, no rule, and a
+    readout that says so. This is the acceptance criterion that a feature drawn over nothing
+    would fail loudly and a feature drawn over everything would fail silently.
+    """
+    plain = attributed_project("Wholly hand typed, start to finish.", [])
+    read = run_workspace(
+        MIRROR_SHAPE + """
+      state.project = { id: 'p1', name: 'One', shots: [], jobs: [], assets: [], sections: [],
+                        messages: [], song: null, creative_brief: '', brief_attribution: [] };
+      answer(true);
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      await flush();
+      at('#creative-brief').selectionStart = 4;
+      fire('#creative-brief:click', {});
+      console.log(JSON.stringify({ shape: mirrorShape(), marks: state.briefMarks,
+        readout: at('#brief-attribution').textContent }));
+    """,
+        responses={"/api/projects/p2": {"body": plain}},
+    )
+    assert read["shape"] == [{"text": "Wholly hand typed, start to finish.\u200b"}]
+    assert read["marks"] == []
+    assert read["readout"] == "Nothing in this Brief was written by the assistant."
+
+
+def test_the_client_never_sends_a_range_back(tmp_path):
+    """AD-45, from the client's side: an ordinary Brief save carries text only.
+
+    The server re-adopts `brief_attribution` on the generic PUT and derives it on every write, so
+    a client that sent ranges would be a second authority on provenance — and provenance with two
+    authorities is provenance with none. Driven through the Save button so the assertion is about
+    the bytes the route receives.
+    """
+    marked = attributed_project(MID_LINE_BRIEF, [MID_LINE_RANGE])
+    read = run_workspace(
+        """
+      state.project = { id: 'p1', name: 'One', shots: [], jobs: [], assets: [], sections: [],
+                        messages: [], song: null, creative_brief: '', brief_attribution: [] };
+      answer(true);
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      await flush();
+      requests.length = 0;
+      await fire('#save-treatment:click', {});
+      await flush();
+      console.log(JSON.stringify({ sent: requests
+        .filter((request) => request.method !== 'GET')
+        .map((request) => ({ path: request.path, body: JSON.parse(request.body) })) }));
+    """,
+        responses={
+            "/api/projects/p2": {"body": marked},
+            "/api/projects/p2/documents": {"body": marked},
+        },
+    )
+    assert read["sent"], "the save never reached the route"
+    for request in read["sent"]:
+        assert "brief_attribution" not in request["body"], request
+        assert set(request["body"]) == set(ProjectDocumentsRequest.model_fields), request
