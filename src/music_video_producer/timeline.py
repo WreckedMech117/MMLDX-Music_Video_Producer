@@ -1711,6 +1711,64 @@ def _asset_description(asset: Asset) -> str:
     return f"{collapsed[:ASSISTANT_DESCRIPTION_LIMIT]}…"
 
 
+def suggest_video_input(project: Project) -> dict[str, Any]:
+    """The trimmed input for one Suggest Video pass (TP-3, story 13.1). Pure and I/O-free.
+
+    `assist_planning`'s docstring left this here by name: it sends the whole project dump because
+    a planning conversation is about the documents and the library, and *"a builder that trims this
+    for a long pass belongs with the pass that needs it (Slice E)"*. This is that builder, and
+    three keys is all of it.
+
+    **What is in it, and why each earns its tokens.**
+
+    * `song` — the lyric sheet and the style description, verbatim and unsummarised. These are the
+      two largest hand-authored texts this application accepts and they are the whole subject of
+      the pass; the title and the length come along because an arc has to land on a known number of
+      seconds. `vocal_type` is here because who sings decides who is on screen, which is one of the
+      five sections being asked for.
+    * `sections` — the Director's own marks, when there are any. **Used when present and never
+      required** (R-15): an unsectioned song sends an empty list and the pass runs on the lyrics
+      alone. Nothing here infers a structure, because a structure this pass invented would be
+      indistinguishable downstream from one the Director marked.
+    * `existing_brief` — whatever is already in the box, which is usually nothing. It is sent so
+      that a Director who typed three lines of intent before pressing the button gets a brief built
+      on them rather than one that overrules them, which is R-7's *"it does not care how the
+      details arrived"* applied to the document as well as to the song.
+
+    **What is deliberately absent is the Treatment and the Style bible.** They are derived *from*
+    the Brief — the Director's own framing and the reason this stage comes first — so feeding them
+    back would ask the pass to reverse the dependency, and it cannot write either of them in any
+    case (TP-10). Shots, assets, jobs, takes and messages are absent for `expansion_input`'s
+    recorded reason: rich context is the measured root cause of Director degradation, and none of
+    them is evidence about what this video should be.
+
+    A project with no Song is not this function's refusal to make — `app.suggest_video_refusal`
+    owns that, before any of this is built — but it is total anyway rather than raising, because a
+    pure builder that can raise is a second place a caller has to remember to guard.
+    """
+    song = project.song
+    ordered = sorted(project.sections, key=lambda section: section.start)
+    return {
+        "song": {
+            "title": song.title if song else "",
+            "duration_seconds": round(song.duration, 3) if song else 0.0,
+            "lyrics": song.lyrics if song else "",
+            "style": song.caption if song else "",
+            "vocal_type": song.vocal_type if song else "unstated",
+        },
+        "sections": [
+            {
+                "label": section.label,
+                "start": round(section.start, 3),
+                "duration": round(section.duration, 3),
+                "prompt": section.prompt,
+            }
+            for section in ordered
+        ],
+        "existing_brief": project.creative_brief,
+    }
+
+
 def assistant_input(project: Project, *, shot_ids: list[str]) -> dict[str, Any]:
     """The purpose-built, trimmed input for one Assistant ProducerBot turn. Pure and I/O-free.
 

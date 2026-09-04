@@ -20,6 +20,8 @@ from .planning_prompt import (
     ASK_DIRECTOR_DESCRIPTION,
     PLANNING_SYSTEM_PROMPT,
     PROPOSE_ASSETS_DESCRIPTION,
+    SUGGEST_VIDEO_DESCRIPTION,
+    SUGGEST_VIDEO_SYSTEM_PROMPT,
     WRITE_BRIEF_DESCRIPTION,
 )
 
@@ -52,6 +54,23 @@ class DirectorBudgetExhausted(DirectorError):
     same way on every attempt. Matching on the message text would make that decision
     hostage to a wording chosen for the Director to read.
     """
+
+
+def failure_description(error: BaseException) -> str:
+    """One failed call, worded so it always says something: the exception class, then its text.
+
+    **`str(error)` alone is not enough**, and that is not a style preference. `httpx.ReadTimeout`
+    stringifies to `""`, so a report built from the string alone once produced the message
+    "invalid response: ." about what was actually a timeout — a blank that reads to the Director
+    as a fault in the application rather than as a slow model. The class name is the part that
+    always says something, and it goes first for that reason.
+
+    Extracted from `expand_shot`, which learned this the expensive way and was the sole holder of
+    the idiom. AD-39 requires Suggest Video to report *by exception class and elapsed time, never
+    by the exception's string*, and a second implementation of a lesson is where two answers to
+    one question start: this is the same sentence, in one place, for both callers.
+    """
+    return f"{type(error).__name__}: {error}"
 
 
 #: The corrective follow-up on a retry after the checker refused an answer. Sent as a user
@@ -992,6 +1011,212 @@ def parse_planning_reply(reply: dict[str, Any]) -> PlanningTurn:
     return turn
 
 
+# ---------------------------------------------------------------------------------------------
+# Suggest Video: one long pass, one tool, and the Brief (AD-39, TP-3, story 13.1)
+# ---------------------------------------------------------------------------------------------
+#
+# A different act from the conversation above, so a different surface rather than a mode of that
+# one. The planning tools exist because *asked a question and wrote nothing* has to be
+# representable; here it must not be. The Director pressed a button meaning "write me a brief",
+# there is no turn after this one to ask in, and a reply that asks instead of writing is a failed
+# pass however well it is worded. What the two surfaces share is the constraint that matters:
+# neither has a field that could write the Treatment, the Style bible, a Shot or an Asset (TP-10).
+#
+# **Every failure mode below is one this project has measured**, which is why the shapes are what
+# they are:
+#
+# * The model drops fields silently, so all five are required and `_strict_tool_schema` refuses to
+#   emit this tool if one is ever left out of the list (AD-38).
+# * A required field that arrives *blank* is not a dropped field and must not be treated as one:
+#   the reply validated, so it is written and reported as partial (AD-39). That is the difference
+#   between "the model answered thinly" and "the model answered wrongly", and collapsing them
+#   would either throw away a usable brief or present an empty section as a finished one.
+# * A reply with nothing in any of the five is not thin, it is empty, and writing it would blank
+#   the Brief. `parse_suggested_brief` refuses it, which routes it to the retry.
+
+#: The one tool of this surface. Named for the act rather than for the document, unlike
+#: `write_brief`, because the Director's control is called Suggest Video and the model is better
+#: served by the two names agreeing than by a taxonomy only this file can see.
+SUGGEST_VIDEO_TOOL = "suggest_video"
+
+#: The five things a Brief has to cover (TP-3), as field name to the heading the composed document
+#: carries. **One mapping, and both directions are guarded by machinery that already exists**: a
+#: name here that `SuggestedBrief` lacks makes `_promoted` raise, and a field on `SuggestedBrief`
+#: missing from here makes `_refuse_optional_fields` raise. Both raise **at import**, because
+#: `SUGGEST_VIDEO_TOOL_NAMES` builds the tool at module scope — the `Song`/`Shot` field
+#: classification gate's precedent: the application refuses to start rather than shipping a brief
+#: with a section nobody promoted.
+#:
+#: Order is the order the Director reads, and it is the order of the argument object, so the
+#: constrained decoder fills in the premise before it invents a look for it.
+BRIEF_SECTIONS: dict[str, str] = {
+    "premise": "Premise",
+    "cast": "Cast",
+    "locations": "Locations",
+    "arc": "Arc",
+    "look": "Look",
+}
+
+
+class SuggestedBrief(BaseModel):
+    """The `suggest_video` argument object, and the source of its JSON schema.
+
+    Five fields, all required, all plain strings, and **none of them carries `min_length`** — which
+    is the one deliberate difference from `WriteBriefArguments` and is worth stating, because it
+    looks like an oversight and is the opposite.
+
+    `write_brief` requires text so that `PlanningTurn.brief == ""` can mean *no write was
+    proposed*: there, a dropped field and an empty one may be collapsed, since both mean the same
+    thing to a route that was going to write nothing either way. Here they must not be. AD-39
+    requires a thin-but-valid reply to be **stored and reported as partial**, so a blank `cast` has
+    to survive validation in order to be reported — with `min_length=1` it would be a
+    `ValidationError`, indistinguishable from the model dropping the key, and a brief that is
+    genuinely four-fifths written would be discarded and re-rolled.
+
+    What is absent is `treatment`, `style_bible`, `shots` and `assets`, for `WriteBriefArguments`'
+    reason: TP-3 and TP-10 hold by the shape of the call rather than by a check in a route.
+    """
+
+    premise: str = Field(
+        description="What happens in this video, as a story. One short paragraph of prose."
+    )
+    cast: str = Field(
+        description="Who is on screen and what each of them is, by role rather than by actor."
+    )
+    locations: str = Field(
+        description="Where it happens — specific, real places a camera could stand in."
+    )
+    arc: str = Field(
+        description="How it moves from the first second to the last, against the song's shape."
+    )
+    look: str = Field(
+        description=(
+            "The visual language: palette, light, lens, texture, and what it must never "
+            "look like."
+        )
+    )
+
+
+def suggest_video_tool() -> dict[str, Any]:
+    """The Suggest Video surface as it goes on the wire. One tool, generated, never written out.
+
+    `planning_tools()`' argument for a surface of one: the required list is *stated* here and
+    `_strict_tool_schema` clears the inherited one before promoting, so the tuple is the sole
+    statement of what the wire requires rather than a restatement of what Pydantic produced for
+    free. Delete a name from it and this raises at import.
+    """
+    return {
+        "type": "function",
+        "function": {
+            "name": SUGGEST_VIDEO_TOOL,
+            "description": SUGGEST_VIDEO_DESCRIPTION,
+            "parameters": _strict_tool_schema(SuggestedBrief, require=tuple(BRIEF_SECTIONS)),
+        },
+    }
+
+
+#: The tool name `parse_suggested_brief` accepts, **read back off the surface that ships** rather
+#: than compared against the literal above. `PLANNING_TOOL_NAMES`' argument, and it is worth the
+#: line even on a surface with one name: building the tool here is what turns
+#: `_strict_tool_schema`'s refusal into an *import-time* failure. A section dropped from the
+#: promotion then stops the application from starting, on the `Song`/`Shot` field classification
+#: gate's precedent, rather than shipping a tool whose grammar is looser than its docstring.
+SUGGEST_VIDEO_TOOL_NAMES: tuple[str, ...] = (suggest_video_tool()["function"]["name"],)
+
+
+def brief_shortfall(suggestion: SuggestedBrief) -> tuple[str, ...]:
+    """The headings this suggestion left blank, in reading order. Pure.
+
+    *Blank* is whitespace-only, and that is deliberately the whole test: "thin" is not a judgement
+    about how good a paragraph is, because that judgement belongs to the Director reading it and an
+    application making it would be refusing work the Director asked for. A section with one
+    sentence in it is a section the model wrote; a section with nothing in it is a section it did
+    not, and only the second is reportable as a shortfall.
+
+    Empty when the reply covered all five, which is what the route reads as *not partial*.
+    """
+    return tuple(
+        label for field, label in BRIEF_SECTIONS.items() if not getattr(suggestion, field).strip()
+    )
+
+
+def compose_brief(suggestion: SuggestedBrief) -> str:
+    """One suggestion as the Brief document the Director reads and edits. Pure.
+
+    Markdown headings, because the Brief is a plain textarea the Director types in afterwards and a
+    structure they can see is a structure they can rearrange. **A blank section is omitted entirely
+    rather than written as an empty heading**: an empty `## Cast` claims the pass considered the
+    cast and found nothing to say, which is a different and false statement from the honest one the
+    partial notice makes. `brief_shortfall` names what is missing; this document does not pretend
+    it is there.
+
+    Sections are stripped, so a model that pads with blank lines does not decide the document's
+    spacing.
+    """
+    return "\n\n".join(
+        f"## {label}\n{getattr(suggestion, field).strip()}"
+        for field, label in BRIEF_SECTIONS.items()
+        if getattr(suggestion, field).strip()
+    )
+
+
+#: What a reply that called no usable tool is reported as. A sentence rather than a bare class
+#: name, because this is the failure a Director sees when the persona needs iterating rather than
+#: when the provider is broken, and the two want different next actions.
+SUGGEST_VIDEO_MALFORMED = (
+    "the reply carried no usable suggest_video call — the model answered in prose, called "
+    "something else, or sent arguments that could not be read"
+)
+#: The one shape that validates and still cannot be written: five fields present and every one of
+#: them blank. Composing it yields the empty string, and writing that would blank a Brief the
+#: Director may have spent an hour on — the exact loss the recovery slot exists to prevent, caused
+#: by the writer rather than survived by it. Refused here so that it re-rolls.
+SUGGEST_VIDEO_EMPTY = (
+    "the reply filled none of the five sections, so there is no brief in it to write"
+)
+#: The provider-failure wrapper. It keeps this module's contract — every provider failure is a
+#: `DirectorError` — while `failure_description` keeps the cause's class inside the sentence, so
+#: a timeout that stringifies to nothing still names itself.
+SUGGEST_VIDEO_INVALID = "LLM director returned no usable brief: {failure}"
+
+
+def parse_suggested_brief(reply: dict[str, Any]) -> SuggestedBrief:
+    """One provider reply as a validated suggestion, or `DirectorError` naming what was wrong.
+
+    `parse_planning_reply`'s shapes with the opposite disposition, and the difference follows from
+    the surface. There, a call that does not fit the vocabulary is collected into `malformed` and
+    reported beside the good calls, because a turn can be partly useful. Here there is one call and
+    one output: a reply that does not carry it has produced nothing, and the only useful thing to
+    do with it is roll again. So this raises, and the retry is what catches it.
+
+    A second `suggest_video` call in one reply takes the **first**, rather than refusing the whole
+    pass as `parse_planning_reply` refuses a second `write_brief`. The arguments differ: there, two
+    whole documents with no sane merge and a silent discard to avoid; here, the alternative to
+    taking one is taking none, and a model that answered twice has answered.
+    """
+    calls = reply.get("tool_calls")
+    for call in calls if isinstance(calls, list) else []:
+        function = call.get("function") if isinstance(call, dict) else None
+        if not isinstance(function, dict) or function.get("name") not in SUGGEST_VIDEO_TOOL_NAMES:
+            continue
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except ValueError:
+                continue
+        if not isinstance(arguments, dict):
+            continue
+        try:
+            suggestion = SuggestedBrief.model_validate(arguments)
+        except ValidationError:
+            continue
+        if len(brief_shortfall(suggestion)) == len(BRIEF_SECTIONS):
+            raise DirectorError(SUGGEST_VIDEO_EMPTY)
+        return suggestion
+    raise DirectorError(SUGGEST_VIDEO_MALFORMED)
+
+
 # The Treatment is already written per section — the live project's is literally an
 # **Intro:** paragraph, a **Verse 1 & Verse 2:** paragraph, a **Chorus 1 & Chorus 2:**
 # paragraph and so on — so this pass invents nothing. It *distributes* prose that exists
@@ -1695,10 +1920,9 @@ class DirectorClient:
             # which once produced the message "invalid response: ." about what was
             # actually a timeout. The class name is the part that always says something.
             raise DirectorError(
-                "LLM director returned an invalid response: "
-                f"{type(error).__name__}: {error}. If the provider rejected the request "
-                "body, note that chat_template_kwargs is an LM Studio / vLLM extension "
-                "and may need removing."
+                f"LLM director returned an invalid response: {failure_description(error)}. "
+                "If the provider rejected the request body, note that chat_template_kwargs is "
+                "an LM Studio / vLLM extension and may need removing."
             ) from error
 
         text = (message.get("content") or "").strip()
@@ -1847,6 +2071,63 @@ class DirectorClient:
             ValueError,
         ) as error:
             raise DirectorError(f"LLM director returned an invalid response: {error}") from error
+
+    async def suggest_video(self, *, brief_input: dict[str, Any]) -> SuggestedBrief:
+        """One Suggest Video pass: the song, whatever structure it has, and the tool that writes.
+
+        `assist_planning`'s transport with three decisions taken the other way, each because this is
+        a button press rather than a turn of conversation.
+
+        **`tool_choice` is forced, not `"auto"`.** Both chat surfaces argue against forcing and
+        both are right for themselves: forcing makes the model pick one of several acts on a turn
+        where prose is the honest answer, and `ask_director` is close enough to "say something"
+        that it gets picked. Neither argument survives here. There is one act, prose is never the
+        honest answer to *write me a brief*, and a chatty roll is a wasted 300 seconds that the
+        Director watches. A provider that ignores the field costs nothing: the reply then carries
+        no call, `parse_suggested_brief` refuses it, and the retry rolls again.
+
+        **One call, and the loop is the caller's** — `expand_shot`'s rule for the same reason. AD-39
+        requires exactly one retry, "exactly" is the whole requirement, and an attempt budget hidden
+        inside a transport method is one no test can count. `app.run_suggest_video` owns it.
+
+        **The error carries the class through `failure_description`.** Wrapping to `DirectorError`
+        is this module's contract and it is kept, but a wrap that reduced the cause to `str(error)`
+        would erase exactly what AD-39 asks to be reported: `httpx.ReadTimeout` stringifies to `""`,
+        so the Director would be shown a sentence ending in a colon and nothing after it.
+
+        `brief_input` is `timeline.suggest_video_input`'s output verbatim — a trimmed builder rather
+        than the project dump the planning turn sends, which `assist_planning`'s docstring said
+        belonged with the pass that needed it. This is that pass.
+        """
+        if not self.base_url or not self.model:
+            raise DirectorUnavailable(
+                "LLM director is not configured. Set MVP_LLM_BASE_URL and MVP_LLM_MODEL."
+            )
+        headers = self._headers()
+        body = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": SUGGEST_VIDEO_SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps(brief_input, ensure_ascii=False)},
+            ],
+            "temperature": PLAN_TEMPERATURE,
+            "tools": [suggest_video_tool()],
+            "tool_choice": {"type": "function", "function": {"name": SUGGEST_VIDEO_TOOL}},
+        }
+        try:
+            response = await self._completion(body=body, headers=headers)
+            return parse_suggested_brief(self._reply(response))
+        except (
+            httpx.HTTPError,
+            KeyError,
+            IndexError,
+            TypeError,
+            json.JSONDecodeError,
+            ValueError,
+        ) as error:
+            raise DirectorError(
+                SUGGEST_VIDEO_INVALID.format(failure=failure_description(error))
+            ) from error
 
     async def inspect_image(
         self, *, image: bytes, mime_type: str, purpose: str

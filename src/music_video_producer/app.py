@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from collections import Counter
 from collections.abc import AsyncIterator, Callable, Container, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -85,8 +86,11 @@ from .director import (
     # reply can carry rather than keeping a second list of them.
     DirectorResult,
     DirectorUnavailable,
+    SuggestedBrief,
+    brief_shortfall,
     director_result_schema,
     document_rejection,
+    failure_description,
 )
 from .effects import (
     BINDING_SETTINGS,
@@ -357,7 +361,13 @@ DOCUMENT_SLOT_DISPLACEMENT = {
     field: (
         "applied replacement"
         if field in DIRECTOR_REPLACEABLE_DOCUMENTS
-        else "save or planning write that changed it"
+        # Three writers since 2026-09-04, when Suggest Video (story 13.1) joined the save and
+        # slice B's planning write. This is the hand-maintained list the note above says will go
+        # stale, met for the first time: `write_document` reduced four displacement sites to one
+        # and did not reduce the number of *gestures* a Director can make, which is what this
+        # sentence names. `test_document_restore_wording_agrees_on_both_sides` holds it to
+        # `api.js`'s copy so the staleness can never be one-sided.
+        else "save, planning write or Suggest Video that changed it"
     )
     for field in DOCUMENT_LABELS
 }
@@ -365,8 +375,8 @@ DOCUMENT_SLOT_CAPTURE = {
     field: (
         "a Director reply actually replaces the document"
         if field in DIRECTOR_REPLACEABLE_DOCUMENTS
-        # Both writers, for `DOCUMENT_SLOT_DISPLACEMENT`'s reason one block up.
-        else "a save or a planning write changes the document's text"
+        # All three writers, for `DOCUMENT_SLOT_DISPLACEMENT`'s reason one block up.
+        else "a save, a planning write or Suggest Video changes the document's text"
     )
     for field in DOCUMENT_LABELS
 }
@@ -1446,6 +1456,240 @@ def planning_proposals_notice(names: list[str]) -> str:
     return PLANNING_PROPOSALS_NOTICE.format(count=len(names), assets=", ".join(names))
 
 
+# ---------------------------------------------------------------------------------------------
+# Suggest Video: the long pass, its refusals, its one retry and what it reports (AD-39, TP-3/4/5)
+# ---------------------------------------------------------------------------------------------
+#
+# **The happy path is one call. Everything below is the unhappy ones**, and every clause of AD-39
+# is a lesson this project paid for rather than a defensive habit:
+#
+# * `populate` has exceeded a 300 s timeout, and reasoning length varies **26x across identical
+#   rolls**. A longer timeout buys the tail of that distribution; a retry re-rolls it. They fix
+#   different failures, which is why AD-39 asks for both and why the retry is exactly one — a
+#   second roll is genuinely a different roll, a third is a Director watching a spinner.
+# * Nothing is written until the reply validates, so a failed pass leaves the Brief
+#   **byte-identical**. The route holds no partially-written project across the call: it re-reads
+#   after the await and assigns only on success.
+# * A reply that validates thinly is **stored and reported as partial**, never presented as
+#   finished. See `SuggestedBrief` for why a blank section has to survive validation to be
+#   reportable at all.
+# * A failure is reported by exception class and elapsed time. `httpx.ReadTimeout` stringifies to
+#   `""`, and `director.failure_description` is the one implementation of that lesson.
+
+#: One call, then exactly one retry. **Exactly** is the requirement: zero leaves the Director on
+#: the wrong side of a distribution with 26x variance, and more than one turns a slow pass into a
+#: pass that cannot be waited out. A constant rather than a parameter, so the number that ships is
+#: the number every test drives and there is no caller able to disagree with it.
+SUGGEST_VIDEO_ATTEMPTS = 2
+
+#: Suggest Video needs a song, and the refusal says so in the Director's own geography rather than
+#: naming a field. `POPULATE_NO_SONG_REFUSAL`'s shape; the two ask for different things and are
+#: stated separately for that route's recorded reason — populate needs a *length* to tile, this
+#: needs *words* to read.
+SUGGEST_VIDEO_NO_SONG_REFUSAL = (
+    "Suggest Video builds the brief out of the song, so this project needs a master song "
+    "first. Add one on the Song page."
+)
+#: The incomplete-song refusal, and it **names the fields and where they live** (TP-3, UX-TP12).
+#: A generic failure here is the worst version of this message: the Director pressed a button that
+#: takes minutes when it works, and "could not run" tells them nothing about which of two text
+#: boxes on another page is empty. The field names come from `SONG_CONTEXT_LABELS`, so the refusal
+#: and the boxes it sends the Director to cannot be called different things.
+#:
+#: It also says the thing R-7 exists to say: an imported track with hand-filled details is a
+#: first-class starting point, and nothing here asks how the words got there.
+SUGGEST_VIDEO_INCOMPLETE_REFUSAL = (
+    "Suggest Video reads the song's own words and the look you have already decided on, and "
+    "this project is missing: {fields}. Fill in on the Song page and run it again — it makes "
+    "no difference whether the song was generated here or imported, only that those boxes "
+    "have something in them."
+)
+#: Written whole, with the version it displaced kept. `elapsed` is in the sentence because the
+#: Director watched it climb and the number is the one honest thing this pass can say about its own
+#: cost — there is no percentage and no estimate, by the same rule that bars fake render progress.
+SUGGEST_VIDEO_WRITTEN_NOTICE = (
+    "Suggest Video wrote the {document} in {elapsed:.1f}s. The version it replaced is kept and "
+    "can be restored."
+)
+#: The same act into a blank document. Separate, for `DOCUMENT_FIRST_DRAFT_NOTICE`'s reason: the
+#: slot it captured is empty and a restore would refuse, so promising a restorable previous version
+#: is a promise broken by the very next click.
+SUGGEST_VIDEO_FIRST_DRAFT_NOTICE = (
+    "Suggest Video wrote the {document} in {elapsed:.1f}s. It was blank, so there is no previous "
+    "version to restore."
+)
+#: **Partial, and it leads with the word.** AD-39's rule is that a thin reply is stored and
+#: reported as partial *never presented as a finished Brief*, so the sentence has to be unmistakable
+#: at a glance rather than qualified halfway through. It names the sections that came back empty,
+#: because "partial" without them sends the Director to compare five headings by eye.
+SUGGEST_VIDEO_PARTIAL_NOTICE = (
+    "Partial: Suggest Video wrote the {document} in {elapsed:.1f}s but returned nothing for "
+    "{missing}. It is a draft to react to rather than a finished brief — write those sections "
+    "yourself, or run it again."
+)
+#: The final failure, after the retry. Three facts and no apology: how long it ran, what the last
+#: failure was **by class**, and that nothing was written. The last is the one the Director cannot
+#: check without leaving the page, and it is the one they most need — a long pass that failed is
+#: exactly when somebody wonders whether it half-wrote something.
+SUGGEST_VIDEO_FAILED = (
+    "Suggest Video ran for {elapsed:.1f}s over {attempts} attempt(s) and returned nothing "
+    "usable. The last failure was {failure}. Nothing was written — the {document} is exactly "
+    "as it was."
+)
+
+
+def suggest_video_refusal(project: Project) -> str:
+    """Why Suggest Video cannot run on this project, or `""` when it can. Pure.
+
+    Two refusals, in the order a Director hits them: no song at all, then a song missing one of the
+    two context fields the pass reads. Both name what is wrong and where to fix it.
+
+    **What is deliberately not checked is as much of the requirement as what is.**
+
+    * **Sections.** R-15 and TP-3: a sectioned song gets a better pass and an unsectioned one still
+      gets a Brief, so the precondition remains a Song record and nothing more. Requiring structure
+      here would make the song analysis a prerequisite for the first stage of planning, which is
+      the opposite of what TP-5 asks for.
+    * **A duration.** An imported track whose length was never probed still has words and a style,
+      which is all this pass reads. The arc is written against the song's shape, and the shape is
+      in the lyric sheet.
+    * **The lock.** That is `document_lock_refusal`'s question, and it is a different answer with a
+      different status code — *this project cannot run the pass* against *this document may not be
+      written by a machine*. Its caller asks both.
+    """
+    if project.song is None:
+        return SUGGEST_VIDEO_NO_SONG_REFUSAL
+    missing = [
+        label
+        for field, label in SONG_CONTEXT_LABELS.items()
+        if not getattr(project.song, field).strip()
+    ]
+    if missing:
+        return SUGGEST_VIDEO_INCOMPLETE_REFUSAL.format(fields=", ".join(missing))
+    return ""
+
+
+class SuggestVideoOutcome(BaseModel):
+    """What one Suggest Video pass produced, including how it failed and how long it took.
+
+    A record rather than a tuple because three of its four fields are reported to the Director
+    verbatim, and because `suggestion is None` has to be the *only* way to say the pass produced
+    nothing — an empty `SuggestedBrief` would be a second spelling of failure, and `compose_brief`
+    would turn it into an empty document that overwrote a real one.
+    """
+
+    #: The validated reply, or `None` when both attempts failed.
+    suggestion: SuggestedBrief | None = None
+    #: How many calls were actually made. One on a first-attempt success, two on a retry, and two
+    #: on a final failure — the number a test counts to prove the retry is one and not zero or two.
+    attempts: int
+    #: Wall-clock seconds across every attempt, including the failed ones. AD-39 reports elapsed
+    #: time rather than a per-attempt figure because that is what the Director sat through.
+    elapsed: float
+    #: The last failure, as `failure_description` words it: class name first. `""` on success.
+    failure: str = ""
+
+
+async def run_suggest_video(
+    director: Any,
+    *,
+    brief_input: dict[str, Any],
+    clock: Callable[[], float] = time.perf_counter,
+) -> SuggestVideoOutcome:
+    """One Suggest Video pass with AD-39's single retry. Writes nothing anywhere.
+
+    **The loop lives here rather than in `DirectorClient`**, on `expand_shot`'s rule that the caller
+    owns the attempt budget. It is not a style preference: "retries exactly once" is a requirement
+    with a number in it, and a budget hidden inside a transport method is one no test can count
+    without reaching through a mock. Here the double's call count *is* the assertion.
+
+    **`DirectorUnavailable` is not retried, and that is the distinction the retry rests on.** A
+    second roll is worth taking because sampling is independent across calls and reasoning length
+    varies 26x; an unconfigured provider fails identically every time, so retrying it spends the
+    Director's wait on no new information. `DirectorError` covers both a transport failure and a
+    reply that did not carry a usable call, which are exactly the two AD-39 names.
+
+    **It writes nothing, and that is what makes byte-identical achievable rather than promised.**
+    This function never sees a `Project`. Its caller re-reads the manifest after the await and
+    assigns only when `suggestion` is not `None`, so a failed pass has no path to the store at all
+    — the guarantee is structural rather than a branch somebody has to keep correct.
+
+    `clock` is injected so a test can state the elapsed time it expects to be reported instead of
+    asserting that some number is present. A report of elapsed time that no test pins is a report
+    that can quietly become zero.
+    """
+    started = clock()
+    failure = ""
+    attempts = 0
+    while attempts < SUGGEST_VIDEO_ATTEMPTS:
+        attempts += 1
+        try:
+            suggestion = await director.suggest_video(brief_input=brief_input)
+        except DirectorError as error:
+            failure = failure_description(error)
+            continue
+        return SuggestVideoOutcome(
+            suggestion=suggestion, attempts=attempts, elapsed=clock() - started
+        )
+    return SuggestVideoOutcome(attempts=attempts, elapsed=clock() - started, failure=failure)
+
+
+def suggest_video_notice(outcome: SuggestVideoOutcome, *, restorable: bool) -> str:
+    """The Director-facing sentence for a pass that wrote. One of three, and never two of them.
+
+    Partial wins over both of the complete wordings, unconditionally, because AD-39's requirement
+    is that a thin reply is *never presented as a finished Brief* — a sentence that led with "wrote
+    the Creative brief" and mentioned the shortfall afterwards would be exactly that presentation.
+    What is lost is the restore hint on a partial write, which the `restorable` field of the
+    response carries for the client anyway.
+
+    `restorable` is not the same fact as *the slot was spent*, and the difference is the whole of
+    `DOCUMENT_FIRST_DRAFT_NOTICE`'s argument: a first draft into a blank Brief displaces `""`, so
+    the slot is written and a restore would still refuse. Promising a version that can be put back
+    is a promise broken by the very next click.
+    """
+    if outcome.suggestion is None:  # pragma: no cover - the caller reports a failure instead
+        raise ValueError("a pass that produced nothing has no written notice")
+    missing = brief_shortfall(outcome.suggestion)
+    if missing:
+        return SUGGEST_VIDEO_PARTIAL_NOTICE.format(
+            document=DOCUMENT_LABELS["creative_brief"],
+            elapsed=outcome.elapsed,
+            missing=", ".join(missing),
+        )
+    wording = SUGGEST_VIDEO_WRITTEN_NOTICE if restorable else SUGGEST_VIDEO_FIRST_DRAFT_NOTICE
+    return wording.format(
+        document=DOCUMENT_LABELS["creative_brief"], elapsed=outcome.elapsed
+    )
+
+
+class SuggestVideoResponse(BaseModel):
+    """What `POST .../brief/suggest` answers with on a pass that wrote.
+
+    The project, because the client has to re-render the Brief and its restore button, and four
+    facts about the pass that the project itself cannot carry. `partial` and `missing` are AD-39's
+    "reported as partial" on the wire: a client that rendered `notice` alone would still say the
+    right thing, and one that wants to mark the box needs the boolean rather than a substring
+    search on a sentence.
+    """
+
+    project: Project
+    #: True when the reply validated but left one or more sections blank. Read this rather than
+    #: `missing` being non-empty; they agree, and one of them is the question being asked.
+    partial: bool
+    #: The section headings that came back empty, in reading order. Empty on a complete pass.
+    missing: list[str]
+    #: Whether the recovery slot now holds text a restore would give back. False on a first draft
+    #: into a blank Brief: the slot *was* written, with `""`, and the restore route refuses an empty
+    #: one — so "a version was kept" and "there is a version to restore" are different facts and
+    #: this is the one the button beside the box needs.
+    restorable: bool
+    #: One and two respectively for a first-attempt success and a success after the retry.
+    attempts: int
+    elapsed: float
+    notice: str
+
+
 def assistant_fill_summary(applied: dict[str, object]) -> str:
     """One shot's line in the applied notice: what was set on it, in the Director's vocabulary.
 
@@ -1516,6 +1760,70 @@ def document_restore_refusal(document: DocumentName) -> str:
     return DOCUMENT_RESTORE_REFUSAL.format(
         document=DOCUMENT_LABELS[document], capture=DOCUMENT_SLOT_CAPTURE[document]
     )
+
+
+#: The two kinds of writer a creative document has, which is the axis the recovery slot turns on.
+#:
+#: `"save"` is the Director's own `PUT /documents`. `"machine"` is anything driven by a model — an
+#: applied Director reply, a planning turn's `write_brief`, Suggest Video — and they are one value
+#: rather than three because the slot cannot tell them apart and must not learn to: the question it
+#: answers is *did a machine displace what the Director had*, and a fourth machine writer that
+#: needed its own case would be a fourth chance to get this wrong.
+DOCUMENT_WRITER_SAVE = "save"
+DOCUMENT_WRITER_MACHINE = "machine"
+DocumentWriter = Literal["save", "machine"]
+
+
+def write_document(
+    project: Project, document: DocumentName, text: str, *, writer: DocumentWriter
+) -> bool:
+    """Write one creative document, displacing what it replaced into that document's slot.
+
+    **The one place a creative document's text and its recovery slot are assigned.** Returns
+    whether the slot was spent, which is the difference between *there is a version to restore* and
+    *there is not*, and is a fact only this function is in a position to know.
+
+    It exists because the displacement was written out inline three times — `replace_documents`,
+    `director_chat`'s apply loop and `planning_turn` — with the capture site carrying a comment
+    saying **extract before duplicating**, and Suggest Video would have been the fourth. The lock
+    half of the same decision was extracted first (`document_lock_refusal`) for exactly this
+    reason, and the two halves belong together: *may a machine write this* and *what happens to
+    what was there* are the two questions every machine writer of a document has to ask.
+
+    **Which writer spends the slot differs by document, and that is a Director ruling of
+    2026-09-03 rather than an inconsistency.** The rule is *whichever writer is the threat fills
+    the slot*, and it has two arms:
+
+    * A machine write always captures, for every document. What destroys a Treatment is a model
+      rewrite, so the copy that protects the Director *from* the model is taken at the moment the
+      model writes.
+    * A save captures only for `SAVE_CAPTURED_DOCUMENTS` — the documents no ordinary reply can
+      write, which today is the Brief alone. Capturing on the human's save as well as on the
+      model's write would let one click of Save spend the single slot that exists to protect them
+      from the model; and for a document with no model writer, not capturing on the save would mean
+      the slot never fills at all and the restore button beside it is furniture.
+
+    **A byte-equal write captures nothing**, on `replace_song_context`'s rule, and it is the one
+    case where doing nothing is the whole feature: the copy the slot would overwrite is the
+    recoverable one and the copy going in is the live one. The comparison is exact rather than
+    stripped, because this function stores what it is given and a comparison the write does not
+    honour is a comparison that disagrees with the thing it is about. Callers that treat an
+    echo as *no write at all* — both machine callers do, on their own stronger stripped test —
+    decide that before they get here and never reach this.
+
+    **The seam Slice C needs.** AD-33 says every Brief write runs one pure reconciliation over
+    (stored text, stored ranges, new text). That is this function's arguments, minus a field that
+    does not exist yet. Nothing here is built on it and `brief_attribution` is deliberately not
+    added — but with four writers reduced to one, Slice C touches one place instead of four.
+    """
+    stored = getattr(project, document)
+    captured = text != stored and (
+        writer == DOCUMENT_WRITER_MACHINE or document in SAVE_CAPTURED_DOCUMENTS
+    )
+    if captured:
+        setattr(project, f"{document}{RECOVERY_SLOT_SUFFIX}", stored)
+    setattr(project, document, text)
+    return captured
 
 
 def document_lock_refusal(project: Project, document: DocumentName) -> str:
@@ -10759,6 +11067,11 @@ MANIFEST_WRITE_GUARDS: dict[str, str] = {
     "replace_song_context": WRITE_GUARD_COMPARE_AND_SWAP,
     "restore_document": WRITE_GUARD_COMPARE_AND_SWAP,
     "restore_song_context": WRITE_GUARD_COMPARE_AND_SWAP,
+    # Suggest Video (story 13.1). `planning_turn`'s argument with a longer window: it holds
+    # nothing open across the call — the manifest is re-read after it — but what it writes
+    # when it lands is the Brief plus its single recovery slot, which is this table's own
+    # example of a write whose loss is undetectable afterwards.
+    "suggest_video": WRITE_GUARD_COMPARE_AND_SWAP,
     # Never refused: a graph is already accepted or an export is already running.
     "assemble_project": WRITE_GUARD_REREAD,
     "edit_asset": WRITE_GUARD_REREAD,

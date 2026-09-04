@@ -773,19 +773,25 @@ export function documentReplaceableByReply(document) {
 // never will, which tells the Director the box is not protected and to stop looking for the
 // button that protects it.
 export function documentSlotDisplacement(document) {
-  // Two writers for the Brief since 2026-09-04: a save, and slice B's `write_brief`.
-  // Mirrors `app.DOCUMENT_SLOT_DISPLACEMENT`, and a contract test holds the pair together
-  // so this cannot drift from it. The song context's identical phrase is not this one and
-  // stays as it is: a lyric sheet really does have a single writer.
+  // Three writers for the Brief since 2026-09-04: a save, slice B's `write_brief`, and story
+  // 13.1's Suggest Video. Mirrors `app.DOCUMENT_SLOT_DISPLACEMENT`, and a contract test holds
+  // the pair together so this cannot drift from it. The song context's identical phrase is not
+  // this one and stays as it is: a lyric sheet really does have a single writer.
   return documentReplaceableByReply(document)
     ? "applied replacement"
-    : "save or planning write that changed it";
+    : "save, planning write or Suggest Video that changed it";
 }
 
 export function documentSlotCapture(document) {
+  // The same three writers, worded for this sentence's own frame. **This clause said "a save
+  // changes its text" until 2026-09-04 and had already been stale for a day**: slice B added the
+  // planning write to the server's phrase and not to this one, and the contract test between them
+  // only held the two sides to naming "Director reply" and "save" — so a writer present on one
+  // side and absent on the other was invisible to it. The test now names every writer, which is
+  // what makes this a mirror rather than a resemblance.
   return documentReplaceableByReply(document)
     ? "a Director reply replaces it"
-    : "a save changes its text";
+    : "a save, a planning write or Suggest Video changes its text";
 }
 
 // Pure: does *this* save keep the version it is about to replace? The other half of

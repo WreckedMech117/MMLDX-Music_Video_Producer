@@ -25386,6 +25386,15 @@ def test_every_route_that_fills_a_single_recovery_slot_is_a_compare_and_swap():
         "replace_song_context",
         "restore_document",
         "restore_song_context",
+        # Suggest Video (story 13.1). The window here is the longest of the five -- a model call
+        # this project has measured past 300 seconds sits between the read that decided the pass
+        # may run and the write that fills the slot -- so it is re-read after the await and saved
+        # against the generation of that second read.
+        "suggest_video",
+        # `planning_turn` fills the same slot and is asserted by the same two claims. It was
+        # outside this list while the list named routes rather than the act, which is the shape
+        # this loop exists to stop: the set is *every writer of a single kept version*.
+        "planning_turn",
     ):
         assert MANIFEST_WRITE_GUARDS[name] == WRITE_GUARD_COMPARE_AND_SWAP, name
         assert "get_project_for_update(" in saving[name], name

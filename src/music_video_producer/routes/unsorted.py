@@ -41,6 +41,7 @@ from ..app import (
     DOCUMENT_LABELS,
     DOCUMENT_REJECTED_EMPTY_NOTICE,
     DOCUMENT_REJECTED_NOTICE,
+    DOCUMENT_WRITER_MACHINE,
     EXPANSION_DUPLICATE_NOTICE,
     EXPANSION_EMPTY_MESSAGE,
     EXPANSION_LOCKED_NOTICE,
@@ -86,6 +87,7 @@ from ..app import (
     shot_claim_mismatch_notice,
     shot_render_provenance,
     shot_write_refusal,
+    write_document,
 )
 from ..batch import shot_label
 from ..director import DirectorError, DirectorUnavailable, document_rejection
@@ -252,9 +254,10 @@ def register(ctx: RouterContext) -> None:
                 continue
             # Capture on apply, never on attempt. Writing the recovery slot before the
             # guard ran would let a rejected candidate overwrite the only copy of the good
-            # document — turning a protective refusal into the data loss it prevents.
-            setattr(project, f"{field}_previous", existing)
-            setattr(project, field, candidate)
+            # document — turning a protective refusal into the data loss it prevents. That
+            # ordering is this loop's; *what* the capture does is `write_document`'s, shared
+            # with the Director's own save and with every other machine writer since 13.1.
+            write_document(project, field, candidate, writer=DOCUMENT_WRITER_MACHINE)
             # A blank target accepts any first draft, by design, so the slot it captures is
             # empty and a restore would refuse. Reported separately: describing that as a
             # replacement whose previous version "can be restored" is a promise broken by
@@ -433,8 +436,9 @@ def register(ctx: RouterContext) -> None:
                     # names two writers for this document, and a machine write that displaced a
                     # Brief the Director spent an hour on without keeping a copy is precisely the
                     # loss the slot exists to prevent. Capture on apply, never on attempt.
-                    project.creative_brief_previous = existing
-                    project.creative_brief = turn.brief
+                    write_document(
+                        project, "creative_brief", turn.brief, writer=DOCUMENT_WRITER_MACHINE
+                    )
                     # A blank target accepts any first draft, so the slot it captures is empty and
                     # a restore would refuse. Reported separately, because describing that as a
                     # replacement whose previous version "can be restored" is a promise broken by

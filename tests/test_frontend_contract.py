@@ -2328,7 +2328,14 @@ def test_document_restore_wording_agrees_on_both_sides():
         # The two sides word the clause for their own sentence -- "one is kept when ..." in the
         # tooltip, "A version is only kept when ..." in the 409 -- so they are held to naming
         # the same writer rather than to being the same string.
-        for writer in ("Director reply", "save"):
+        #
+        # **The list was ("Director reply", "save") and that was one writer short of the
+        # mechanism.** Slice B added the planning write to the server's phrase and not to the
+        # browser's, and this loop could not see it: both sides said "save", neither said
+        # "Director reply", and the assertion passed over a phrase naming one writer against a
+        # phrase naming two. Every writer either side can name is checked now, so a fourth one
+        # added to one side alone fails here rather than a day later.
+        for writer in ("Director reply", "save", "planning write", "Suggest Video"):
             assert (writer in browser["capture"][document]) == (
                 writer in DOCUMENT_SLOT_CAPTURE[document]
             ), (document, writer)

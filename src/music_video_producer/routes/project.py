@@ -20,14 +20,17 @@ from ..app import (
     DEFAULT_SETTING_NOT_A_SETTING,
     DELETE_PROJECT_CONFIRM,
     DOCUMENT_LABELS,
+    DOCUMENT_WRITER_MACHINE,
+    DOCUMENT_WRITER_SAVE,
     PROJECT_CHANGED_REFUSAL,
     RECOVERY_SLOT_SUFFIX,
-    SAVE_CAPTURED_DOCUMENTS,
+    SUGGEST_VIDEO_FAILED,
     DefaultSettingRequest,
     DocumentName,
     ProjectCreate,
     ProjectDocumentsRequest,
     SectionListRequest,
+    SuggestVideoResponse,
     _adopt_expansion_maps,
     _adopt_job_measurements,
     _adopt_shot_effects,
@@ -40,12 +43,19 @@ from ..app import (
     _require_approval_unchanged,
     _require_in_flight_status_kept,
     _require_song_replacement_confirmation,
+    document_lock_refusal,
     document_restore_notice,
     document_restore_refusal,
     legal_sections,
     refresh_reference_maps,
+    run_suggest_video,
+    suggest_video_notice,
+    suggest_video_refusal,
+    write_document,
 )
+from ..director import DirectorUnavailable, brief_shortfall, compose_brief
 from ..models import Project, TreatmentMessage
+from ..timeline import suggest_video_input
 from .context import RouterContext
 
 
@@ -58,6 +68,7 @@ def register(ctx: RouterContext) -> None:
     the whole diff.
     """
     app = ctx.app
+    director = ctx.director
     discovered_looks = ctx.discovered_looks
     get_project = ctx.get_project
     get_project_for_update = ctx.get_project_for_update
@@ -116,19 +127,16 @@ def register(ctx: RouterContext) -> None:
         """
         project, generation = get_project_for_update(project_id)
         for field in DOCUMENT_LABELS:
-            text = getattr(request, field)
-            stored = getattr(project, field)
-            # **This capture has a second caller now and will have a third.** Slice B's
-            # `write_brief` fills the same slot from the planning route, and Suggest Video
-            # (story 13.1) will: *"the existing text goes to the recovery slot, and a locked
-            # Brief refuses the write by name"*. The lock half is already shared —
-            # `app.document_lock_refusal` exists for exactly that and names both callers in
-            # its own docstring. This half is not, and a third inline copy of *displace the
-            # stored text into the slot* is the two-answers-to-one-question shape that has
-            # produced this project's worst defects. **Extract before duplicating.**
-            if field in SAVE_CAPTURED_DOCUMENTS and text != stored:
-                setattr(project, f"{field}{RECOVERY_SLOT_SUFFIX}", stored)
-            setattr(project, field, text)
+            # **The capture was inline here and is not any more** (story 13.1). It had a second
+            # caller in Slice B's `write_brief` and Suggest Video would have been the third, so
+            # the comment this replaces asked for the extraction before that happened:
+            # *displace the stored text into the slot* written out three times is the
+            # two-answers-to-one-question shape that has produced this project's worst defects.
+            # `app.write_document` is the one implementation, and it is where the partition this
+            # route used to apply for itself — a save captures for `SAVE_CAPTURED_DOCUMENTS` and
+            # nothing else — now lives, as the `"save"` arm. The lock half was extracted first,
+            # for the same reason, and the two belong together.
+            write_document(project, field, getattr(request, field), writer=DOCUMENT_WRITER_SAVE)
             # Tri-state, and the one field here that means "leave it alone" when absent: every
             # other field defaults to "", which is why an omitted one blanks its document, and
             # a lock defaulting to False the same way would silently unlock every document on
@@ -189,6 +197,113 @@ def register(ctx: RouterContext) -> None:
             )
         )
         return store.save(project, if_generation=generation)
+
+    @app.post(
+        "/api/projects/{project_id}/brief/suggest", response_model=SuggestVideoResponse
+    )
+    async def suggest_video(project_id: str) -> SuggestVideoResponse:
+        """One press: a complete video idea proposed from the song (TP-3, TP-4, story 13.1).
+
+        *"I want a complete video idea proposed from my song, so that I have something to disagree
+        with instead of an empty box."* It writes the Brief and nothing else, and the Director
+        revises it before it is broken down into a Treatment and a Style bible — their own framing,
+        and the reason this is the first stage of planning rather than a step inside it.
+
+        **It is here, beside `PUT /documents` and the restore, because those are the other two
+        routes that touch the Brief's single kept version.** `planning_turn` is next door in
+        `unsorted.py` as a turn of a conversation; this is not one. There is no message, no thread
+        and no consent flag on the wire: `apply_documents` exists because a chat turn may write a
+        document *incidentally*, and the whole meaning of pressing this control is "write the
+        brief". A flag would be consent asked twice for one act, and the second ask is the one
+        somebody eventually defaults to true.
+
+        **Four guards, in this order, and the order is the argument.**
+
+        1. **The lock, before the model call.** A locked Brief refuses by name through
+           `document_lock_refusal` — Slice A's one implementation of *may a machine write this
+           document*, the same sentence the chat route refuses with. It is asked first because
+           telling a Director to go and fill in a lyric sheet, when the pass would refuse anyway,
+           sends them to do work that changes nothing. And it is asked *before* the call because
+           the alternative is spending minutes of their time to answer a question already settled.
+        2. **The song, before the model call**, by `suggest_video_refusal`. Sections are not
+           checked and never will be (R-15): a sectioned song gets a better pass, an unsectioned
+           one still gets a Brief.
+        3. **The lock again, after it**, on the freshly re-read project. A long pass holds nothing
+           open for minutes, and a Director who locked the Brief while it ran has said something
+           more recent than the check at the top. `director_chat` re-reads after its await for the
+           same reason and this is the same window, only longer.
+        4. **`if_generation`**, because this route fills a recovery slot.
+           `MANIFEST_WRITE_GUARDS` names a swapped slot as its example of a write whose loss is
+           undetectable afterwards: a pass landing over a manifest a save just wrote would revert
+           the save *and* record its text as "the version you had before", and both outcomes are a
+           well-formed pair of strings.
+
+        **Nothing is written until the reply validates**, and that is structural rather than a
+        branch. `run_suggest_video` never sees a `Project`; the manifest is not even re-read until
+        it has returned something, and `store.save` is reached only past the `is None` check. A
+        failed pass has no path to the store, so the Brief is byte-identical — which a test proves
+        by comparing the stored manifest across a failure rather than by reading this paragraph.
+
+        **A thin reply is written and reported as partial** (AD-39). It is not refused and it is
+        not re-rolled: four sections out of five is work the Director can react to, which is the
+        whole point of the feature, and `document_rejection`'s ratio floor is deliberately *not*
+        applied here for the same reason — it would refuse exactly the short-but-real answer this
+        route is required to keep. The one reply that is refused is the one with nothing in any
+        section, and that is refused in the parser, where it becomes a retry.
+        """
+        project = get_project(project_id)
+        if refusal := document_lock_refusal(project, "creative_brief"):
+            raise HTTPException(status_code=409, detail=refusal)
+        if refusal := suggest_video_refusal(project):
+            raise HTTPException(status_code=422, detail=refusal)
+        try:
+            outcome = await run_suggest_video(
+                director, brief_input=suggest_video_input(project)
+            )
+        except DirectorUnavailable as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        if outcome.suggestion is None:
+            # 502 rather than 504, on `director_chat`'s mapping: the provider answered badly or
+            # not at all, and this application is the gateway in front of it either way. The
+            # sentence names the exception class and the elapsed time and never the exception's
+            # own string, because `httpx.ReadTimeout` stringifies to `""` — see
+            # `director.failure_description`, which is where that lesson lives.
+            raise HTTPException(
+                status_code=502,
+                detail=SUGGEST_VIDEO_FAILED.format(
+                    document=DOCUMENT_LABELS["creative_brief"],
+                    elapsed=outcome.elapsed,
+                    attempts=outcome.attempts,
+                    failure=outcome.failure,
+                ),
+            )
+        project, generation = get_project_for_update(project_id)
+        if refusal := document_lock_refusal(project, "creative_brief"):
+            raise HTTPException(status_code=409, detail=refusal)
+        displaced = project.creative_brief
+        # Two facts, and they are not the same one. `write_document` answers *was the slot
+        # spent*; the restore button needs *is there anything in it*, and a first draft into a
+        # blank Brief spends the slot on `""`, which `restore_document` refuses. Reporting the
+        # first as though it were the second is a promise broken by the very next click.
+        restorable = (
+            write_document(
+                project,
+                "creative_brief",
+                compose_brief(outcome.suggestion),
+                writer=DOCUMENT_WRITER_MACHINE,
+            )
+            and bool(displaced.strip())
+        )
+        missing = brief_shortfall(outcome.suggestion)
+        return SuggestVideoResponse(
+            project=store.save(project, if_generation=generation),
+            partial=bool(missing),
+            missing=list(missing),
+            restorable=restorable,
+            attempts=outcome.attempts,
+            elapsed=outcome.elapsed,
+            notice=suggest_video_notice(outcome, restorable=restorable),
+        )
 
     @app.delete("/api/projects/{project_id}")
     def delete_project(project_id: str, confirm_delete: bool = False) -> dict[str, str]:
