@@ -959,6 +959,37 @@ def test_a_thin_reply_is_stored_and_reported_as_partial(tmp_path):
     assert stored.creative_brief_previous == "Before."
 
 
+def test_a_second_identical_pass_says_so_instead_of_calling_a_full_brief_blank(tmp_path):
+    """**Through the route, because the wiring is what keeps surviving.**
+
+    Two passes, the same suggestion both times. The second composes text byte-identical to what is
+    stored, `write_document` captures nothing on that comparison, and `restorable` therefore comes
+    back `False` — the same `False` a first draft into a blank Brief produces. Reading the
+    sentence off `restorable` alone told a Director looking at a page of their own words that it
+    *"was blank"*, which is what this asserts is gone.
+
+    The slot is asserted too: the first pass filled it, and the second must leave it alone rather
+    than overwrite the recoverable copy with the live one.
+    """
+    director = SuggestingDirector(suggestion(), suggestion())
+    client, store, _ = make_client(tmp_path, director=director)
+    project = suggestable_project(store, brief="Before.")
+
+    first = client.post(SUGGEST.format(project=project.id)).json()
+    second = client.post(SUGGEST.format(project=project.id)).json()
+
+    assert first["restorable"] is True
+    assert "can be restored" in first["notice"]
+    # The second wrote the same bytes, so there was nothing to displace.
+    assert second["restorable"] is False
+    assert "returned the same text" in second["notice"]
+    assert "blank" not in second["notice"]
+    assert "no previous version" not in second["notice"]
+    stored = store.get(project.id)
+    assert stored.creative_brief == compose_brief(suggestion())
+    assert stored.creative_brief_previous == "Before."
+
+
 def test_a_partial_pass_is_never_worded_as_a_finished_one(tmp_path):
     """The wording rule, isolated from the route so the branch itself is asserted.
 
@@ -966,15 +997,33 @@ def test_a_partial_pass_is_never_worded_as_a_finished_one(tmp_path):
     would be exactly the presentation AD-39 forbids, and it is the natural thing to write.
     """
     thin = SuggestVideoOutcome(suggestion=suggestion(arc=""), attempts=1, elapsed=12.0)
+    # **Every combination of the two facts below it**, because partial's primacy is
+    # unconditional and `changed` is a second thing that could have unseated it — the
+    # unchanged wording names no shortfall, so a pass that returned thin text twice would
+    # lose the only actionable part of its report.
     for restorable in (True, False):
-        notice = suggest_video_notice(thin, restorable=restorable)
-        assert notice.startswith("Partial:")
-        assert "Arc" in notice
+        for changed in (True, False):
+            notice = suggest_video_notice(thin, restorable=restorable, changed=changed)
+            assert notice.startswith("Partial:")
+            assert "Arc" in notice
     whole = SuggestVideoOutcome(suggestion=suggestion(), attempts=1, elapsed=12.0)
-    assert suggest_video_notice(whole, restorable=True).startswith("Suggest Video wrote")
-    assert "can be restored" in suggest_video_notice(whole, restorable=True)
-    assert "no previous version" in suggest_video_notice(whole, restorable=False)
-    assert "12.0s" in suggest_video_notice(whole, restorable=True)
+
+    def wording(**facts: bool) -> str:
+        return suggest_video_notice(whole, **facts)
+
+    assert wording(restorable=True, changed=True).startswith("Suggest Video wrote")
+    assert "can be restored" in wording(restorable=True, changed=True)
+    assert "no previous version" in wording(restorable=False, changed=True)
+    assert "12.0s" in wording(restorable=True, changed=True)
+    # The third arm. It claims nothing about the previous state and nothing about a kept
+    # version existing, so it is the one wording that is true whatever the slot holds.
+    for restorable in (True, False):
+        unchanged = wording(restorable=restorable, changed=False)
+        assert "returned the same text" in unchanged
+        assert "12.0s" in unchanged
+        assert "blank" not in unchanged
+        assert "no previous version" not in unchanged
+        assert "can be restored" not in unchanged
 
 
 def test_a_final_failure_leaves_the_manifest_byte_identical_and_names_the_class(tmp_path):

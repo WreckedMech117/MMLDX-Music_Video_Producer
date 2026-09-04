@@ -136,6 +136,7 @@ from .models import (
     SHOT_MODE_SPECS,
     Asset,
     AssetCitation,
+    BriefRange,
     EffectSpec,
     ExportLook,
     MessageNotice,
@@ -1518,6 +1519,25 @@ SUGGEST_VIDEO_FIRST_DRAFT_NOTICE = (
     "Suggest Video wrote the {document} in {elapsed:.1f}s. It was blank, so there is no previous "
     "version to restore."
 )
+#: **The pass returned the text the {document} already had.** A separate sentence because
+#: `restorable` collapses two causes and the wording read off it lied about one of them: a
+#: byte-identical machine write captures nothing, so `write_document` returns `False` exactly as it
+#: does for a first draft into a blank Brief, and `SUGGEST_VIDEO_FIRST_DRAFT_NOTICE` then told a
+#: Director looking at a page of their own text that it *"was blank"*. Reproduced against the route
+#: rather than reasoned: a second identical pass leaves `restorable` false on a non-blank Brief.
+#:
+#: The Director ruled a third sentence rather than softening the second, because *the model gave
+#: the same answer twice* is the fact worth having and a wording broad enough to cover both causes
+#: would lose it.
+#:
+#: **It does not say a kept version exists**, which the ruling's own phrasing would have implied.
+#: Nothing was displaced, so the slot holds whatever it held before this pass — possibly nothing,
+#: if the Brief was typed by hand and never machine-written. What is unconditionally true is that
+#: this pass did not touch it, and that is what the sentence claims.
+SUGGEST_VIDEO_UNCHANGED_NOTICE = (
+    "Suggest Video ran in {elapsed:.1f}s and returned the same text the {document} already had. "
+    "Nothing was replaced, so the restore button is exactly as you left it."
+)
 #: **Partial, and it leads with the word.** AD-39's rule is that a thin reply is stored and
 #: reported as partial *never presented as a finished Brief*, so the sentence has to be unmistakable
 #: at a glance rather than qualified halfway through. It names the sections that came back empty,
@@ -1634,14 +1654,22 @@ async def run_suggest_video(
     return SuggestVideoOutcome(attempts=attempts, elapsed=clock() - started, failure=failure)
 
 
-def suggest_video_notice(outcome: SuggestVideoOutcome, *, restorable: bool) -> str:
-    """The Director-facing sentence for a pass that wrote. One of three, and never two of them.
+def suggest_video_notice(
+    outcome: SuggestVideoOutcome, *, restorable: bool, changed: bool
+) -> str:
+    """The Director-facing sentence for a pass that wrote. One of four, and never two of them.
 
     Partial wins over both of the complete wordings, unconditionally, because AD-39's requirement
     is that a thin reply is *never presented as a finished Brief* — a sentence that led with "wrote
     the Creative brief" and mentioned the shortfall afterwards would be exactly that presentation.
     What is lost is the restore hint on a partial write, which the `restorable` field of the
     response carries for the client anyway.
+
+    **`changed` is a second fact for the same reason `restorable` is one.** `restorable`
+    separates *there is a version to restore* from *the slot was spent on nothing*;
+    `changed` separates *the slot was spent on nothing because the Brief was blank* from
+    *because the pass returned what was already there*. Both collapse into a single false
+    boolean if you try to derive them from each other.
 
     `restorable` is not the same fact as *the slot was spent*, and the difference is the whole of
     `DOCUMENT_FIRST_DRAFT_NOTICE`'s argument: a first draft into a blank Brief displaces `""`, so
@@ -1656,6 +1684,15 @@ def suggest_video_notice(outcome: SuggestVideoOutcome, *, restorable: bool) -> s
             document=DOCUMENT_LABELS["creative_brief"],
             elapsed=outcome.elapsed,
             missing=", ".join(missing),
+        )
+    # **Asked after partial and before either wording that reads `restorable`.** Partial
+    # keeps its primacy unconditionally, and it is not one of the sentences that was wrong:
+    # it makes no claim about the document's previous state at all. The two below do —
+    # `restorable` cannot tell a byte-identical rewrite from a first draft, and `changed`
+    # is the fact that can.
+    if not changed:
+        return SUGGEST_VIDEO_UNCHANGED_NOTICE.format(
+            document=DOCUMENT_LABELS["creative_brief"], elapsed=outcome.elapsed
         )
     wording = SUGGEST_VIDEO_WRITTEN_NOTICE if restorable else SUGGEST_VIDEO_FIRST_DRAFT_NOTICE
     return wording.format(

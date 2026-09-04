@@ -244,6 +244,35 @@ Director's own mis-click, and a caller writing raw JSON is not making one.
 the single-slot question moot for documents the planning tools touch. That is a different mechanism
 with a different lifetime and it gets its own argument.
 
+### R-19 — A pass that returns what was already there says so
+
+*Ruled 2026-09-04, on a false sentence found while closing Slice E2.*
+
+**A Brief full of the Director's own words was reported as having been blank.** Reproduced through
+the route rather than reasoned: `restorable` is `write_document(...) and bool(displaced.strip())`,
+and a machine write captures nothing when the text is byte-identical, so a second identical pass
+returns the same `False` a first draft into a blank Brief returns. `SUGGEST_VIDEO_FIRST_DRAFT_NOTICE`
+then says *"It was blank, so there is no previous version to restore"* over a full page.
+
+**The cause is one boolean carrying two facts**, which is the shape this feature has now produced
+twice: `restorable` already exists because *the slot was spent* and *there is something in it* are
+different questions, and this is the same error one level down.
+
+**Ruled: a third sentence, rather than softening the second.** *"The pass returned the same text the
+Brief already had, so nothing was replaced and your kept version is untouched."* A wording broad
+enough to cover both causes would lose the fact worth having, which is that **the model gave the
+same answer twice** — a Director who re-runs a pass wants to know it was not worth re-running.
+
+**Two departures from the ruling's own phrasing, both deliberate.** The shipped sentence does not
+say *a kept version exists*: nothing was displaced, so the slot holds whatever it held before, and
+that can be nothing at all. And it carries the elapsed time like its three siblings. What it claims
+is only what is unconditionally true — that this pass did not touch the slot.
+
+**Partial still wins over it, unconditionally.** AD-39's requirement is that a thin reply is never
+presented as a finished Brief, and the partial wording is not one of the sentences that was wrong:
+it makes no claim about the document's previous state at all. A pass that returned the same thin
+text twice reports the shortfall, because the shortfall is the actionable part.
+
 ## Open questions for the PRD
 
 1. ~~**What exactly is a "Brief" for, now?**~~ **Answered 2026-08-22, and the analyst's premise was wrong.** The Brief is *already* upstream: `timeline.py` puts `creative_brief` into the project dump at three call sites, and the Director's own prompt opens *"You are handed the whole project: creative brief, treatment, style bible, the song's words."* Treatment and Style Bible have always been generated with the Brief as an input — the Director's original understanding was correct.

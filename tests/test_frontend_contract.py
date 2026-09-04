@@ -3023,6 +3023,7 @@ def suggest_reply(**overrides) -> dict:
     )
     elapsed = overrides.pop("elapsed", 130.44)
     restorable = overrides.pop("restorable", True)
+    changed = overrides.pop("changed", True)
     outcome = SuggestVideoOutcome(suggestion=suggestion, attempts=1, elapsed=elapsed)
     written = {**SUGGEST_PROJECT, "creative_brief": "WRITTEN BY THE PASS",
                "creative_brief_previous": SUGGEST_PROJECT["creative_brief"]}
@@ -3030,7 +3031,7 @@ def suggest_reply(**overrides) -> dict:
     return {
         "project": written, "partial": bool(missing), "missing": list(missing),
         "restorable": restorable, "attempts": 1, "elapsed": elapsed,
-        "notice": suggest_video_notice(outcome, restorable=restorable),
+        "notice": suggest_video_notice(outcome, restorable=restorable, changed=changed),
         **overrides,
     }
 

@@ -281,6 +281,14 @@ def register(ctx: RouterContext) -> None:
         if refusal := document_lock_refusal(project, "creative_brief"):
             raise HTTPException(status_code=409, detail=refusal)
         displaced = project.creative_brief
+        proposed = compose_brief(outcome.suggestion)
+        # **A third fact, and it is not derivable from the two below.** A machine write
+        # captures nothing when the text is byte-identical, so `write_document` returns
+        # the same `False` for *the pass returned what was already there* as it does for
+        # *the Brief was blank* — and the second of those is what the notice used to say
+        # out loud, on a page full of the Director's own words. Compared here, before the
+        # write, rather than inferred from its answer afterwards.
+        changed = proposed != displaced
         # Two facts, and they are not the same one. `write_document` answers *was the slot
         # spent*; the restore button needs *is there anything in it*, and a first draft into a
         # blank Brief spends the slot on `""`, which `restore_document` refuses. Reporting the
@@ -289,7 +297,7 @@ def register(ctx: RouterContext) -> None:
             write_document(
                 project,
                 "creative_brief",
-                compose_brief(outcome.suggestion),
+                proposed,
                 writer=DOCUMENT_WRITER_MACHINE,
             )
             and bool(displaced.strip())
@@ -302,7 +310,7 @@ def register(ctx: RouterContext) -> None:
             restorable=restorable,
             attempts=outcome.attempts,
             elapsed=outcome.elapsed,
-            notice=suggest_video_notice(outcome, restorable=restorable),
+            notice=suggest_video_notice(outcome, restorable=restorable, changed=changed),
         )
 
     @app.delete("/api/projects/{project_id}")
