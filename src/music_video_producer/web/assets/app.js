@@ -1,5 +1,9 @@
 import { adoptedShotEffects, aiModPlan, alignLyricsKeptTranscription, api, applyRenderStatus, APPLY_DOCUMENTS_CONTROL, approvalControl, approvalNotice, assetNamePlan, assetsForTab, assetTab, assetTabEmpty, ASSET_NAME_HELP, ASSET_NAME_LABEL, ASSET_ROLE_LABELS, ASSET_TABS, assistantControl, assistantFillAllControl, assistantToast, ASSISTANT_EDIT_BLOCKED, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, batchReportToast, beatBandIdentity, beatMarkersControlPlan, characterSlotPlan, CITATION_MISSING_LABEL, clearDocumentConsent, clipEffectsChip, comfyOutputUrl, consistencyAnchorPlan, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, documentChangeToast, documentClearing, documentClearingQuestion, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, DOCUMENT_CONTROLS, driveReadoutPlan, driveReadoutView, driveReadoutWanted, effectBandChange, effectBandEdit, effectBandStripDrag, effectBandStripHit, effectBandStripPlan, effectBandToggle, effectBindingsBody, effectBindingsSet, effectControlKey, effectControlTarget, effectCopyBody, effectCopyReport, effectDropTarget, effectMoveOffered, effectNudgeDirection, effectNudgeTarget, effectParameterDefinition, effectParameterReadout, effectParameterValue, effectSliderFill, effectsPanelModel, effectsRefusalNotice, effectStackAdd, effectStackChanged, effectStackMove, effectStackRemove, effectStackSetParameter, effectStackToggle, effectStackWrite, EFFECT_BAND_CLOSED, EFFECT_BAND_ID, EFFECT_PARAMETER_ID, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, expansionReport, generateAllPlan, hasActiveRenderJobs, INSTRUMENTAL_NOTE, jobTarget, markReadyControl, markReadyNotice, monitorPreviewView, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, PLACEHOLDER_PROMPT, prefillControl, PREVIEW_UNPLAYABLE, previewAdoption, randomSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderAgainQuestion, renderSettledToast, RENDER_POLL_INTERVAL_MS, resolveShotMode, shotBoundaries, shotCitations, shotEffectStack, shotExpansionToast, shotInspectorReadiness, shotLabel, shotModeOptionLabel, shotPreviewWanted, shotPromptCell, shotSpecificationProblems, shotTab, shotTabAfterKey, shotTabStrip, shotTakeUrl, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SHOT_TABS, SINGING_STATES, snapSeconds, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songOrderRanks, songRefusalMessage, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, tagLyricLine, threadHtml, unsavedWorkPending, unsavedWorkQuestion, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, vocalTaggingPlan, vocalTypeSpec, VOCAL_TYPES, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE } from "./api.js";
 import { ASSEMBLE_RUNNING, EXPORT_PRESETS, EXPORT_PRESET_DEFAULT, assemblyControl, assemblyProgress, effectiveOffset, latestAssemblyExport, monitorShowsTake, monitorState, newShotFromPlan, renderProgressByTarget, renderingFlag, shotRenderState, takeAnchorControl, takeAudioControl, takesStripRows, trimNudgeControl } from "./api.js";
+// Suggest Video's watched pass (TP-4, story 13.2). Every decision is pure and lives in api.js --
+// the ticking approximation, the measurement, the abandon question and the note's face -- and
+// this module starts the pass, draws them and stops watching when it is told to.
+import { SUGGEST_VIDEO_ABANDON_CONTROL, SUGGEST_VIDEO_CONTROL, SUGGEST_VIDEO_ELAPSED, SUGGEST_VIDEO_ELAPSED_HELP, SUGGEST_VIDEO_INDICATOR, SUGGEST_VIDEO_NOTE, SUGGEST_VIDEO_NOTE_KINDS, SUGGEST_VIDEO_QUESTION, SUGGEST_VIDEO_TICK_MS, suggestVideoAbandonQuestion, suggestVideoAbandonedNote, suggestVideoControl, suggestVideoNote, suggestVideoRunningLabel } from "./api.js";
 import { EXPAND_ALL_PROMPTS_CONFIRM, EXPAND_ALL_PROMPTS_RUNNING, EXPAND_ALL_PROMPTS_TIMELINE_CONTROL, EXPAND_ALL_PROMPTS_TIMELINE_LABEL, NOTICE_KINDS, expansionSweepLines } from "./api.js";
 // Generate All Empty: the cuts bar's second batch door, beside Expand All Prompts. Its whole
 // decision -- the count, the drafts it commits on the way, the bundle it spends -- is
@@ -357,6 +361,12 @@ async function loadProject(id) {
     // randomizer on a shot nobody has looked at -- and a *refresh* must not untick a box the
     // Director ticked a second ago.
     randomizeSeedShots.clear();
+    // And the last Suggest Video report, on the identical test and for the sharpest version of
+    // its reason: that note names a document and a measured time, and left standing over another
+    // project it is a specific false claim about a Brief nobody has run a pass on. A *refresh*
+    // must not clear it -- the queue poll reloads the project on screen every few seconds, and
+    // the report of a five-minute pass would vanish before it had been read.
+    setSuggestNote("", "");
   }
   // The transition catalogue is asked again if this workspace still has not got one. A plan
   // landing is this application's retry for it: bounded to one request per load by the flag the
@@ -1023,6 +1033,7 @@ function renderTreatment() {
     $(control.box).value = project?.[documentKey] || "";
   }
   syncDocumentControls();
+  syncSuggestVideoControls();
   const thread = $("#chat-thread");
   // The whole body -- the empty-thread copy, every bubble, the prose/notice split and every
   // escape -- is `threadHtml`, a pure function the suite executes. This line is the only place
@@ -5268,6 +5279,162 @@ async function restoreDocument(documentKey) {
   }
 }
 
+// -- Suggest Video: a pass you can watch and walk away from (TP-4, story 13.2, slice E2) ----------
+//
+// The pass in flight, or null. `{ projectId, startedAt, timer, controller, abandoned }` -- one
+// record rather than five flags, because each of them is meaningless without the others: a start
+// time with no pass is a number the indicator would go on painting, and a controller with no pass
+// is an abort nothing is waiting on. `endSuggestPass` drops the whole record, so "is a pass
+// running" is one question with one answer.
+//
+// Deliberately module-level rather than on `state`: `state.project` is what `PUT /api/projects/{id}`
+// sends back whole, and anything folded into it is written straight into the manifest by the next
+// ordinary save. A pass in flight is not a fact about a video.
+let suggestPass = null;
+
+// The button's live state, applied from the one pure decision and nowhere else. It runs from
+// `renderTreatment` -- which every project load and every reply already goes through -- and from
+// both ends of a pass, because those are the only moments the answer changes.
+function syncSuggestVideoControls() {
+  const control = suggestVideoControl(Boolean(suggestPass));
+  const button = $(SUGGEST_VIDEO_CONTROL);
+  button.disabled = control.disabled;
+  button.title = control.title;
+}
+
+// The ticking number, repainted. **This is the approximation, and it is the only thing here that
+// ever reads a clock**: the label function it calls has no parameter a reply could be passed
+// through, so nothing on this path can paint the server's measurement into the running indicator.
+function paintSuggestElapsed() {
+  if (!suggestPass) return;
+  $(SUGGEST_VIDEO_ELAPSED).textContent = suggestVideoRunningLabel(suggestPass.startedAt, Date.now());
+}
+
+// The indicator goes up, the clock starts, and the note of whatever happened last comes down --
+// a finished report left standing over a pass that has just started would be describing a run that
+// is not the one on screen. Answers the record, so the caller holds the pass it started rather than
+// re-reading a module-level slot that `endSuggestPass` will have emptied by the time it looks.
+function beginSuggestPass(projectId, controller) {
+  suggestPass = { projectId, startedAt: Date.now(), timer: 0, controller, abandoned: false };
+  setSuggestNote("", "");
+  const indicator = $(SUGGEST_VIDEO_INDICATOR);
+  indicator.hidden = false;
+  indicator.title = SUGGEST_VIDEO_ELAPSED_HELP;
+  // Painted once before the first tick fires, or the indicator carries the empty string for a whole
+  // second at the one moment the Director is looking hardest at it.
+  paintSuggestElapsed();
+  suggestPass.timer = setInterval(paintSuggestElapsed, SUGGEST_VIDEO_TICK_MS);
+  syncSuggestVideoControls();
+  return suggestPass;
+}
+
+// The pass is over as far as this browser is concerned, however it ended.
+//
+// **This is the line that keeps the two elapsed numbers from contradicting each other.** The
+// ticking reading is stopped, taken off the screen *and emptied* here, and every caller runs it
+// before drawing a report -- so the approximation is never left standing beside the measurement for
+// anyone to compare, and a stale number cannot survive behind a hidden element to reappear on the
+// next pass. Idempotent, because it is called on the reply path and again in a `finally`.
+function endSuggestPass() {
+  if (!suggestPass) return;
+  clearInterval(suggestPass.timer);
+  suggestPass = null;
+  $(SUGGEST_VIDEO_INDICATOR).hidden = true;
+  $(SUGGEST_VIDEO_ELAPSED).textContent = "";
+  syncSuggestVideoControls();
+}
+
+// The last pass's report, or nothing. `kind` is one of the stylesheet's three edges; `""` both
+// clears the text and hides the note, which is what a new pass and a project change each want.
+function setSuggestNote(text, kind) {
+  const note = $(SUGGEST_VIDEO_NOTE);
+  note.textContent = text;
+  note.hidden = !text;
+  for (const face of SUGGEST_VIDEO_NOTE_KINDS) note.classList.toggle(face, kind === face);
+}
+
+// One press: a whole video idea proposed from the song and written into the Brief.
+//
+// **Two guards before anything is sent.** A second press while one is running is refused rather
+// than queued -- the control is already shut, and this is the same answer for a keyboard press or
+// for a click that was already on its way. And the reply re-renders the document editors from the
+// server, so the unsaved-edits question every other server-overwrites-the-editors path asks is
+// asked here too: five minutes later is the worst possible moment to discover typing was discarded.
+//
+// The project id is captured before the await, on `expandShotPrompts`' rule and for longer: this
+// call can run for five minutes with the project selector live throughout, and a reply adopted
+// under another project's name would draw one project's Brief as another's.
+async function suggestVideo() {
+  if (!requireProject()) return;
+  if (suggestPass) return;
+  if (!confirmDiscardingDocumentEdits(SUGGEST_VIDEO_QUESTION)) return;
+  const controller = new AbortController();
+  // The record, held locally, and **the project id is read back off it** rather than kept in a
+  // second variable: the id the request is sent for and the id the reply is checked against are
+  // then one value that cannot drift apart.
+  //
+  // Held locally rather than re-read from `suggestPass` after the await, which would read `null`:
+  // an abandon empties that slot synchronously and the rejection it causes arrives a microtask
+  // later, so the abandoned arm below would never be taken and a pass the Director stopped
+  // watching would report itself as a failure.
+  const pass = beginSuggestPass(state.project.id, controller);
+  try {
+    const reply = await api.suggestVideo(pass.projectId, { signal: controller.signal });
+    // Stopped and cleared *before* the report is drawn, so the ticking approximation and the
+    // server's measurement are never on screen at the same time.
+    endSuggestPass();
+    // A reply that beat the abort home. Dropped rather than drawn: the Director was told this
+    // browser had stopped watching and that reloading is how they would find out, and adopting the
+    // result now would make both halves of that sentence false while it is still on screen.
+    if (pass.abandoned) return;
+    if (state.project?.id !== pass.projectId) return;
+    state.project = reply.project;
+    markDocumentsSaved();
+    renderAll();
+    // The server's own sentence, and the face `partial` decides. Nothing about the outcome is
+    // recomputed from the Brief's text here.
+    const note = suggestVideoNote(reply);
+    setSuggestNote(note.text, note.kind);
+  } catch (error) {
+    endSuggestPass();
+    // An abandoned pass has no failure to report: the abort is this browser's own doing and the
+    // pass is running perfectly well on the server. Reporting its `AbortError` would be the
+    // application announcing a fault it caused itself, over the note that just explained it.
+    if (pass.abandoned) return;
+    // Otherwise E1's sentence, whichever it is -- the 502 names the exception class and the elapsed
+    // time, the 409 the lock refusal, the 422 the song refusal. `errorMessage` renders all of them
+    // into `error.message`, which is why a `ReadTimeout` that stringifies to `""` still arrives as
+    // a sentence rather than as a blank.
+    setSuggestNote(error.message, "failed");
+  } finally {
+    endSuggestPass();
+  }
+}
+
+// **Abandon stops watching, and says so before it is pressed** (the ruling of 2026-09-04).
+//
+// The route has no cancellation awareness -- no `Request` parameter, no `is_disconnected()` -- so
+// the abort below stops this browser waiting and reaches the server not at all: the pass runs to
+// completion and writes the Brief. `suggestVideoAbandonQuestion` says exactly that, in the future
+// tense, because this application already forbids a control claiming in the past tense that
+// something happened when it did not. What makes saying it safe rather than merely honest is E1's
+// recovery slot, which holds the text this pass will displace.
+//
+// The abort is issued rather than the promise merely ignored: an ignored fetch is a reply that
+// lands minutes later and writes `state.project` over whatever the Director has done since -- a
+// second unannounced write, on top of the one they were warned about.
+function abandonSuggestVideo() {
+  if (!suggestPass) return;
+  if (!window.confirm(suggestVideoAbandonQuestion(state.project))) return;
+  suggestPass.abandoned = true;
+  // Composed before the abort, off the project as it stands: the same state the question they just
+  // answered was worded from, so the note and the question cannot describe different Briefs.
+  const note = suggestVideoAbandonedNote(state.project);
+  suggestPass.controller.abort();
+  endSuggestPass();
+  setSuggestNote(note, "");
+}
+
 // Write a prompt onto every unlocked shot from the Treatment, the Style bible and the shot
 // windows. It queues nothing: no render is submitted, no shot status changes, and the prompts land
 // in the shot inspector where they stay editable -- which is why the button says so.
@@ -6980,6 +7147,11 @@ function bindEvents() {
   });
   $("#send-treatment").addEventListener("click", () => document.querySelector('[data-panel="treatment"]').click());
   $("#expand-shot-prompts").addEventListener("click", () => expandShotPrompts("story"));
+  // Suggest Video and the control that stops watching it. Both are bound here rather than drawn
+  // per render: they are markup that never moves, and a handler rebound on every paint is how a
+  // click lands twice.
+  $(SUGGEST_VIDEO_CONTROL).addEventListener("click", suggestVideo);
+  $(SUGGEST_VIDEO_ABANDON_CONTROL).addEventListener("click", abandonSuggestVideo);
   $("#dp-pass").addEventListener("click", () => expandShotPrompts("photography"));
   // Pass two, beside pass one and in that order on screen, because that is the order the two run
   // in: pass one lays the shots out so they flow together and writes each one's intent, pass two

@@ -2,9 +2,13 @@
 
 Epic 10's retrospective action item **22**: *a gate that is not in the gate is not a gate.*
 `pyproject.toml` sets `testpaths = ["tests"]` with pytest's default `python_files`, so all
-~~twenty-four~~ ~~twenty-five~~ **twenty-six** `tests/e2e_*.py` files — ~~twenty-three~~
-~~twenty-four~~ **twenty-five** harnesses
-and `e2e_support.py` — sit outside `uv run pytest -q`. What that cost, measured:
+~~twenty-four~~ ~~twenty-five~~ ~~twenty-six~~ **twenty-nine** `tests/e2e_*.py` files —
+~~twenty-three~~ ~~twenty-four~~ ~~twenty-five~~ **twenty-eight** harnesses
+and `e2e_support.py` — sit outside `uv run pytest`. *(Corrected 2026-09-04: this said twenty-six
+and twenty-five, and was two harnesses stale before Suggest Video's was added — a count going
+stale inside the module whose whole subject is counts going stale, and the one number here that
+no test reads. `test_the_runbook_counts_what_it_lists` guards the runbook's sentences; nothing
+guards this one.)* What that cost, measured:
 `e2e_effects_tab.py` broke on Epic 10's first slice and **four consecutive slices reported green**;
 `1933c2e` made `e2e_band_panel.py`'s step 7e unreachable, so Story 10.4's browser QA gate could not
 have passed as written; two more have been failing since before Epic 10; and `e2e_band_panel.py`
@@ -86,7 +90,8 @@ WORDS = {
     "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
     "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
     "nineteen": 19, "twenty": 20, "twenty-one": 21, "twenty-two": 22, "twenty-three": 23,
-    "twenty-four": 24, "twenty-five": 25,
+    "twenty-four": 24, "twenty-five": 25, "twenty-six": 26, "twenty-seven": 27,
+    "twenty-eight": 28, "twenty-nine": 29, "thirty": 30,
 }
 
 
@@ -330,7 +335,7 @@ def test_the_runbook_counts_what_it_lists():
 
 @pytest.mark.parametrize("name", [path.stem for path in harnesses()])
 def test_each_harness_is_reached_by_all_of_the_above(name):
-    """A named case per harness, so a green run says which twenty-three were looked at.
+    """A named case per harness, so a green run says which twenty-eight were looked at.
 
     Without this the whole of item 22 is seven test functions, and a harness that vanished from
     `tests/` would take its coverage with it silently — which is the failure mode of every count

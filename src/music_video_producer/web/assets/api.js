@@ -1012,6 +1012,192 @@ export function documentRestoreStaleNotice(document, available) {
     : `No kept version of ${label} exists on the server; this project has been refreshed.`;
 }
 
+// -- Suggest Video, watched (TP-4, story 13.2, slice E2) -----------------------------------------
+//
+// The route shipped headless in E1: one press proposes a whole video idea and writes the Brief,
+// with one retry, a byte-identical Brief on failure, and a failure reported by exception class and
+// elapsed time. What only a browser can answer is whether a Director can *watch* it: a local model
+// takes minutes and the pass's own timeout is 300 s, so an interface that says nothing for five
+// minutes is indistinguishable from a broken application.
+//
+// **Two elapsed numbers exist and they are different facts.**
+//
+// * `suggestVideoTicked` is the *client's approximation* — how long this browser has had a request
+//   in flight. It includes the request and the reply on the wire, and it is whole seconds, floored.
+// * `suggestVideoMeasured` is the *measurement* — `SuggestVideoResponse.elapsed`, the wall clock
+//   `run_suggest_video` kept across every attempt, quoted to the same tenth of a second the
+//   server's own sentences quote it to.
+//
+// **The rule that stops them contradicting each other is structural rather than remembered: they
+// are never on screen at the same time, and neither function can see the other's input.** The
+// ticking one takes a start time and a clock and has no parameter a reply could reach; the measured
+// one takes a reply and has no parameter a clock could reach. `app.js` takes the ticking number off
+// the screen — and empties the element that held it — before it draws the report, so the
+// approximation is never left standing beside the measurement for a reader to compare.
+//
+// **There is no percentage, no bar, no estimate and no spinner** (standing law 8, UX-TP10). Nothing
+// here knows how far through the pass is, because nothing can: reasoning length swings 26x across
+// identical rolls on this model. Elapsed time is the honest reading, and the number gets large.
+export const SUGGEST_VIDEO_CONTROL = "#suggest-video";
+export const SUGGEST_VIDEO_LABEL = "Suggest video";
+export const SUGGEST_VIDEO_INDICATOR = "#suggest-indicator";
+export const SUGGEST_VIDEO_ELAPSED = "#suggest-elapsed";
+export const SUGGEST_VIDEO_ABANDON_CONTROL = "#abandon-suggest";
+export const SUGGEST_VIDEO_ABANDON_LABEL = "Stop watching";
+export const SUGGEST_VIDEO_NOTE = "#suggest-note";
+//: The three faces the note can wear, which are the stylesheet's three coloured left edges. Named
+//: here rather than spelled out at the toggle so a face added to one and not the other cannot
+//: leave a stale class on the note: `setSuggestNote` clears every one of these on every write.
+export const SUGGEST_VIDEO_NOTE_KINDS = ["written", "partial", "failed"];
+
+//: How often the indicator repaints. One second, because the reading is whole seconds: a faster
+//: tick would repaint the same string, and a slower one would let the number lag what it claims.
+export const SUGGEST_VIDEO_TICK_MS = 1000;
+
+//: What the button says it will do, before it is pressed. It names the cost (minutes, and no
+//: render), what it replaces, and that the version it replaces is kept — because this is the one
+//: control in the workspace that spends the Brief's single recovery slot without the Director
+//: typing anything.
+export const SUGGEST_VIDEO_HELP =
+  "Propose a whole video idea from the song and write it into the Creative brief. It calls the "
+  + "local model and can take minutes; nothing is rendered. The Brief you have now is kept and can "
+  + "be restored.";
+//: And what it says while one is already running. A second press cannot help — the pass is one call
+//: and there is nothing to queue behind it — so the control is shut rather than left to fire a
+//: second five-minute pass over the first one's result.
+export const SUGGEST_VIDEO_BUSY_HELP =
+  "A Suggest Video pass is already running. Its elapsed time is beside the workspace heading.";
+
+//: The indicator's own reading. `{elapsed}` is the *approximation*, filled by
+//: `suggestVideoRunningLabel`, and the word "running" is the whole claim being made — never a
+//: fraction, and never an estimate of what is left.
+export const SUGGEST_VIDEO_RUNNING = "Suggest Video · running · {elapsed}";
+//: Hover text on the indicator, which is where standing law 8 is said to the Director in words. It
+//: states which of the two numbers they are looking at, so the finished report quoting a slightly
+//: different one reads as the measurement replacing the estimate rather than as a disagreement.
+export const SUGGEST_VIDEO_ELAPSED_HELP =
+  "Time since this browser sent the request. There is no progress figure because how far through a "
+  + "language-model pass is cannot be measured; when it lands it reports its own measured time.";
+
+//: The unsaved-edits question this press asks, in `confirmDiscardingDocumentEdits`'s form. The
+//: reply is the whole project and the editors are re-rendered from it, exactly as an expansion and
+//: a restore are — so the same gate is asked here, worded for the write that is about to happen.
+export const SUGGEST_VIDEO_QUESTION =
+  "Run Suggest Video? It replaces the Creative brief with a proposal written from the song.";
+
+//: What is drawn for a pass that came back and said nothing. A reply carrying no notice is a server
+//: fault, and a note left blank at the moment a five-minute pass lands reads as "nothing happened" —
+//: the exact failure class this slice exists to remove. Never composed beside a notice that exists.
+export const SUGGEST_VIDEO_SILENT_REPLY =
+  "Suggest Video wrote the {document} in {elapsed}s and reported nothing else.";
+
+//: **The abandon confirmation, and it promises nothing it cannot deliver.** The route has no
+//: cancellation awareness — no `Request` parameter and no `is_disconnected()` — so aborting this
+//: browser's fetch does not reach the server: the pass runs to completion and writes. Making the
+//: server check before writing was rejected (2026-09-04) because `is_disconnected()` is unreliable
+//: and leaves a race, and **a write that lands after a promise not to is worse than one the
+//: Director was warned about.** This application already forbids a control claiming in the past
+//: tense that something happened when it did not; promising in the future tense what will not
+//: happen is the same fault, so this sentence says plainly that the pass cannot be called back.
+export const SUGGEST_VIDEO_ABANDON_QUESTION =
+  "Stop watching this pass?\n\nIt cannot be called back. It goes on running, and if it finishes it "
+  + "writes the {document} — stopping only takes the indicator off your screen.\n\n{recovery}";
+//: The recovery half, and it is two sentences rather than one because the Brief's slot has two
+//: states and only one of them can be promised. `DOCUMENT_FIRST_DRAFT_NOTICE`'s argument exactly: a
+//: first draft into a blank Brief spends the slot on `""` and the restore route refuses it, so
+//: offering a restore there is a promise broken by the very next click.
+export const SUGGEST_VIDEO_ABANDON_KEPT =
+  "The {document} stored now is kept as the version the pass replaces, so \"Restore {document}\" "
+  + "puts it back.";
+export const SUGGEST_VIDEO_ABANDON_BLANK =
+  "The {document} stored now is empty, so there is nothing to keep and nothing to restore: what the "
+  + "pass writes is a first draft.";
+//: What is left on screen after abandoning. It repeats neither more nor less than the question just
+//: accepted, and it names the one gesture that shows what the pass did — this client cannot know
+//: when a pass it stopped watching finishes, and a note implying it would find out on its own would
+//: be the same false promise in a third tense.
+export const SUGGEST_VIDEO_ABANDONED_NOTE =
+  "Stopped watching. The pass was not called back, so what is on screen may be out of date: reload "
+  + "this page to see whether it wrote. {recovery}";
+
+// The approximation. Whole seconds and **floored**, so the indicator can never claim more time has
+// passed than has: rounding to nearest would show "1s" at 500 ms, which is a number the client has
+// not earned. Non-finite and backwards inputs answer 0 rather than propagating — a clock that went
+// backwards is not evidence that a pass ran for minus three seconds.
+export function suggestVideoTicked(startedAt, now) {
+  const millis = Number(now) - Number(startedAt);
+  if (!Number.isFinite(millis) || millis <= 0) return 0;
+  return Math.floor(millis / 1000);
+}
+
+// The indicator's whole text. Takes a start time and a clock, and **there is no parameter a reply
+// could be passed in through**: that is what keeps the approximation and the measurement apart.
+export function suggestVideoRunningLabel(startedAt, now) {
+  return fillWording(SUGGEST_VIDEO_RUNNING, { elapsed: `${suggestVideoTicked(startedAt, now)}s` });
+}
+
+// The measurement, in the tenth of a second the server's own sentences quote. Takes a reply, and
+// **there is no parameter a clock could be passed in through**, for the same reason.
+export function suggestVideoMeasured(reply) {
+  const elapsed = Number(reply?.elapsed);
+  return (Number.isFinite(elapsed) && elapsed > 0 ? elapsed : 0).toFixed(1);
+}
+
+// Whether the button is live, and what it says in each state. Pure so both halves are executable;
+// applied by `syncSuggestVideoControls` and nowhere else.
+export function suggestVideoControl(running) {
+  return running
+    ? { disabled: true, title: SUGGEST_VIDEO_BUSY_HELP }
+    : { disabled: false, title: SUGGEST_VIDEO_HELP };
+}
+
+// The clause about the recovery slot, in the one state it can honestly be said in. Read off the
+// **stored** text rather than off the textarea: the slot captures what the server holds, which is
+// what a Director who typed and did not save would otherwise be promised back.
+function suggestVideoRecoveryClause(project) {
+  const stored = project?.creative_brief;
+  const kept = typeof stored === "string" && stored.trim().length > 0;
+  return fillWording(kept ? SUGGEST_VIDEO_ABANDON_KEPT : SUGGEST_VIDEO_ABANDON_BLANK, {
+    document: documentLabel("creative_brief"),
+  });
+}
+
+export function suggestVideoAbandonQuestion(project) {
+  return fillWording(SUGGEST_VIDEO_ABANDON_QUESTION, {
+    document: documentLabel("creative_brief"),
+    recovery: suggestVideoRecoveryClause(project),
+  });
+}
+
+export function suggestVideoAbandonedNote(project) {
+  return fillWording(SUGGEST_VIDEO_ABANDONED_NOTE, {
+    recovery: suggestVideoRecoveryClause(project),
+  });
+}
+
+// What the note says when a pass lands, and which of the faces it wears.
+//
+// **The sentence is the server's own `notice`, verbatim.** It already states the measured elapsed
+// time and, on a partial, names the sections that came back empty — so composing a second sentence
+// here out of `missing` would be a sibling copy of a wording that has already been got right once,
+// and this repository's record on sibling copies is that the second one goes stale on its own.
+// `partial` is read for the *face* rather than for the words, which is precisely the split
+// `SuggestVideoResponse` was designed for: "a client that wants to mark the box needs the boolean
+// rather than a substring search on a sentence".
+//
+// Nothing here recomputes `partial` or `missing` from the Brief's text (constraint 6): the reply is
+// the authority on what came back thin, and this browser has no second opinion about it.
+export function suggestVideoNote(reply) {
+  const notice = typeof reply?.notice === "string" ? reply.notice.trim() : "";
+  return {
+    kind: reply?.partial === true ? "partial" : "written",
+    text: notice || fillWording(SUGGEST_VIDEO_SILENT_REPLY, {
+      document: documentLabel("creative_brief"),
+      elapsed: suggestVideoMeasured(reply),
+    }),
+  };
+}
+
 // What a Director reply actually did to the documents, computed from the project before and
 // after the call. The reply itself states which documents changed, were locked, or were
 // rejected; the toast is the most prominent feedback there is, so it must not assert an
@@ -10872,6 +11058,18 @@ export const api = {
   // Recovery must not depend on the model that caused the problem, so this is its own
   // route and carries no message: nothing here reaches the Director.
   restoreDocument: (id, document) => request(`/api/projects/${id}/documents/${document}/restore`, { method: "POST" }),
+  // One press: a whole video idea proposed from the song and written into the Brief (TP-3, TP-4).
+  // No body at all — everything the pass reads is derived on the server from the project itself,
+  // and there is no consent flag because pressing the control *is* "write the brief": a flag here
+  // would be consent asked twice for one act, and the second ask is the one somebody defaults to
+  // true. The reply is `SuggestVideoResponse`: the whole project, plus the four facts about the
+  // pass that the project cannot carry.
+  //
+  // **`signal` is the only thing on the wire this caller adds, and it does not cancel anything on
+  // the server.** The route has no cancellation awareness, so aborting stops this browser waiting
+  // and nothing else; `abandonSuggestVideo` says so before it is used. It is here rather than
+  // absent because the alternative is a fetch nobody can ever stop listening to.
+  suggestVideo: (id, { signal = undefined } = {}) => request(`/api/projects/${id}/brief/suggest`, { method: "POST", signal }),
   // `updated_at` is the revision this list was edited against; the server refuses the save
   // when it is stale (409) instead of silently overwriting later work — the 2026-08-19
   // revert, where one background save from a tab loaded earlier reverted 32 prompts at once.

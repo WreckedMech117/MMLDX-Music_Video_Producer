@@ -2923,6 +2923,714 @@ def test_the_restore_toast_says_the_same_thing_the_thread_will_record():
     assert "one-way" in final[0] and "one-way" not in swapped[0]
 
 
+#: A project whose Brief already holds text, so the recovery slot has something to promise. Every
+#: Suggest Video test below starts from this or from a copy with one field changed, because the two
+#: arms of the abandon sentence and the two arms of the restore hint all turn on that one field.
+SUGGEST_PROJECT: dict = {
+    "id": "p1", "name": "P", "shots": [], "assets": [], "messages": [],
+    "creative_brief": "the brief this pass will replace", "treatment": "", "style_bible": "",
+    "creative_brief_previous": "", "treatment_previous": "", "style_bible_previous": "",
+    "creative_brief_locked": False, "treatment_locked": False, "style_bible_locked": False,
+}
+
+#: `POST /api/projects/{id}/brief/suggest`, spelled once. Every request assertion below names this
+#: rather than a substring, so a client that posted to a plausible-looking neighbour still fails.
+SUGGEST_PATH = "/api/projects/p1/brief/suggest"
+
+#: The workspace body every Suggest Video test starts with: a controllable clock, a captured
+#: interval, and a `fetch` that **holds the suggest request open** while answering everything else
+#: at once.
+#:
+#: The pending request is the whole point. `run_workspace`'s own canned `fetch` resolves
+#: immediately, and a pass that is over before the next statement runs has no life to observe: the
+#: indicator would be drawn and undrawn inside one microtask, and "it shows for the whole pass"
+#: would be unstateable. Holding it open is also what makes the abandon arm reachable at all.
+#:
+#: `Date.now` is stubbed rather than real for the reason `run_suggest_video` takes an injected
+#: clock: an elapsed reading nothing pins is a reading that can quietly become zero, and a test
+#: that asserts "some number appeared" would pass against exactly that.
+SUGGEST_HARNESS = """
+  state.project = __SEED__;
+  let tick = null;
+  let clearedTimers = [];
+  globalThis.setInterval = (fn) => { tick = fn; return 77; };
+  globalThis.clearInterval = (token) => { clearedTimers.push(token); };
+  let clock = 1000000;
+  Date.now = () => clock;
+  let held = null;
+  let aborts = 0;
+  const answered = [];
+  globalThis.fetch = (path, options = {}) => {
+    requests.push({ path, method: options.method || "GET", body: options.body || null });
+    if (path !== __SUGGEST__) {
+      answered.push(path);
+      return Promise.resolve({
+        ok: true, status: 200, statusText: "canned",
+        headers: { get: () => "application/json" }, json: async () => (state.project),
+      });
+    }
+    return new Promise((resolve, reject) => {
+      held = { resolve, reject, signal: options.signal };
+      options.signal?.addEventListener?.("abort", () => {
+        aborts += 1;
+        const failure = new Error("The operation was aborted.");
+        failure.name = "AbortError";
+        reject(failure);
+      });
+    });
+  };
+  const land = (body, status = 200) => held.resolve({
+    ok: status < 400, status, statusText: "canned",
+    headers: { get: () => "application/json" }, json: async () => (body),
+  });
+  // `hidden` is reported as a **string**, and the third value is the whole reason: the stub
+  // element has no such property until `app.js` writes one, so `"undefined"` means the markup's own
+  // `hidden` attribute still stands and nothing in the client has touched it. Reported as a raw
+  // boolean it was `undefined`, which `JSON.stringify` drops -- so the key was simply absent and
+  // every assertion about it was a `KeyError` waiting for the test to be selected.
+  const running = () => ({
+    hidden: String(at('#suggest-indicator').hidden),
+    reading: at('#suggest-elapsed').textContent,
+    button: { disabled: at('#suggest-video').disabled, title: at('#suggest-video').title },
+  });
+  const report = () => ({
+    text: at('#suggest-note').textContent,
+    hidden: String(at('#suggest-note').hidden),
+    faces: [...at('#suggest-note').classList.flags],
+  });
+"""
+
+
+def suggest_workspace(body: str, project: dict | None = None) -> dict:
+    """Boot the workspace with a Suggest Video pass drivable by hand.
+
+    The click is deliberately **not** awaited: the handler awaits a request this harness holds
+    open, so awaiting it would deadlock node on an unsettled top-level await rather than fail.
+    """
+    seeded = SUGGEST_HARNESS.replace("__SEED__", json.dumps(project or SUGGEST_PROJECT))
+    return run_workspace(seeded.replace("__SUGGEST__", json.dumps(SUGGEST_PATH)) + body)
+
+
+def suggest_reply(**overrides) -> dict:
+    """A `SuggestVideoResponse` as the route builds one, with the server's own notice."""
+    from music_video_producer.app import SuggestVideoOutcome, suggest_video_notice
+    from music_video_producer.director import SuggestedBrief, brief_shortfall
+
+    suggestion = overrides.pop("suggestion", None) or SuggestedBrief(
+        premise="A night drive that opens into wilderness.", cast="One driver, no dialogue.",
+        locations="A coast road, then salt flats.", arc="Claustrophobia into release.",
+        look="Sodium and rain, then flat noon light.",
+    )
+    elapsed = overrides.pop("elapsed", 130.44)
+    restorable = overrides.pop("restorable", True)
+    outcome = SuggestVideoOutcome(suggestion=suggestion, attempts=1, elapsed=elapsed)
+    written = {**SUGGEST_PROJECT, "creative_brief": "WRITTEN BY THE PASS",
+               "creative_brief_previous": SUGGEST_PROJECT["creative_brief"]}
+    missing = brief_shortfall(suggestion)
+    return {
+        "project": written, "partial": bool(missing), "missing": list(missing),
+        "restorable": restorable, "attempts": 1, "elapsed": elapsed,
+        "notice": suggest_video_notice(outcome, restorable=restorable),
+        **overrides,
+    }
+
+
+def test_the_suggest_video_controls_exist_in_the_markup_the_app_dereferences():
+    """Every selector the pass path dereferences, and the two that must ship `hidden`.
+
+    `app.js` reaches four elements by id on this path and would throw on the first one that is not
+    there — inside a click handler, where the throw is a silent no-op to the Director. And two of
+    them are state: an indicator or a note painted by markup would claim a pass that nothing ran,
+    which is this application's own "a control that says in the past tense that something happened
+    when it did not" in its purest form.
+    """
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    ids = run_module("""
+      import { SUGGEST_VIDEO_ABANDON_CONTROL, SUGGEST_VIDEO_ABANDON_LABEL, SUGGEST_VIDEO_CONTROL,
+               SUGGEST_VIDEO_ELAPSED, SUGGEST_VIDEO_HELP, SUGGEST_VIDEO_INDICATOR,
+               SUGGEST_VIDEO_LABEL, SUGGEST_VIDEO_NOTE }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        control: SUGGEST_VIDEO_CONTROL, indicator: SUGGEST_VIDEO_INDICATOR,
+        elapsed: SUGGEST_VIDEO_ELAPSED, abandon: SUGGEST_VIDEO_ABANDON_CONTROL,
+        note: SUGGEST_VIDEO_NOTE, label: SUGGEST_VIDEO_LABEL,
+        abandonLabel: SUGGEST_VIDEO_ABANDON_LABEL, help: SUGGEST_VIDEO_HELP,
+      }));
+    """)
+    for name in ("control", "indicator", "elapsed", "abandon", "note"):
+        assert f'id="{ids[name].lstrip("#")}"' in markup, name
+    # The labels are api.js's, so a rename cannot half-land between the constant and the button.
+    assert f'>{ids["label"]}</button>' in markup
+    assert f'>{ids["abandonLabel"]}</button>' in markup
+    assert ids["help"] in markup, "the button's hover text is not api.js's SUGGEST_VIDEO_HELP"
+    # Both stateful elements ship hidden, and the stylesheet backs the attribute. `display` on
+    # either class outranks the user agent's `[hidden] { display: none }`, so without these rules
+    # the indicator would be permanently on screen -- visible to no offline test.
+    assert re.search(r'<span class="pass-indicator" id="suggest-indicator" hidden>', markup)
+    assert re.search(r'<p class="pass-note" id="suggest-note" hidden', markup)
+    styles = STYLES_CSS.read_text(encoding="utf-8")
+    assert ".pass-indicator[hidden] { display: none; }" in styles
+    assert ".pass-note[hidden] { display: none; }" in styles
+
+
+def test_the_indicator_reports_elapsed_time_and_never_a_progress_figure():
+    """Standing law 8, executed: *elapsed time only* for work whose progress cannot be measured.
+
+    The reading is swept rather than sampled at one value, because the two ways this goes wrong are
+    both invisible at a single point: a percentage composed from a guessed ceiling reads fine at
+    0 s, and a reading that rounds to nearest claims a second that has not passed at 500 ms.
+    """
+    readings = run_module("""
+      import { SUGGEST_VIDEO_RUNNING, suggestVideoRunningLabel, suggestVideoTicked }
+        from './src/music_video_producer/web/assets/api.js';
+      const sweep = [0, 1, 499, 500, 999, 1000, 1001, 59999, 60000, 299000, 300000, 3600000];
+      console.log(JSON.stringify({
+        wording: SUGGEST_VIDEO_RUNNING,
+        labels: sweep.map((millis) => suggestVideoRunningLabel(1000, 1000 + millis)),
+        seconds: sweep.map((millis) => suggestVideoTicked(1000, 1000 + millis)),
+        backwards: suggestVideoTicked(9000, 1000),
+        nonFinite: suggestVideoTicked(undefined, 1000),
+      }));
+    """)
+    # Floored, never rounded: 999 ms is still 0 s, and 300 s -- the pass's own timeout -- is 300.
+    assert readings["seconds"] == [0, 0, 0, 0, 0, 1, 1, 59, 60, 299, 300, 3600]
+    # A clock that went backwards is not evidence of a negative pass.
+    assert readings["backwards"] == 0 and readings["nonFinite"] == 0
+    # Nothing anywhere in the reading is a fraction of anything: no percentage, no "of", no
+    # estimate, no remaining. The number gets large and that is the honest reading.
+    for label in readings["labels"]:
+        assert "%" not in label, label
+        assert " of " not in label and "remaining" not in label.lower(), label
+        assert "estimate" not in label.lower() and "eta" not in label.lower(), label
+        assert re.search(r"\b\d+s$", label), label
+    assert "{elapsed}" in readings["wording"] and "%" not in readings["wording"]
+    # And the drawn indicator carries no progress affordance of any kind -- an element the
+    # stylesheet could grow a fill on is as much a progress bar as a number is.
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    indicator = markup.split('id="suggest-indicator"', 1)[1].split("</span>\n", 1)[0]
+    for forbidden in ("<progress", "progressbar", "aria-valuenow", "aria-valuemax"):
+        assert forbidden not in indicator, forbidden
+    # No percentage width anywhere on the indicator: a box the stylesheet could fill is a progress
+    # bar whether or not anything fills it today.
+    styles = STYLES_CSS.read_text(encoding="utf-8")
+    for rule in re.findall(r"^\.pass-[a-z-]+.*$", styles, re.MULTILINE):
+        assert not re.search(r"width:\s*[\d.]+%", rule), rule
+
+
+def test_the_indicator_shows_for_the_whole_life_of_a_pass_and_ticks_while_it_does():
+    """The bound control, driven — not `suggestVideoRunningLabel`, which is covered above.
+
+    The wiring is what has survived four slices running: a pure decision covered by a test and the
+    caller that calls it covered by nothing. So this presses the button a Director presses and
+    watches the element a Director looks at, at four points in one pass: before, at the first
+    paint, after a tick, and after the reply.
+    """
+    landed = suggest_workspace("""
+      answer(true);
+      const before = running();
+      const pass = fire('#suggest-video:click');
+      await flush();
+      const started = running();
+      const quiet = report();
+      clock += 7400;
+      tick();
+      const ticked = running();
+      clock += 60000;
+      tick();
+      const later = running();
+      land(__REPLY__);
+      await flush();
+      console.log(JSON.stringify({
+        before, started, quiet, ticked, later, after: running(), report: report(),
+        requests, clearedTimers,
+      }));
+    """.replace("__REPLY__", json.dumps(suggest_reply())))
+
+    # Nothing before the press, and the request really is the route E1 shipped.
+    assert landed["before"] == {
+        "hidden": "undefined", "reading": "",
+        "button": {"disabled": False, "title": ""},
+    }, landed["before"]
+    assert landed["requests"] == [{"path": SUGGEST_PATH, "method": "POST", "body": None}]
+    # Up from the first moment, with a reading rather than an empty box: the indicator is painted
+    # once before the first tick fires, or it says nothing for a whole second at the one moment the
+    # Director is looking hardest at it.
+    assert landed["started"]["hidden"] == "false"
+    assert landed["started"]["reading"].endswith("0s"), landed["started"]["reading"]
+    # And nothing is being reported while it runs: an empty note must be hidden rather than drawn
+    # as an empty panel, which is the "measured thing that draws as nothing" class inverted.
+    assert landed["quiet"] == {"text": "", "hidden": "true", "faces": []}, landed["quiet"]
+    # And it climbs. 67 s is not dressed up as anything.
+    assert landed["ticked"]["reading"].endswith("7s")
+    assert landed["later"]["reading"].endswith("67s")
+    # The button is shut for the life of the pass and live again afterwards.
+    assert landed["started"]["button"]["disabled"] is True
+    assert landed["after"]["button"]["disabled"] is False
+    # Gone when the pass is, and the timer is really stopped -- an interval left running repaints a
+    # reading whose pass ended, which is the only way this indicator could lie.
+    assert landed["after"]["hidden"] == "true"
+    assert landed["clearedTimers"] == [77]
+    assert landed["report"]["hidden"] == "false"
+
+
+def test_a_new_pass_takes_down_the_last_ones_report():
+    """The report of the previous pass is not left standing over the one that has just started.
+
+    It names a document and a measured time, so a note describing the pass before this one is a
+    specific false claim about the pass the Director is watching — and worse on the failure arm,
+    where a red note would sit under a live indicator saying nothing was written.
+    """
+    from music_video_producer.app import SUGGEST_VIDEO_FAILED
+
+    sentence = SUGGEST_VIDEO_FAILED.format(
+        document=DOCUMENT_LABELS["creative_brief"], elapsed=3.0, attempts=2,
+        failure="ReadTimeout (no message)",
+    )
+    again = suggest_workspace("""
+      answer(true);
+      fire('#suggest-video:click');
+      await flush();
+      land({ detail: __SENTENCE__ }, 502);
+      await flush();
+      const reported = report();
+      fire('#suggest-video:click');
+      await flush();
+      console.log(JSON.stringify({ reported, during: report(), running: running() }));
+    """.replace("__SENTENCE__", json.dumps(sentence)))
+
+    assert again["reported"]["text"] == sentence
+    assert again["reported"]["faces"] == ["failed"]
+    # The second pass is running and the first one's report is gone, class and all.
+    assert again["running"]["hidden"] == "false"
+    assert again["during"] == {"text": "", "hidden": "true", "faces": []}, again["during"]
+
+
+def test_the_ticking_number_leaves_the_screen_before_the_measurement_is_drawn():
+    """**The two elapsed numbers, and the rule that stops them contradicting each other.**
+
+    They are different facts: the client's is time-with-a-request-in-flight, measured by this
+    browser; `SuggestVideoResponse.elapsed` is what `run_suggest_video` clocked across every
+    attempt. They will not agree, and neither is wrong.
+
+    The rule is that only one of them is ever on screen. So this drives a pass whose two numbers
+    disagree *loudly* — the client ticks to 5 s and the server reports 130.4 s — and asserts the
+    ticking element is emptied and hidden at the moment the report appears. Emptied as well as
+    hidden: text left behind a hidden element is the next pass's first frame.
+    """
+    reply = suggest_reply(elapsed=130.44)
+    landed = suggest_workspace("""
+      answer(true);
+      fire('#suggest-video:click');
+      await flush();
+      clock += 5000;
+      tick();
+      const watching = running();
+      land(__REPLY__);
+      await flush();
+      console.log(JSON.stringify({ watching, after: running(), report: report() }));
+    """.replace("__REPLY__", json.dumps(reply)))
+
+    assert landed["watching"]["reading"].endswith("5s")
+    # The moment the measurement is drawn, the approximation is gone from the screen and from the
+    # element that held it.
+    assert landed["after"]["reading"] == ""
+    assert landed["after"]["hidden"] == "true"
+    # The report states the measurement, in the server's own words and to the server's own tenth.
+    assert landed["report"]["text"] == reply["notice"]
+    assert "130.4s" in landed["report"]["text"]
+    # And the approximation is nowhere in it: the ticking number is never quoted after the fact.
+    assert "5s" not in landed["report"]["text"].replace("130.4s", "")
+
+
+def test_a_partial_pass_is_drawn_as_partial_and_names_what_came_back_thin():
+    """AD-39: a thin reply is never presented as a finished Brief.
+
+    Two halves. The **sentence** is the server's own `notice`, drawn verbatim — and `missing` is
+    used here as the oracle for it rather than as a second source to compose from, so a client that
+    re-wrote the sentence would have to keep naming every section the server named. The **face** is
+    decided by `partial` off the wire and not by looking at the Brief: the reply below carries a
+    Brief with text in it, so anything recomputing "is this thin?" from the document would call it
+    complete.
+    """
+    from music_video_producer.director import SuggestedBrief
+
+    thin = SuggestedBrief(
+        premise="A night drive that opens into wilderness.", cast="", locations="",
+        arc="Claustrophobia into release.", look="Sodium and rain.",
+    )
+    reply = suggest_reply(suggestion=thin)
+    assert reply["partial"] is True and len(reply["missing"]) == 2, reply["missing"]
+
+    drawn = suggest_workspace("""
+      answer(true);
+      fire('#suggest-video:click');
+      await flush();
+      land(__REPLY__);
+      await flush();
+      console.log(JSON.stringify({ report: report(), brief: at('#creative-brief').value }));
+    """.replace("__REPLY__", json.dumps(reply)))
+
+    assert drawn["report"]["text"] == reply["notice"]
+    assert drawn["report"]["text"].startswith("Partial:")
+    # Every section the server said came back empty is named on screen. `missing` is the oracle.
+    for heading in reply["missing"]:
+        assert heading in drawn["report"]["text"], heading
+    # The face is the boolean's, not a substring search and not a look at the document.
+    assert drawn["report"]["faces"] == ["partial"]
+    assert drawn["brief"] == "WRITTEN BY THE PASS", "the partial Brief was not drawn"
+
+    # And the complete arm of the same reply shape takes the other face, so "partial" is a
+    # decision rather than the only class this note ever gets.
+    whole = suggest_workspace("""
+      answer(true);
+      fire('#suggest-video:click');
+      await flush();
+      land(__REPLY__);
+      await flush();
+      console.log(JSON.stringify({ report: report() }));
+    """.replace("__REPLY__", json.dumps(suggest_reply())))
+    assert whole["report"]["faces"] == ["written"]
+    assert not whole["report"]["text"].startswith("Partial:")
+
+
+def test_a_failed_pass_reports_e1s_sentence_rather_than_a_blank():
+    """`httpx.ReadTimeout` stringifies to `""`, which is why E1 reports by class and elapsed time.
+
+    The failure the Director actually meets is a 502 carrying `SUGGEST_VIDEO_FAILED`. This drives
+    that refusal through the real client and asserts the sentence arrives whole — and that the
+    Brief on screen is untouched, which is the other half of what that sentence promises.
+    """
+    from music_video_producer.app import SUGGEST_VIDEO_FAILED
+
+    sentence = SUGGEST_VIDEO_FAILED.format(
+        document=DOCUMENT_LABELS["creative_brief"], elapsed=612.4, attempts=2,
+        failure="ReadTimeout (no message)",
+    )
+    reported = suggest_workspace("""
+      answer(true);
+      fire('#suggest-video:click');
+      await flush();
+      clock += 9000;
+      tick();
+      land({ detail: __SENTENCE__ }, 502);
+      await flush();
+      console.log(JSON.stringify({
+        report: report(), after: running(), brief: state.project.creative_brief,
+      }));
+    """.replace("__SENTENCE__", json.dumps(sentence)))
+
+    assert reported["report"]["text"] == sentence
+    assert reported["report"]["text"], "a failure reached the Director as a blank"
+    assert "ReadTimeout" in reported["report"]["text"]
+    assert "612.4s" in reported["report"]["text"]
+    assert reported["report"]["faces"] == ["failed"]
+    # The failure's own elapsed time is the measurement, so the approximation goes for its sake too.
+    assert reported["after"]["reading"] == "" and reported["after"]["hidden"] == "true"
+    # And the Brief this client holds is byte-identical, which is the other half of what that
+    # sentence promises: a failed pass has no path to `state.project` at all.
+    assert reported["brief"] == SUGGEST_PROJECT["creative_brief"]
+
+
+def test_abandon_asks_before_it_stops_watching_and_promises_only_what_it_can_keep():
+    """**The ruling of 2026-09-04, in the sentence a Director reads before they press it.**
+
+    The route has no cancellation awareness, so the pass runs to completion and writes whatever the
+    browser does. The control therefore says three things and no fourth: it cannot be called back,
+    it will write if it finishes, and what happens to the text they have now. The third has two
+    arms because the Brief's slot has two states — a first draft into a blank Brief spends the slot
+    on `""` and the restore route refuses it, so offering a restore there is a promise broken by the
+    very next click.
+
+    Declining is driven too: a confirmation that stops watching whichever button is pressed is the
+    same control with no question on it.
+    """
+    asked = suggest_workspace("""
+      answer(false);
+      fire('#suggest-video:click');
+      await flush();
+      fire('#abandon-suggest:click');
+      await flush();
+      const declined = { asked: [...asked], running: running(), aborts, report: report() };
+      answer(true);
+      fire('#abandon-suggest:click');
+      await flush();
+      console.log(JSON.stringify({
+        declined, accepted: [...asked], after: running(), aborts, report: report(),
+      }));
+    """)
+
+    question = asked["declined"]["asked"][0]
+    assert asked["accepted"] == [question], "the two presses asked different questions"
+    # It cannot be called back, and it will write if it finishes. Stated, not implied.
+    assert "cannot be called back" in question, question
+    assert "if it finishes it writes" in question, question
+    # And it never claims the opposite in any tense. This is the standing rule against a control
+    # that says in the past tense that something happened when it did not, applied forwards.
+    for lie in ("will be cancelled", "will stop the pass", "nothing will be written",
+                "the pass is cancelled", "has been cancelled"):
+        assert lie not in question.lower(), lie
+    # Declining leaves the pass exactly as it was: still watched, nothing aborted, nothing said.
+    assert asked["declined"]["running"]["hidden"] == "false"
+    assert asked["declined"]["aborts"] == 0
+    assert asked["declined"]["report"]["text"] == ""
+    # Accepting stops this browser waiting -- really aborts, rather than ignoring the promise --
+    # and takes the indicator down.
+    assert asked["aborts"] == 1
+    assert asked["after"]["hidden"] == "true" and asked["after"]["reading"] == ""
+    # What is left on screen repeats the same three facts, and names the one gesture that shows
+    # what the pass did. This client cannot know when a pass it stopped watching finishes.
+    note = asked["report"]["text"]
+    assert "not called back" in note and "reload" in note.lower(), note
+    assert "kept" in note, note
+    # An abandon is not an outcome, so it takes none of the three outcome faces.
+    assert asked["report"]["faces"] == []
+
+
+def test_the_abandon_sentence_offers_a_restore_only_where_one_would_work():
+    """The blank arm, driven through the same control on a project whose Brief is empty.
+
+    Offering "Restore Creative brief" here would be a promise the restore route answers 409 to —
+    `DOCUMENT_FIRST_DRAFT_NOTICE`'s argument exactly, and the same defect class as a restore button
+    enabled over an empty slot.
+    """
+    blank = {**SUGGEST_PROJECT, "creative_brief": "   "}
+    asked = suggest_workspace("""
+      answer(true);
+      fire('#suggest-video:click');
+      await flush();
+      fire('#abandon-suggest:click');
+      await flush();
+      console.log(JSON.stringify({ asked: [...asked], report: report() }));
+    """, project=blank)
+
+    question = asked["asked"][0]
+    assert "cannot be called back" in question
+    assert "nothing to keep and nothing to restore" in question, question
+    assert "first draft" in question, question
+    assert "Restore" not in question, "a restore is offered over an empty recovery slot"
+    # The note left behind says the same thing, from the same clause: one spelling, two places.
+    assert "nothing to keep and nothing to restore" in asked["report"]["text"]
+
+
+def test_a_pass_that_lands_after_an_abandon_is_not_drawn_over_the_note():
+    """The race the abort leaves: a reply already settled when the Director stops watching.
+
+    Dropped rather than adopted. They were told this browser had stopped watching and that reloading
+    is how they would find out; adopting the result now would make both halves of the sentence they
+    are still looking at false. The Brief is safe either way — it is written on the server, which is
+    what the sentence says.
+
+    **The order below is the whole test and it took a mutation to find.** Abandoning *first* and
+    landing afterwards does not reproduce this at all: the abort rejects the promise, and a
+    `resolve` on an already-rejected promise does nothing, so the handler never resumes with a reply
+    and the guard is never reached. Written that way the test passed with the guard deleted. So the
+    reply is settled first and the abandon is pressed before the microtask queue is drained, which
+    is exactly the shape of the real race -- a reply on the wire when the button is pressed.
+    """
+    landed = suggest_workspace("""
+      answer(true);
+      fire('#suggest-video:click');
+      await flush();
+      // Settled, and deliberately not flushed: the handler is still suspended on it.
+      land(__REPLY__);
+      fire('#abandon-suggest:click');
+      const abandoned = report().text;
+      await flush();
+      console.log(JSON.stringify({
+        abandoned, report: report(), brief: state.project.creative_brief, running: running(),
+      }));
+    """.replace("__REPLY__", json.dumps(suggest_reply())))
+
+    assert "not called back" in landed["abandoned"]
+    assert landed["report"]["text"] == landed["abandoned"], "the dropped reply overwrote the note"
+    assert landed["report"]["faces"] == []
+    assert landed["brief"] == SUGGEST_PROJECT["creative_brief"], (
+        "a reply the Director stopped watching was adopted anyway"
+    )
+    assert landed["running"]["hidden"] == "true"
+
+
+def test_the_workspace_stays_usable_while_a_pass_runs():
+    """No modal, no disabled workspace — asserted rather than assumed (constraint 4).
+
+    Two ways, because either alone can pass against a broken one: nothing else is *marked*
+    disabled, and a second action really completes while the pass is in flight. The second is the
+    one that matters — a workspace can be perfectly enabled and still be wedged behind a request
+    everything else is queued on.
+    """
+    during = suggest_workspace("""
+      answer(true);
+      fire('#suggest-video:click');
+      await flush();
+      const shut = ['#save-treatment', '#restore-brief', '#expand-shot-prompts', '#dp-pass',
+                    '#save-project', '#lock-brief', '#creative-brief', '#treatment-text',
+                    '#project-select', '#new-project']
+        .filter((selector) => at(selector).disabled);
+      requests.length = 0;
+      fire('#save-treatment:click');
+      await flush();
+      console.log(JSON.stringify({
+        shut, saved: requests.map((entry) => entry.method + ' ' + entry.path),
+        stillRunning: running(),
+      }));
+    """)
+
+    # The only control that shuts is the one that would start a second pass.
+    assert during["shut"] == [], during["shut"]
+    # And a save really lands while the pass is still in flight.
+    assert during["saved"] == ["PUT /api/projects/p1/documents"], during["saved"]
+    # The pass is untouched by it: still watched, still ticking.
+    assert during["stillRunning"]["hidden"] == "false"
+    assert during["stillRunning"]["button"]["disabled"] is True
+
+
+def test_a_second_press_while_a_pass_runs_starts_nothing():
+    """The control is shut, and the handler refuses anyway.
+
+    Both, because they answer different questions. A disabled button is honoured by the browser and
+    by nothing else — a keyboard activation, a click already dispatched, or a stale reference all
+    reach the handler — and a second pass would spend another five minutes writing over the first
+    one's result with no indicator able to describe two of them.
+    """
+    twice = suggest_workspace("""
+      answer(true);
+      fire('#suggest-video:click');
+      await flush();
+      fire('#suggest-video:click');
+      fire('#suggest-video:click');
+      await flush();
+      console.log(JSON.stringify({ requests, running: running() }));
+    """)
+    assert [entry["path"] for entry in twice["requests"]] == [SUGGEST_PATH]
+    assert twice["running"]["hidden"] == "false"
+
+
+def test_the_press_asks_before_it_discards_unsaved_document_edits():
+    """The reply re-renders the editors from the server, so this is the same gate every other
+    server-overwrites-the-editors path asks — and it is asked *before* the request, because five
+    minutes later is the worst possible moment to discover typing was discarded."""
+    declined = suggest_workspace("""
+      state.documentsDirty = true;
+      answer(false);
+      fire('#suggest-video:click');
+      await flush();
+      const refused = { asked: [...asked], requests: [...requests], running: running() };
+      answer(true);
+      fire('#suggest-video:click');
+      await flush();
+      console.log(JSON.stringify({ refused, asked: [...asked], requests, running: running() }));
+    """)
+
+    assert declined["refused"]["requests"] == [], "the pass was sent before the question was asked"
+    assert declined["refused"]["running"]["hidden"] == "undefined"
+    assert len(declined["refused"]["asked"]) == 1
+    question = declined["refused"]["asked"][0]
+    assert "Suggest Video" in question and "Creative brief" in question, question
+    consequence = run_module("""
+      import { UNSAVED_DOCUMENT_EDITS_CONSEQUENCE }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify(UNSAVED_DOCUMENT_EDITS_CONSEQUENCE));
+    """)
+    assert consequence in question, question
+    # Accepting sends it.
+    assert [entry["path"] for entry in declined["requests"]] == [SUGGEST_PATH]
+    assert declined["running"]["hidden"] == "false"
+
+
+def test_a_reply_for_a_project_no_longer_loaded_is_dropped():
+    """Five minutes with the project selector live throughout is the longest such window this
+    workspace has. A reply adopted under another project's name would draw one project's Brief as
+    another's — and unlike the expansion's version of this, it would also draw a *recovery slot*
+    belonging to a project nobody is looking at."""
+    landed = suggest_workspace("""
+      answer(true);
+      fire('#suggest-video:click');
+      await flush();
+      state.project = { ...state.project, id: 'p2' };
+      land(__REPLY__);
+      await flush();
+      console.log(JSON.stringify({
+        brief: state.project.creative_brief, report: report(), id: state.project.id,
+        running: running(),
+      }));
+    """.replace("__REPLY__", json.dumps(suggest_reply())))
+
+    assert landed["id"] == "p2"
+    assert landed["brief"] == SUGGEST_PROJECT["creative_brief"], "another project's Brief was drawn"
+    assert landed["report"]["text"] == "", "another project's report was drawn"
+    # The indicator still comes down: this browser is no longer waiting on anything.
+    assert landed["running"]["hidden"] == "true"
+
+
+def test_the_report_is_cleared_by_a_project_change_and_not_by_a_refresh():
+    """A note naming a document and a measured time is a specific false claim about another
+    project's Brief. Cleared on the same test the document consent and the music lock use — and
+    **not** on a refresh, because the queue poll reloads the project on screen every few seconds
+    and the report of a five-minute pass would vanish before it had been read."""
+    source = app_js_block("async function loadProject(id)")
+    assert "setSuggestNote(\"\", \"\");" in source, source
+    assert source.index("documentConsentClearedOnLoad") < source.index("setSuggestNote"), source
+    # And it is inside that block rather than beside it -- outside, every queue poll clears it.
+    guarded = source.split("documentConsentClearedOnLoad", 1)[1].split("\n  }", 1)[0]
+    assert "setSuggestNote" in guarded, guarded
+
+
+def test_reduced_motion_gets_a_static_dot_through_the_no_preference_form():
+    """`prefers-reduced-motion` gets a still dot, and so does a browser that never answers.
+
+    The `no-preference` form is the one this stylesheet already uses for `.toast`, and the reason is
+    the third case: under `@media (prefers-reduced-motion: reduce) { animation: none }` a browser
+    that answers neither way falls through to the animated rule, so the still version would be the
+    one state nobody could reach. Here the still dot is the default and the motion is the opt-in.
+    """
+    # Comments stripped first: this stylesheet explains in prose why it does *not* use the
+    # `reduce` form, and a scan that could not tell the explanation from a rule would fail on the
+    # sentence that is the reason the rule is right.
+    styles = re.sub(r"/[*].*?[*]/", "", STYLES_CSS.read_text(encoding="utf-8"), flags=re.DOTALL)
+    # No `reduce` block anywhere: the whole point is that motion is opted *in* to.
+    assert "prefers-reduced-motion: reduce" not in styles
+    opt_in = styles.split("@media (prefers-reduced-motion: no-preference) {", 1)
+    assert len(opt_in) == 2, "the stylesheet's one no-preference block has moved or split"
+    inside = opt_in[1]
+    outside = opt_in[0]
+    # The dot exists, is `--amber` (standing law 7's *running*), and is drawn outside the block.
+    base = [rule for rule in outside.splitlines() if rule.startswith(".pass-dot ")]
+    assert len(base) == 1, base
+    assert "var(--amber)" in base[0], base[0]
+    assert "animation" not in base[0], "the dot animates for everyone, whatever they asked for"
+    # And the only animation it has is inside the opt-in block, with its keyframes.
+    assert ".pass-dot { animation: pass-pulse" in inside
+    assert "@keyframes pass-pulse" in inside
+    assert "pass-pulse" not in outside, "the pulse escaped the no-preference block"
+    # Nothing about the indicator's meaning is carried by the motion: only opacity moves, so a
+    # reader who never sees it move is not missing a state.
+    frames = inside.split("@keyframes pass-pulse", 1)[1].split("}\n", 1)[0]
+    assert "opacity" in frames
+    for moving in ("transform", "width", "background", "content"):
+        assert moving not in frames, moving
+
+
+def test_the_suggest_route_is_real_and_the_request_carries_nothing():
+    """The client's half of E1's route: the path exists on the server, and the POST has no body.
+
+    No body is the design rather than an omission — everything the pass reads is derived on the
+    server from the project itself, and there is no consent flag because pressing the control *is*
+    the consent. A body here would be the second ask that somebody eventually defaults to true.
+    """
+    routes = {route.path for route in create_app().routes}
+    assert "/api/projects/{project_id}/brief/suggest" in routes
+    sent = suggest_workspace("""
+      answer(true);
+      fire('#suggest-video:click');
+      await flush();
+      console.log(JSON.stringify({ requests }));
+    """)
+    assert sent["requests"] == [{"path": SUGGEST_PATH, "method": "POST", "body": None}]
+    # And the client sends an abort signal it never pretends is a cancellation.
+    entry = API_JS.read_text(encoding="utf-8").split("  suggestVideo: (id,", 1)[1].splitlines()[0]
+    assert "signal" in entry and "/brief/suggest" in entry, entry
+
+
 def test_expansion_reaches_a_real_route_and_sends_no_chat_message_or_render():
     """Expansion is its own route, carries nothing, and queues nothing — in the client half too.
 

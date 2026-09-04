@@ -218,7 +218,21 @@
       <section class="panel" id="panel-treatment" aria-labelledby="treatment-heading">
         <div class="workspace-heading">
           <div><span class="eyebrow">Conversational direction</span><h1 id="treatment-heading">Story & treatment</h1></div>
-          <div class="heading-meta" id="llm-state">LLM not configured</div>
+          <!-- The pass indicator sits beside the LLM state rather than inside the Brief's tab: a
+               Suggest Video pass can run for minutes and the Director is free to read the Treatment
+               or the Style bible while it does, so an indicator scoped to one document tab would
+               disappear the moment they looked at anything else. It ships `hidden`, and app.js's
+               beginSuggestPass is the only thing that shows it — a running indicator painted by
+               markup would claim a pass that nothing started. Its dot is `--amber`, which in this
+               palette means *running* (standing law 7), and it carries elapsed time and nothing
+               else: no percentage, no bar and no estimate, because how far through a language-model
+               pass is cannot be measured (standing law 8). Its reading, its hover text and the
+               abandon label are api.js's SUGGEST_VIDEO_* constants, asserted against this markup by
+               tests/test_frontend_contract.py. -->
+          <div class="heading-meta pass-meta">
+            <span id="llm-state">LLM not configured</span>
+            <span class="pass-indicator" id="suggest-indicator" hidden><span class="pass-dot" aria-hidden="true"></span><span id="suggest-elapsed"></span><button class="quiet-button" type="button" id="abandon-suggest">Stop watching</button></span>
+          </div>
         </div>
         <div class="treatment-layout">
           <div class="chat-column">
@@ -266,7 +280,7 @@
                  tests/test_frontend_contract.py; the restore tooltips are set from the same mapping
                  by syncDocumentControls rather than duplicated here, and so is each lock's toast. -->
             <div class="document-actions">
-              <div class="document-scoped active" data-doc-controls="brief"><label class="lock-toggle" title="A locked Brief is not overwritten by a planning pass; you can still edit and save it yourself"><input type="checkbox" id="lock-brief">Lock Creative brief</label><button class="quiet-button" id="restore-brief" disabled>Restore Creative brief</button></div>
+              <div class="document-scoped active" data-doc-controls="brief"><label class="lock-toggle" title="A locked Brief is not overwritten by a planning pass; you can still edit and save it yourself"><input type="checkbox" id="lock-brief">Lock Creative brief</label><button class="quiet-button" id="restore-brief" disabled>Restore Creative brief</button><button class="quiet-button" type="button" id="suggest-video" title="Propose a whole video idea from the song and write it into the Creative brief. It calls the local model and can take minutes; nothing is rendered. The Brief you have now is kept and can be restored.">Suggest video</button></div>
               <div class="document-scoped" data-doc-controls="treatment"><label class="lock-toggle" title="A locked document is never replaced by a Director reply"><input type="checkbox" id="lock-treatment">Lock Treatment</label><button class="quiet-button" id="restore-treatment" disabled>Restore Treatment</button></div>
               <div class="document-scoped" data-doc-controls="style"><label class="lock-toggle" title="A locked document is never replaced by a Director reply"><input type="checkbox" id="lock-style">Lock Style bible</label><button class="quiet-button" id="restore-style" disabled>Restore Style bible</button></div>
               <!-- The expansion control is one name in three places: this id, its label, and app.js's
@@ -281,6 +295,16 @@
                    cannot import them, so tests/test_frontend_contract.py asserts both. -->
               <button class="quiet-button" id="save-treatment">Save document</button><button class="primary-button" id="expand-shot-prompts" title="Write a prompt for every unlocked shot from the Treatment, Style bible and shot windows. Nothing is rendered and no shot window is changed.">Expand shots into prompts</button><button class="quiet-button" id="dp-pass" title="Director of Photography pass: recompose the camera (size, angle, movement, focus) across the whole plan — varied setups, deliberate stillness, section energy. Rewrites each shot's intent; nothing is rendered.">DP pass</button><button class="quiet-button" id="expand-h3-prompts" disabled>Expand into H3 prompts</button>
             </div>
+            <!-- What a finished Suggest Video pass said, kept on screen rather than toasted. A toast
+                 self-removes after 4.2 s and this is the report of a pass that can run for minutes:
+                 the whole premise of the feature is that the Director walked away from it, so the
+                 one channel that cannot be used for the answer is the one that expires. It ships
+                 `hidden` and empty; every sentence it draws is either the server's own `notice`
+                 (which already states the measured elapsed time and names any thin sections) or an
+                 error the server worded, and none is composed here. It is the fourth row of
+                 `.document-column`'s grid rather than a child of the Brief's own panel, so a
+                 Director reading the Treatment while a pass lands still sees the answer. -->
+            <p class="pass-note" id="suggest-note" hidden aria-live="polite"></p>
           </div>
         </div>
       </section>

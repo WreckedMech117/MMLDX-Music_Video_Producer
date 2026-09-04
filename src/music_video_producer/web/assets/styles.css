@@ -227,7 +227,11 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
    send row would read as decoration on it. The separator says the two are not the same send. */
 .composer .assistant-row { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
 .composer .assistant-row #assistant-fill { margin-left: auto; }
-.document-column { display: grid; grid-template-rows: auto 1fr auto; }
+/* Four rows since the pass note joined it: tabs, the editor, the actions, and the report of the
+   last Suggest Video pass. The note is `auto` and hidden until there is one, so a column that has
+   never run a pass lays out exactly as it did with three rows -- and when one lands, the editor's
+   `1fr` is what gives up the height rather than the note being squeezed to nothing. */
+.document-column { display: grid; grid-template-rows: auto 1fr auto auto; }
 .document-tabs { display: flex; border-bottom: 1px solid var(--line); }
 .document-tabs button { min-height: 43px; border: 0; border-bottom: 2px solid transparent; padding: 0 17px; background: transparent; color: var(--muted); }
 .document-tabs button.active { color: var(--acid); border-bottom-color: var(--acid); }
@@ -245,6 +249,28 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
    is offered over the Creative brief, which has no lock and no kept version. */
 .document-scoped { display: none; align-items: center; gap: 8px; margin-right: auto; }
 .document-scoped.active { display: flex; }
+/* Suggest Video's in-flight indicator, in the Treatment workspace heading beside the LLM state.
+   `--amber` is *running* in this palette (standing law 7) and this is that state exactly; no new
+   colour was added for it. What the row carries is elapsed time and a control, and deliberately
+   nothing that could read as progress: no bar, no percentage, no arc (standing law 8).
+   The `[hidden]` rule is not redundant -- `display: inline-flex` here would outrank the user
+   agent's `[hidden] { display: none }`, so without it the indicator would be permanently on
+   screen claiming a pass that nothing started, which is the shape of defect a stylesheet
+   introduces and no offline test can see. */
+.pass-meta { display: flex; align-items: center; gap: 14px; }
+.pass-indicator { display: inline-flex; align-items: center; gap: 8px; color: var(--amber); }
+.pass-indicator[hidden] { display: none; }
+.pass-dot { flex: 0 0 auto; width: 9px; height: 9px; border-radius: 50%; background: var(--amber); }
+/* What a finished pass said, kept until the next one replaces it. `.message-notice`'s shape --
+   a quiet panel with one coloured left edge -- because it is the same kind of thing: a statement
+   about what a machine write did, read after the fact. Three edges and no fourth colour:
+   acid for a Brief that was written whole, amber for one that came back thin, red for a failure.
+   An abandoned pass takes the inert edge, because "you stopped watching" is not an outcome. */
+.pass-note { margin: 0; padding: 10px 12px; border-top: 1px solid var(--line); border-left: 3px solid var(--dim); background: var(--surface-1); color: var(--ink); font-size: 12px; line-height: 1.55; white-space: pre-wrap; }
+.pass-note[hidden] { display: none; }
+.pass-note.written { border-left-color: var(--acid); }
+.pass-note.partial { border-left-color: var(--amber); }
+.pass-note.failed { border-left-color: var(--red); }
 .lock-toggle { display: flex; align-items: center; gap: 6px; margin: 0 4px 0 0; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
 .lock-toggle input { width: 13px; height: 13px; accent-color: var(--acid); }
 /* The shot inspector's seed and its randomize toggle, on one line. The Director's ask,
@@ -1320,4 +1346,14 @@ dialog p { color: var(--muted); line-height: 1.5; }
 @media (prefers-reduced-motion: no-preference) {
   .toast { animation: toast-in .16s ease-out; }
   @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } }
+  /* The running dot pulses only where motion has been *asked for*. The `no-preference` form is
+     the one this stylesheet already uses, and the reason is the browser that never answers the
+     query at all: under `@media (prefers-reduced-motion: reduce) { animation: none }` an
+     unanswering browser falls through to the animated rule, so the still version would be the one
+     state nobody could get. Here the still dot is the default and the animation is the opt-in, so
+     an unanswered query lands on the safe side. The dot is the same size and the same `--amber`
+     either way -- only its opacity moves -- so nothing about the indicator's meaning is carried by
+     the motion, and a reader who never sees it move is not missing a state. */
+  .pass-dot { animation: pass-pulse 1.4s ease-in-out infinite; }
+  @keyframes pass-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
 }
