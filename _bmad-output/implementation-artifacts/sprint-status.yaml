@@ -121,7 +121,7 @@ development_status:
   epic-13-retrospective: optional
 
   epic-14: backlog
-  14-1-the-assistant-can-ask-and-can-write-the-brief: backlog
+  14-1-the-assistant-can-ask-and-can-write-the-brief: done
   14-2-planning-mode: backlog
   14-3-see-which-half-came-from-where: backlog
   14-4-step-back-through-the-conversation-s-changes: backlog
