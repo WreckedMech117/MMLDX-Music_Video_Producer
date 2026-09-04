@@ -273,6 +273,40 @@ presented as a finished Brief, and the partial wording is not one of the sentenc
 it makes no claim about the document's previous state at all. A pass that returned the same thin
 text twice reports the shortfall, because the shortfall is the actionable part.
 
+### R-20 — A machine write marks what it changed, not the document it changed
+
+*Ruled 2026-09-04, on a limit the implementer of Slice C1 raised against their own work.*
+
+**As first built, a machine write that changed anything marked the whole Brief as the
+assistant's.** Correct for Suggest Video, which composes a Brief out of nothing. Wrong for a
+planning turn, which AD-43 makes an ordinary message and which is commonly asked to *revise*: a
+model handed a Brief and told to change the cast returns the premise back verbatim, and the
+Director's own paragraph came back marked as the assistant's.
+
+**That is the failure direction AD-45 singles out.** The reconciliation's own errors are safe —
+it drops a mark rather than invents one, and an unmarked run reads as the Director's. This one
+**invented** a mark on the Director's words, which is *provenance with two authorities* by another
+route: the record says the assistant wrote a sentence the Director typed.
+
+**Ruled: mark only what the write changed.** The Director's unmarked runs that survive verbatim
+stay theirs; only genuinely new stretches are marked. The accepted cost, priced explicitly at the
+ruling: **a re-flowed paragraph is marked as new** — over-marking at the paragraph rather than at
+the document, which is a smaller and more local wrong than the one it replaces.
+
+**Two things the build found that the ruling did not anticipate**, both recorded because they
+change what the rule means:
+
+* **The unit is a line, not a paragraph.** Finer, and it costs nothing: `compose_brief` puts
+  `## Cast` on its own line, so a turn that rewrites a section keeps the heading unmarked. And
+  presence is a **substring** test rather than line-set equality, so a model that re-wraps one of
+  the Director's paragraphs does not have every line of it declared new.
+* **Surviving marks and new stretches are not disjoint**, which I had assumed they were. They ask
+  their question at different sizes: `One driver` survives verbatim into the rewritten line
+  `One driver walks alone.`, so the old mark sits *inside* the new stretch. **The writing turn
+  wins** — the turn that emitted the line now on the page is the honest single answer, and
+  clipping the older mark into fragments around the new one would invent boundaries neither turn
+  wrote. Disjointness of the result is now asserted over every table row rather than assumed.
+
 ## Open questions for the PRD
 
 1. ~~**What exactly is a "Brief" for, now?**~~ **Answered 2026-08-22, and the analyst's premise was wrong.** The Brief is *already* upstream: `timeline.py` puts `creative_brief` into the project dump at three call sites, and the Director's own prompt opens *"You are handed the whole project: creative brief, treatment, style bible, the song's words."* Treatment and Style Bible have always been generated with the Brief as an input — the Director's original understanding was correct.

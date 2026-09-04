@@ -27,7 +27,7 @@ Sprint tracking: `_bmad-output/implementation-artifacts/sprint-status.yaml` — 
 | Feature | Artifacts |
 |---|---|
 | Effects | `effects-and-transitions-research-2026-08-21.md` · `effects-director-rulings-2026-08-21.md` (R-1…R-7) · **`effects-director-rulings-2026-08-24.md` (~~R-8…R-28~~ ~~R-8…R-32~~ ~~R-8…R-41~~ R-8…R-46)** *(corrected 2026-08-28 twice, and again on 2026-08-30 by the commit that added R-42 — the third time, and the first where the range moved in the same pass as the ruling rather than one pass later. The first range was written by `ad67a14`, the commit that added R-29 and R-30. The correction to R-32 was written by `1933c2e`, **the commit that added R-33** — the same defect, in the pass that was fixing it. Found by `tests/test_stale_claims.py` on its first run, which is why that guard exists.)* · `prds/prd-MusicVideoProducer-effects-2026-08-21/` · `ux-designs/ux-effects-2026-08-21/` · `architecture/architecture-MusicVideoProducer-effects-2026-08-21/` (AD-16…AD-31 + `BUILD-ORDER.md`) · `epics-effects.md` |
-| Treatment | `treatment-planning-findings-and-rulings-2026-08-22.md` (F-1…F-6, R-1…R-19) · `prds/prd-MusicVideoProducer-treatment-2026-08-22/` · `ux-designs/ux-treatment-2026-08-22/` · `architecture/architecture-MusicVideoProducer-treatment-2026-08-22/` (AD-32…AD-47 + `BUILD-ORDER.md`) · `epics-treatment.md` |
+| Treatment | `treatment-planning-findings-and-rulings-2026-08-22.md` (F-1…F-6, R-1…R-20) · `prds/prd-MusicVideoProducer-treatment-2026-08-22/` · `ux-designs/ux-treatment-2026-08-22/` · `architecture/architecture-MusicVideoProducer-treatment-2026-08-22/` (AD-32…AD-47 + `BUILD-ORDER.md`) · `epics-treatment.md` |
 
 All paths relative to `_bmad-output/planning-artifacts/` — *corrected 2026-08-27, this said ~~`_bmad-output/`~~ and there is no `_bmad-output/prds/`, `ux-designs/` or `architecture/`; every artifact above is one level further down.* Requirement prefixes never collide: base `FR-`, effects `FX-`, treatment `TP-`. Architecture decisions are one sequence, `AD-1`…`AD-47`.
 
@@ -422,6 +422,46 @@ impossible, in the evidence section. **A measured claim is worse than a reasoned
 specific way: reasoning announces itself and a number does not.** Before quoting a sweep, state
 what the harness could not vary and check that list against the mechanism under test. A sweep that
 has never produced a single disagreement has not been shown to be capable of one.
+
+### A guard cited as proof of a claim is often narrower than the claim
+
+**Measured 2026-09-04, on my own spec, and it very nearly shipped invented provenance.**
+
+Treatment Slice C's spec carried two rows in its *what exists, verified rather than remembered*
+table:
+
+| The one write | `write_document(...)` — **the only place a creative document's text and its recovery slot are assigned** |
+| Its guard | an AST scan over the whole package pins the complete set of slot-assignment sites |
+
+The first row is false and the second row is why nobody noticed. `restore_document` assigns a
+document's text with `setattr(project, document, previous)` and does not call `write_document`.
+The guard has known that the whole time — `restore_document` is in its allowed set by name —
+because **the guard pins `*_previous` slot assignments, and the claim was about the text.** Two
+different fields. The citation reads as proof and is not proof of that sentence.
+
+The implementer caught it, and only because they went to look. Attaching the attribution
+reconciliation where the row said would have left the restore swapping new text under old
+character offsets: marks claiming the assistant wrote whatever now sits at those characters, and
+offsets running past the end of a shorter document. **AD-45 calls invented provenance worse than
+none**, so the slice would have shipped the exact defect it exists to prevent.
+
+**What to do with this, concretely.** When a document, spec or docstring says *the one place* and
+names a guard:
+
+1. **Read the guard's assertion, not its name.** `test_every_writer_of_a_creative_document_goes_
+   through_the_one_capture` is a true sentence about the capture and says nothing about the text.
+2. **Check the field.** A guard over field X does not hold a claim about field Y in the same
+   function, however tightly the two are coupled today.
+3. **If the claim is worth making, make it assertable.** The remedy here was
+   `test_every_place_that_writes_a_creative_documents_text_is_one_that_reconciles`, in
+   `test_every_writer_of_an_expansion_records_the_map_it_was_written_against`'s sibling-pair
+   shape: enumerate the functions that write the *text* and fail when a new one appears. A guard
+   over the mark cannot see a text-only writer **by construction**, which is precisely the fifth
+   writer that would reintroduce the defect.
+
+This is the same family as *"a claim that an invariant is held stops the next reader looking for
+the place that holds it"* (AD-18's amendment, Epic 11's most expensive false record), with one
+extra turn: **here there was a guard, it was green, and it was green about something else.**
 
 ### When you amend a record, grep for the sentence's siblings
 

@@ -101,6 +101,7 @@ from ..models import (
     dangling_citations,
     identity_sheet_ids,
     mode_specification_problems,
+    new_id,
     prefer_identity_sheets,
 )
 from ..timeline import (
@@ -388,6 +389,12 @@ def register(ctx: RouterContext) -> None:
         project, generation = get_project_for_update(project_id)
         project.messages.append(TreatmentMessage(role="user", content=request.message))
         notices: list[MessageNotice] = []
+        # The reply's id, allocated before the write rather than by the append at the bottom.
+        # A mark on the Brief names the turn that made it (AD-43), and the turn's own message
+        # cannot be built until the write has happened — its notices are what the write
+        # produces. So the id comes first and both halves are given the same one, which is what
+        # makes *"which turn wrote this paragraph"* answerable from the stored project alone.
+        reply_id = new_id("msg")
         label = DOCUMENT_LABELS["creative_brief"]
         # `turn.wrote_nothing()` rather than `not turn.brief`: the question this branch asks is
         # about the turn, and the empty string is an encoding of the answer rather than the answer.
@@ -436,8 +443,16 @@ def register(ctx: RouterContext) -> None:
                     # names two writers for this document, and a machine write that displaced a
                     # Brief the Director spent an hour on without keeping a copy is precisely the
                     # loss the slot exists to prevent. Capture on apply, never on attempt.
+                    #
+                    # `attributed_to` is what makes the mark this write leaves point back at
+                    # this turn. The reconciliation itself is `write_document`'s, run there for
+                    # every writer of the Brief; nothing about it is decided here.
                     write_document(
-                        project, "creative_brief", turn.brief, writer=DOCUMENT_WRITER_MACHINE
+                        project,
+                        "creative_brief",
+                        turn.brief,
+                        writer=DOCUMENT_WRITER_MACHINE,
+                        attributed_to=reply_id,
                     )
                     # A blank target accepts any first draft, so the slot it captures is empty and
                     # a restore would refuse. Reported separately, because describing that as a
@@ -476,7 +491,7 @@ def register(ctx: RouterContext) -> None:
         if not notices and turn.wrote_nothing():
             notices.append(MessageNotice(kind="flag", text=PLANNING_WITHOUT_TOOL_CALL_NOTICE))
         message = turn.message.strip() or PLANNING_EMPTY_MESSAGE
-        project.messages.append(assistant_reply(message, notices))
+        project.messages.append(assistant_reply(message, notices, message_id=reply_id))
         return store.save(project, if_generation=generation)
 
     @app.post("/api/projects/{project_id}/director/expand", response_model=Project)

@@ -17,6 +17,7 @@ import shutil
 from fastapi import HTTPException, status
 
 from ..app import (
+    ATTRIBUTED_DOCUMENTS,
     DEFAULT_SETTING_NOT_A_SETTING,
     DELETE_PROJECT_CONFIRM,
     DOCUMENT_LABELS,
@@ -47,6 +48,7 @@ from ..app import (
     document_restore_notice,
     document_restore_refusal,
     legal_sections,
+    reconcile_attribution,
     refresh_reference_maps,
     run_suggest_video,
     suggest_video_notice,
@@ -188,6 +190,23 @@ def register(ctx: RouterContext) -> None:
         displaced = getattr(project, document)
         setattr(project, f"{document}{RECOVERY_SLOT_SUFFIX}", displaced)
         setattr(project, document, previous)
+        # **The one Brief write that does not go through `write_document`, so the reconciliation
+        # is run here by hand.** This route swaps two stored strings rather than writing a new
+        # one, and it cannot use the shared writer: that function fills a recovery slot, and this
+        # one is the slot's reader. What it must not do is leave the marks behind pointing into
+        # text that is no longer there — offsets into a document that has been replaced are not
+        # stale metadata, they are a claim that the assistant wrote whatever now sits at those
+        # characters, and a restore usually changes the length as well as the words. So the same
+        # pure function decides, on the same comparison it always makes: a marked run whose exact
+        # text is in the restored version keeps its mark at the offset it moved to, and every
+        # other mark is dropped to unmarked, which reads as the Director's own. Losing a true
+        # mark that way is the safe direction; inventing one is not.
+        if attributed := ATTRIBUTED_DOCUMENTS.get(document):
+            setattr(
+                project,
+                attributed,
+                reconcile_attribution(displaced, getattr(project, attributed), previous),
+            )
         # Recorded in the thread, not only toasted: the chat is the audit trail of what
         # happened to these documents, and a restore is as much a change as a replacement.
         project.messages.append(
@@ -494,6 +513,18 @@ def register(ctx: RouterContext) -> None:
         for field in DOCUMENT_LABELS:
             for owned in (f"{field}_previous", f"{field}_locked"):
                 setattr(project, owned, getattr(current, owned))
+        # The Brief's attribution is server-owned on the identical argument, and this is the
+        # **seventeenth** recorded time this one route has been the hole for a field a narrower
+        # sibling guards — the Brief's own slot and lock were the sixteenth (2026-09-03). It is a
+        # defaulted `list`, so every client written before it existed sends nothing, Pydantic
+        # fills `[]`, and one ordinary save would strip every mark out of the Brief: the record
+        # of what the assistant wrote, gone, with the text it describes still on the page. The
+        # other direction is the worse one and is why this is not a bare default — a body that
+        # *invented* ranges would be planting authorship, telling a Director six months later
+        # that a paragraph they wrote themselves came out of a model. The server is the sole
+        # writer (AD-45) — `app.write_document` for every write of new text, and the restore's own
+        # swap above — and the guard lands in the same commit as the field (AD-16, AD-41).
+        project.brief_attribution = current.brief_attribution
         # The thread is server-owned for the same reason and by the same argument. Nothing in
         # this application posts a message: the chat route, the expansion route and the restore
         # route are the only writers, and each appends exactly what it did. A client body is

@@ -913,7 +913,15 @@ def test_a_pass_writes_the_brief_and_nothing_else(tmp_path):
 
     after = store.get(project.id).model_dump(mode="json")
     changed = {key for key in after if before[key] != after[key]}
-    assert changed == {"creative_brief", "creative_brief_previous", "updated_at"}
+    # `brief_attribution` joined the set on 2026-09-04 with slice 14.3, and it belongs to the
+    # Brief exactly as the slot above does: this pass is a machine writer, so the Brief it wrote
+    # carries a mark saying so. Nothing else moved, which is what this test is actually for.
+    assert changed == {
+        "creative_brief",
+        "creative_brief_previous",
+        "brief_attribution",
+        "updated_at",
+    }
 
 
 def test_a_first_draft_into_a_blank_brief_reports_that_there_is_nothing_to_restore(tmp_path):

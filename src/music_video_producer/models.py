@@ -2098,6 +2098,32 @@ class RenderJob(BaseModel):
     updated_at: datetime = Field(default_factory=now_utc)
 
 
+class BriefRange(BaseModel):
+    """One stretch of the Creative brief the **assistant** wrote, and which turn wrote it.
+
+    Half-open character offsets into `Project.creative_brief`: `start` is the first character of
+    the marked run and `end` is one past its last, so `text[start:end]` is exactly what was
+    marked and two runs that touch share a number. Characters rather than words, because the
+    Brief is stored as one string and every reader of it — the reconciliation, the overlay C2
+    builds — indexes that string; a word index would need a tokeniser both sides agree on
+    forever.
+
+    **Only the assistant's runs exist (AD-45).** There is no "the Director wrote this" range and
+    the unmarked default is theirs, so a Brief with no ranges is a hand-typed one and behaves
+    exactly like every Brief written before this field existed. Adding a Director range later
+    would be a different decision, not an extension of this one.
+
+    `message_id` is the `TreatmentMessage.id` of the turn that wrote the run, which is what makes
+    *"which turn wrote this"* answerable six months later (AD-43). It is `""` for a machine write
+    that has no turn to point at — Suggest Video is its own pass with no thread and no message,
+    and an invented id would be worse than an honest blank.
+    """
+
+    start: int = Field(ge=0)
+    end: int = Field(ge=0)
+    message_id: str = ""
+
+
 class Project(BaseModel):
     id: str = Field(default_factory=lambda: new_id("project"))
     name: str
@@ -2136,6 +2162,27 @@ class Project(BaseModel):
     creative_brief_locked: bool = False
     treatment_locked: bool = False
     style_bible_locked: bool = False
+    #: Which stretches of the Creative brief the **assistant** wrote, and which turn wrote each
+    #: (AD-33, AD-45). Empty means *nothing here was written by a machine* — which is what every
+    #: Brief written before this field existed says, what a hand-typed Brief says, and a wholly
+    #: valid state rather than a missing one. Only the Brief has it; see `app.ATTRIBUTED_DOCUMENTS`.
+    #:
+    #: **Server-owned, and the server is the sole writer (AD-45).** An ordinary Brief save carries
+    #: text only: `ProjectDocumentsRequest` has no field for this and never will, because a client
+    #: that computed its own ranges would be a second authority on provenance, and provenance with
+    #: two authorities is provenance with none. `app.write_document` derives it from (stored text,
+    #: stored ranges, new text) on every write of new text, which is the one reconciliation AD-33
+    #: names; the restore route runs the same pure function over the version it brings back, and
+    #: those two plus `replace_project`'s re-adoption are the only places in the package that
+    #: assign this field at all.
+    #:
+    #: The generic full-project `PUT` re-adopts the stored value rather than trusting a body, on
+    #: `default_setting_id`'s argument and `sampling_profile`'s: a defaulted `list` that any
+    #: pre-existing client omits arrives as `[]`, so one ordinary save would clear every mark —
+    #: and a body that *invented* ranges would be planting authorship for text nobody attributed,
+    #: which is the worse of the two. That hole has been found in that route **sixteen** times;
+    #: this field is not the seventeenth.
+    brief_attribution: list[BriefRange] = Field(default_factory=list)
     song: Song | None = None
     # The song's structure, the Director's own marks (see `SongSection`). Defaulted so
     # every existing manifest loads unchanged; empty means unmarked, and everything that

@@ -934,6 +934,14 @@ DIRECTOR_CONTEXT_EXCLUDE: dict[str, Any] = {
     # any better than the first. Withholding it also keeps every Director prompt byte-identical
     # to what it was before this field existed, which is what makes the field safe to add.
     "shot_sections": True,
+    # `Project.brief_attribution` — character offsets into the Brief and a message id — withheld
+    # on the never-been-in grounds `SHOT_DIRECTOR_WITHHELD` sets and `Song.analysis` reuses. The
+    # model is handed the Brief itself, which is the thing it can read; a parallel list of integer
+    # spans is a second encoding of nothing it can act on, and this repository's recorded Director
+    # failure mode is degradation under rich structured context. Withholding it also keeps every
+    # Director prompt byte-identical to what it was before the field existed, which is the bar a
+    # newly declared field has to clear before it is safe to add.
+    "brief_attribution": True,
     # `notices` goes out whole, and that is the invariant Story 2.2 established extended to this
     # route. A notice's `raw` field holds the degraded output a refusal is about, and this dump is
     # what the *next* Director call is handed — so leaving it in would make the guard that catches
@@ -1811,12 +1819,232 @@ DOCUMENT_WRITER_MACHINE = "machine"
 DocumentWriter = Literal["save", "machine"]
 
 
+#: Which creative documents carry **attribution** — a record of which stretches of them the
+#: assistant wrote — mapped to the `Project` field that holds it.
+#:
+#: A mapping rather than a hardcoded `if document == "creative_brief"`, for `DOCUMENT_LABELS`'
+#: reason: `write_document` is the one writer of all three documents, and a document that grows
+#: attribution later gets it by arriving here rather than by somebody remembering to edit a
+#: condition. It has one member today and that is a decision rather than an oversight — the
+#: Treatment and the Style bible are *made from* the Brief by a machine, so nearly every
+#: character of them is the assistant's and a mark covering everything says nothing (AD-45).
+ATTRIBUTED_DOCUMENTS: dict[DocumentName, str] = {"creative_brief": "brief_attribution"}
+
+
+def _nearest_occurrence(text: str, marked: str, *, at_or_after: int, near: int) -> int:
+    """Where `marked` sits in `text` at or after `at_or_after`, closest to `near`, or `-1`."""
+    best = -1
+    index = text.find(marked, at_or_after)
+    while index >= 0:
+        if best < 0 or abs(index - near) < abs(best - near):
+            best = index
+        index = text.find(marked, index + 1)
+    return best
+
+
+def reconcile_attribution(
+    stored: str, ranges: Sequence[BriefRange], text: str
+) -> list[BriefRange]:
+    """`(stored text, stored ranges, new text) → ranges`. Pure, and AD-33's one implementation.
+
+    **A range whose exact text still appears survives with adjusted offsets; a range whose text
+    changed is dropped.** That sentence is the whole feature — it is what makes *"editing a range
+    clears its mark"* true rather than aspirational — and the drop is deliberately the default:
+    a mark this function cannot place with certainty is a claim about who wrote something, and an
+    unmarked run reads as the Director's own, which is the honest answer once the record is gone.
+    Guessing the other way leaves the Director's own sentence wearing the assistant's mark, and
+    that is the failure this slice exists to prevent rather than a smaller version of it.
+
+    **Marks are placed left to right and never overlap.** Each survivor is searched for at or
+    after the end of the previous survivor, so two adjacent marks stay adjacent and stay in
+    order, and no mark can be re-placed on top of one already settled.
+
+    **Where a mark's text occurs more than once, the occurrence nearest its old offset wins.**
+    A Brief that repeats a sentence is ordinary, and taking the first occurrence every time would
+    slide a mark backwards over text the Director wrote. Nearest-to-origin is also what makes an
+    insertion *before* a mark shift it by exactly the insertion's length.
+
+    Reconciliation over an empty list is the identity, which is what makes an unattributed Brief
+    — every Brief written before this field existed — behave exactly like a hand-typed one.
+    """
+    survivors: list[BriefRange] = []
+    cursor = 0
+    for mark in sorted(ranges, key=lambda mark: (mark.start, mark.end)):
+        # A mark that does not describe a real run of the stored text describes nothing, and a
+        # slice would truncate silently rather than say so. Dropped, on the rule above.
+        if mark.end <= mark.start or mark.end > len(stored):
+            continue
+        marked = stored[mark.start : mark.end]
+        found = _nearest_occurrence(text, marked, at_or_after=cursor, near=mark.start)
+        if found < 0:
+            continue
+        survivors.append(
+            BriefRange(start=found, end=found + len(marked), message_id=mark.message_id)
+        )
+        cursor = found + len(marked)
+    return survivors
+
+
+#: How a machine write is cut up when it decides what it actually wrote: one **line** at a time.
+#:
+#: The Director's ruling of 2026-09-04 priced *paragraph* granularity and accepted the cost it
+#: names — "a re-flowed paragraph being marked as new, which is over-marking at the paragraph
+#: rather than at the document". A line is never coarser than a paragraph, so it is never worse
+#: on that cost, and it is better on the shape this application actually produces: `compose_brief`
+#: writes `## Cast` on its own line above the section's prose, so a turn that rewrites the cast
+#: and keeps the heading marks the prose and leaves the heading alone. It also needs no diff
+#: algorithm — the question a line asks is the same substring question `reconcile_attribution`
+#: already asks, in the other direction — which is what kept the ruling implementable without a
+#: token-level comparison neither the model nor the Director would be able to predict.
+#:
+#: A blank line is not a unit. It has no text to be present or absent, and treating it as one
+#: would split every stretch this produces in two at every paragraph break.
+BRIEF_LINE = re.compile(r"[^\n]+")
+
+
+def _trimmed_span(text: str, start: int, end: int) -> tuple[int, int] | None:
+    """`(start, end)` with whitespace at both ends dropped, or `None` if nothing is left.
+
+    The gaps between kept lines are the line breaks that separated them, and a mark that opened
+    on the blank line above a paragraph would draw a highlight over nothing. Trimming is why the
+    stretch a Director sees starts at the first character somebody actually wrote.
+    """
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    return (start, end) if end > start else None
+
+
+def _unchanged_spans(stored: str, text: str) -> list[tuple[int, int]]:
+    """Where in `text` the lines that were already in `stored` sit, in order.
+
+    *Present in the stored text* is the ruling's own wording and it is a **substring** question,
+    asked exactly as `reconcile_attribution` asks it of a mark: does this run of characters still
+    appear at all. Deliberately not line-set equality, which is stricter and errs the wrong way —
+    a model that re-wraps one of the Director's paragraphs into shorter lines would have every one
+    of them declared new, and over-marking is the failure this feature exists to avoid. Under-
+    marking leaves text unmarked, which reads as the Director's own and is the honest default.
+    """
+    return [
+        (found.start(), found.end())
+        for found in BRIEF_LINE.finditer(text)
+        if found.group().strip() and found.group() in stored
+    ]
+
+
+def new_stretches(stored: str, text: str, *, message_id: str = "") -> list[BriefRange]:
+    """The runs of `text` that were not in `stored`, as marks naming the turn that wrote them.
+
+    The **complement** of the lines that survive verbatim, rather than a list of the lines that
+    do not — and that is what makes a wholly new document come back as exactly one mark from `0`
+    to the end rather than as one mark per line. Suggest Video composes a Brief over a blank or
+    wholly replaced document, so it keeps producing the single whole-document mark it produced
+    before this ruling, without a special case for it anywhere.
+
+    Contiguous new material merges for the same reason: the gap between two new lines is not a
+    kept line, so it is inside the complement and the two arrive as one stretch.
+    """
+    fresh: list[BriefRange] = []
+    cursor = 0
+    # The sentinel closes the last gap: everything after the final kept line is new, and without
+    # it a document whose new material is at the end would come back unmarked.
+    for start, end in [*_unchanged_spans(stored, text), (len(text), len(text))]:
+        if span := _trimmed_span(text, cursor, start):
+            fresh.append(BriefRange(start=span[0], end=span[1], message_id=message_id))
+        cursor = max(cursor, end)
+    return fresh
+
+
+def written_attribution(
+    stored: str,
+    ranges: Sequence[BriefRange],
+    text: str,
+    *,
+    writer: DocumentWriter,
+    message_id: str,
+) -> list[BriefRange]:
+    """The ranges a document carries *after* one write of `text` over `stored`.
+
+    Two arms, and they are the two writers `write_document` already partitions on.
+
+    * **A machine write marks what it changed** — the Director's ruling of 2026-09-04. It used
+      to mark the whole document, on the true-but-useless observation that both machine writers
+      emit a complete Brief rather than a patch. True, and useless: a turn asked to add a Look
+      section returns the Director's own premise back verbatim inside its reply, and marking the
+      whole document put the assistant's name on paragraphs the Director wrote themselves. That
+      is over-marking at the document, and the ruling moved it to over-marking at the paragraph:
+      *keep the Director's unmarked runs that survive verbatim, and mark only the stretches that
+      are genuinely new.* `new_stretches` is *what was new*; the reconciliation below is *which
+      of the assistant's earlier marks survived*; this function is the two put together.
+    * **A save reconciles, and never marks.** The Director's own typing is the unmarked default
+      (AD-45), so a save can only move or clear a mark the assistant left; there is no "the
+      Director wrote this" range for it to create.
+
+    **The two sets are made disjoint here, deliberately, and they are not disjoint on their
+    own.** A surviving mark sits in text that is present in both versions, so it *looks* like it
+    can never land inside a new stretch — and that is false, because the two ask their question
+    at different sizes. A mark on `One driver` survives into the rewritten line
+    `One driver walks alone.`, whose *line* is new; the run is inside the stretch. Where they
+    collide the writing turn wins and the older mark is dropped: the turn that emitted the line
+    that is on the page now is the honest answer to *"who wrote this"*, both claims are true, and
+    provenance with two answers is the thing AD-45 refuses. Nothing overlaps in the result, which
+    is asserted rather than assumed.
+
+    **A byte-equal write marks nothing new**, on `write_document`'s own rule and for a sharper
+    reason than the recovery slot has: a pass that returned exactly the text already on the page
+    did not write the Director's Brief, and stamping it as the assistant's would take authorship
+    of an hour of their revisions on the strength of a no-op.
+
+    **That rule used to be a guard clause here and is now a consequence**, which is a change the
+    ruling made rather than a rule dropped. `text == stored` means every line of the write is
+    present in the stored text, so `new_stretches` returns nothing and the answer is the
+    reconciliation either way. The clause was kept for one run after the ruling and a mutant that
+    deleted it survived — an equivalent mutant, and this repository's own standard is that a
+    condition which cannot be made to fail is not a guard. It is stated here and asserted by
+    `test_a_byte_equal_machine_write_takes_authorship_of_nothing`, which now exercises the
+    mechanism that actually enforces it.
+    """
+    survivors = reconcile_attribution(stored, ranges, text)
+    if writer != DOCUMENT_WRITER_MACHINE:
+        return survivors
+    fresh = new_stretches(stored, text, message_id=message_id)
+    kept = [
+        one
+        for one in survivors
+        if not any(one.start < among.end and among.start < one.end for among in fresh)
+    ]
+    return sorted([*kept, *fresh], key=lambda one: (one.start, one.end))
+
+
 def write_document(
-    project: Project, document: DocumentName, text: str, *, writer: DocumentWriter
+    project: Project,
+    document: DocumentName,
+    text: str,
+    *,
+    writer: DocumentWriter,
+    attributed_to: str = "",
 ) -> bool:
     """Write one creative document, displacing what it replaced into that document's slot.
 
-    **The one place a creative document's text and its recovery slot are assigned.** Returns
+    **The one place a creative document's text is *written*, and the one place its recovery
+    slot is filled.** Both halves are narrower than they read, and the first was stated too
+    widely here until 2026-09-04: it said *the one place the text is assigned*, and that was
+    never true. `restore_document` assigns it too — `setattr(project, document, previous)`
+    on a version it takes out of the slot — and does not come through here, because this
+    function's job is to *fill* the slot that route *reads*. The two acts are opposites and
+    the guard that pins them says so: `restore_document` has always been in its allowed set.
+
+    **That sentence was a false record of the expensive kind**, and Slice C is what found it:
+    a claim that an invariant holds stops the next reader looking for the place that holds
+    it, and attaching the attribution reconciliation only where this docstring said to would
+    have left the restore swapping new text under old offsets. Marks pointing at characters
+    the assistant never wrote — invented provenance, which AD-45 calls worse than none.
+    `test_every_place_that_writes_a_creative_documents_text_is_one_that_reconciles` now holds
+    the corrected claim in the suite, so a fifth writer fails rather than being trusted to
+    have read this paragraph.
+
+    Returns
     whether the slot was spent, which is the difference between *there is a version to restore* and
     *there is not*, and is a fact only this function is in a position to know.
 
@@ -1848,10 +2076,17 @@ def write_document(
     echo as *no write at all* — both machine callers do, on their own stronger stripped test —
     decide that before they get here and never reach this.
 
-    **The seam Slice C needs.** AD-33 says every Brief write runs one pure reconciliation over
-    (stored text, stored ranges, new text). That is this function's arguments, minus a field that
-    does not exist yet. Nothing here is built on it and `brief_attribution` is deliberately not
-    added — but with four writers reduced to one, Slice C touches one place instead of four.
+    **The seam Slice C needed, filled.** AD-33 says every Brief write runs one pure
+    reconciliation over (stored text, stored ranges, new text) — this function's arguments
+    exactly, which is why the extraction was worth doing first. `written_attribution` is that
+    reconciliation and it runs *here*, once, for every writer of the Brief there is: the
+    Director's save, the planning turn and Suggest Video. Not per caller — three inline copies
+    of the displacement is what this function was extracted to end, and three inline copies of
+    the reconciliation would be the same defect one field along.
+
+    `attributed_to` is the `TreatmentMessage.id` of the turn doing the writing, so a mark can
+    name the turn that made it (AD-43). It is meaningless on a save — a save marks nothing — and
+    `""` on a machine write with no thread to point at, which is Suggest Video.
     """
     stored = getattr(project, document)
     captured = text != stored and (
@@ -1860,6 +2095,21 @@ def write_document(
     if captured:
         setattr(project, f"{document}{RECOVERY_SLOT_SUFFIX}", stored)
     setattr(project, document, text)
+    # After the text is assigned and against the text it *replaced*: the reconciliation is
+    # asserted by comparison of the two, so it reads `stored` rather than what is on the model
+    # now. A document with no attribution field is left exactly as it was.
+    if attributed := ATTRIBUTED_DOCUMENTS.get(document):
+        setattr(
+            project,
+            attributed,
+            written_attribution(
+                stored,
+                getattr(project, attributed),
+                text,
+                writer=writer,
+                message_id=attributed_to,
+            ),
+        )
     return captured
 
 
@@ -2653,18 +2903,28 @@ def rejection_notice(kept: str, empty: str, *, raw: str, **fields: object) -> Me
     return MessageNotice(kind="refusal", text=empty.format(**fields))
 
 
-def assistant_reply(prose: str, notices: list[MessageNotice]) -> TreatmentMessage:
+def assistant_reply(
+    prose: str, notices: list[MessageNotice], *, message_id: str = ""
+) -> TreatmentMessage:
     """The one way either Director route turns prose plus notices into a stored reply.
 
     `content` keeps carrying the joined text: it is what every saved project already holds and
     what `api.js`'s marker-scanning helpers read, so changing it would break both for no gain.
     The notices ride alongside it as data, which is what lets the renderer split the two apart
     without searching the message for a separator that its own text may contain.
+
+    `message_id` exists because a turn that writes the Brief has to be *named by the mark it
+    leaves* (AD-43), and the mark is written before the reply that reports it — the notices are
+    not known until the write has happened. So the caller allocates the id up front and hands it
+    to both. Defaulted, because only the planning turn needs it: a caller that does not care gets
+    the model's own default, which is the id every stored reply has always had.
     """
     content = prose
     if notices:
         content = prose + NOTICE_SEPARATOR + NOTICE_JOIN.join(notice.text for notice in notices)
-    return TreatmentMessage(role="assistant", content=content, notices=notices)
+    return TreatmentMessage(
+        role="assistant", content=content, notices=notices, id=message_id or new_id("msg")
+    )
 
 
 def _short(value: str, limit: int = 60) -> str:
