@@ -307,6 +307,27 @@ change what the rule means:
   clipping the older mark into fragments around the new one would invent boundaries neither turn
   wrote. Disjointness of the result is now asserted over every table row rather than assumed.
 
+### R-21 — The attribution wash stays a whisper; the rule is the signal
+
+*Ruled 2026-09-04, on a measurement taken after Slice C2 shipped it.*
+
+**The wash is `--surface-1` on the editor's `#101212` ground, which computes to a contrast ratio of
+1.06:1** — seven values across three channels, near-identical to the eye. Computed rather than
+judged, and confirmed by looking: in the wide screenshot the marks could not be found at all, and
+only the 2 px `--line-strong` rule (**2.08:1**) made them findable. Both numbers sit under WCAG
+1.4.11's 3:1 for a non-text element that carries meaning.
+
+**Ruled: leave it.** The rule is the signal and the wash is a whisper that rewards a close look
+without shouting. *Provenance is not a state* is DESIGN 3's own argument, and a barely-there wash is
+the most honest expression of it — the Director's own text is the unmarked default, and a loud
+mark would invert which half of the document looks like the exception.
+
+**Recorded so the number does not reopen the question.** Two alternatives were priced and declined:
+`--surface-2` for the wash (1.23:1, still neutral, still inside the closed palette) and a 3 px rule
+matching `.pass-note`, `.snap-report` and `.section-pill`. Neither is wrong; both were judged to buy
+loudness this mark does not want. **What would reopen it is evidence rather than a number:** a
+Director who cannot find a mark they know is there, on a real Brief rather than a fixture.
+
 ## Open questions for the PRD
 
 1. ~~**What exactly is a "Brief" for, now?**~~ **Answered 2026-08-22, and the analyst's premise was wrong.** The Brief is *already* upstream: `timeline.py` puts `creative_brief` into the project dump at three call sites, and the Director's own prompt opens *"You are handed the whole project: creative brief, treatment, style bible, the song's words."* Treatment and Style Bible have always been generated with the Brief as an input — the Director's original understanding was correct.
