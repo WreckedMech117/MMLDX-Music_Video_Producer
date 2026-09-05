@@ -1,4 +1,4 @@
-import { adoptedShotEffects, aiModPlan, alignLyricsKeptTranscription, api, applyRenderStatus, APPLY_DOCUMENTS_CONTROL, approvalControl, approvalNotice, assetNamePlan, assetsForTab, assetTab, assetTabEmpty, ASSET_NAME_HELP, ASSET_NAME_LABEL, ASSET_ROLE_LABELS, ASSET_TABS, assistantControl, assistantFillAllControl, assistantToast, ASSISTANT_EDIT_BLOCKED, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, batchReportToast, beatBandIdentity, beatMarkersControlPlan, BRIEF_ATTRIBUTION_CONTROLS, briefAttributionLabel, briefAttributionMarkAt, briefAttributionRanges, briefAttributionSegments, briefAttributionSummary, briefMarkRule, characterSlotPlan, CITATION_MISSING_LABEL, clearDocumentConsent, clipEffectsChip, comfyOutputUrl, consistencyAnchorPlan, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, documentChangeToast, documentClearing, documentClearingQuestion, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, DOCUMENT_CONTROLS, driveReadoutPlan, driveReadoutView, driveReadoutWanted, effectBandChange, effectBandEdit, effectBandStripDrag, effectBandStripHit, effectBandStripPlan, effectBandToggle, effectBindingsBody, effectBindingsSet, effectControlKey, effectControlTarget, effectCopyBody, effectCopyReport, effectDropTarget, effectMoveOffered, effectNudgeDirection, effectNudgeTarget, effectParameterDefinition, effectParameterReadout, effectParameterValue, effectSliderFill, effectsPanelModel, effectsRefusalNotice, effectStackAdd, effectStackChanged, effectStackMove, effectStackRemove, effectStackSetParameter, effectStackToggle, effectStackWrite, EFFECT_BAND_CLOSED, EFFECT_BAND_ID, EFFECT_PARAMETER_ID, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, expansionReport, generateAllPlan, hasActiveRenderJobs, INSTRUMENTAL_NOTE, jobTarget, markReadyControl, markReadyNotice, monitorPreviewView, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, PLACEHOLDER_PROMPT, prefillControl, PREVIEW_UNPLAYABLE, previewAdoption, randomSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderAgainQuestion, renderSettledToast, RENDER_POLL_INTERVAL_MS, resolveShotMode, shotBoundaries, shotCitations, shotEffectStack, shotExpansionToast, shotInspectorReadiness, shotLabel, shotModeOptionLabel, shotPreviewWanted, shotPromptCell, shotSpecificationProblems, shotTab, shotTabAfterKey, shotTabStrip, shotTakeUrl, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SHOT_TABS, SINGING_STATES, snapSeconds, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songOrderRanks, songRefusalMessage, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, tagLyricLine, threadHtml, unsavedWorkPending, unsavedWorkQuestion, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, vocalTaggingPlan, vocalTypeSpec, VOCAL_TYPES, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE } from "./api.js";
+import { adoptedShotEffects, aiModPlan, alignLyricsKeptTranscription, api, applyRenderStatus, APPLY_DOCUMENTS_CONTROL, approvalControl, approvalNotice, assetNamePlan, assetsForTab, assetTab, assetTabEmpty, ASSET_NAME_HELP, ASSET_NAME_LABEL, ASSET_ROLE_LABELS, ASSET_TABS, assistantControl, assistantFillAllControl, assistantToast, ASSISTANT_EDIT_BLOCKED, ASSISTANT_FILL_ALL_CONTROL, ASSISTANT_FILL_CONTROL, ASSISTANT_PREFILL_CONTROL, ASSISTANT_WITHOUT_REQUEST, batchReportToast, beatBandIdentity, beatMarkersControlPlan, BRIEF_ATTRIBUTION_CONTROLS, briefAttributionLabel, briefAttributionMarkAt, briefAttributionRanges, briefAttributionSegments, briefAttributionSummary, briefMarkRule, characterSlotPlan, CITATION_MISSING_LABEL, clearDocumentConsent, clipEffectsChip, comfyOutputUrl, composerRoute, consistencyAnchorPlan, CONSISTENCY_PROMPT_HELP, CONSISTENCY_PROMPT_LABEL, documentChangeToast, documentClearing, documentClearingQuestion, documentConsent, documentConsentClearedOnLoad, documentLabel, documentLockNotice, documentRestoreAvailable, documentRestoreNotice, documentRestoreRefusal, documentRestoreStaleNotice, documentRestoreTitle, DOCUMENT_CONTROLS, driveReadoutPlan, driveReadoutView, driveReadoutWanted, effectBandChange, effectBandEdit, effectBandStripDrag, effectBandStripHit, effectBandStripPlan, effectBandToggle, effectBindingsBody, effectBindingsSet, effectControlKey, effectControlTarget, effectCopyBody, effectCopyReport, effectDropTarget, effectMoveOffered, effectNudgeDirection, effectNudgeTarget, effectParameterDefinition, effectParameterReadout, effectParameterValue, effectSliderFill, effectsPanelModel, effectsRefusalNotice, effectStackAdd, effectStackChanged, effectStackMove, effectStackRemove, effectStackSetParameter, effectStackToggle, effectStackWrite, EFFECT_BAND_CLOSED, EFFECT_BAND_ID, EFFECT_PARAMETER_ID, escapeHtml, expandAllPromptsControl, expandAllPromptsToast, expandPromptControl, expandPromptToast, EXPAND_ALL_PROMPTS_CONTROL, EXPAND_ALL_PROMPTS_WITHOUT_SHOTS, expansionReport, generateAllPlan, hasActiveRenderJobs, INSTRUMENTAL_NOTE, jobTarget, markReadyControl, markReadyNotice, monitorPreviewView, multiviewPlan, musicFormFieldUpdate, musicGenerationPlan, nextRenderSeed, PLACEHOLDER_PROMPT, planningBar, planningConsentControl, planningEnterNotice, planningTurnToast, PLANNING_ENTER_LABEL, PLANNING_MODE_CONTROLS, prefillControl, PREVIEW_UNPLAYABLE, previewAdoption, randomSeed, RANDOM_SEED_CONTROL, RANDOM_SEED_HELP, RANDOM_SEED_LABEL, readinessLines, readinessSummary, reconcileShotCitations, renderAgainControl, renderAgainNotice, renderAgainQuestion, renderSettledToast, RENDER_POLL_INTERVAL_MS, resolveShotMode, shotBoundaries, shotCitations, shotEffectStack, shotExpansionToast, shotInspectorReadiness, shotLabel, shotModeOptionLabel, shotPreviewWanted, shotPromptCell, shotSpecificationProblems, shotTab, shotTabAfterKey, shotTabStrip, shotTakeUrl, SHOT_EXPANSION_EDIT_BLOCKED, SHOT_EXPANSION_WITHOUT_SHOTS, SHOT_MODES, SHOT_TABS, SINGING_STATES, snapSeconds, songChangeNeedsConfirmation, songContextClearing, songContextClearingQuestion, songContextCount, songContextEditable, songContextFields, songContextRestoreAvailable, songContextRestoreNotice, songContextRestoreRefusal, songContextRestoreTitle, songContextSeedClearedOnLoad, songEncoderCeiling, songImportDuration, songOrderRanks, songRefusalMessage, SONG_CHANGE_CONSEQUENCE, SONG_CONTEXT_CONTROLS, SONG_CONTEXT_COUNTS, tagLyricLine, threadHtml, unsavedWorkPending, unsavedWorkQuestion, UNSAVED_DOCUMENT_EDITS_CONSEQUENCE, vocalTaggingPlan, vocalTypeSpec, VOCAL_TYPES, vramEjectAvailable, vramEjectChecked, vramEjectNote, vramEjectTitle, vramEjectToast, VRAM_EJECT_CONTROL, VRAM_EJECT_NOTE } from "./api.js";
 import { ASSEMBLE_RUNNING, EXPORT_PRESETS, EXPORT_PRESET_DEFAULT, assemblyControl, assemblyProgress, effectiveOffset, latestAssemblyExport, monitorShowsTake, monitorState, newShotFromPlan, renderProgressByTarget, renderingFlag, shotRenderState, takeAnchorControl, takeAudioControl, takesStripRows, trimNudgeControl } from "./api.js";
 // Suggest Video's watched pass (TP-4, story 13.2). Every decision is pure and lives in api.js --
 // the ticking approximation, the measurement, the abandon question and the note's face -- and
@@ -356,6 +356,13 @@ async function loadProject(id) {
   if (documentConsentClearedOnLoad(state.project?.id, id)) {
     clearDocumentConsent(applyDocumentsControl());
     unlockedFromMusic.clear();
+    // Planning Mode goes with them, on the same test and for the sharper version of the reason
+    // above (TP-6): the mode is a standing consent to rewrite *a* Brief, and carried into another
+    // project it would rewrite a Brief the Director was not looking at when they entered it. This
+    // is the project-change hook extended rather than a second one, so a *refresh* -- the queue
+    // poll, both generate paths, multiview -- cannot drop a Director out of a mode they are still
+    // in, three seconds after they entered it and with nothing on screen to explain why.
+    leavePlanningMode();
     // The seed randomizer, per shot since 2026-08-21 and cleared on the same test for the same
     // reason: ids collide across projects, so a set carried into another project would arm the
     // randomizer on a shot nobody has looked at -- and a *refresh* must not untick a box the
@@ -1039,6 +1046,10 @@ function renderTreatment() {
   renderBriefAttribution();
   syncDocumentControls();
   syncSuggestVideoControls();
+  // From the render path rather than only from the two clicks, so the bar's locked sentence
+  // follows a lock toggled anywhere -- the lock control is a route and a project reload, and a bar
+  // that only repainted on enter would go on promising a live edit of a Brief nothing can write.
+  syncPlanningMode();
   const thread = $("#chat-thread");
   // The whole body -- the empty-thread copy, every bubble, the prose/notice split and every
   // escape -- is `threadHtml`, a pure function the suite executes. This line is the only place
@@ -1193,7 +1204,12 @@ function confirmDiscardingDocumentEdits(question) {
 // re-render the editors from the server and so discard unsaved typing -- that is why the gate
 // fires either way -- but only a consented send can *replace* a document, and warning about a
 // rewrite that cannot happen deters a send that would write nothing.
-function directorSendQuestion(applyDocuments) {
+function directorSendQuestion(applyDocuments, planning) {
+  // A planning turn is a different send with a different reach: it writes the Creative brief and
+  // can touch neither the Treatment nor the Style bible, which is the opposite of the reply's
+  // arms. Naming "either creative document" here would warn about a rewrite that cannot happen
+  // and stay silent about the one that can.
+  if (planning) return "Send this planning turn? It can rewrite the Creative brief in place.";
   return applyDocuments
     ? "Send this to the Director? A reply can replace either creative document."
     : "Send this to the Director? No document will be replaced, but the editors are re-rendered from the text stored on the server.";
@@ -1204,6 +1220,63 @@ function directorSendQuestion(applyDocuments) {
 // this is the one place that turns the selector into an element.
 function applyDocumentsControl() {
   return $(APPLY_DOCUMENTS_CONTROL);
+}
+
+// ---- Planning Mode, the drawing half (TP-6, AD-35) -------------------------------------------
+// **The seam.** Every decision is api.js's and is imported: whether the bar is there, what it
+// says, what a locked Brief changes about it, what entering announces, and what the suspended
+// consent control looks like. Nothing below decides any of that, and nothing below tells the
+// server anything: the mode exists in `state.planningMode` and in no request, field or header.
+
+// **The one place the mode is entered.** That is deliberate and it is what D1 owes D2: the
+// Director has ruled that entering takes a session-start snapshot (story 14.4, AD-34/AD-44), so
+// entering has to be one obvious, testable place rather than three. Nothing is snapshotted here --
+// that shape is D2's to choose, and storing something convenient now would pre-empt it.
+//
+// Entering states the trade in one sentence, and it is the same sentence the bar then carries: a
+// mode announced in one wording and described in another is two promises about one thing.
+function enterPlanningMode() {
+  state.planningMode = true;
+  syncPlanningMode();
+  toast(planningEnterNotice(state.project));
+}
+
+// The one place it is left. Consent never survives leaving, so the per-turn tick comes back
+// **unticked** -- restoring an operable, ticked box would hand back a consent the Director gave to
+// the mode rather than to the next turn.
+function leavePlanningMode() {
+  state.planningMode = false;
+  clearDocumentConsent(applyDocumentsControl());
+  syncPlanningMode();
+}
+
+// The bar and the suspended control, repainted from the mode and the project. Exported for the
+// executed frontend contract on `renderShotInspector`'s precedent: "the checkbox is disabled and
+// visibly superseded" is a claim about elements, and a test that only read this source could not
+// tell a control that is shut from one whose handler happens to return early.
+export function syncPlanningMode() {
+  const bar = planningBar(state.project, state.planningMode);
+  const barElement = $(PLANNING_MODE_CONTROLS.bar);
+  // `hidden` as an attribute, matching the pass indicator: the stylesheet's `[hidden]` rule is
+  // what keeps a `display: flex` from outranking it, and both halves are asserted.
+  if (bar.visible) barElement.removeAttribute("hidden");
+  else barElement.setAttribute("hidden", "");
+  $(PLANNING_MODE_CONTROLS.name).textContent = bar.label;
+  $(PLANNING_MODE_CONTROLS.sentence).textContent = bar.sentence;
+  $(PLANNING_MODE_CONTROLS.exit).textContent = bar.exit;
+  const enter = $(PLANNING_MODE_CONTROLS.enter);
+  enter.textContent = PLANNING_ENTER_LABEL;
+  enter.disabled = bar.visible;
+  const suspended = planningConsentControl(state.planningMode);
+  const control = applyDocumentsControl();
+  if (control) control.disabled = suspended.disabled;
+  const toggle = $(PLANNING_MODE_CONTROLS.consentToggle);
+  toggle.classList.toggle("superseded", suspended.superseded);
+  toggle.title = suspended.title;
+  const note = $(PLANNING_MODE_CONTROLS.superseded);
+  note.textContent = suspended.note;
+  if (suspended.note) note.removeAttribute("hidden");
+  else note.setAttribute("hidden", "");
 }
 
 // Assistant ProducerBot's three controls, repainted from the current selection and the current
@@ -7215,6 +7288,15 @@ function bindEvents() {
     // looking at, and a restore button swaps a version they cannot see.
     $$("[data-doc-controls]").forEach((group) => group.classList.toggle("active", group.dataset.docControls === button.dataset.doc));
   }));
+  // Entered and left explicitly, and by these two controls only: not by opening the Brief tab,
+  // not by running Suggest Video, and not by a reply asking to write. Both go through the one
+  // function that owns each transition, so "the moment of entering" is a place D2 can hook.
+  $(PLANNING_MODE_CONTROLS.enter).addEventListener("click", () => {
+    if (!requireProject()) return;
+    if (state.planningMode) return;
+    enterPlanningMode();
+  });
+  $(PLANNING_MODE_CONTROLS.exit).addEventListener("click", () => leavePlanningMode());
   $("#chat-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     if (!requireProject()) return;
@@ -7225,17 +7307,29 @@ function bindEvents() {
     // Read from the control, never hardcoded: it is the Director's consent for this turn, and a
     // fixed `true` here would reinstate the unrequested rewrite the flag exists to stop, while a
     // fixed `false` would make the control decorative.
-    const applyDocuments = documentConsent(applyDocumentsControl());
+    const ticked = documentConsent(applyDocumentsControl());
+    // **AD-35 on the wire, decided in api.js and applied here.** Planning Mode picks the route and
+    // the consent *this* request carries; it is never a standing authority, and the server reads
+    // `apply_documents` out of this body and out of nothing it was told earlier. With the mode off
+    // the control's own answer is passed through, so a workspace that never entered the mode sends
+    // exactly what it sent before the mode existed.
+    const send = composerRoute(state.planningMode, ticked);
+    const applyDocuments = send.applyDocuments;
     // The whole project comes back, so the editors are re-rendered from the server whether or
     // not anything changed. Ask before that discards typing that was never stored and therefore
     // was never recoverable -- and ask about the send that is actually happening, since only a
     // consented one can replace a document.
-    if (!confirmDiscardingDocumentEdits(directorSendQuestion(applyDocuments))) return;
+    if (!confirmDiscardingDocumentEdits(directorSendQuestion(applyDocuments, send.planning))) return;
     const before = state.project;
     const button = event.currentTarget.querySelector("button[type=submit]");
     button.disabled = true; button.textContent = "Directing…";
     try {
-      state.project = await api.directorChat(state.project.id, { message, apply_shots: false, apply_documents: applyDocuments });
+      // Two routes, one consent, and the consent is in the body either way. A planning turn is
+      // an ordinary message when it comes back (AD-43): its notices land in the same thread the
+      // reply below lands in, drawn by the same `threadHtml`, with no second surface for them.
+      state.project = send.planning
+        ? await api.planningTurn(state.project.id, { message, apply_documents: applyDocuments })
+        : await api.directorChat(state.project.id, { message, apply_shots: false, apply_documents: applyDocuments });
       field.value = "";
       markDocumentsSaved();
       renderAll();
@@ -7244,7 +7338,13 @@ function bindEvents() {
       // and the most prominent feedback on screen must not contradict the reply itself. The
       // consent is passed in because a declined turn's "nothing changed" has a different cause
       // -- and a different remedy -- from a lock or a rejection.
-      toast(documentChangeToast(before, state.project, applyDocuments));
+      // Each route reports what *it* can have done. `documentChangeToast` diffs the two
+      // documents a Director reply can replace, and a planning turn writes neither of them --
+      // asked about a planning turn it would say "no document changed" over a Brief that had
+      // just been rewritten on screen.
+      toast(send.planning
+        ? planningTurnToast(before, state.project)
+        : documentChangeToast(before, state.project, applyDocuments));
     } catch (error) { toast(error.message, "error"); }
     // The consent this turn carried is spent, so the next turn starts from a decline again.
     finally { clearDocumentConsent(applyDocumentsControl()); button.disabled = false; button.textContent = "Send to Director"; }
@@ -7780,6 +7880,10 @@ async function init() {
   if (session.beatMarkers === false) beatMarkersOn = false;
   syncSnapTargetsControl();
   syncBeatMarkersControl();
+  // The mode's own controls, painted before anything is loaded. Their labels are api.js's and the
+  // markup ships them empty, so without this a workspace with no project offers two blank buttons
+  // -- and the render path that would have labelled them runs only once a project is on screen.
+  syncPlanningMode();
   // The effect catalogue joins the boot reads rather than the tab's own open, for the reason
   // `loadEffectCatalogue` records: the server holds its looks scan for the life of the process
   // precisely so a picker is not a folder read every time it opens.

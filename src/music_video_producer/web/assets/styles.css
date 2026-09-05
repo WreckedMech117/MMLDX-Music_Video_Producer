@@ -231,7 +231,41 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
    last Suggest Video pass. The note is `auto` and hidden until there is one, so a column that has
    never run a pass lays out exactly as it did with three rows -- and when one lands, the editor's
    `1fr` is what gives up the height rather than the note being squeezed to nothing. */
-.document-column { display: grid; grid-template-rows: auto 1fr auto auto; }
+/* Five rows since the Planning bar joined them (TP-6): the bar, the tabs, the editor, the
+   actions, and the report of the last Suggest Video pass. The bar is `auto` and ships hidden,
+   so a workspace that never enters Planning Mode lays out exactly as it did with four rows --
+   and when the mode is entered the editor's `1fr` is what gives up the height, never the bar,
+   which is the row that has to be readable to be the statement it is. */
+.document-column { display: grid; grid-template-rows: auto auto 1fr auto auto; }
+/* **Every row is placed explicitly, and that is a fix rather than a flourish.** A hidden
+   Planning bar is `display: none`, which removes it from the grid entirely -- so with
+   auto-placement the four remaining children slid up one track and the *actions row* took the
+   `1fr`, collapsing the Brief to two lines and leaving a hand's width of dead space under the
+   buttons. Every offline assertion about the template passed; it was read off a screenshot.
+   Named rows mean the editor keeps the `1fr` whether or not the bar is there, and a fifth
+   child added later lands where it was put rather than wherever the count happened to fall. */
+.document-column > .planning-bar { grid-row: 1; }
+.document-column > .document-tabs { grid-row: 2; }
+.document-column > .document-editor { grid-row: 3; }
+.document-column > .document-actions { grid-row: 4; }
+.document-column > .pass-note { grid-row: 5; }
+/* The Planning bar (DESIGN §4.1): the chrome-banner shape this application already uses for
+   its topbar and rail -- `#0e1010` on a `--line` bottom border -- with one sentence and its
+   controls right-aligned. It is over the documents rather than beside the chat because the
+   documents are what the mode puts at risk. The `[hidden]` rule is not redundant: `display:
+   flex` here outranks the user agent's `[hidden] { display: none }`, and this application has
+   shipped that exact defect once already -- an indicator permanently on screen claiming a
+   state nothing entered. No seventh accent: the dot is `--amber` because planning mode is a
+   write happening without per-turn consent, which is honestly a caution (DESIGN §1). The
+   sentence carries the state in words, so the colour is never carrying it alone. */
+.planning-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 9px 12px; border-bottom: 1px solid var(--line); background: #0e1010; color: var(--ink); font-size: 12px; line-height: 1.5; }
+.planning-bar[hidden] { display: none; }
+.planning-dot { flex: 0 0 auto; width: 9px; height: 9px; border-radius: 50%; background: var(--amber); }
+/* The mode's name, in the established Consolas micro-label form (9px, letter-spaced,
+   uppercase) that every other mode, kind and origin label in this application uses. */
+.planning-mode-name { flex: 0 0 auto; color: var(--amber); font: 9px/1.4 Consolas, monospace; letter-spacing: .1em; text-transform: uppercase; }
+#planning-sentence { flex: 1 1 260px; min-width: 0; color: var(--muted); }
+.planning-bar button { flex: 0 0 auto; margin-left: auto; }
 .document-tabs { display: flex; border-bottom: 1px solid var(--line); }
 .document-tabs button { min-height: 43px; border: 0; border-bottom: 2px solid transparent; padding: 0 17px; background: transparent; color: var(--muted); }
 .document-tabs button.active { color: var(--acid); border-bottom-color: var(--acid); }
@@ -330,6 +364,31 @@ input:focus, textarea:focus, select:focus { border-color: var(--acid); }
 .pass-note.failed { border-left-color: var(--red); }
 .lock-toggle { display: flex; align-items: center; gap: 6px; margin: 0 4px 0 0; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
 .lock-toggle input { width: 13px; height: 13px; accent-color: var(--acid); }
+/* The per-turn consent control while Planning Mode holds the consent instead (TP-6). Disabled
+   is not enough on its own: a greyed checkbox still looks like the control that decides, so
+   the label is struck through and a Consolas micro-label beside it names what took over. Both
+   halves are shape and text rather than colour, which is the accessibility floor's own rule. */
+.lock-toggle.superseded { color: var(--dim); }
+/* The strike is on the control's **name** and not on the row, because `text-decoration`
+   propagates into in-flow descendants and cannot be undone by a child's own
+   `text-decoration: none` -- struck at the row it also crossed out the label naming what took
+   over, which reads as that being cancelled too. Read off a screenshot, not off a rule.
+   `inherit` on the name's own colour and metrics keeps the unsuperseded control looking
+   exactly as it did: `.composer span` would otherwise repaint it `--dim` at 10px the moment
+   it stopped being a bare text node. */
+.lock-toggle .consent-name { color: inherit; font: inherit; letter-spacing: inherit; }
+.lock-toggle.superseded .consent-name { text-decoration: line-through; }
+.lock-toggle.superseded input { accent-color: var(--dim); }
+/* Scoped under `.lock-toggle` rather than left bare, and that is a fix rather than a style:
+   `.composer span` sets every span in this form to `--dim` at (0,1,1), which outranks a bare
+   `.superseded-note` at (0,1,0) -- so the label naming what took over was painted in the
+   inert token and read as one more disabled thing. Caught by the browser harness, which
+   resolves the colour; every offline assertion about it passed. `inline-block` is the other
+   half: `text-decoration` propagates into in-flow descendants and cannot be undone by a
+   child's own `text-decoration: none`, so the note would carry the parent's strike -- an
+   atomic inline-level box is what the propagation stops at. */
+.lock-toggle .superseded-note { display: inline-block; color: var(--amber); font: 9px/1.4 Consolas, monospace; letter-spacing: .1em; text-transform: uppercase; }
+.lock-toggle .superseded-note[hidden] { display: none; }
 /* The shot inspector's seed and its randomize toggle, on one line. The Director's ask,
    2026-08-20: "we should shorten that box a bit and add a randomize toggle (1-99999)". The box
    is sized to the five digits the randomizer can produce plus the number input's own spinner,

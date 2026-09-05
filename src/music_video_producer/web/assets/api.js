@@ -1117,6 +1117,158 @@ export function documentConsentClearedOnLoad(currentProjectId, nextProjectId) {
   return (currentProjectId || null) !== (nextProjectId || null);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Planning Mode (TP-6, AD-35): a mode the browser holds, and the server learns nothing from it.
+//
+// **What the mode changes is which route the composer sends to and what that request says about
+// itself — never what the server may assume.** `PlanningRequest.apply_documents` is read out of
+// the body of the request it arrives on and out of nothing else, so a request that carries no
+// consent is refused however long the mode has been on. Nothing here writes a cookie, a header, a
+// stored flag or a `Project` field, and there is no route that records a mode: what session
+// consent buys the Director is not ticking a box every turn, and what it must never buy is a
+// server that will write because of something it was told earlier.
+//
+// Everything below is a decision and `app.js` draws it — what the bar says, whether the composer
+// sends a planning turn or a chat turn, what entering announces, and what a locked Brief changes
+// about the bar. The lock half is a **statement, not a gate**: `document_lock_refusal` on the
+// server is still the only authority on whether a machine may write a document, and a bar that
+// refused locally would be a second one, disagreeing with the first the day a lock is toggled
+// somewhere this client did not see. What the bar buys is that the Director is told early rather
+// than by sending.
+//
+// **Nothing here is session undo.** No snapshot, no stack, no step-back: that is story 14.4, and
+// what this owes it is only that entering the mode is one obvious place rather than three.
+// ---------------------------------------------------------------------------------------------
+
+//: The mode's elements, in one table for `DOCUMENT_CONTROLS`' reason: a selector spelled out again
+//: at the bind, draw and clear sites is how a rename half-lands and leaves the bar showing a state
+//: the composer is no longer in. `consentToggle` is the label around `APPLY_DOCUMENTS_CONTROL` —
+//: the checkbox is what gets disabled, and the label is what has to *look* superseded.
+export const PLANNING_MODE_CONTROLS = {
+  bar: "#planning-bar",
+  name: "#planning-mode-name",
+  sentence: "#planning-sentence",
+  enter: "#enter-planning",
+  exit: "#exit-planning",
+  consentToggle: "#apply-documents-toggle",
+  superseded: "#apply-documents-superseded",
+};
+
+//: Entered and left explicitly, so both acts are named controls and neither is a side effect of
+//: opening a tab, running a pass, or a reply asking to write.
+export const PLANNING_ENTER_LABEL = "Enter planning";
+export const PLANNING_EXIT_LABEL = "Exit planning";
+//: The mode's name on the bar. A Consolas micro-label, uppercased by the stylesheet like every
+//: other mode name in this application (DESIGN §2), so the text here is written in prose case.
+export const PLANNING_MODE_LABEL = "Planning mode";
+
+// **The trade, in one sentence, written once.** The bar states it for as long as the mode is on
+// and entering announces the same words, because the sentence the Director reads at the moment
+// they accept the trade is the one that has to stay true afterwards — two wordings would be two
+// promises. It names the control it suspends and the document it puts at risk, both quoted from
+// the constants the rest of the application uses rather than retyped.
+export const PLANNING_MODE_TRADE =
+  `Planning mode is on: the ${DOCUMENT_LABELS.creative_brief} is edited live by every turn you ` +
+  `send, without ticking "${APPLY_DOCUMENTS_LABEL}" per turn — nothing else is written, and ` +
+  `${PLANNING_EXIT_LABEL} gives the per-turn tick back.`;
+
+// A locked Brief, stated by the bar rather than discovered by sending — the state table's
+// *"planning states it cannot write"*. It does not stop the send and nothing that sends consults
+// it: the request still goes and the server still refuses it in its own words.
+export const PLANNING_MODE_LOCKED =
+  `Planning mode is on, but the ${DOCUMENT_LABELS.creative_brief} is locked, so a planning turn ` +
+  `cannot write it — the conversation still runs and still asks questions. Unlock it beside ` +
+  `the editor to let planning edit it live.`;
+
+// What the bar says, in every state it has. The mode itself decides whether the bar is there at
+// all; the Brief's lock decides which sentence it carries. `planning` is compared rather than
+// coerced for `documentConsent`'s reason: a mode this was handed `undefined` for is a mode that is
+// off, and a bar drawn over a workspace nobody put into planning claims a consent nobody gave.
+export function planningBar(project, planning) {
+  const on = planning === true;
+  const locked = on && project?.creative_brief_locked === true;
+  return {
+    visible: on,
+    locked,
+    label: PLANNING_MODE_LABEL,
+    sentence: on ? (locked ? PLANNING_MODE_LOCKED : PLANNING_MODE_TRADE) : "",
+    exit: PLANNING_EXIT_LABEL,
+  };
+}
+
+// What entering announces: the sentence the bar is about to carry, so there is one wording of the
+// trade, and a locked Brief is named at the moment the Director enters rather than at the moment
+// they find out by sending.
+export function planningEnterNotice(project) {
+  return planningBar(project, true).sentence;
+}
+
+//: The markup's own title on the per-turn consent control, so the drawing can put it back when the
+//: mode is left. Asserted against `index.html` by a contract test: a title restored to a sentence
+//: the markup no longer carries is a control explaining itself wrongly for the rest of the session.
+export const APPLY_DOCUMENTS_TITLE =
+  "Off by default: the reply names what it proposed to change instead of replacing the Treatment " +
+  "or Style bible";
+//: The visible half of "superseded". A Consolas micro-label beside the struck-through control,
+//: because a disabled checkbox is *state is never colour-alone* in miniature: greyed out says
+//: "not now" and says nothing whatever about what took over.
+export const APPLY_DOCUMENTS_SUPERSEDED = "Superseded by planning mode";
+export const APPLY_DOCUMENTS_SUPERSEDED_TITLE =
+  "Planning mode carries this consent on every turn it sends, so the per-turn tick is suspended " +
+  `until ${PLANNING_EXIT_LABEL}.`;
+
+// The per-turn consent control while the mode is on: **disabled and visibly superseded**, which is
+// one requirement rather than two. A control that is merely disabled still looks like the thing
+// that decides — the Director ticks it, nothing happens, and the next write gets blamed on a
+// mode that was doing exactly what it said. `disabled` stops the click; `superseded` and `note` are
+// what the drawing turns into a struck-through label and a micro-label naming what took over.
+export function planningConsentControl(planning) {
+  const on = planning === true;
+  return {
+    disabled: on,
+    superseded: on,
+    note: on ? APPLY_DOCUMENTS_SUPERSEDED : "",
+    title: on ? APPLY_DOCUMENTS_SUPERSEDED_TITLE : APPLY_DOCUMENTS_TITLE,
+  };
+}
+
+// What a planning turn actually did, for the toast. **`documentChangeToast` cannot answer this
+// and must not be asked to**: it diffs `DIRECTOR_REPLACEABLE_DOCUMENTS`, which is the Treatment
+// and the Style bible, and a planning turn writes neither — so it would report "no document
+// changed" over a Brief that had just been rewritten in front of the Director. The most prominent
+// feedback on screen contradicting the reply beside it is the exact failure that toast's own
+// comment was written about; this is that rule applied to the other route.
+//
+// It promises nothing about restoring: a first draft into an empty Brief spends an empty slot, so
+// "the previous version is kept" is a promise the very next click can break. What was kept is the
+// server's own notice to say, in the thread, where it is said accurately or not at all.
+export const PLANNING_TURN_WROTE_TOAST =
+  `${DOCUMENT_LABELS.creative_brief} rewritten by this planning turn; the reply says what it ` +
+  `changed.`;
+export const PLANNING_TURN_UNCHANGED_TOAST =
+  `The planner replied and the ${DOCUMENT_LABELS.creative_brief} is unchanged; the reply says ` +
+  `what it did and why.`;
+
+export function planningTurnToast(before, after) {
+  return (before?.creative_brief ?? "") !== (after?.creative_brief ?? "")
+    ? PLANNING_TURN_WROTE_TOAST
+    : PLANNING_TURN_UNCHANGED_TOAST;
+}
+
+// **AD-35's client half, and the one function the safety property runs through.** Which route the
+// composer sends to, and the consent *that request* carries.
+//
+// Being in the mode is what makes the client send `apply_documents: true`; it is never what makes
+// the server assume it, and that difference is the whole slice. With the mode off, the control's
+// own answer is passed through exactly as it was before Planning Mode existed — which is why a
+// workspace that never enters the mode behaves identically, and why a hardcoded `true` here would
+// be the guard hole rather than a shortcut.
+export function composerRoute(planning, consent) {
+  return planning === true
+    ? { planning: true, applyDocuments: true }
+    : { planning: false, applyDocuments: consent === true };
+}
+
 // One lookup for both tables, throwing rather than returning undefined: a document the
 // server has no field for must fail loudly here instead of rendering "undefined" into a
 // toast or silently binding a control to nothing.
@@ -11451,6 +11603,13 @@ export const api = {
   markShotReady: (projectId, shotId) => request(`/api/projects/${projectId}/shots/${shotId}/mark-ready`, { method: "POST" }),
   markShotDraft: (projectId, shotId) => request(`/api/projects/${projectId}/shots/${shotId}/mark-draft`, { method: "POST" }),
   directorChat: (id, body) => request(`/api/projects/${id}/director/chat`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
+  // One Treatment Planning turn (TP-6). Its own route rather than a flag on the chat one,
+  // because the two turns reach different tools: a planning turn can write the Brief and
+  // propose assets and can touch nothing else, and a Director reply can replace the Treatment
+  // and the Style bible and cannot touch the Brief. The body is passed straight through, so
+  // the consent this request carries is the caller's decision and never this function's --
+  // `composerRoute` is where that is decided, and a default here would be a second answer.
+  planningTurn: (id, body) => request(`/api/projects/${id}/planning/turn`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }),
   // Asset Fill (the Director's stage 3): the Stage Manager assesses the library and queues
   // one Flux render per proposal. confirm_gpu is the acknowledgement, server-enforced.
   fillAssets: (id, count) => request(`/api/projects/${id}/assets/fill`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ count, confirm_gpu: true }) }),

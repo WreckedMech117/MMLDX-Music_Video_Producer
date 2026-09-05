@@ -100,6 +100,21 @@ export const state = {
   // that route re-adopts the stored value to prevent. Empty is the honest starting state: a
   // Brief nobody has rendered yet has no marks to be inside.
   briefMarks: [],
+  // Planning Mode (TP-6, AD-35). **Frontend state, and that is the invariant rather than an
+  // implementation detail.** The server never stores, infers or remembers document-write consent:
+  // being in the mode is what makes the composer put `apply_documents: true` in a request body,
+  // and a request that carries no consent is refused however long this has been true.
+  //
+  // Deliberately **not** on `state.project`, beside `briefMarks` and for its reason: the project
+  // object is what `PUT /api/projects/{id}` sends back whole, so a mode folded into it would be
+  // written straight into the manifest by the next ordinary save -- and a mode in a manifest is a
+  // server that remembers consent, which is the one thing AD-35 forbids.
+  //
+  // Session-scoped and **never persisted**: a reload leaves the mode off, which is what makes
+  // "consent never survives a reload" true by construction rather than by a clearing step
+  // somebody has to remember. Cleared on a real project change by `loadProject`, never on a
+  // refresh of the project already on screen.
+  planningMode: false,
 };
 
 export function selectedAsset() {

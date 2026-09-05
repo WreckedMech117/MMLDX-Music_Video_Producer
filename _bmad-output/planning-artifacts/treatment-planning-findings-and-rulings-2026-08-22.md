@@ -328,6 +328,42 @@ matching `.pass-note`, `.snap-report` and `.section-pill`. Neither is wrong; bot
 loudness this mark does not want. **What would reopen it is evidence rather than a number:** a
 Director who cannot find a mark they know is there, on a real Brief rather than a fixture.
 
+### R-22 — Entering Planning Mode takes a floor the session cannot erase
+
+*Ruled 2026-09-04, on the one decision AD-34 deferred to Slice D by name.*
+
+**AD-34's own correction is the argument.** The persisted recovery slot holds *the version before the
+last save that changed the Brief*, which is **not** the version the session opened with: during a
+planning session of repeated writes it moves forward, and after the second write the opening version
+is gone. The undo stack is bounded, so a long session loses the opening state from that end too.
+Between them there is no way back to where planning began, which is exactly the thing a Director
+talking a Brief into shape most wants to be able to undo.
+
+**Ruled: entering Planning Mode snapshots the Brief and its ranges, and that snapshot is never aged
+out by the depth bound and never overwritten by a later write.** Three levels, and they answer three
+different questions:
+
+| Control | Answers | Lifetime |
+|---|---|---|
+| Step back | *undo that one turn* | the session, bounded |
+| Back to where this session started | *forget this whole conversation's edits* | the session, never aged out |
+| Restore Creative brief | *the durable floor* | persisted, survives reload |
+
+**The alternative that was declined, and why it is worth recording:** a shallow stack plus the
+snapshot, on the argument that with a guaranteed floor the middle history is redundant. Declined
+because *"undo the last turn"* and *"undo the whole session"* are not the ends of one scale — a
+Director who wants step 7 of 12 wants a specific paragraph back, and neither end offers it.
+
+**The depth is 40, matched to `api.UNDO_DEPTH` rather than chosen afresh.** The timeline's stack
+already argued that number for a snapshot stack in this application, and a second number would be a
+second argument nobody had made. This closes the `[ASSUMPTION: a depth in the low tens]` the
+architecture's Deferred list carries against AD-34.
+
+**Not ruled here, and it belongs to D2's build:** whether the snapshot survives leaving and
+re-entering the mode within one page life. The UX says the stack lives *"for the life of that
+session"*, which makes exiting the end of a session — but that is a reading of a sentence, not a
+decision, and D2 should raise it rather than infer it.
+
 ## Open questions for the PRD
 
 1. ~~**What exactly is a "Brief" for, now?**~~ **Answered 2026-08-22, and the analyst's premise was wrong.** The Brief is *already* upstream: `timeline.py` puts `creative_brief` into the project dump at three call sites, and the Director's own prompt opens *"You are handed the whole project: creative brief, treatment, style bible, the song's words."* Treatment and Style Bible have always been generated with the Brief as an input — the Director's original understanding was correct.

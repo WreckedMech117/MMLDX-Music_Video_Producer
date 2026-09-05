@@ -246,7 +246,7 @@
                  a declined turn proposed; tests/test_frontend_contract.py asserts all three. -->
             <form class="composer" id="chat-form">
               <textarea name="message" rows="3" placeholder="The verses should feel claustrophobic, then the chorus breaks into a huge sodium-lit desert…"></textarea>
-              <div><span>Structured output stays editable before rendering.</span><label class="lock-toggle" title="Off by default: the reply names what it proposed to change instead of replacing the Treatment or Style bible"><input type="checkbox" id="apply-documents">Apply document changes</label><button class="primary-button" type="submit">Send to Director</button></div>
+              <div><span>Structured output stays editable before rendering.</span><label class="lock-toggle" id="apply-documents-toggle" title="Off by default: the reply names what it proposed to change instead of replacing the Treatment or Style bible"><input type="checkbox" id="apply-documents"><span class="consent-name" id="apply-documents-name">Apply document changes</span><span class="superseded-note" id="apply-documents-superseded" hidden></span></label><button class="primary-button" type="submit">Send to Director</button></div>
               <!-- Assistant ProducerBot's three controls, beside the chat because that is where the
                    Director described them: click a shot, click prefill, type the request, send.
                    All three are `type="button"` and none of them is this form's submit -- the
@@ -262,6 +262,19 @@
             </form>
           </div>
           <div class="document-column">
+            <!-- The Planning bar (TP-6, AD-35, DESIGN §4.1). It sits over the **documents**
+                 rather than beside the chat, because the documents are what the mode puts at
+                 risk, and it is the first row of `.document-column`'s grid so it governs all
+                 three editors rather than a single one. It ships `hidden` and empty: the mode is
+                 frontend state that no load restores, so a bar painted by markup would claim a
+                 consent nobody gave. Every string it draws is api.js's -- PLANNING_MODE_LABEL,
+                 PLANNING_MODE_TRADE or PLANNING_MODE_LOCKED, and PLANNING_EXIT_LABEL -- applied
+                 by syncPlanningMode and asserted against this markup by
+                 tests/test_frontend_contract.py. A `status` region, so the mode is available
+                 without hunting for it (EXPERIENCE, accessibility floor). The leading dot is
+                 `--amber` because planning is a caution, and it is `aria-hidden` because the
+                 sentence beside it says the same thing in words. -->
+            <div class="planning-bar" id="planning-bar" role="status" hidden><span class="planning-dot" aria-hidden="true"></span><span class="planning-mode-name" id="planning-mode-name"></span><span id="planning-sentence"></span><button class="quiet-button" type="button" id="exit-planning"></button></div>
             <div class="document-tabs"><button class="active" data-doc="brief">Brief</button><button data-doc="treatment">Treatment</button><button data-doc="style">Style bible</button></div>
             <!-- The Brief's help paragraph is api.js's BRIEF_HELP, asserted against this markup by
                  tests/test_frontend_contract.py: TP-2 asks the Brief to state what belongs in it and
@@ -289,7 +302,10 @@
                  tests/test_frontend_contract.py; the restore tooltips are set from the same mapping
                  by syncDocumentControls rather than duplicated here, and so is each lock's toast. -->
             <div class="document-actions">
-              <div class="document-scoped active" data-doc-controls="brief"><label class="lock-toggle" title="A locked Brief is not overwritten by a planning pass; you can still edit and save it yourself"><input type="checkbox" id="lock-brief">Lock Creative brief</label><button class="quiet-button" id="restore-brief" disabled>Restore Creative brief</button><button class="quiet-button" type="button" id="suggest-video" title="Propose a whole video idea from the song and write it into the Creative brief. It calls the local model and can take minutes; nothing is rendered. The Brief you have now is kept and can be restored.">Suggest video</button></div>
+              <div class="document-scoped active" data-doc-controls="brief"><label class="lock-toggle" title="A locked Brief is not overwritten by a planning pass; you can still edit and save it yourself"><input type="checkbox" id="lock-brief">Lock Creative brief</label><button class="quiet-button" id="restore-brief" disabled>Restore Creative brief</button><button class="quiet-button" type="button" id="suggest-video" title="Propose a whole video idea from the song and write it into the Creative brief. It calls the local model and can take minutes; nothing is rendered. The Brief you have now is kept and can be restored.">Suggest video</button><!-- The one way into Planning Mode, and it is a control rather than a side effect: not
+                   opening this tab, not running Suggest Video, not a reply asking to write.
+                   It is beside Suggest video because both write the Brief. Its label is
+                   api.js's PLANNING_ENTER_LABEL, applied by syncPlanningMode. --><button class="quiet-button" type="button" id="enter-planning"></button></div>
               <div class="document-scoped" data-doc-controls="treatment"><label class="lock-toggle" title="A locked document is never replaced by a Director reply"><input type="checkbox" id="lock-treatment">Lock Treatment</label><button class="quiet-button" id="restore-treatment" disabled>Restore Treatment</button></div>
               <div class="document-scoped" data-doc-controls="style"><label class="lock-toggle" title="A locked document is never replaced by a Director reply"><input type="checkbox" id="lock-style">Lock Style bible</label><button class="quiet-button" id="restore-style" disabled>Restore Style bible</button></div>
               <!-- The expansion control is one name in three places: this id, its label, and app.js's

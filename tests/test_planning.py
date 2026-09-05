@@ -18,6 +18,7 @@ import json
 
 import httpx
 import pytest
+from package_source import package_code
 from pydantic import BaseModel, ValidationError
 from test_api import FakeDirector, make_client
 
@@ -575,6 +576,91 @@ def test_consent_is_per_request_and_is_never_remembered(tmp_path):
     assert "apply_documents" not in after.model_dump()
     assert PlanningRequest(message="x").apply_documents is False
     assert PlanningRequest(message="x", apply_documents=None).apply_documents is False
+
+
+def test_a_consentless_request_is_refused_after_a_consented_one_on_the_same_project(tmp_path):
+    """**AD-35, and the test to keep if only one could be kept** (story 14.2, Planning Mode).
+
+    Planning Mode is *frontend* state. Slice D gave the Director a mode they can be *in*, and the
+    simplification that would ruin it is a server that remembers being told — a session flag, a
+    `Project` field, a cookie, anything that means *this client may write*. The shape of that
+    defect is not a wrong answer to one request; it is a **right answer to the first request and a
+    wrong one to the second**, which is why this is a sequence in one process on one project and
+    not three independent cases.
+
+    Four requests, in the order that makes the failure visible:
+
+    1. consented — writes, which is what makes the mode worth having;
+    2. **not** consented — refused, *after* the server has just been told yes about this exact
+       project by this exact client. This is the assertion. It fails the day somebody adds a
+       server-side session, and it fails quietly for nobody: the Brief is unchanged and the
+       refusal is in the thread in the server's own words;
+    3. consented again — writes, so the refusal is not sticky either. A server that started
+       refusing everything after a decline would also be remembering, in the other direction;
+    4. not consented — refused again, so nothing about being told twice accumulates.
+
+    And then the negative space, because a behavioural sequence cannot see a field that is merely
+    *available* to be read: the request model carries exactly two fields, the stored project comes
+    back with nothing whose name means a mode or a session, and the manifest is byte-identical in
+    that respect to one that never planned at all.
+    """
+    label = DOCUMENT_LABELS["creative_brief"]
+    refusal = PLANNING_WITHOUT_CONSENT_NOTICE.format(document=label)
+    # Four answers, never a short one: `document_rejection`'s ratio floor refuses a much shorter
+    # candidate *before* consent is consulted, and this sequence would then pass for a reason it
+    # was not written to assert -- the silence rule shares its branch with the consent refusal.
+    director = PlanningDirector(
+        turn(brief=REVISED), turn(brief=THIRD), turn(brief=THIRD), turn(brief=REVISED)
+    )
+    client, store, comfy = make_client(tmp_path, director=director)
+    project = planning_project(store)
+
+    # 1. Consented, and it writes.
+    client.post(
+        TURN.format(project=project.id),
+        json={"message": "tighten the brief", "apply_documents": True},
+    )
+    assert store.get(project.id).creative_brief == REVISED
+
+    # 2. **The assertion.** Same project, same process, same client, consent absent — refused.
+    client.post(TURN.format(project=project.id), json={"message": "and again"})
+    after = store.get(project.id)
+    assert after.creative_brief == REVISED, "consent given earlier wrote a later request"
+    assert refusal in notice_text(after)
+    assert last_reply(after).notices[0].kind == "refusal"
+
+    # 3. Consented again: the refusal is not remembered either.
+    client.post(
+        TURN.format(project=project.id),
+        json={"message": "now do it", "apply_documents": True},
+    )
+    assert store.get(project.id).creative_brief == THIRD
+
+    # 4. And a fourth request without it is refused exactly as the second was.
+    client.post(TURN.format(project=project.id), json={"message": "once more"})
+    assert store.get(project.id).creative_brief == THIRD
+    assert refusal in notice_text(store.get(project.id))
+
+    # The model was asked every time: nothing here is a client-side gate, and the conversation
+    # runs whether or not a turn may write.
+    assert len(director.messages) == 4
+    assert not comfy.prompts
+
+    # --- The negative space ---------------------------------------------------------------
+    # The request model is the only carrier there is, and it carries exactly two things.
+    assert set(PlanningRequest.model_fields) == {"message", "apply_documents"}
+    # Nothing on the stored project could be read as a standing consent, a mode or a session.
+    stored = store.get(project.id).model_dump()
+    for field in stored:
+        for forbidden in ("apply_documents", "consent", "planning_mode", "session", "mode"):
+            assert forbidden not in field, f"{field} looks like a remembered mode"
+    # A project that has planned is, in that respect, the same shape as one that never has.
+    assert set(stored) == set(Project(name="never planned").model_dump())
+    # And there is no door for a mode to arrive through: no cookie, no header, no dependency and
+    # no middleware anywhere in the application. Scanned over the package rather than one file,
+    # because the sibling module is where a new one would plausibly be added.
+    for door in ("Cookie(", "Header(", "Depends(", "add_middleware", "BaseHTTPMiddleware"):
+        assert door not in package_code(), f"{door} is a way for a client to be remembered"
 
 
 def test_a_locked_brief_is_refused_by_the_rule_that_refuses_a_director_reply(tmp_path):

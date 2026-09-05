@@ -4046,7 +4046,15 @@ def test_composer_sends_document_consent_from_its_own_control():
     assert "flex-wrap: wrap" in composer_row.group(1), composer_row.group(1)
 
     handler = chat_submit_handler()
-    assert "const applyDocuments = documentConsent(applyDocumentsControl());" in handler
+    # The control's own answer, and then the one decision that turns it into what this request
+    # carries. Planning Mode is what can make the sent consent differ from the tick (AD-35, TP-6),
+    # and it does so by putting `true` in *this* body -- never by the server assuming anything.
+    # A `const applyDocuments = documentConsent(...)` straight into the body would be the shape
+    # that cannot express the mode at all; `composerRoute` is where the two are reconciled, and it
+    # is executed in `test_the_composer_route_is_the_only_thing_that_decides_the_sent_consent`.
+    assert "const ticked = documentConsent(applyDocumentsControl());" in handler
+    assert "const send = composerRoute(state.planningMode, ticked);" in handler
+    assert "const applyDocuments = send.applyDocuments;" in handler
     assert "apply_documents: applyDocuments" in handler
     # No spelling of a hardcoded consent, in any form -- match the value, not one syntax.
     assert not re.search(r"apply_documents\W{0,4}(true|false)", handler), handler
@@ -4136,7 +4144,14 @@ def test_consent_is_cleared_after_every_turn_and_on_every_project_change():
 
     # Exactly these two callers; a third would be a rule nobody stated, and nothing anywhere
     # ticks the box from code -- consent comes from the Director or not at all.
-    assert source.count("clearDocumentConsent(") == 2
+    # Three call sites since Planning Mode: the turn that spends it, the project change, and
+    # `leavePlanningMode`, which is what makes "leaving restores the per-turn tick **unticked**"
+    # true. A fourth is what this count is here to notice -- consent handed back ticked, or
+    # revoked somewhere the Director cannot connect to anything they did.
+    assert source.count("clearDocumentConsent(") == 3
+    assert "clearDocumentConsent(applyDocumentsControl());" in app_js_function(
+        "leavePlanningMode"
+    )
     assert not re.search(r"apply-documents\"\)\.checked = true|Control\(\)\.checked = true", source)
 
 
@@ -4211,7 +4226,10 @@ def test_the_send_confirmation_describes_the_send_that_is_actually_happening():
     assert "re-rendered from the text stored on the server" in declined
 
     handler = chat_submit_handler()
-    assert "confirmDiscardingDocumentEdits(directorSendQuestion(applyDocuments))" in handler
+    assert (
+        "confirmDiscardingDocumentEdits(directorSendQuestion(applyDocuments, send.planning))"
+        in handler
+    )
     # The gate is not skipped for a declined turn: the editors are overwritten regardless.
     assert handler.index("directorSendQuestion") < handler.index("api.directorChat(")
 
@@ -4362,6 +4380,664 @@ def test_the_declined_marker_is_a_real_substring_of_the_servers_own_notice():
     assert result["systemOnly"] is False
     for empty in ("noMessages", "noProject", "absent", "nonArray"):
         assert result[empty] is False, empty
+
+
+# ---------------------------------------------------------------------------------------------
+# Planning Mode (story 14.2, TP-6, AD-35): a mode the browser holds.
+#
+# **The safety property itself is asserted server-side, in `tests/test_planning.py`**, because that
+# is where it can actually be lost: a request without consent is refused however emphatically an
+# earlier one carried it. What is asserted here is the half that decides what goes on the wire --
+# and the wiring, which is what has survived mutation in this repository six slices running.
+# ---------------------------------------------------------------------------------------------
+
+#: A project at the stage Planning Mode is for: a Brief that exists and is being revised.
+PLANNING_PROJECT: dict = {
+    "id": "p1", "name": "P", "shots": [], "assets": [], "messages": [], "jobs": [],
+    "creative_brief": "A night drive that opens into wilderness.",
+    "treatment": "", "style_bible": "",
+    "creative_brief_previous": "", "treatment_previous": "", "style_bible_previous": "",
+    "creative_brief_locked": False, "treatment_locked": False, "style_bible_locked": False,
+}
+
+#: The two routes the composer can reach, spelled once. Named rather than matched as substrings so
+#: a client that posted to a plausible-looking neighbour still fails.
+PLANNING_PATH = "/api/projects/p1/planning/turn"
+CHAT_PATH = "/api/projects/p1/director/chat"
+
+#: The workspace body every driven Planning Mode test starts from: a project, a configured model,
+#: an event the composer's submit handler can actually read, and one reader for every element the
+#: mode paints. The event is hand-built because the handler reaches for `currentTarget.elements`
+#: and `currentTarget.querySelector("button[type=submit]")`, neither of which a selector-keyed stub
+#: can answer -- and driving the real handler is the only way to see the wiring at all.
+PLANNING_HARNESS = """
+  state.project = __PROJECT__;
+  state.health = { llm: { configured: true } };
+  const sendButton = at('#chat-send');
+  const submitEvent = () => ({
+    preventDefault() {},
+    currentTarget: { elements: at('#chat-form').elements, querySelector: () => sendButton },
+  });
+  const send = async (message) => {
+    at('#chat-form').elements.message.value = message;
+    requests.length = 0;
+    await fire('#chat-form:submit', submitEvent());
+    await flush();
+    return requests.map((sent) => ({ path: sent.path, body: JSON.parse(sent.body || 'null') }));
+  };
+  const toasts = () => at('#toast-region').appended.map((node) => node.textContent);
+  // `hidden` is read as an **attribute**: the stub element has no such property until something
+  // writes one, so a raw boolean would report `undefined` for "the markup's own hidden still
+  // stands" and `JSON.stringify` would drop the key entirely.
+  const painted = () => ({
+    bar: {
+      hidden: at('#planning-bar').getAttribute('hidden'),
+      name: at('#planning-mode-name').textContent,
+      sentence: at('#planning-sentence').textContent,
+      exit: at('#exit-planning').textContent,
+    },
+    enter: { label: at('#enter-planning').textContent, disabled: at('#enter-planning').disabled },
+    consent: {
+      disabled: at('#apply-documents').disabled,
+      checked: at('#apply-documents').checked,
+      superseded: at('#apply-documents-toggle').classList.contains('superseded'),
+      title: at('#apply-documents-toggle').title,
+      note: at('#apply-documents-superseded').textContent,
+      noteHidden: at('#apply-documents-superseded').getAttribute('hidden'),
+    },
+    mode: state.planningMode,
+  });
+"""
+
+
+def planning_workspace(
+    body: str, project: dict | None = None, reloads: list[dict] | None = None
+) -> dict:
+    """Boot the workspace with Planning Mode drivable by hand, both routes answered.
+
+    `reloads` is what `GET /api/projects/p1` answers, in order, the last entry repeating -- which
+    is how a project that gains a lock between two renders becomes drivable. Unlisted by default,
+    so a reload rejects exactly as it does for every other caller here.
+    """
+    seeded = PLANNING_HARNESS.replace("__PROJECT__", json.dumps(project or PLANNING_PROJECT))
+    responses: dict = {
+        PLANNING_PATH: {"body": project or PLANNING_PROJECT},
+        CHAT_PATH: {"body": project or PLANNING_PROJECT},
+    }
+    if reloads is not None:
+        responses["/api/projects/p1"] = [{"body": reload} for reload in reloads]
+    return run_workspace(seeded + body, responses=responses)
+
+
+def planning_strings() -> dict:
+    """api.js's half of the mode: its selectors, its labels and its two sentences."""
+    return run_module("""
+      import { APPLY_DOCUMENTS_SUPERSEDED, APPLY_DOCUMENTS_SUPERSEDED_TITLE,
+               APPLY_DOCUMENTS_TITLE, PLANNING_ENTER_LABEL, PLANNING_EXIT_LABEL,
+               PLANNING_MODE_CONTROLS, PLANNING_MODE_LABEL, PLANNING_MODE_LOCKED,
+               PLANNING_MODE_TRADE }
+        from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({
+        controls: PLANNING_MODE_CONTROLS, enter: PLANNING_ENTER_LABEL,
+        exit: PLANNING_EXIT_LABEL, label: PLANNING_MODE_LABEL, trade: PLANNING_MODE_TRADE,
+        locked: PLANNING_MODE_LOCKED, supersededTitle: APPLY_DOCUMENTS_SUPERSEDED_TITLE,
+        superseded: APPLY_DOCUMENTS_SUPERSEDED, title: APPLY_DOCUMENTS_TITLE,
+      }));
+    """)
+
+
+def test_the_planning_bar_is_in_the_markup_the_app_dereferences():
+    """Every selector `syncPlanningMode` reaches by id, and the state it must not ship painted.
+
+    A bar painted by the markup would claim a mode nobody entered -- this application's own "a
+    control that says in the past tense that something happened when it did not", and here the
+    something is a standing consent to rewrite the Brief. The `[hidden]` rule is not redundant
+    either: `display: flex` on the class outranks the user agent's `[hidden] { display: none }`,
+    which is a defect this repository has already shipped once and no offline reading catches.
+    """
+    markup = INDEX_HTML.read_text(encoding="utf-8")
+    strings = planning_strings()
+    for name, selector in strings["controls"].items():
+        assert f'id="{selector.lstrip("#")}"' in markup, name
+    assert '<div class="planning-bar" id="planning-bar" role="status" hidden>' in markup
+    # The bar's own strings are api.js's and are applied at run time, so the markup ships them
+    # empty: a label typed into the markup as well is the copy that goes stale.
+    assert '<button class="quiet-button" type="button" id="exit-planning"></button>' in markup
+    assert '<button class="quiet-button" type="button" id="enter-planning"></button>' in markup
+    assert '<span id="planning-sentence"></span>' in markup
+    # The consent control the mode suspends must also be reachable as a label, or the "visibly
+    # superseded" half is bound to nothing while the disabled half goes on working.
+    assert 'id="apply-documents-toggle"' in markup
+
+    styles = STYLES_CSS.read_text(encoding="utf-8")
+    assert ".planning-bar[hidden] { display: none; }" in styles
+    assert ".lock-toggle .superseded-note[hidden] { display: none; }" in styles
+    # A new row of the document column rather than a child of one editor's panel: the mode governs
+    # all three documents, and a bar inside the Brief's panel would vanish on the Treatment tab.
+    # Anchored at the line start: `.chat-column, .document-column { ... }` shares a rule with it
+    # and carries no template, so an unanchored search reads the wrong declaration block.
+    grid = re.search(r"^\.document-column \{([^}]*)\}", styles, re.MULTILINE)
+    assert grid, "the document column no longer has a grid rule of its own"
+    rows = css_track_list(
+        re.search(r"grid-template-rows:([^;]*);", grid.group(1)).group(1).strip()
+    )
+    assert rows == ["auto", "auto", "1fr", "auto", "auto"], rows
+    children = [child["attributes"].get("id") for child in markup_children("document-column")]
+    assert children[0] == "planning-bar", children
+
+    # **And every row is placed by name.** A hidden bar is `display: none`, which takes it out of
+    # the grid -- so under auto-placement the remaining four children slide up a track and the
+    # *actions row* inherits the `1fr`, which collapses the Brief to two lines in every workspace
+    # that has not entered the mode. That shipped, passed every assertion above, and was caught by
+    # opening a screenshot. Named rows are what make the template mean what it says.
+    placed = dict(
+        re.findall(r"^\.document-column > \.([\w-]+) \{ grid-row: (\d); \}$", styles, re.MULTILINE)
+    )
+    assert placed == {
+        "planning-bar": "1", "document-tabs": "2", "document-editor": "3",
+        "document-actions": "4", "pass-note": "5",
+    }, placed
+
+    # `--amber`, and no seventh accent: DESIGN §1 is closed, and planning mode is a write happening
+    # without per-turn consent, which is honestly a caution. Every colour in the bar's own rules is
+    # a palette token rather than a literal -- except the chrome background the banner shape shares
+    # with the topbar and the rail, which is the shape DESIGN §4.1 names.
+    bar_rules = "\n".join(
+        match.group(0)
+        for match in re.finditer(r"^\.planning-[\w-]+[^{]*\{[^}]*\}", styles, re.MULTILINE)
+    )
+    assert "background: var(--amber)" in bar_rules, bar_rules
+    literals = set(re.findall(r"#[0-9a-fA-F]{3,8}", bar_rules))
+    assert literals == {"#0e1010"}, literals
+    root = re.search(r":root\s*\{(.*?)\n\}", styles, re.DOTALL)
+    for token in set(re.findall(r"var\((--[\w-]+)\)", bar_rules)):
+        assert f"{token}:" in root.group(1), token
+
+
+def test_the_modes_controls_are_labelled_before_any_project_is_loaded():
+    """The markup ships both buttons empty, so something has to label them at boot.
+
+    Their labels are api.js's and are applied by `syncPlanningMode`, which the render path calls --
+    and the render path runs once a project is on screen. A workspace opened with no project, which
+    is every first run, would otherwise offer two blank buttons: the "measured thing that draws as
+    nothing" class, and one no source reading catches because the constants are all correct.
+    """
+    booted = run_workspace("""
+      console.log(JSON.stringify({
+        enter: at('#enter-planning').textContent,
+        exit: at('#exit-planning').textContent,
+        name: at('#planning-mode-name').textContent,
+        hidden: at('#planning-bar').getAttribute('hidden'),
+        disabled: at('#apply-documents').disabled,
+        mode: state.planningMode,
+      }));
+    """)
+
+    strings = planning_strings()
+    assert booted["enter"] == strings["enter"]
+    assert booted["exit"] == strings["exit"]
+    assert booted["name"] == strings["label"]
+    # And nothing is claimed: no project, no mode, no bar, and the per-turn tick still operable.
+    assert booted["mode"] is False
+    assert booted["hidden"] == ""
+    assert booted["disabled"] is False
+
+
+def test_the_planning_bar_states_the_trade_and_a_locked_brief_changes_what_it_says():
+    """What the bar says, in every state it has, executed rather than read.
+
+    Three requirements meet in one function. Entering states the trade **in one sentence** -- the
+    Brief edited live, without the per-turn tick -- and the bar goes on stating it, from the same
+    constant, because the sentence read at the moment the trade is accepted is the one that has to
+    stay true. A locked Brief is *stated by the bar rather than discovered by sending*: the state
+    table's "planning states it cannot write". And with the mode off there is no bar and no
+    sentence at all, which is what makes "nothing else degrades" true.
+
+    The lock half is a statement and never a gate. Nothing here lets the client refuse:
+    `document_lock_refusal` is still the authority, and `tests/test_planning.py` asserts that a
+    request sent anyway is still refused by the server in the server's own words.
+    """
+    strings = planning_strings()
+    states = run_module("""
+      import { planningBar, planningEnterNotice }
+        from './src/music_video_producer/web/assets/api.js';
+      const open = { creative_brief_locked: false };
+      const shut = { creative_brief_locked: true };
+      console.log(JSON.stringify({
+        off: planningBar(open, false),
+        offOnLocked: planningBar(shut, false),
+        on: planningBar(open, true),
+        onLocked: planningBar(shut, true),
+        // A mode nothing ever set is a mode that is off: a truthy-but-not-true value drawing a
+        // bar would claim a consent nobody gave.
+        absent: planningBar(open),
+        truthy: planningBar(open, 'yes'),
+        noProject: planningBar(null, true),
+        entering: planningEnterNotice(open),
+        enteringLocked: planningEnterNotice(shut),
+      }));
+    """)
+
+    assert states["off"] == {
+        "visible": False, "locked": False, "label": strings["label"],
+        "sentence": "", "exit": strings["exit"],
+    }
+    # A locked Brief with the mode off says nothing: the bar is not there to say it in.
+    assert states["offOnLocked"]["visible"] is False
+    assert states["offOnLocked"]["locked"] is False
+    assert states["offOnLocked"]["sentence"] == ""
+    for absent in ("absent", "truthy"):
+        assert states[absent]["visible"] is False, absent
+
+    assert states["on"]["visible"] is True
+    assert states["on"]["locked"] is False
+    assert states["on"]["sentence"] == strings["trade"]
+    assert states["onLocked"]["locked"] is True
+    assert states["onLocked"]["sentence"] == strings["locked"]
+    assert states["noProject"]["locked"] is False, "an absent project is not a locked one"
+
+    # Entering announces the bar's own sentence, so there is one wording of the trade.
+    assert states["entering"] == strings["trade"]
+    assert states["enteringLocked"] == strings["locked"]
+
+    # The trade names both halves of what it is: the document edited live, and the tick it
+    # suspends -- quoted from the constants rather than retyped, so a rename cannot half-land.
+    assert DOCUMENT_LABELS["creative_brief"] in strings["trade"]
+    assert APPLY_DOCUMENTS_LABEL in strings["trade"]
+    assert strings["exit"] in strings["trade"], "the way out is not named in the sentence"
+    # And the locked sentence says the two things the state table asks of it: it cannot write, and
+    # the conversation still runs.
+    assert "locked" in strings["locked"] and "cannot write it" in strings["locked"]
+    assert "still runs" in strings["locked"]
+    # The title the mode restores is the markup's own, or the control explains itself wrongly for
+    # the rest of the session -- and the superseded one names what took over.
+    assert f'title="{strings["title"]}"' in INDEX_HTML.read_text(encoding="utf-8")
+    assert strings["exit"] in strings["supersededTitle"]
+
+
+def test_the_composer_route_is_the_only_thing_that_decides_the_sent_consent():
+    """**AD-35's client half, executed over every combination there is.**
+
+    Being in the mode is what makes the client send `apply_documents: true`; it is never what makes
+    the server assume it. Off, the control's own answer is passed through unchanged, which is why a
+    workspace that never entered the mode sends exactly what it sent before the mode existed --
+    and a `true` here for an unticked box with the mode off is the guard hole this slice was
+    written to avoid, not a convenience.
+    """
+    routed = run_module("""
+      import { composerRoute } from './src/music_video_producer/web/assets/api.js';
+      const cases = {};
+      for (const planning of [true, false, undefined, null, 'yes']) {
+        for (const consent of [true, false, undefined, null, 'yes']) {
+          cases[String(planning) + '/' + String(consent)] = composerRoute(planning, consent);
+        }
+      }
+      console.log(JSON.stringify(cases));
+    """)
+
+    # In the mode: the planning route, and consent stated explicitly on this request.
+    for ticked in ("true/false", "true/true", "true/undefined"):
+        assert routed[ticked] == {"planning": True, "applyDocuments": True}, ticked
+
+    # Out of it: the chat route, and the tick decides -- including for everything that is not a
+    # real ticked checkbox, which is `documentConsent`'s own rule carried through unchanged.
+    assert routed["false/true"] == {"planning": False, "applyDocuments": True}
+    for declined in ("false/false", "false/undefined", "false/null", "false/yes"):
+        assert routed[declined] == {"planning": False, "applyDocuments": False}, declined
+    # A mode that is anything other than exactly `true` is a mode that is off, so nothing that is
+    # not the mode can put a standing consent on the wire.
+    for off in ("undefined/false", "null/false", "yes/false"):
+        assert routed[off] == {"planning": False, "applyDocuments": False}, off
+    for off in ("undefined/true", "null/true", "yes/true"):
+        assert routed[off] == {"planning": False, "applyDocuments": True}, off
+
+
+def test_planning_mode_is_entered_and_left_by_two_controls_and_carries_consent_per_turn():
+    """**The wiring, driven rather than grepped**, which is where six slices' survivors have hidden.
+
+    A pure decision every test agrees with, and a caller that ignores it, is the failure this
+    executes away. So the real controls are clicked, the real submit handler is fired, and what is
+    read back is the request body and the painted controls: a mode that never disabled the
+    checkbox, a composer that went on sending a chat turn while planning, and a consent hardcoded
+    `true` with the mode off all pass every reading of the source and fail here.
+    """
+    strings = planning_strings()
+    driven = planning_workspace("""
+      app.syncPlanningMode();
+      const off = painted();
+      const chat = await send('what if she is a passenger');
+      const before = toasts().length;
+      fire('#enter-planning:click', {});
+      const on = painted();
+      const announced = toasts().slice(before);
+      const planning = await send('she is a passenger, not the driver');
+      // A second turn in the same mode carries its own consent: nothing is spent and nothing is
+      // remembered by the client either.
+      const second = await send('and her brother is driving');
+      fire('#exit-planning:click', {});
+      const left = painted();
+      const after = await send('leave it there');
+      console.log(JSON.stringify({ off, chat, on, announced, planning, second, left, after }));
+    """)
+
+    # 1. Mode off: the composer behaves exactly as it did, per-turn tick and all.
+    assert driven["off"]["mode"] is False
+    assert driven["off"]["bar"]["hidden"] == "", "the bar is drawn before anyone entered the mode"
+    assert driven["off"]["bar"]["sentence"] == ""
+    assert driven["off"]["consent"] == {
+        "disabled": False, "checked": False, "superseded": False,
+        "title": strings["title"], "note": "", "noteHidden": "",
+    }
+    assert driven["chat"] == [{
+        "path": CHAT_PATH,
+        "body": {"message": "what if she is a passenger", "apply_shots": False,
+                 "apply_documents": False},
+    }]
+
+    # 2. Entered: a bar states what the mode means and offers a way out, and the consent control
+    #    is disabled *and* visibly superseded.
+    assert driven["on"]["mode"] is True
+    assert driven["on"]["bar"]["hidden"] is None
+    assert driven["on"]["bar"]["name"] == strings["label"]
+    assert driven["on"]["bar"]["sentence"] == strings["trade"]
+    assert driven["on"]["bar"]["exit"] == strings["exit"]
+    assert driven["on"]["enter"] == {"label": strings["enter"], "disabled": True}
+    assert driven["on"]["consent"] == {
+        "disabled": True, "checked": False, "superseded": True,
+        "title": strings["supersededTitle"], "note": strings["superseded"], "noteHidden": None,
+    }
+    # Entering states the trade, in the sentence the bar then carries.
+    assert driven["announced"] == [strings["trade"]]
+
+    # 3. A turn sent while planning goes to the planning route and carries consent explicitly --
+    #    on every turn, not on the first one only.
+    for turn, message in (
+        ("planning", "she is a passenger, not the driver"),
+        ("second", "and her brother is driving"),
+    ):
+        assert driven[turn] == [{
+            "path": PLANNING_PATH, "body": {"message": message, "apply_documents": True},
+        }], turn
+
+    # 4. Leaving restores per-turn consent, unticked, and the next turn is an ordinary chat turn
+    #    carrying the decline the empty box means.
+    assert driven["left"]["mode"] is False
+    assert driven["left"]["bar"]["hidden"] == ""
+    assert driven["left"]["consent"] == {
+        "disabled": False, "checked": False, "superseded": False,
+        "title": strings["title"], "note": "", "noteHidden": "",
+    }
+    assert driven["after"] == [{
+        "path": CHAT_PATH,
+        "body": {"message": "leave it there", "apply_shots": False, "apply_documents": False},
+    }]
+
+
+def test_leaving_planning_mode_hands_the_tick_back_unticked():
+    """Consent never survives leaving -- and "restored" must not mean "restored ticked".
+
+    A control handed back ticked would carry a consent the Director gave to the *mode* into the
+    very next turn, which is the "on until somebody notices" state the per-turn tick exists to
+    prevent. Driven with the box ticked before the mode was entered, which is the arm that would
+    pass by accident if leaving merely re-enabled the control it found.
+    """
+    driven = planning_workspace("""
+      app.syncPlanningMode();
+      at('#apply-documents').checked = true;
+      fire('#enter-planning:click', {});
+      const suspended = { checked: at('#apply-documents').checked,
+                          disabled: at('#apply-documents').disabled };
+      fire('#exit-planning:click', {});
+      const restored = { checked: at('#apply-documents').checked,
+                         disabled: at('#apply-documents').disabled };
+      const sent = await send('one more');
+      console.log(JSON.stringify({ suspended, restored, sent }));
+    """)
+
+    assert driven["suspended"]["disabled"] is True
+    assert driven["restored"] == {"checked": False, "disabled": False}
+    assert driven["sent"][0]["body"]["apply_documents"] is False
+
+
+def test_a_locked_brief_is_stated_by_the_bar_and_the_request_still_goes():
+    """The bar tells the truth early; it never becomes a second gate.
+
+    *"The lock refusal already exists server-side and must still be the authority."* A client that
+    refused to send would be a second answer to "may a machine write this document", disagreeing
+    with the first the day a lock is changed somewhere this client did not see -- and it would take
+    the conversation with it, which the edge case explicitly keeps: *the conversation still runs
+    and still asks questions.* `tests/test_planning.py` owns the other half.
+    """
+    strings = planning_strings()
+    locked = {**PLANNING_PROJECT, "creative_brief_locked": True}
+    driven = planning_workspace("""
+      app.syncPlanningMode();
+      fire('#enter-planning:click', {});
+      const on = painted();
+      const sent = await send('tighten it anyway');
+      console.log(JSON.stringify({ on, sent }));
+    """, project=locked)
+
+    assert driven["on"]["bar"]["sentence"] == strings["locked"]
+    assert driven["on"]["bar"]["hidden"] is None
+    # And it still sends, with consent, so the server's own refusal is what the Director reads.
+    assert driven["sent"] == [{
+        "path": PLANNING_PATH, "body": {"message": "tighten it anyway", "apply_documents": True},
+    }]
+
+
+def test_a_project_change_leaves_planning_mode_and_a_refresh_does_not():
+    """Consent never survives a project change -- and a refresh must not revoke it either.
+
+    Both halves are the point. `loadProject` is the refresh path as well as the switch path: the
+    queue refresh, both generate paths, multiview and the queue-ready loop all reload the project
+    already on screen, and dropping the Director out of the mode there would be the control
+    fighting them three seconds after they entered it. So this rides on
+    `documentConsentClearedOnLoad` -- the hook that already exists and is already gated -- rather
+    than on a second test of the same rule.
+    """
+    driven = planning_workspace("""
+      app.syncPlanningMode();
+      fire('#enter-planning:click', {});
+      const entered = { mode: state.planningMode };
+      answer(true);
+      await fire('#refresh-jobs:click', {});
+      const refreshed = { mode: state.planningMode,
+                          hidden: at('#planning-bar').getAttribute('hidden') };
+      answer(true);
+      await fire('#project-select:change', { target: { value: 'p2' } });
+      const switched = { mode: state.planningMode, checked: at('#apply-documents').checked,
+                         disabled: at('#apply-documents').disabled,
+                         hidden: at('#planning-bar').getAttribute('hidden') };
+      console.log(JSON.stringify({ entered, refreshed, switched }));
+    """)
+
+    assert driven["entered"]["mode"] is True
+    # A refresh of the project on screen disturbs neither the mode nor the bar.
+    assert driven["refreshed"] == {"mode": True, "hidden": None}
+    # A real change of project takes the mode away and hands the tick back, unticked and operable.
+    assert driven["switched"] == {
+        "mode": False, "checked": False, "disabled": False, "hidden": "",
+    }
+
+
+def test_the_bar_follows_a_lock_set_after_the_mode_was_entered():
+    """A lock is not only ever set before planning starts, and the bar has to keep up.
+
+    The Brief's lock is a route and a project reload: the Director toggles it beside the editor,
+    another tab toggles it, or Suggest Video's own reload brings back a project whose lock moved.
+    A bar painted only by the enter click would go on promising a live edit of a Brief that
+    nothing can write -- the exact inversion of what constraint 8 asks for, and one that reads as
+    *more* trustworthy than saying nothing.
+
+    So the paint hangs off the render path, and this drives a real reload to prove it: the mode is
+    entered over an unlocked Brief, the project comes back locked, and the sentence changes with
+    nobody re-entering anything. `syncPlanningMode` removed from `renderTreatment` survives every
+    other test in this file.
+    """
+    strings = planning_strings()
+    locked = {**PLANNING_PROJECT, "creative_brief_locked": True}
+    driven = planning_workspace("""
+      app.syncPlanningMode();
+      fire('#enter-planning:click', {});
+      const entered = at('#planning-sentence').textContent;
+      answer(true);
+      // A reload of the project already on screen -- the refresh path, not the switch path, so
+      // `documentConsentClearedOnLoad` is false and nothing here is a decision to leave the mode.
+      await fire('#project-select:change', { target: { value: 'p1' } });
+      await flush();
+      const afterReload = {
+        sentence: at('#planning-sentence').textContent,
+        locked: state.project?.creative_brief_locked,
+        mode: state.planningMode,
+        hidden: at('#planning-bar').getAttribute('hidden'),
+      };
+      console.log(JSON.stringify({ entered, afterReload, left: unconsumed() }));
+    """, reloads=[locked])
+
+    assert driven["entered"] == strings["trade"]
+    # The reload really happened and really carried the lock, so the assertion below is about the
+    # bar rather than about a fixture.
+    assert driven["afterReload"]["locked"] is True
+    # A refresh is not a project change, so the mode is still on -- and the sentence has moved.
+    assert driven["afterReload"]["mode"] is True
+    assert driven["afterReload"]["hidden"] is None
+    assert driven["afterReload"]["sentence"] == strings["locked"]
+
+
+def test_planning_mode_is_frontend_state_and_nothing_persists_or_announces_it():
+    """AD-35's negative, on the client side of it, asserted rather than described.
+
+    A reload leaves the mode off **by construction**: it lives in `state`, nothing writes it to
+    storage, and no request carries a field that means *and remember this*. Each of those is a
+    thing a builder could add in one line while every behavioural test above went on passing --
+    a `localStorage` entry restoring the mode across a reload would be the first, and a
+    `planning_mode` on a request body would be the second.
+    """
+    state_js = Path("src/music_video_producer/web/assets/state.js").read_text(encoding="utf-8")
+    assert "planningMode: false," in state_js, "the mode is not session state with an off default"
+
+    app = APP_JS.read_text(encoding="utf-8")
+    api = API_JS.read_text(encoding="utf-8")
+    for source, name in ((app, "app.js"), (api, "api.js")):
+        # The session store exists in this application and is written by `persistSession`; the
+        # mode must not be in it, or a reload comes back consenting.
+        stored = re.search(r"(localStorage|sessionStorage)[^\n]*planning", source, re.IGNORECASE)
+        assert not stored, name
+    # Nothing on the wire says "and remember this": the only planning field a request carries is
+    # the per-request consent the route already had.
+    for spelling in ("planning_mode", "session_consent", "sessionConsent"):
+        assert spelling not in api, spelling
+    calls = re.findall(r"api\.planningTurn\([^;]*", app)
+    assert calls, "nothing calls the planning route"
+    for call in calls:
+        assert "apply_documents" in call, call
+
+    # And the mode is set in exactly two places, which is what makes "entered and left explicitly"
+    # a property rather than a hope -- and what story 14.4's session-start snapshot hooks into.
+    assignments = re.findall(r"state\.planningMode = (\w+);", app)
+    assert assignments == ["true", "false"], assignments
+    assert "state.planningMode = true;" in app_js_function("enterPlanningMode")
+    assert "state.planningMode = false;" in app_js_function("leavePlanningMode")
+    # Left on a project change through the one function that owns leaving, inside the gate that
+    # already decides a change from a refresh.
+    load = app_js_block("async function loadProject(id) {", "\nasync function")
+    assert "leavePlanningMode();" in load
+    assert load.index("documentConsentClearedOnLoad") < load.index("leavePlanningMode();")
+    # Nothing else may enter it: the Brief tab, Suggest Video and a reply asking to write are all
+    # named in the spec as ways in that must not exist.
+    entered = re.findall(r"enterPlanningMode\(\)", app)
+    assert len(entered) == 2, entered  # the declaration and the one control that calls it
+
+
+def test_a_planning_turn_is_reported_by_a_toast_that_can_actually_see_what_it_did():
+    """The most prominent feedback on screen must not contradict the reply beside it.
+
+    `documentChangeToast` diffs `DIRECTOR_REPLACEABLE_DOCUMENTS` -- the Treatment and the Style
+    bible -- because a Director *reply* cannot carry the Brief at all. A planning turn writes the
+    Brief and neither of those, so reusing that toast would report **"no document changed"** over a
+    Brief that had just been rewritten in front of the Director: true about the documents it
+    looked at, and false about the only one this turn could touch.
+
+    So each route reports what it can have done, and the planning one promises nothing about
+    restoring -- a first draft into an empty Brief spends an empty slot, and "the previous version
+    is kept" would be a promise the next click breaks.
+    """
+    toasts = run_module("""
+      import { DOCUMENT_UNCHANGED_TOAST, PLANNING_TURN_UNCHANGED_TOAST, PLANNING_TURN_WROTE_TOAST,
+               documentChangeToast, planningTurnToast }
+        from './src/music_video_producer/web/assets/api.js';
+      const before = { creative_brief: 'the brief before', treatment: 'T', style_bible: 'S' };
+      const after = { creative_brief: 'the brief after', treatment: 'T', style_bible: 'S' };
+      console.log(JSON.stringify({
+        wrote: planningTurnToast(before, after),
+        unchanged: planningTurnToast(before, before),
+        // What the Director reply's toast says about the very same pair, which is the reason
+        // this second function exists rather than a third argument on the first.
+        replyWouldSay: documentChangeToast(before, after, true),
+        replyUnchanged: DOCUMENT_UNCHANGED_TOAST,
+        wroteConstant: PLANNING_TURN_WROTE_TOAST,
+        unchangedConstant: PLANNING_TURN_UNCHANGED_TOAST,
+        absent: planningTurnToast(null, after),
+        both: planningTurnToast(undefined, undefined),
+      }));
+    """)
+
+    assert toasts["wrote"] == toasts["wroteConstant"]
+    assert toasts["unchanged"] == toasts["unchangedConstant"]
+    # The failure this exists to prevent, stated as a comparison rather than described.
+    assert toasts["replyWouldSay"] == toasts["replyUnchanged"], (
+        "documentChangeToast can see a Brief change after all; this second toast is redundant"
+    )
+    assert toasts["wrote"] != toasts["replyWouldSay"]
+    assert DOCUMENT_LABELS["creative_brief"] in toasts["wrote"]
+    assert DOCUMENT_LABELS["creative_brief"] in toasts["unchanged"]
+    # Nothing here promises a restore, because a first draft leaves nothing to restore.
+    for wording in (toasts["wrote"], toasts["unchanged"]):
+        assert "restore" not in wording.lower(), wording
+        assert "previous version" not in wording.lower(), wording
+    # An absent project on either side is a change into text, and two absent ones are no change.
+    assert toasts["absent"] == toasts["wroteConstant"]
+    assert toasts["both"] == toasts["unchangedConstant"]
+
+    # And the handler asks the one that can answer, per route.
+    handler = chat_submit_handler()
+    assert "planningTurnToast(before, state.project)" in handler
+    assert "documentChangeToast(before, state.project, applyDocuments)" in handler
+    assert "toast(send.planning" in handler, "the toast is not chosen by the route"
+
+
+def test_a_planning_replys_notices_land_in_the_existing_thread():
+    """AD-43: a planning turn is an ordinary message carrying structured notices.
+
+    Not a second surface, and not a convention inside `content` that something parses back out of
+    prose. The thread already renders `notices`, so what this asserts is that the route's own
+    sentences arrive there -- the server's constants, not a transcription of them.
+    """
+    from music_video_producer.app import PLANNING_WITHOUT_CONSENT_NOTICE
+
+    refusal = PLANNING_WITHOUT_CONSENT_NOTICE.format(
+        document=DOCUMENT_LABELS["creative_brief"]
+    )
+    thread = run_module(f"""
+      import {{ threadHtml }} from './src/music_video_producer/web/assets/api.js';
+      console.log(JSON.stringify({{ thread: threadHtml([
+        {{ id: 'msg_1', role: 'user', content: 'she is a passenger' }},
+        {{ id: 'msg_2', role: 'assistant', content: 'Rewritten.', notices: [
+          {{ kind: 'refusal', text: {json.dumps(refusal)} }},
+          {{ kind: 'change', text: 'Creative brief replaced by this reply.' }},
+        ] }},
+      ]) }}));
+    """)["thread"]
+
+    assert 'class="message assistant"' in thread
+    assert "notice-refusal" in thread and "notice-change" in thread
+    # The server's own sentence, whole: a client that summarised it would be the second wording.
+    escaped = (
+        refusal.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        .replace('"', "&quot;").replace("'", "&#39;")
+    )
+    assert escaped in thread
 
 
 def test_editor_overwrites_warn_before_discarding_unsaved_edits_and_clear_the_flags():

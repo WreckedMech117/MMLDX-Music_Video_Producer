@@ -17,7 +17,7 @@ days of prose that the commit messages already carry better.
 | What | Where |
 |---|---|
 | What each change did and why | the commit messages, which this project writes long on purpose |
-| Every Director decision | `effects-director-rulings-2026-08-24.md` (R-1—R-46) and `treatment-planning-findings-and-rulings-2026-08-22.md` (R-1—R-21) |
+| Every Director decision | `effects-director-rulings-2026-08-24.md` (R-1—R-46) and `treatment-planning-findings-and-rulings-2026-08-22.md` (R-1—R-22) |
 | What each epic cost and taught | `epic-8-retro-*.md` through `epic-11-retro-*.md`, and their 86 action items in `sprint-status.yaml` — all closed |
 | Everything found and not fixed | `deferred-work.md`, ~53 open entries above `## Resolved` |
 | Why an architecture decision reads as it does | the two `ARCHITECTURE-SPINE.md` files, amended in place with strike-throughs |

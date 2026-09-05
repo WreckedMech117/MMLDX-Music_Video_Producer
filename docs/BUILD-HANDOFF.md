@@ -27,7 +27,7 @@ Sprint tracking: `_bmad-output/implementation-artifacts/sprint-status.yaml` — 
 | Feature | Artifacts |
 |---|---|
 | Effects | `effects-and-transitions-research-2026-08-21.md` · `effects-director-rulings-2026-08-21.md` (R-1…R-7) · **`effects-director-rulings-2026-08-24.md` (~~R-8…R-28~~ ~~R-8…R-32~~ ~~R-8…R-41~~ R-8…R-46)** *(corrected 2026-08-28 twice, and again on 2026-08-30 by the commit that added R-42 — the third time, and the first where the range moved in the same pass as the ruling rather than one pass later. The first range was written by `ad67a14`, the commit that added R-29 and R-30. The correction to R-32 was written by `1933c2e`, **the commit that added R-33** — the same defect, in the pass that was fixing it. Found by `tests/test_stale_claims.py` on its first run, which is why that guard exists.)* · `prds/prd-MusicVideoProducer-effects-2026-08-21/` · `ux-designs/ux-effects-2026-08-21/` · `architecture/architecture-MusicVideoProducer-effects-2026-08-21/` (AD-16…AD-31 + `BUILD-ORDER.md`) · `epics-effects.md` |
-| Treatment | `treatment-planning-findings-and-rulings-2026-08-22.md` (F-1…F-6, R-1…R-21) · `prds/prd-MusicVideoProducer-treatment-2026-08-22/` · `ux-designs/ux-treatment-2026-08-22/` · `architecture/architecture-MusicVideoProducer-treatment-2026-08-22/` (AD-32…AD-47 + `BUILD-ORDER.md`) · `epics-treatment.md` |
+| Treatment | `treatment-planning-findings-and-rulings-2026-08-22.md` (F-1…F-6, R-1…R-22) · `prds/prd-MusicVideoProducer-treatment-2026-08-22/` · `ux-designs/ux-treatment-2026-08-22/` · `architecture/architecture-MusicVideoProducer-treatment-2026-08-22/` (AD-32…AD-47 + `BUILD-ORDER.md`) · `epics-treatment.md` |
 
 All paths relative to `_bmad-output/planning-artifacts/` — *corrected 2026-08-27, this said ~~`_bmad-output/`~~ and there is no `_bmad-output/prds/`, `ux-designs/` or `architecture/`; every artifact above is one level further down.* Requirement prefixes never collide: base `FR-`, effects `FX-`, treatment `TP-`. Architecture decisions are one sequence, `AD-1`…`AD-47`.
 
@@ -422,6 +422,42 @@ impossible, in the evidence section. **A measured claim is worse than a reasoned
 specific way: reasoning announces itself and a number does not.** Before quoting a sweep, state
 what the harness could not vary and check that list against the mechanism under test. A sweep that
 has never produced a single disagreement has not been shown to be capable of one.
+
+### This repo is not uniformly CRLF, and assuming it is makes a mutation harness lie
+
+**Counted 2026-09-04, after a whole slice's specs had said otherwise: 92 CRLF-only files, 41
+LF-only, 0 mixed.** It does **not** split by extension. `app.py` is CRLF; `assistant_prompt.py`,
+`preferences.py`, `vram.py`, `prompt_cleanup.py`, `reference_map.py`, `transcription.py` and
+`dp_prompt.py` are LF. **Every web asset is LF** — `api.js`, `app.js`, `state.js`, `styles.css`,
+`index.html` — and so are most `tests/e2e_*.py`.
+
+**Why it matters more than a formatting note.** A multi-line mutation anchor written with `
+`
+matches **nothing** in an LF file, so the mutant is never applied and the harness reports
+**SURVIVED** for a guard that was never tested. That is a false green in the one tool this project
+uses to prove a guard is capable of failing — the same family as the two inert gates above, arrived
+at from the opposite direction.
+
+It was caught only because the implementer **asserted the anchor count** before replacing, rather
+than trusting `str.replace` to have done something. That assertion is the whole defence:
+
+```python
+nl = "
+" if "
+" in raw else "
+"      # this file's ending, not the repo's
+o = old.replace("
+", nl)
+assert raw.count(o) == 1, f"{path}: {raw.count(o)} matches"   # loud, not silent
+```
+
+`write_bytes` for the restore is still right, and was never the problem: it is right *because* it
+does not translate, which is exactly why it survives a tree with both endings in it. What was wrong
+was the sentence explaining it.
+
+**Do not normalise the tree to fix this.** Rewriting 41 files' endings would produce a diff touching
+every line of five assets and eight modules, for no behavioural gain, and would bury whatever real
+change rode along with it.
 
 ### A guard cited as proof of a claim is often narrower than the claim
 
