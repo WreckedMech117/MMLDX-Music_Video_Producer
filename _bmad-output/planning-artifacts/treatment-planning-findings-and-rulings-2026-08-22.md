@@ -364,6 +364,31 @@ re-entering the mode within one page life. The UX says the stack lives *"for the
 session"*, which makes exiting the end of a session — but that is a reading of a sentence, not a
 decision, and D2 should raise it rather than infer it.
 
+### R-23 — A planning session is the life of the page, not the life of the mode
+
+*Ruled 2026-09-11, on an ambiguity D1 refused to resolve by inference.*
+
+The UX says the undo stack lives *"for the life of that session"*, and D1 made Planning Mode
+something a Director can leave and re-enter without reloading. **That sentence does not say which
+one a session is**, and reading it either way is an interpretation rather than a decision — which
+is why D1 recorded it instead of picking.
+
+**Ruled: the history survives leaving.** The step-back stack and R-22's session-start snapshot live
+until a reload or a project change. Leaving Planning Mode switches the mode off and nothing else.
+
+**The consequence that matters for the build:** re-entering does **not** retake the snapshot. The
+snapshot is taken when there is not one, not every time the mode is entered — otherwise a Director
+who exits to glance at the Treatment tab and comes back would silently lose the version their
+session began from, which is the one thing R-22 exists to guarantee. *"Where this session started"*
+is anchored to the page, in the same place `state.planningMode` and the timeline's own stack are
+anchored.
+
+**Why not the cleaner story.** Making Exit end the session gives the snapshot an unambiguous
+meaning, and was declined because an accidental Exit would then destroy the history silently, and
+Exit does not warn. **Consent is the deliberate exception and stays one**: it is cleared on leaving,
+because consent given to a mode is not consent given to the next turn. History and permission
+expire on different clocks, and that asymmetry is the ruling rather than an oversight.
+
 ## Open questions for the PRD
 
 1. ~~**What exactly is a "Brief" for, now?**~~ **Answered 2026-08-22, and the analyst's premise was wrong.** The Brief is *already* upstream: `timeline.py` puts `creative_brief` into the project dump at three call sites, and the Director's own prompt opens *"You are handed the whole project: creative brief, treatment, style bible, the song's words."* Treatment and Style Bible have always been generated with the Brief as an input — the Director's original understanding was correct.

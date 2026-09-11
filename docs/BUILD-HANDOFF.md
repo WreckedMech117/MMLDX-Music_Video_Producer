@@ -27,7 +27,7 @@ Sprint tracking: `_bmad-output/implementation-artifacts/sprint-status.yaml` — 
 | Feature | Artifacts |
 |---|---|
 | Effects | `effects-and-transitions-research-2026-08-21.md` · `effects-director-rulings-2026-08-21.md` (R-1…R-7) · **`effects-director-rulings-2026-08-24.md` (~~R-8…R-28~~ ~~R-8…R-32~~ ~~R-8…R-41~~ R-8…R-46)** *(corrected 2026-08-28 twice, and again on 2026-08-30 by the commit that added R-42 — the third time, and the first where the range moved in the same pass as the ruling rather than one pass later. The first range was written by `ad67a14`, the commit that added R-29 and R-30. The correction to R-32 was written by `1933c2e`, **the commit that added R-33** — the same defect, in the pass that was fixing it. Found by `tests/test_stale_claims.py` on its first run, which is why that guard exists.)* · `prds/prd-MusicVideoProducer-effects-2026-08-21/` · `ux-designs/ux-effects-2026-08-21/` · `architecture/architecture-MusicVideoProducer-effects-2026-08-21/` (AD-16…AD-31 + `BUILD-ORDER.md`) · `epics-effects.md` |
-| Treatment | `treatment-planning-findings-and-rulings-2026-08-22.md` (F-1…F-6, R-1…R-22) · `prds/prd-MusicVideoProducer-treatment-2026-08-22/` · `ux-designs/ux-treatment-2026-08-22/` · `architecture/architecture-MusicVideoProducer-treatment-2026-08-22/` (AD-32…AD-47 + `BUILD-ORDER.md`) · `epics-treatment.md` |
+| Treatment | `treatment-planning-findings-and-rulings-2026-08-22.md` (F-1…F-6, R-1…R-23) · `prds/prd-MusicVideoProducer-treatment-2026-08-22/` · `ux-designs/ux-treatment-2026-08-22/` · `architecture/architecture-MusicVideoProducer-treatment-2026-08-22/` (AD-32…AD-47 + `BUILD-ORDER.md`) · `epics-treatment.md` |
 
 All paths relative to `_bmad-output/planning-artifacts/` — *corrected 2026-08-27, this said ~~`_bmad-output/`~~ and there is no `_bmad-output/prds/`, `ux-designs/` or `architecture/`; every artifact above is one level further down.* Requirement prefixes never collide: base `FR-`, effects `FX-`, treatment `TP-`. Architecture decisions are one sequence, `AD-1`…`AD-47`.
 
@@ -454,6 +454,9 @@ assert raw.count(o) == 1, f"{path}: {raw.count(o)} matches"   # loud, not silent
 `write_bytes` for the restore is still right, and was never the problem: it is right *because* it
 does not translate, which is exactly why it survives a tree with both endings in it. What was wrong
 was the sentence explaining it.
+
+**And the endings are not stable over time**, which is the second reason to detect rather than hardcode. Committing those files emits `warning: in the working copy of '<path>', LF will be replaced by CRLF the next time Git touches it` — eleven of them at once on 2026-09-04. So a harness that hardcoded `
+` after measuring the tree today would break on the same file tomorrow, in the same silent direction. Detect at read time, every time.
 
 **Do not normalise the tree to fix this.** Rewriting 41 files' endings would produce a diff touching
 every line of five assets and eight modules, for no behavioural gain, and would bury whatever real
